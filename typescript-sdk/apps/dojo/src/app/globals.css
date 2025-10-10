@@ -276,6 +276,11 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground font-sans;
+    /*
+      TODO: remove important modifier (!)
+      after troubleshooting why the dojo
+      sidebar text is white when on 404 pages
+    */
+    @apply bg-background! text-foreground! font-sans;
   }
 }
