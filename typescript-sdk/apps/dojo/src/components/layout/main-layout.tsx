@@ -10,6 +10,7 @@ import { useURLParams } from "@/contexts/url-params-context";
 import { getTitleForCurrentDomain } from "@/utils/domain-config";
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
+  const { sidebarHidden } = useURLParams();
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
 
@@ -42,7 +43,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     <ViewerLayout>
       <div className="flex h-full w-full overflow-hidden relative gap-2">
         {/* Mobile Header with Hamburger Menu */}
-        {isMobile && (
+        {isMobile && !sidebarHidden && (
           <div className="absolute top-0 left-0 right-0 z-50 bg-background border-b p-2 md:hidden">
             <div className="flex items-center justify-between">
               <Button
@@ -60,7 +61,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         )}
 
         {/* Mobile Overlay */}
-        {isMobile && isMobileSidebarOpen && (
+        {isMobile && isMobileSidebarOpen && !sidebarHidden && (
           <div
             className="absolute inset-0 bg-black/50 z-40 md:hidden"
             onClick={toggleMobileSidebar}
@@ -76,7 +77,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         </Suspense>
 
         {/* Content */}
-        <div className={`flex-1 overflow-auto ${isMobile ? 'pt-12' : ''}`}>
+        <div className={`flex-1 overflow-auto ${isMobile && !sidebarHidden ? 'pt-12' : ''}`}>
           <div className="h-full">{children}</div>
         </div>
       </div>
