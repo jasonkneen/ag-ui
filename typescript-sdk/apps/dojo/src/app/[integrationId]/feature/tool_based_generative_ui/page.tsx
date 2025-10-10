@@ -2,7 +2,7 @@
 import React, { useState } from "react";
 import "@copilotkit/react-ui/styles.css";
 import { CopilotKit, useCopilotAction } from "@copilotkit/react-core";
-import { CopilotSidebar, CopilotPopup } from "@copilotkit/react-ui";
+import { CopilotSidebar } from "@copilotkit/react-ui";
 import {
   Carousel,
   CarouselContent,

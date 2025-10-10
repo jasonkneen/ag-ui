@@ -1,4 +1,3 @@
-import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
 import React, { useEffect, useState } from "react";
 
 
