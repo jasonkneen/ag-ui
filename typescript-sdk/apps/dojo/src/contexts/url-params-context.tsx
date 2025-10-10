@@ -7,6 +7,7 @@ import { View } from "@/types/interface";
 interface URLParamsState {
   view: View;
   sidebarHidden: boolean;
+  chatDefaultOpen: boolean;
   frameworkPickerHidden: boolean;
   viewPickerHidden: boolean;
   featurePickerHidden: boolean;
@@ -17,6 +18,7 @@ interface URLParamsState {
 interface URLParamsContextType extends URLParamsState {
   setView: (view: View) => void;
   setSidebarHidden: (disabled: boolean) => void;
+  setChatDefaultOpen: (open: boolean) => void;
   setFrameworkPickerHidden: (disabled: boolean) => void;
   setViewPickerHidden: (disabled: boolean) => void;
   setFeaturePickerHidden: (disabled: boolean) => void;
@@ -39,6 +41,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
   const [state, setState] = useState<URLParamsState>(() => ({
     view: (searchParams.get("view") as View) || "preview",
     sidebarHidden: searchParams.get("sidebar") === "false",
+    chatDefaultOpen: searchParams.get("chatDefaultOpen") === "true",
     frameworkPickerHidden: searchParams.get("frameworkPicker") === "false",
     viewPickerHidden: searchParams.get("viewPicker") === "false",
     featurePickerHidden: searchParams.get("featurePicker") === "false",
@@ -64,6 +67,15 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
         params.set("sidebar", "false");
       } else {
         params.delete("sidebar");
+      }
+    }
+
+    // Update chatDefaultOpen param
+    if (newState.chatDefaultOpen !== undefined) {
+      if (newState.chatDefaultOpen) {
+        params.set("chatDefaultOpen", "true");
+      } else {
+        params.delete("chatDefaultOpen");
       }
     }
 
@@ -116,6 +128,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     const newState: URLParamsState = {
       view: (searchParams.get("view") as View) || "preview",
       sidebarHidden: searchParams.get("sidebar") === "false",
+      chatDefaultOpen: searchParams.get("chatDefaultOpen") === "true",
       frameworkPickerHidden: searchParams.get("frameworkPicker") === "false",
       viewPickerHidden: searchParams.get("viewPicker") === "false",
       featurePickerHidden: searchParams.get("featurePicker") === "false",
@@ -137,6 +150,12 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     const newState = { ...state, sidebarHidden };
     setState(newState);
     updateURL({ sidebarHidden });
+  };
+
+  const setChatDefaultOpen = (chatDefaultOpen: boolean) => {
+    const newState = { ...state, chatDefaultOpen };
+    setState(newState);
+    updateURL({ chatDefaultOpen });
   };
 
   const setFrameworkPickerHidden = (frameworkPickerHidden: boolean) => {
@@ -173,6 +192,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     ...state,
     setView,
     setSidebarHidden,
+    setChatDefaultOpen,
     setFrameworkPickerHidden,
     setViewPickerHidden,
     setFeaturePickerHidden,
