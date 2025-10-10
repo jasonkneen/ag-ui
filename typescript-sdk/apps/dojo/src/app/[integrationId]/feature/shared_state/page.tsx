@@ -7,6 +7,7 @@ import "@copilotkit/react-ui/styles.css";
 import "./style.css";
 import { useMobileView } from "@/utils/use-mobile-view";
 import { useMobileChat } from "@/utils/use-mobile-chat";
+import { useURLParams } from "@/contexts/url-params-context";
 
 interface SharedStateProps {
   params: Promise<{
@@ -17,6 +18,7 @@ interface SharedStateProps {
 export default function SharedState({ params }: SharedStateProps) {
   const { integrationId } = React.use(params);
   const { isMobile } = useMobileView();
+  const { chatDefaultOpen } = useURLParams();
   const defaultChatHeight = 50;
   const { isChatOpen, setChatHeight, setIsChatOpen, isDragging, chatHeight, handleDragStart } =
     useMobileChat(defaultChatHeight);
@@ -137,7 +139,7 @@ export default function SharedState({ params }: SharedStateProps) {
           </>
         ) : (
           <CopilotSidebar
-            defaultOpen={true}
+            defaultOpen={chatDefaultOpen}
             labels={{
               title: chatTitle,
               initial: initialLabel,

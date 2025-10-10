@@ -10,6 +10,7 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
+import { useURLParams } from "@/contexts/url-params-context";
 
 interface ToolBasedGenerativeUIProps {
   params: Promise<{
@@ -26,9 +27,10 @@ interface Haiku {
 
 export default function ToolBasedGenerativeUI({ params }: ToolBasedGenerativeUIProps) {
   const { integrationId } = React.use(params);
+  const { chatDefaultOpen } = useURLParams();
 
   const chatProps = {
-    defaultOpen: true,
+    defaultOpen: chatDefaultOpen,
     labels: {
       title: "Haiku Generator",
       initial: "I'm a haiku generator 👋. How can I help you?",

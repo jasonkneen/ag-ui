@@ -13,6 +13,7 @@ import { CopilotKit, useCoAgent, useCopilotAction, useCopilotChat } from "@copil
 import { CopilotChat, CopilotSidebar } from "@copilotkit/react-ui";
 import { useMobileView } from "@/utils/use-mobile-view";
 import { useMobileChat } from "@/utils/use-mobile-chat";
+import { useURLParams } from "@/contexts/url-params-context";
 
 const extensions = [StarterKit];
 
@@ -25,6 +26,7 @@ interface PredictiveStateUpdatesProps {
 export default function PredictiveStateUpdates({ params }: PredictiveStateUpdatesProps) {
   const { integrationId } = React.use(params);
   const { isMobile } = useMobileView();
+  const { chatDefaultOpen } = useURLParams();
   const defaultChatHeight = 50;
   const { isChatOpen, setChatHeight, setIsChatOpen, isDragging, chatHeight, handleDragStart } =
     useMobileChat(defaultChatHeight);
@@ -162,7 +164,7 @@ export default function PredictiveStateUpdates({ params }: PredictiveStateUpdate
           </>
         ) : (
           <CopilotSidebar
-            defaultOpen={true}
+            defaultOpen={chatDefaultOpen}
             suggestions={[
               {
                 title: "Write a pirate story",

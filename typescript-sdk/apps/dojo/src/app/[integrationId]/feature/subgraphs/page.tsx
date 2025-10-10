@@ -6,6 +6,7 @@ import { CopilotKit, useCoAgent, useLangGraphInterrupt } from "@copilotkit/react
 import { CopilotSidebar } from "@copilotkit/react-ui";
 import { useMobileView } from "@/utils/use-mobile-view";
 import { useMobileChat } from "@/utils/use-mobile-chat";
+import { useURLParams } from "@/contexts/url-params-context";
 
 interface SubgraphsProps {
   params: Promise<{
@@ -152,6 +153,7 @@ function InterruptHumanInTheLoop<TAgent extends AvailableAgents>({
 export default function Subgraphs({ params }: SubgraphsProps) {
   const { integrationId } = React.use(params);
   const { isMobile } = useMobileView();
+  const { chatDefaultOpen } = useURLParams();
   const defaultChatHeight = 50;
   const {
     isChatOpen,
@@ -240,7 +242,7 @@ export default function Subgraphs({ params }: SubgraphsProps) {
               {/* Chat Content */}
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden pb-16">
                 <CopilotSidebar
-                  defaultOpen={true}
+                  defaultOpen={chatDefaultOpen}
                   labels={{
                     title: chatTitle,
                     initial: initialLabel,
@@ -260,7 +262,7 @@ export default function Subgraphs({ params }: SubgraphsProps) {
           </>
         ) : (
           <CopilotSidebar
-            defaultOpen={true}
+            defaultOpen={chatDefaultOpen}
             labels={{
               title: chatTitle,
               initial: initialLabel,
