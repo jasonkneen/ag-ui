@@ -29,8 +29,9 @@ function FileTreeNode({
       {depth > 0 && <div className="absolute left-0 top-0 h-full w-px bg-border" />}
       <button
         className={cn(
-          "flex w-full items-center gap-2 rounded-sm px-2 py-1 text-sm hover:bg-accent/50",
-          isSelected && "bg-accent",
+          "flex w-full items-center gap-2 rounded-sm px-2 py-1 text-sm text-gray-700 dark:text-gray-200",
+          !isSelected && "hover:bg-foreground/5 hover:text-gray-900 dark:hover:text-white",
+          isSelected && "bg-foreground/10 text-gray-900 dark:text-white",
           depth === 1 && "ml-0.5",
           depth === 2 && "ml-1",
           depth === 3 && "ml-1.5",
