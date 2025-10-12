@@ -13,6 +13,7 @@ interface URLParamsState {
   featurePickerHidden: boolean;
   file?: string;
   codeLayout: "sidebar" | "tabs";
+  theme: "light" | "dark";
 }
 
 interface URLParamsContextType extends URLParamsState {
@@ -24,6 +25,7 @@ interface URLParamsContextType extends URLParamsState {
   setFeaturePickerHidden: (disabled: boolean) => void;
   setCodeFile: (fileName: string) => void;
   setCodeLayout: (layout: "sidebar" | "tabs") => void;
+  setTheme: (theme: "light" | "dark") => void;
 }
 
 const URLParamsContext = createContext<URLParamsContextType | undefined>(undefined);
@@ -46,6 +48,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     viewPickerHidden: searchParams.get("viewPicker") === "false",
     featurePickerHidden: searchParams.get("featurePicker") === "false",
     codeLayout: (searchParams.get("codeLayout") as "sidebar" | "tabs") || "sidebar",
+    theme: (searchParams.get("theme") as "light" | "dark") || "light",
   }));
 
   // Update URL when state changes
@@ -114,6 +117,15 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
       }
     }
 
+    // Update theme param
+    if (newState.theme !== undefined) {
+      if (newState.theme === "light") {
+        params.delete("theme");
+      } else {
+        params.set("theme", newState.theme);
+      }
+    }
+
     // Update file param
     if (newState.file !== undefined) {
       params.set("file", newState.file);
@@ -134,6 +146,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
       featurePickerHidden: searchParams.get("featurePicker") === "false",
       file: searchParams.get("file") || undefined,
       codeLayout: (searchParams.get("codeLayout") as "sidebar" | "tabs") || "sidebar",
+      theme: (searchParams.get("theme") as "light" | "dark") || "light",
     };
 
     setState(newState);
@@ -188,6 +201,12 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     updateURL({ codeLayout });
   };
 
+  const setTheme = (theme: "light" | "dark") => {
+    const newState = { ...state, theme };
+    setState(newState);
+    updateURL({ theme });
+  };
+
   const contextValue: URLParamsContextType = {
     ...state,
     setView,
@@ -198,6 +217,7 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     setFeaturePickerHidden,
     setCodeFile,
     setCodeLayout,
+    setTheme,
   };
 
   return <URLParamsContext.Provider value={contextValue}>{children}</URLParamsContext.Provider>;
