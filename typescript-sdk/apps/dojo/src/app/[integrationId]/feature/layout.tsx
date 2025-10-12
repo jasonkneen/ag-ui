@@ -6,6 +6,7 @@ import filesJSON from '../../../files.json'
 import Readme from "@/components/readme/readme";
 import CodeViewer from "@/components/code-viewer/code-viewer";
 import { useURLParams } from "@/contexts/url-params-context";
+import { cn } from "@/lib/utils";
 
 type FileItem = {
   name: string;
@@ -24,6 +25,7 @@ interface Props {
 }
 
 export default function FeatureLayout({ children, params }: Props) {
+  const { sidebarHidden } = useURLParams();
   const { integrationId } = React.use(params);
   const pathname = usePathname();
   const { view } = useURLParams();
@@ -58,7 +60,11 @@ export default function FeatureLayout({ children, params }: Props) {
   }, [children, codeFiles, readme, view])
 
   return (
-    <div className="bg-(--copilot-kit-background-color) rounded-lg w-full h-full overflow-hidden">
+    <div className={cn(
+      "bg-white rounded-lg w-full h-full overflow-hidden",
+      // if used in iframe, match background to chat background color, otherwise, use white
+      sidebarHidden && "bg-(--copilot-kit-background-color)",
+    )}>
       <div className="flex flex-col h-full overflow-auto">
         {content}
       </div>
