@@ -61,9 +61,11 @@ export default function FeatureLayout({ children, params }: Props) {
 
   return (
     <div className={cn(
-      "bg-white rounded-lg w-full h-full overflow-hidden",
+      "bg-white w-full h-full overflow-hidden",
       // if used in iframe, match background to chat background color, otherwise, use white
       sidebarHidden && "bg-(--copilot-kit-background-color)",
+      // if not used in iframe, round the corners of the content area
+      !sidebarHidden && "rounded-lg",
     )}>
       <div className="flex flex-col h-full overflow-auto">
         {content}
