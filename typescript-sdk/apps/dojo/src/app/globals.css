@@ -4,6 +4,7 @@
 @plugin "tailwindcss-animate";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant prefers-dark (@media (prefers-color-scheme: dark));
 
 @theme {
   /* Base Shadcn Colors */
