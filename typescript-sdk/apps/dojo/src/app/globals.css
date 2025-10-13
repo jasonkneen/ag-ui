@@ -186,6 +186,7 @@
   --anthropic: hsl(240 80% 60%); /* Bright blue */
   --cohere: hsl(0 80% 60%); /* Bright red */ --background: oklch(1 0 0); --foreground: oklch(0.145 0 0);
 
+  --cpk-docs-dark-bg: oklch(0.274 0.006 286.033);
 }
 
 .dark {
@@ -269,6 +270,7 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-cpk-docs-dark-bg: var(--cpk-docs-dark-bg);
 }
 
 @layer base {
