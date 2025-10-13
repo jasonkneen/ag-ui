@@ -26,7 +26,7 @@ export default function CodeViewer({ codeFiles }: { codeFiles: FeatureFile[] }) 
               <TabsTrigger
                 key={file.name}
                 value={file.name}
-                className="border-0 shadow-none text-gray-600 dark:text-neutral-300 hover:bg-foreground/5 hover:text-gray-900 dark:hover:text-neutral-100 data-[state=active]:bg-foreground/10 data-[state=active]:text-gray-900 dark:data-[state=active]:text-white"
+                className="border-0 shadow-none text-gray-600 dark:text-neutral-300 hover:bg-foreground/5 hover:text-gray-900 dark:hover:text-neutral-100 data-[state=active]:bg-foreground/8 data-[state=active]:text-gray-900 dark:data-[state=active]:text-white"
               >
                 {file.name.split("/").pop()}
               </TabsTrigger>
