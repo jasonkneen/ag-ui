@@ -21,12 +21,12 @@ export default function CodeViewer({ codeFiles }: { codeFiles: FeatureFile[] }) 
           onValueChange={setCodeFile}
           className="flex-1 flex flex-col"
         >
-          <TabsList className="w-full justify-start h-auto flex-wrap p-1 gap-1 bg-white dark:bg-gray-800 rounded-none">
+          <TabsList className="w-full justify-start h-auto flex-wrap p-1 gap-1 bg-white dark:bg-cpk-docs-dark-bg rounded-none">
             {codeFiles.map((file) => (
               <TabsTrigger
                 key={file.name}
                 value={file.name}
-                className="border-0 shadow-none text-gray-600 dark:text-gray-300 hover:bg-foreground/5 hover:text-gray-900 dark:hover:text-gray-100 data-[state=active]:bg-foreground/10 data-[state=active]:text-gray-900 dark:data-[state=active]:text-white"
+                className="border-0 shadow-none text-gray-600 dark:text-neutral-300 hover:bg-foreground/5 hover:text-gray-900 dark:hover:text-neutral-100 data-[state=active]:bg-foreground/8 data-[state=active]:text-gray-900 dark:data-[state=active]:text-white"
               >
                 {file.name.split("/").pop()}
               </TabsTrigger>
@@ -50,7 +50,7 @@ export default function CodeViewer({ codeFiles }: { codeFiles: FeatureFile[] }) 
 
   return (
     <div className="flex h-full">
-      <div className="w-72 border-r border-gray-200 dark:border-gray-700 flex flex-col bg-white dark:bg-gray-800">
+      <div className="w-72 border-r border-gray-200 dark:border-neutral-700 flex flex-col bg-white dark:bg-cpk-docs-dark-bg">
         <div className="flex-1 overflow-auto">
           <FileTree files={codeFiles} selectedFile={selectedFile} onFileSelect={setCodeFile} />
         </div>
@@ -61,7 +61,7 @@ export default function CodeViewer({ codeFiles }: { codeFiles: FeatureFile[] }) 
             <CodeEditor file={selectedFile} />
           </div>
         ) : (
-          <div className="flex items-center justify-center h-full text-muted-foreground dark:text-gray-300">
+          <div className="flex items-center justify-center h-full text-muted-foreground dark:text-neutral-300">
             Select a file to view its content.
           </div>
         )}

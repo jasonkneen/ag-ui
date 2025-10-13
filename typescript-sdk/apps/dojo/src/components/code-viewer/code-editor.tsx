@@ -14,7 +14,8 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
     }
   };
 
-  const theme = useTheme();
+  const { forcedTheme, resolvedTheme } = useTheme();
+  const currentTheme = forcedTheme || resolvedTheme;
 
   if (file?.language === "ts") file.language = "typescript";
 
@@ -36,7 +37,7 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
             enabled: false,
           },
         }}
-        theme="vs-dark"
+        theme={currentTheme !== "dark" ? "light" : "vs-dark"}
       />
     </div>
   ) : (
