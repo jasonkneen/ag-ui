@@ -11,8 +11,8 @@ This way, the Core package is not depending on Jackson.
 
 ```xml
 <dependency>
-    <groupId>com.ag-ui</groupId>
-    <artifactId>json</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-json</artifactId>
     <version>0.0.1</version>
 </dependency>
 ```

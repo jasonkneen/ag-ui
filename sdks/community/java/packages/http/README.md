@@ -13,8 +13,8 @@ The Http Agent needs a HttpClient (OkHttp or Spring Rest implementations).
 
 ```xml
 <dependency>
-    <groupId>com.ag-ui</groupId>
-    <artifactId>http</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-http</artifactId>
     <version>0.0.1</version>
 </dependency>
 ```

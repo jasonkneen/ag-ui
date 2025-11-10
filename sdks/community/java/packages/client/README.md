@@ -11,8 +11,8 @@ This package contains the [Abstract Agent](./src/main/java/com/agui/client/agent
 
 ```xml
 <dependency>
-    <groupId>com.ag-ui</groupId>
-    <artifactId>client</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-client</artifactId>
     <version>0.0.1</version>
 </dependency>
 ```

@@ -4,13 +4,13 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>com.ag-ui</groupId>
-        <artifactId>ag-ui</artifactId>
+        <groupId>com.ag-ui.community</groupId>
+        <artifactId>java-ag-ui</artifactId>
         <version>0.0.1</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
-    <artifactId>http</artifactId>
+    <artifactId>java-http</artifactId>
     <version>${ag-ui.version}</version>
 
     <name>AG-UI Http</name>
@@ -23,8 +23,8 @@
 
     <dependencies>
         <dependency>
-            <groupId>com.ag-ui</groupId>
-            <artifactId>client</artifactId>
+            <groupId>com.ag-ui.community</groupId>
+            <artifactId>java-client</artifactId>
             <version>${ag-ui.version}</version>
         </dependency>
 

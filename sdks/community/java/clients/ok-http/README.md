@@ -11,8 +11,8 @@ This package contains the [Http Client](./src/main/java/com/agui/okhttp/HttpClie
 
 ```xml
 <dependency>
-    <groupId>com.ag-ui</groupId>
-    <artifactId>client</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-ok-http</artifactId>
     <version>4.12.0</version>
 </dependency>
 ```

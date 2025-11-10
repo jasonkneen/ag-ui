@@ -4,13 +4,13 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>com.ag-ui</groupId>
-        <artifactId>ag-ui</artifactId>
+        <groupId>com.ag-ui.community</groupId>
+        <artifactId>java-ag-ui</artifactId>
         <version>0.0.1</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
-    <artifactId>ok-http</artifactId>
+    <artifactId>java-ok-http</artifactId>
     <version>${okhttp.version}</version>
 
     <name>AG-UI Ok-http</name>
@@ -24,13 +24,13 @@
 
     <dependencies>
         <dependency>
-            <groupId>com.ag-ui</groupId>
-            <artifactId>http</artifactId>
+            <groupId>com.ag-ui.community</groupId>
+            <artifactId>java-http</artifactId>
             <version>${ag-ui.version}</version>
         </dependency>
         <dependency>
-            <groupId>com.ag-ui</groupId>
-            <artifactId>json</artifactId>
+            <groupId>com.ag-ui.community</groupId>
+            <artifactId>java-json</artifactId>
             <version>${ag-ui.version}</version>
         </dependency>
         <dependency>

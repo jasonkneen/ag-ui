@@ -11,8 +11,8 @@ This package contains the Abstract Agent implementation [Local Agent](./src/main
 
 ```xml
 <dependency>
-    <groupId>com.ag-ui</groupId>
-    <artifactId>server</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-server</artifactId>
     <version>0.0.1</version>
 </dependency>
 ```
