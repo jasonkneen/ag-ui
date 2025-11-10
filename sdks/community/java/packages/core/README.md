@@ -1,4 +1,4 @@
-# AG-UI-4J Core
+# AG-UI Core
 
 ![Java](https://img.shields.io/badge/Java-17-orange?logo=openjdk&logoColor=white)
 ![Maven](https://img.shields.io/badge/Maven-0.0.1-C71A36?logo=apachemaven&logoColor=white)
