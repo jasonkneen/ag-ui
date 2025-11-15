@@ -107,8 +107,21 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
       "agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
-      // commented out while fixing
-      // "agentic_generative_ui",
+      "agentic_generative_ui",
+      "predictive_state_updates",
+      "shared_state",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
+    id: "microsoft-agent-framework-python",
+    name: "Microsoft Agent Framework (Python)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "agentic_generative_ui",
+      "predictive_state_updates",
       "shared_state",
       "tool_based_generative_ui",
     ],
