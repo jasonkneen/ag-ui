@@ -11,7 +11,10 @@
     </parent>
 
     <artifactId>java-json</artifactId>
-    <version>0.0.1</version>
+    <version>${ag-ui.version}</version>
+
+    <name>AG-UI Json Utils</name>
+    <description>AG-UI Json Utils library</description>
 
     <properties>
         <jackson.version>2.19.2</jackson.version>
@@ -23,7 +26,6 @@
             <groupId>com.ag-ui.community</groupId>
             <artifactId>java-core</artifactId>
             <version>0.0.1</version>
-            <scope>compile</scope>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

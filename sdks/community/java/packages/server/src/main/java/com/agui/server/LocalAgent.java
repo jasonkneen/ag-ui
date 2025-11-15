@@ -225,7 +225,7 @@ Context:
 
     protected void combineMessages(RunAgentInput input) {
         input.messages().forEach((message) -> {
-            if (this.messages.stream().filter((m) -> m.equals(message)).findAny().isEmpty()) {
+            if (this.messages.stream().filter((m) -> m.getId().equals(message.getId())).findAny().isEmpty()) {
                 this.messages.add(message);
             }
         });
