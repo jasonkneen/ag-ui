@@ -11,6 +11,7 @@ type envVars = {
   crewAiUrl: string;
   pydanticAIUrl: string;
   adkMiddlewareUrl: string;
+  agentFrameworkPythonUrl: string;
   a2aUrl: string;
   agentFrameworkDotnetUrl: string;
   a2aMiddlewareBuildingsManagementUrl: string;
@@ -41,6 +42,7 @@ export default function getEnvVars(): envVars {
     crewAiUrl: process.env.CREW_AI_URL || 'http://localhost:9002',
     pydanticAIUrl: process.env.PYDANTIC_AI_URL || 'http://localhost:9000',
     adkMiddlewareUrl: process.env.ADK_MIDDLEWARE_URL || 'http://localhost:8000',
+    agentFrameworkPythonUrl: process.env.AGENT_FRAMEWORK_PYTHON_URL || 'http://localhost:8888',
     agentFrameworkDotnetUrl: process.env.AGENT_FRAMEWORK_DOTNET_URL || 'http://localhost:5018',
     springAiUrl: process.env.SPRING_AI_URL || 'http://localhost:8080',
     a2aUrl: process.env.A2A_URL || 'http://localhost:10002',

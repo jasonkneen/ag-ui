@@ -346,6 +346,34 @@ export const agentsIntegrations: AgentIntegrationConfig[] = [
     },
   },
   {
+    id: "microsoft-agent-framework-python",
+    agents: async () => {
+      return {
+        agentic_chat: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/agentic_chat`,
+        }),
+        backend_tool_rendering: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/backend_tool_rendering`,
+        }),
+        human_in_the_loop: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/human_in_the_loop`,
+        }),
+        agentic_generative_ui: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/agentic_generative_ui`,
+        }),
+        shared_state: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/shared_state`,
+        }),
+        tool_based_generative_ui: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/tool_based_generative_ui`,
+        }),
+        predictive_state_updates: new HttpAgent({
+          url: `${envVars.agentFrameworkPythonUrl}/predictive_state_updates`,
+        }),
+      };
+    },
+  },
+  {
     id: "a2a-basic",
     agents: async () => {
       const a2aClient = new A2AClient(envVars.a2aUrl);
@@ -379,6 +407,9 @@ export const agentsIntegrations: AgentIntegrationConfig[] = [
         }),
         tool_based_generative_ui: new HttpAgent({
           url: `${envVars.agentFrameworkDotnetUrl}/tool_based_generative_ui`,
+        }),
+        predictive_state_updates: new HttpAgent({
+          url: `${envVars.agentFrameworkDotnetUrl}/predictive_state_updates`,
         }),
       };
     },
