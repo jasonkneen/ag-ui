@@ -259,8 +259,8 @@ export async function runSubscribersWithMutation(
   }
 
   return {
-    ...(JSON.stringify(messages) !== JSON.stringify(initialMessages) ? { messages } : {}),
-    ...(JSON.stringify(state) !== JSON.stringify(initialState) ? { state } : {}),
+    ...(messages !== messages0 ? { messages } : {}),
+    ...(state !== state0 ? { state } : {}),
     ...(stopPropagation !== undefined ? { stopPropagation } : {}),
   };
 }
