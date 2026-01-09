@@ -1,4 +1,4 @@
-name: Publish Kotlin SDK to Maven Central
+name: Publish Javaotlin SDK to Maven Central
 
 on:
   # Manual trigger only - no automatic publishing
