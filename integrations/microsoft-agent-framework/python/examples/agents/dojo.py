@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from agent_framework.openai import OpenAIChatClient
+# TODO: Uncomment this when we have a way to authenticate with Azure
+# from azure.identity import DefaultAzureCredential
+# from agent_framework.azure import AzureOpenAIChatClient
 from agent_framework_ag_ui import add_agent_framework_fastapi_endpoint
 from agent_framework_ag_ui_examples.agents import (
     document_writer_agent,
@@ -32,7 +35,6 @@ from agent_framework_ag_ui_examples.agents import (
     ui_generator_agent,
     weather_agent,
 )
-from azure.identity import DefaultAzureCredential
 
 load_dotenv()
 
@@ -78,6 +80,12 @@ chat_client = OpenAIChatClient(
     model_id=deployment_name,
     api_key=api_key,
 )
+# TODO: Uncomment this to authenticate with Azure
+# chat_client = AzureOpenAIChatClient(
+#     credential=DefaultAzureCredential(),
+#     deployment_name=deployment_name,
+#     endpoint=endpoint,
+# )
 
 # Agentic Chat - simple_agent
 add_agent_framework_fastapi_endpoint(app, simple_agent(chat_client), "/agentic_chat")
