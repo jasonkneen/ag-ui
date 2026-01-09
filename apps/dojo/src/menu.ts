@@ -1,6 +1,37 @@
-import { MenuIntegrationConfig } from "./types/integration";
+import type { MenuIntegrationConfig } from "./types/integration";
+export * from "./types/integration";
 
-export const menuIntegrations: MenuIntegrationConfig[] = [
+/**
+ * Integration configuration - SINGLE SOURCE OF TRUTH
+ *
+ * This file defines all integrations and their available features.
+ * Used by:
+ * - UI menu components
+ * - proxy.ts (for route validation)
+ * - agents.ts validates agent keys against these features
+ */
+
+export const menuIntegrations = [
+  {
+    id: "agent-spec-langgraph",
+    name: "Open Agent Spec (LangGraph)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
+    id: "agent-spec-wayflow",
+    name: "Open Agent Spec (Wayflow)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
   {
     id: "langgraph",
     name: "LangGraph (Python)",
@@ -35,7 +66,7 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
     name: "LangGraph (Typescript)",
     features: [
       "agentic_chat",
-      "backend_tool_rendering",
+      // "backend_tool_rendering",
       "human_in_the_loop",
       "agentic_generative_ui",
       "predictive_state_updates",
@@ -44,12 +75,21 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
       "subgraphs",
     ],
   },
+  // {
+  //   id: "langchain",
+  //   name: "LangChain",
+  //   features: [
+  //     "agentic_chat",
+  //     "tool_based_generative_ui",
+  //   ],
+  // },
   {
     id: "mastra",
     name: "Mastra",
     features: [
       "agentic_chat",
       "backend_tool_rendering",
+      "human_in_the_loop",
       "tool_based_generative_ui",
     ],
   },
@@ -59,6 +99,7 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
     features: [
       "agentic_chat",
       "backend_tool_rendering",
+      "human_in_the_loop",
       "shared_state",
       "tool_based_generative_ui",
     ],
@@ -95,9 +136,10 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
       "agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
+      // TODO: @contextablemark Re-enable predictive state updates once it is working
+      // "predictive_state_updates",
       "shared_state",
       "tool_based_generative_ui",
-      // "predictive_state_updates"
     ],
   },
   {
@@ -132,6 +174,7 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
     features: [
       "agentic_chat",
       "backend_tool_rendering",
+      "human_in_the_loop",
       "tool_based_generative_ui",
     ],
   },
@@ -151,7 +194,7 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
     name: "CrewAI",
     features: [
       "agentic_chat",
-      "backend_tool_rendering",
+      // "backend_tool_rendering",
       "human_in_the_loop",
       "agentic_generative_ui",
       "predictive_state_updates",
@@ -187,7 +230,7 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
       "agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
-      "agentic_chat_reasoning",
+      // "agentic_chat_reasoning",
       "agentic_generative_ui",
       "predictive_state_updates",
       "shared_state",
@@ -199,4 +242,15 @@ export const menuIntegrations: MenuIntegrationConfig[] = [
     name: "A2A",
     features: ["a2a_chat"],
   },
-];
+  {
+    id: "aws-strands",
+    name: "AWS Strands",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "agentic_generative_ui",
+      "shared_state",
+      "human_in_the_loop",
+    ],
+  },
+] as const satisfies MenuIntegrationConfig[];

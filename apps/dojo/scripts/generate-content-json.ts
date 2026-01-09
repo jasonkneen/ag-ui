@@ -1,69 +1,12 @@
 import fs from "fs";
 import path from "path";
+import { menuIntegrations } from "../src/menu";
 
-// Function to parse agents.ts file and extract agent keys without executing
-function parseAgentsFile(): Array<{ id: string; agentKeys: string[] }> {
-  const agentsFilePath = path.join(__dirname, "../src/agents.ts");
-  const agentsContent = fs.readFileSync(agentsFilePath, "utf8");
-
-  const agentConfigs: Array<{ id: string; agentKeys: string[] }> = [];
-
-  // Split the content to process each agent configuration individually
-  const agentBlocks = agentsContent.split(/(?=\s*{\s*id:\s*["'])/);
-
-  for (const block of agentBlocks) {
-    // Extract the ID
-    const idMatch = block.match(/id:\s*["']([^"']+)["']/);
-    if (!idMatch) continue;
-
-    const id = idMatch[1];
-
-    // Find the return object by looking for the pattern and then manually parsing balanced braces
-    const returnMatch = block.match(
-      /agents:\s*async\s*\(\)\s*=>\s*{\s*return\s*{/,
-    );
-    if (!returnMatch) continue;
-
-    const startIndex = returnMatch.index! + returnMatch[0].length;
-    const returnObjectContent = extractBalancedBraces(block, startIndex);
-
-    // Extract keys from the return object - only capture keys that are followed by a colon and then 'new'
-    // This ensures we only get the top-level keys like "agentic_chat: new ..." not nested keys like "url: ..."
-    const keyRegex = /^\s*(\w+):\s*new\s+\w+/gm;
-    const keys: string[] = [];
-    let keyMatch;
-    while ((keyMatch = keyRegex.exec(returnObjectContent)) !== null) {
-      keys.push(keyMatch[1]);
-    }
-
-    agentConfigs.push({ id, agentKeys: keys });
-  }
-
-  return agentConfigs;
-}
-
-// Helper function to extract content between balanced braces
-function extractBalancedBraces(text: string, startIndex: number): string {
-  let braceCount = 0;
-  let i = startIndex;
-
-  while (i < text.length) {
-    if (text[i] === "{") {
-      braceCount++;
-    } else if (text[i] === "}") {
-      if (braceCount === 0) {
-        // Found the closing brace for the return object
-        return text.substring(startIndex, i);
-      }
-      braceCount--;
-    }
-    i++;
-  }
-
-  return "";
-}
-
-const agentConfigs = parseAgentsFile();
+// Map menuIntegrations to the format needed for content generation
+const agentConfigs = menuIntegrations.map((integration) => ({
+  id: integration.id,
+  agentKeys: [...integration.features],
+}));
 
 const featureFiles = ["page.tsx", "style.css", "README.mdx"];
 
@@ -208,7 +151,7 @@ const agentFilesMapper: Record<
       path.join(
         __dirname,
         integrationsFolderPath,
-        `/mastra/typescript/examples/src/mastra/agents/weather-agent.ts`,
+        `/mastra/typescript/examples/src/mastra/agents/agentic-chat.ts`,
       ),
     ],
     backend_tool_rendering: [
@@ -218,24 +161,29 @@ const agentFilesMapper: Record<
         `/mastra/typescript/examples/src/mastra/agents/backend-tool-rendering.ts`,
       ),
     ],
+    human_in_the_loop: [
+      path.join(
+        __dirname,
+        integrationsFolderPath,
+        `/mastra/typescript/examples/src/mastra/agents/human-in-the-loop.ts`,
+      ),
+    ],
     tool_based_generative_ui: [
       path.join(
         __dirname,
         integrationsFolderPath,
-        `/mastra/example/src/mastra/agents/haiku-agent.ts`,
+        `/mastra/typescript/examples/src/mastra/agents/tool-based-generative-ui.ts`,
       ),
     ],
   }),
 
-  "mastra-agent-local": (agentKeys: string[]) => {
-    return agentKeys.reduce(
-      (acc, agentId) => ({
-        ...acc,
-        [agentId]: [path.join(__dirname, "../src/mastra/index.ts")],
-      }),
-      {},
-    );
-  },
+  "mastra-agent-local": () => ({
+    agentic_chat: [path.join(__dirname, "../src/mastra/agents/agentic-chat.ts")],
+    human_in_the_loop: [path.join(__dirname, "../src/mastra/agents/human-in-the-loop.ts")],
+    backend_tool_rendering: [path.join(__dirname, "../src/mastra/agents/backend-tool-rendering.ts")],
+    shared_state: [path.join(__dirname, "../src/mastra/agents/shared-state.ts")],
+    tool_based_generative_ui: [path.join(__dirname, "../src/mastra/agents/tool-based-generative-ui.ts")],
+  }),
 
   "vercel-ai-sdk": () => ({
     agentic_chat: [
@@ -363,6 +311,36 @@ const agentFilesMapper: Record<
       {},
     );
   },
+  "aws-strands": (agentKeys: string[]) => {
+    return agentKeys.reduce(
+      (acc, agentId) => ({
+        ...acc,
+        [agentId]: [
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/aws-strands/python/examples/server/api/${agentId}.py`,
+          )
+        ],
+      }),
+      {},
+    );
+  },
+  "microsoft-agent-framework-python": (agentKeys: string[]) => {
+    return agentKeys.reduce(
+      (acc, agentId) => ({
+        ...acc,
+        [agentId]: [
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/microsoft-agent-framework/python/examples/agents/dojo.py`,
+          ),
+        ],
+      }),
+      {},
+    );
+  },
   "microsoft-agent-framework-dotnet": (agentKeys: string[]) => {
     return agentKeys.reduce(
       (acc, agentId) => ({
@@ -388,6 +366,39 @@ const agentFilesMapper: Record<
       {},
     );
   },
+  "agent-spec-langgraph": (agentKeys: string[]) => {
+    return agentKeys.reduce(
+      (acc, agentId) => ({
+        ...acc,
+        [agentId]: [
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/agent-spec/python/examples/server/api/${agentId}.py`,
+          ),
+        ],
+      }),
+      {},
+    );
+  },
+  "agent-spec-wayflow": (agentKeys: string[]) => {
+    return agentKeys.reduce(
+      (acc, agentId) => ({
+        ...acc,
+        [agentId]: [
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/agent-spec/python/examples/server/api/${agentId}.py`,
+          ),
+        ],
+      }),
+      {},
+    );
+  },
+  // A2A integrations use runtime-configured agents without per-feature source files
+  "a2a-basic": () => ({}),
+  "a2a": () => ({}),
 };
 
 async function runGenerateContent() {
@@ -399,15 +410,22 @@ async function runGenerateContent() {
     const agentFilePaths = agentFilesMapper[agentConfig.id]?.(
       agentConfig.agentKeys,
     );
+
+    console.log(agentConfig.id, agentFilePaths);
     if (!agentFilePaths) {
       continue;
     }
 
+    // If agentsPerFeatures is empty but we have agentFilePaths, use the keys from agentFilePaths
+    // This handles cases like Mastra where agents are dynamically discovered
+    const featureIds = agentsPerFeatures.length > 0
+      ? agentsPerFeatures
+      : Object.keys(agentFilePaths);
+
     // Per feature, assign all the frontend files like page.tsx as well as all agent files
-    for (const featureId of agentsPerFeatures) {
+    for (const featureId of featureIds) {
       const agentFilePathsForFeature = agentFilePaths[featureId] ?? [];
-      // @ts-expect-error -- redundant error about indexing of a new object.
-      result[`${agentConfig.id}::${featureId}`] = [
+      const allFiles = [
         // Get all frontend files for the feature
         ...(await getFeatureFrontendFiles(featureId)),
         // Get the agent (python/TS) file
@@ -415,13 +433,108 @@ async function runGenerateContent() {
           agentFilePathsForFeature.map(async (f) => await getFile(f)),
         )),
       ];
+      // Filter out empty objects (files that weren't found)
+      // @ts-expect-error -- redundant error about indexing of a new object.
+      result[`${agentConfig.id}::${featureId}`] = allFiles.filter(
+        (file) => Object.keys(file).length > 0
+      );
     }
   }
 
   return result;
 }
 
+/**
+ * Validates that all integration IDs in menuIntegrations have corresponding
+ * entries in agentFilesMapper. Returns true if valid, false otherwise.
+ */
+function validateAgentFilesMapper(): boolean {
+  const menuIntegrationIds = menuIntegrations.map((integration) => integration.id);
+  const mapperKeys = new Set(Object.keys(agentFilesMapper));
+
+  const missingEntries = menuIntegrationIds.filter((id) => !mapperKeys.has(id));
+
+  if (missingEntries.length > 0) {
+    console.error("❌ Missing agentFilesMapper entries for the following integration IDs:");
+    console.error("");
+    for (const id of missingEntries) {
+      console.error(`   - ${id}`);
+    }
+    console.error("");
+    console.error("Please add entries for these IDs in:");
+    console.error("   apps/dojo/scripts/generate-content-json.ts (agentFilesMapper object)");
+    console.error("");
+    console.error("Then run `(p)npm run generate-content-json` in the apps/dojo folder.");
+    console.error("");
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Validates that all feature folders have a README.mdx file.
+ * Returns true if valid, false otherwise.
+ */
+function validateFeatureReadmes(): boolean {
+  // Get all unique features across all integrations
+  const allFeatures = new Set<string>();
+  for (const integration of menuIntegrations) {
+    for (const feature of integration.features) {
+      allFeatures.add(feature);
+    }
+  }
+
+  const missingReadmes: Array<{ feature: string; integrations: string[] }> = [];
+
+  for (const feature of allFeatures) {
+    const readmePath = path.join(
+      __dirname,
+      `../src/app/[integrationId]/feature/${feature}/README.mdx`
+    );
+
+    if (!fs.existsSync(readmePath)) {
+      // Find which integrations use this feature
+      const integrationsUsingFeature = menuIntegrations
+        .filter((i) => (i.features as string[]).includes(feature))
+        .map((i) => i.id);
+
+      missingReadmes.push({
+        feature,
+        integrations: integrationsUsingFeature,
+      });
+    }
+  }
+
+  if (missingReadmes.length > 0) {
+    console.error("❌ Missing README.mdx files for the following features:");
+    console.error("");
+    for (const { feature, integrations } of missingReadmes) {
+      console.error(`   - ${feature}`);
+      console.error(`     Used by: ${integrations.join(", ")}`);
+      console.error(`     Missing: apps/dojo/src/app/[integrationId]/feature/${feature}/README.mdx`);
+    }
+    console.error("");
+    console.error("Please create README.mdx files for these features.");
+    console.error("See apps/dojo/src/app/[integrationId]/feature/agentic_chat/README.mdx for an example.");
+    console.error("");
+    return false;
+  }
+
+  return true;
+}
+
 (async () => {
+  // Validate that all menuIntegrations have agentFilesMapper entries
+  if (!validateAgentFilesMapper()) {
+    process.exit(1);
+  }
+
+  // Validate that all features have README.mdx files
+  if (!validateFeatureReadmes()) {
+    process.exit(1);
+  }
+
   const result = await runGenerateContent();
   fs.writeFileSync(
     path.join(__dirname, "../src/files.json"),
