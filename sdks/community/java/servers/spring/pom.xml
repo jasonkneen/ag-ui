@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>spring</artifactId>
-    <version>${ag-ui.version}</version>
+    <version>0.0.1</version>
 
     <name>AG-UI Spring Server</name>
     <description>AG-UI Spring Server library</description>

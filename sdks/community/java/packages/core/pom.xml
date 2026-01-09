@@ -9,7 +9,7 @@
     </parent>
 
     <artifactId>java-core</artifactId>
-    <version>${ag-ui.version}</version>
+    <version>0.0.1</version>
 
     <name>AG-UI Core</name>
     <description>AG-UI Core library</description>

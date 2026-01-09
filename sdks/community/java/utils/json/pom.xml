@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>java-json</artifactId>
-    <version>${ag-ui.version}</version>
+    <version>0.0.1</version>
 
     <name>AG-UI Json Utils</name>
     <description>AG-UI Json Utils library</description>

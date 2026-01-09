@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>spring-ai</artifactId>
-    <version>${spring-ai.version}</version>
+    <version>1.0.1</version>
 
     <name>AG-UI Spring AI</name>
     <description>AG-UI Spring AI Integration</description>

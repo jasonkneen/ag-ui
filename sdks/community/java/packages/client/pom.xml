@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>java-client</artifactId>
-    <version>${ag-ui.version}</version>
+    <version>0.0.1</version>
 
     <name>AG-UI Client</name>
     <description>AG-UI Client library</description>

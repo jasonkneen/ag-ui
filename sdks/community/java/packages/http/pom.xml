@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>java-http</artifactId>
-    <version>${ag-ui.version}</version>
+    <version>0.0.1</version>
 
     <name>AG-UI Http</name>
     <description>AG-UI Http library</description>

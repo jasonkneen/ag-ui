@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>java-ok-http</artifactId>
-    <version>${okhttp.version}</version>
+    <version>4.12.0</version>
 
     <name>AG-UI Ok-http</name>
     <description>AG-UI Ok-http Client</description>

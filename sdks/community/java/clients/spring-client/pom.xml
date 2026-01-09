@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>java-spring-client</artifactId>
-    <version>${spring.version}</version>
+    <version>6.2.7</version>
 
     <name>AG-UI Spring Client</name>
     <description>AG-UI Spring Client</description>
