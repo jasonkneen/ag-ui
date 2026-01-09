@@ -153,6 +153,22 @@ const ALL_SERVICES = {
       env: { PORT: 8017 },
     },
   ],
+  "claude-agent-sdk-python": [
+    {
+      command: "uv run dev",
+      name: "Claude Agent SDK (Python)",
+      cwd: path.join(integrationsRoot, "claude-agent-sdk/python/examples"),
+      env: { PORT: 8019 },
+    },
+  ],
+  "claude-agent-sdk-typescript": [
+    {
+      command: "npx tsx examples/server.ts",
+      name: "Claude Agent SDK (TypeScript)",
+      cwd: path.join(integrationsRoot, "claude-agent-sdk/typescript"),
+      env: { PORT: 8020 },
+    },
+  ],
   "adk-middleware": [
     {
       command: "uv run dev",
@@ -234,6 +250,8 @@ const ALL_SERVICES = {
         A2A_MIDDLEWARE_IT_URL: "http://localhost:8013",
         A2A_MIDDLEWARE_ORCHESTRATOR_URL: "http://localhost:8014",
         AWS_STRANDS_URL: "http://localhost:8017",
+        CLAUDE_AGENT_SDK_PYTHON_URL: "http://localhost:8019",
+        CLAUDE_AGENT_SDK_TYPESCRIPT_URL: "http://localhost:8020",
         NEXT_PUBLIC_CUSTOM_DOMAIN_TITLE:
           "cpkdojo.local___CopilotKit Feature Viewer",
       },
@@ -263,6 +281,8 @@ const ALL_SERVICES = {
         A2A_MIDDLEWARE_IT_URL: "http://localhost:8013",
         A2A_MIDDLEWARE_ORCHESTRATOR_URL: "http://localhost:8014",
         AWS_STRANDS_URL: "http://localhost:8017",
+        CLAUDE_AGENT_SDK_PYTHON_URL: "http://localhost:8019",
+        CLAUDE_AGENT_SDK_TYPESCRIPT_URL: "http://localhost:8020",
         NEXT_PUBLIC_CUSTOM_DOMAIN_TITLE:
           "cpkdojo.local___CopilotKit Feature Viewer",
       },
