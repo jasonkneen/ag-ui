@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Maven default annotation processors profile" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <module name="spring-ai-example" />
+        <module name="server" />
+        <module name="java-ok-http" />
+        <module name="java-json" />
+        <module name="java-http" />
+        <module name="ok-http" />
+        <module name="spring" />
+        <module name="core" />
+        <module name="java-server" />
+        <module name="java-spring-client" />
+        <module name="java-client" />
+        <module name="client" />
+        <module name="http" />
+        <module name="json" />
+        <module name="spring-ai" />
+        <module name="spring-client" />
+        <module name="java-core" />
+      </profile>
+    </annotationProcessing>
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="spring-ai-example" options="-parameters" />
+    </option>
+  </component>
+</project>

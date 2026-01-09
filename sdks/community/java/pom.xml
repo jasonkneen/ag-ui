@@ -32,16 +32,6 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.javadoc.failOnError>false</maven.javadoc.failOnError>
 
-        <!-- SonarCloud configuration -->
-        <sonar.java.coveragePlugin>jacoco</sonar.java.coveragePlugin>
-        <sonar.dynamicAnalysis>reuseReports</sonar.dynamicAnalysis>
-        <sonar.language>java</sonar.language>
-        <sonar.coverage.jacoco.xmlReportPaths>
-            ${project.basedir}/target/site/jacoco-aggregate/jacoco.xml
-        </sonar.coverage.jacoco.xmlReportPaths>
-        <sonar.organization>work-m8</sonar.organization>
-        <sonar.host.url>https://sonarcloud.io</sonar.host.url>
-
         <!-- JaCoCo configuration -->
         <jacoco.version>0.8.13</jacoco.version>
         <maven.surefire.version>3.5.3</maven.surefire.version>
@@ -58,7 +48,7 @@
     </properties>
 
 
-    <url>https://github.com/work-m8/ag-ui-4j</url>
+    <url>https://github.com/ag-ui-protocol/ag-ui</url>
 
     <licenses>
         <license>
@@ -76,9 +66,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com/work-m8/ag-ui-4j.git</connection>
-        <developerConnection>scm:git:ssh://github.com:work-m8/ag-ui-4j.git</developerConnection>
-        <url>https://github.com/work-m8/ag-ui-4j/tree/main</url>
+        <connection>scm:git:git://github.com/ag-ui-protocol/ag-ui.git</connection>
+        <developerConnection>scm:git:ssh://github.com:ag-ui-protocol/ag-ui.git</developerConnection>
+        <url>https://github.com/ag-ui-protocol/ag-ui/tree/main</url>
     </scm>
 
     <repositories>
@@ -94,19 +84,6 @@
             </snapshots>
         </repository>
     </repositories>
-
-    <distributionManagement>
-        <repository>
-            <id>github</id>
-            <name>GitHub Packages</name>
-            <url>https://maven.pkg.github.com/work-m8/ag-ui-4j</url>
-        </repository>
-        <snapshotRepository>
-            <id>github</id>
-            <name>GitHub Packages</name>
-            <url>https://maven.pkg.github.com/work-m8/ag-ui-4j</url>
-        </snapshotRepository>
-    </distributionManagement>
 
     <dependencyManagement>
         <dependencies>
