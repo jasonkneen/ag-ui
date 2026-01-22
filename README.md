@@ -133,7 +133,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 ## Middleware
 | Framework | Status | AG-UI Resources |
 | ---------- | ------- | ---------------- |
-| [MCP Apps](https://blog.modelcontextprotocol.io/posts/2025-11-21-mcp-apps/) | ✅ Supported | ➡️ [Docs]() 🎮 [Demos]() |
+| [MCP Apps](https://blog.modelcontextprotocol.io/posts/2025-11-21-mcp-apps/) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/generative-ui-specs/mcp-apps) 🎮 [Demos]() |
 
 
 ## SDKs
