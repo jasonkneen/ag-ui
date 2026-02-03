@@ -53,7 +53,7 @@ messages in the system.
 Represents the possible roles a message sender can have.
 
 ```python
-Role = Literal["developer", "system", "assistant", "user", "tool", "activity"]
+Role = Literal["developer", "system", "assistant", "user", "tool", "activity", "reasoning"]
 ```
 
 ### DeveloperMessage
@@ -187,15 +187,17 @@ class ToolMessage(ConfiguredBaseModel):
     content: str
     tool_call_id: str
     error: Optional[str] = None
+    encrypted_value: Optional[str] = None
 ```
 
-| Property       | Type              | Description                                  |
-| -------------- | ----------------- | -------------------------------------------- |
-| `id`           | `str`             | Unique identifier for the message            |
-| `content`      | `str`             | Text content of the message                  |
-| `role`         | `Literal["tool"]` | Role of the message sender, fixed as "tool"  |
-| `tool_call_id` | `str`             | ID of the tool call this message responds to |
-| `error`        | `Optional[str]`   | Error message if the tool call failed        |
+| Property          | Type              | Description                                     |
+| ----------------- | ----------------- | ----------------------------------------------- |
+| `id`              | `str`             | Unique identifier for the message               |
+| `content`         | `str`             | Text content of the message                     |
+| `role`            | `Literal["tool"]` | Role of the message sender, fixed as "tool"     |
+| `tool_call_id`    | `str`             | ID of the tool call this message responds to    |
+| `error`           | `Optional[str]`   | Error message if the tool call failed           |
+| `encrypted_value` | `Optional[str]`   | Optional encrypted value attached via signature |
 
 ### ActivityMessage
 
@@ -211,12 +213,33 @@ class ActivityMessage(ConfiguredBaseModel):
     content: Dict[str, Any]
 ```
 
-| Property        | Type                    | Description                                             |
-| --------------- | ----------------------- | ------------------------------------------------------- |
-| `id`            | `str`                   | Unique identifier for the activity message              |
-| `role`          | `Literal["activity"]`   | Fixed discriminator identifying the message as activity |
-| `activity_type` | `str`                   | Activity discriminator used for renderer selection      |
-| `content`       | `Dict[str, Any]`        | Structured payload representing the activity state      |
+| Property        | Type                  | Description                                             |
+| --------------- | --------------------- | ------------------------------------------------------- |
+| `id`            | `str`                 | Unique identifier for the activity message              |
+| `role`          | `Literal["activity"]` | Fixed discriminator identifying the message as activity |
+| `activity_type` | `str`                 | Activity discriminator used for renderer selection      |
+| `content`       | `Dict[str, Any]`      | Structured payload representing the activity state      |
+
+### ReasoningMessage
+
+`from ag_ui.core import ReasoningMessage`
+
+Represents a reasoning/thinking message from an agent's internal thought process.
+
+```python
+class ReasoningMessage(ConfiguredBaseModel):
+    id: str
+    role: Literal["reasoning"]
+    content: str
+    encrypted_value: Optional[str] = None
+```
+
+| Property          | Type                    | Description                                        |
+| ----------------- | ----------------------- | -------------------------------------------------- |
+| `id`              | `str`                   | Unique identifier for the reasoning message        |
+| `role`            | `Literal["reasoning"]`  | Fixed discriminator identifying the reasoning role |
+| `content`         | `str`                   | The reasoning/thinking content                     |
+| `encrypted_value` | `Optional[str]`         | Optional encrypted value attached via signature    |
 
 ### Message
 
@@ -233,6 +256,7 @@ Message = Annotated[
         UserMessage,
         ToolMessage,
         ActivityMessage,
+        ReasoningMessage,
     ],
     Field(discriminator="role")
 ]
@@ -249,13 +273,15 @@ class ToolCall(ConfiguredBaseModel):
     id: str
     type: Literal["function"]
     function: FunctionCall
+    encrypted_value: Optional[str] = None
 ```
 
-| Property   | Type                  | Description                              |
-| ---------- | --------------------- | ---------------------------------------- |
-| `id`       | `str`                 | Unique identifier for the tool call      |
-| `type`     | `Literal["function"]` | Type of the tool call, always "function" |
-| `function` | `FunctionCall`        | Details about the function being called  |
+| Property          | Type                  | Description                                     |
+| ----------------- | --------------------- | ----------------------------------------------- |
+| `id`              | `str`                 | Unique identifier for the tool call             |
+| `type`            | `Literal["function"]` | Type of the tool call, always "function"        |
+| `function`        | `FunctionCall`        | Details about the function being called         |
+| `encrypted_value` | `Optional[str]`       | Optional encrypted value attached via signature |
 
 #### FunctionCall
 

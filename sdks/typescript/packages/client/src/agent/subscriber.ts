@@ -24,6 +24,12 @@ import {
   ActivitySnapshotEvent,
   ActivityDeltaEvent,
   ActivityMessage,
+  ReasoningStartEvent,
+  ReasoningMessageStartEvent,
+  ReasoningMessageContentEvent,
+  ReasoningMessageEndEvent,
+  ReasoningEndEvent,
+  ReasoningEncryptedValueEvent,
 } from "@ag-ui/core";
 import { AbstractAgent } from "./agent";
 import { structuredClone_ } from "@/utils";
@@ -147,6 +153,37 @@ export interface AgentSubscriber {
 
   onCustomEvent?(
     params: { event: CustomEvent } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  // Reasoning events
+  onReasoningStartEvent?(
+    params: { event: ReasoningStartEvent } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  onReasoningMessageStartEvent?(
+    params: { event: ReasoningMessageStartEvent } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  onReasoningMessageContentEvent?(
+    params: {
+      event: ReasoningMessageContentEvent;
+      reasoningMessageBuffer: string;
+    } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  onReasoningMessageEndEvent?(
+    params: {
+      event: ReasoningMessageEndEvent;
+      reasoningMessageBuffer: string;
+    } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  onReasoningEndEvent?(
+    params: { event: ReasoningEndEvent } & AgentSubscriberParams,
+  ): MaybePromise<AgentStateMutation | void>;
+
+  onReasoningEncryptedValueEvent?(
+    params: { event: ReasoningEncryptedValueEvent } & AgentSubscriberParams,
   ): MaybePromise<AgentStateMutation | void>;
 
   // State changes
