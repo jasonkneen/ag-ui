@@ -1299,4 +1299,48 @@ describe("defaultApplyEvents with reasoning events", () => {
     expect(finalUpdate?.messages?.[2]?.role).toBe("reasoning");
     expect(finalUpdate?.messages?.[2]?.content).toBe("More thinking...");
   });
+
+  it("should not set encryptedValue on activity messages", async () => {
+    const events$ = new Subject<BaseEvent>();
+    const initialState: RunAgentInput = {
+      messages: [
+        {
+          id: "activity-1",
+          role: "activity",
+          activityType: "SEARCH",
+          content: { query: "test" },
+        },
+      ] as Message[],
+      state: {},
+      threadId: "test-thread",
+      runId: "test-run",
+      tools: [],
+      context: [],
+    };
+
+    const agent = createAgent(initialState.messages);
+    const result$ = defaultApplyEvents(initialState, events$, agent, []);
+    const stateUpdatesPromise = firstValueFrom(result$.pipe(toArray()));
+
+    events$.next({ type: EventType.RUN_STARTED } as RunStartedEvent);
+    events$.next({
+      type: EventType.REASONING_ENCRYPTED_VALUE,
+      subtype: "message",
+      entityId: "activity-1",
+      encryptedValue: "should-not-be-set",
+    } as ReasoningEncryptedValueEvent);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    events$.complete();
+
+    const stateUpdates = await stateUpdatesPromise;
+
+    // Should not have any message updates since activity messages don't support encryptedValue
+    const hasMessageUpdate = stateUpdates.some((update) => update.messages !== undefined);
+    expect(hasMessageUpdate).toBe(false);
+
+    // Verify the activity message doesn't have encryptedValue set
+    const activityMessage = initialState.messages.find((m) => m.id === "activity-1");
+    expect((activityMessage as any)?.encryptedValue).toBeUndefined();
+  });
 });

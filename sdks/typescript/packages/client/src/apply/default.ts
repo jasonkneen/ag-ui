@@ -1036,7 +1036,8 @@ export const defaultApplyEvents = (
               // subtype is "message"
               // Find message by entityId and set encryptedValue
               const message = messages.find((m) => m.id === entityId);
-              if (message) {
+              // Activity messages do not have encryptedValue
+              if (message?.role !== "activity" && message) {
                 message.encryptedValue = encryptedValue;
                 entityUpdated = true;
               }
