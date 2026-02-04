@@ -14,18 +14,6 @@ export enum EventType {
   TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT",
   TEXT_MESSAGE_END = "TEXT_MESSAGE_END",
   TEXT_MESSAGE_CHUNK = "TEXT_MESSAGE_CHUNK",
-  /**
-   * @deprecated Use REASONING_MESSAGE_START instead. Will be removed in 1.0.0.
-   */
-  THINKING_TEXT_MESSAGE_START = "THINKING_TEXT_MESSAGE_START",
-  /**
-   * @deprecated Use REASONING_MESSAGE_CONTENT instead. Will be removed in 1.0.0.
-   */
-  THINKING_TEXT_MESSAGE_CONTENT = "THINKING_TEXT_MESSAGE_CONTENT",
-  /**
-   * @deprecated Use REASONING_MESSAGE_END instead. Will be removed in 1.0.0.
-   */
-  THINKING_TEXT_MESSAGE_END = "THINKING_TEXT_MESSAGE_END",
   TOOL_CALL_START = "TOOL_CALL_START",
   TOOL_CALL_ARGS = "TOOL_CALL_ARGS",
   TOOL_CALL_END = "TOOL_CALL_END",
@@ -39,6 +27,18 @@ export enum EventType {
    * @deprecated Use REASONING_END instead. Will be removed in 1.0.0.
    */
   THINKING_END = "THINKING_END",
+  /**
+   * @deprecated Use REASONING_MESSAGE_START instead. Will be removed in 1.0.0.
+   */
+  THINKING_TEXT_MESSAGE_START = "THINKING_TEXT_MESSAGE_START",
+  /**
+   * @deprecated Use REASONING_MESSAGE_CONTENT instead. Will be removed in 1.0.0.
+   */
+  THINKING_TEXT_MESSAGE_CONTENT = "THINKING_TEXT_MESSAGE_CONTENT",
+  /**
+   * @deprecated Use REASONING_MESSAGE_END instead. Will be removed in 1.0.0.
+   */
+  THINKING_TEXT_MESSAGE_END = "THINKING_TEXT_MESSAGE_END",
   STATE_SNAPSHOT = "STATE_SNAPSHOT",
   STATE_DELTA = "STATE_DELTA",
   MESSAGES_SNAPSHOT = "MESSAGES_SNAPSHOT",
