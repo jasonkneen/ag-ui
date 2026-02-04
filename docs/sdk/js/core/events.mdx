@@ -567,6 +567,28 @@ type ReasoningEncryptedValueEvent = BaseEvent & {
 | `entityId`       | `string`                   | ID of the tool call or message to attach the value |
 | `encryptedValue` | `string`                   | The encrypted value to attach to the entity        |
 
+## Deprecated Events
+
+<Warning>
+  The `THINKING_*` events are deprecated and will be removed in version 1.0.0.
+  New implementations should use `REASONING_*` events instead.
+</Warning>
+
+### Thinking Events (Deprecated)
+
+The following event types are deprecated:
+
+| Deprecated Event                | Replacement                 |
+| ------------------------------- | --------------------------- |
+| `THINKING_START`                | `REASONING_START`           |
+| `THINKING_END`                  | `REASONING_END`             |
+| `THINKING_TEXT_MESSAGE_START`   | `REASONING_MESSAGE_START`   |
+| `THINKING_TEXT_MESSAGE_CONTENT` | `REASONING_MESSAGE_CONTENT` |
+| `THINKING_TEXT_MESSAGE_END`     | `REASONING_MESSAGE_END`     |
+
+See [Reasoning Migration](/concepts/reasoning#migration-from-thinking-events)
+for detailed migration guidance.
+
 ## Event Schemas
 
 The SDK uses Zod schemas to validate events:
