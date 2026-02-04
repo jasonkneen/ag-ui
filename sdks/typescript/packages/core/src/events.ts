@@ -14,15 +14,30 @@ export enum EventType {
   TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT",
   TEXT_MESSAGE_END = "TEXT_MESSAGE_END",
   TEXT_MESSAGE_CHUNK = "TEXT_MESSAGE_CHUNK",
+  /**
+   * @deprecated Use REASONING_MESSAGE_START instead. Will be removed in 1.0.0.
+   */
   THINKING_TEXT_MESSAGE_START = "THINKING_TEXT_MESSAGE_START",
+  /**
+   * @deprecated Use REASONING_MESSAGE_CONTENT instead. Will be removed in 1.0.0.
+   */
   THINKING_TEXT_MESSAGE_CONTENT = "THINKING_TEXT_MESSAGE_CONTENT",
+  /**
+   * @deprecated Use REASONING_MESSAGE_END instead. Will be removed in 1.0.0.
+   */
   THINKING_TEXT_MESSAGE_END = "THINKING_TEXT_MESSAGE_END",
   TOOL_CALL_START = "TOOL_CALL_START",
   TOOL_CALL_ARGS = "TOOL_CALL_ARGS",
   TOOL_CALL_END = "TOOL_CALL_END",
   TOOL_CALL_CHUNK = "TOOL_CALL_CHUNK",
   TOOL_CALL_RESULT = "TOOL_CALL_RESULT",
+  /**
+   * @deprecated Use REASONING_START instead. Will be removed in 1.0.0.
+   */
   THINKING_START = "THINKING_START",
+  /**
+   * @deprecated Use REASONING_END instead. Will be removed in 1.0.0.
+   */
   THINKING_END = "THINKING_END",
   STATE_SNAPSHOT = "STATE_SNAPSHOT",
   STATE_DELTA = "STATE_DELTA",
@@ -77,10 +92,16 @@ export const TextMessageChunkEventSchema = BaseEventSchema.extend({
   delta: z.string().optional(),
 });
 
+/**
+ * @deprecated Use ReasoningMessageStartEventSchema instead. Will be removed in 1.0.0.
+ */
 export const ThinkingTextMessageStartEventSchema = BaseEventSchema.extend({
   type: z.literal(EventType.THINKING_TEXT_MESSAGE_START),
 });
 
+/**
+ * @deprecated Use ReasoningMessageContentEventSchema instead. Will be removed in 1.0.0.
+ */
 export const ThinkingTextMessageContentEventSchema = TextMessageContentEventSchema.omit({
   messageId: true,
   type: true,
@@ -88,6 +109,9 @@ export const ThinkingTextMessageContentEventSchema = TextMessageContentEventSche
   type: z.literal(EventType.THINKING_TEXT_MESSAGE_CONTENT),
 });
 
+/**
+ * @deprecated Use ReasoningMessageEndEventSchema instead. Will be removed in 1.0.0.
+ */
 export const ThinkingTextMessageEndEventSchema = BaseEventSchema.extend({
   type: z.literal(EventType.THINKING_TEXT_MESSAGE_END),
 });
@@ -126,11 +150,17 @@ export const ToolCallChunkEventSchema = BaseEventSchema.extend({
   delta: z.string().optional(),
 });
 
+/**
+ * @deprecated Use ReasoningStartEventSchema instead. Will be removed in 1.0.0.
+ */
 export const ThinkingStartEventSchema = BaseEventSchema.extend({
   type: z.literal(EventType.THINKING_START),
   title: z.string().optional(),
 });
 
+/**
+ * @deprecated Use ReasoningEndEventSchema instead. Will be removed in 1.0.0.
+ */
 export const ThinkingEndEventSchema = BaseEventSchema.extend({
   type: z.literal(EventType.THINKING_END),
 });
