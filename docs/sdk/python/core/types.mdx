@@ -30,16 +30,16 @@ class RunAgentInput(ConfiguredBaseModel):
     forwarded_props: Any
 ```
 
-| Property          | Type            | Description                                   |
-| ----------------- | --------------- | --------------------------------------------- |
-| `thread_id`       | `str`           | ID of the conversation thread                 |
-| `run_id`          | `str`           | ID of the current run                         |
-| `parent_run_id`   | `Optional[str]` | (Optional) ID of the run that spawned this run|
-| `state`           | `Any`           | Current state of the agent                    |
-| `messages`        | `List[Message]` | List of messages in the conversation          |
-| `tools`           | `List[Tool]`    | List of tools available to the agent          |
-| `context`         | `List[Context]` | List of context objects provided to the agent |
-| `forwarded_props` | `Any`           | Additional properties forwarded to the agent  |
+| Property          | Type            | Description                                    |
+| ----------------- | --------------- | ---------------------------------------------- |
+| `thread_id`       | `str`           | ID of the conversation thread                  |
+| `run_id`          | `str`           | ID of the current run                          |
+| `parent_run_id`   | `Optional[str]` | (Optional) ID of the run that spawned this run |
+| `state`           | `Any`           | Current state of the agent                     |
+| `messages`        | `List[Message]` | List of messages in the conversation           |
+| `tools`           | `List[Tool]`    | List of tools available to the agent           |
+| `context`         | `List[Context]` | List of context objects provided to the agent  |
+| `forwarded_props` | `Any`           | Additional properties forwarded to the agent   |
 
 ## Message Types
 
@@ -144,10 +144,10 @@ class TextInputContent(ConfiguredBaseModel):
     text: str
 ```
 
-| Property | Type            | Description                  |
-| -------- | --------------- | ---------------------------- |
+| Property | Type              | Description                  |
+| -------- | ----------------- | ---------------------------- |
 | `type`   | `Literal["text"]` | Identifies the fragment type |
-| `text`   | `str`           | Text content                 |
+| `text`   | `str`             | Text content                 |
 
 ### BinaryInputContent
 
@@ -163,14 +163,14 @@ class BinaryInputContent(ConfiguredBaseModel):
     filename: Optional[str] = None
 ```
 
-| Property   | Type              | Description                                                   |
-| ---------- | ----------------- | ------------------------------------------------------------- |
-| `type`     | `Literal["binary"]` | Identifies the fragment type                                 |
-| `mime_type`| `str`             | MIME type, for example `"image/png"`                          |
-| `id`       | `Optional[str]`   | Reference to previously uploaded content                      |
-| `url`      | `Optional[str]`   | Remote URL where the content can be retrieved                 |
-| `data`     | `Optional[str]`   | Base64 encoded content                                        |
-| `filename` | `Optional[str]`   | Optional filename hint                                        |
+| Property    | Type                | Description                                   |
+| ----------- | ------------------- | --------------------------------------------- |
+| `type`      | `Literal["binary"]` | Identifies the fragment type                  |
+| `mime_type` | `str`               | MIME type, for example `"image/png"`          |
+| `id`        | `Optional[str]`     | Reference to previously uploaded content      |
+| `url`       | `Optional[str]`     | Remote URL where the content can be retrieved |
+| `data`      | `Optional[str]`     | Base64 encoded content                        |
+| `filename`  | `Optional[str]`     | Optional filename hint                        |
 
 > **Validation:** At least one of `id`, `url`, or `data` must be provided.
 
@@ -224,7 +224,8 @@ class ActivityMessage(ConfiguredBaseModel):
 
 `from ag_ui.core import ReasoningMessage`
 
-Represents a reasoning/thinking message from an agent's internal thought process.
+Represents a reasoning/thinking message from an agent's internal thought
+process.
 
 ```python
 class ReasoningMessage(ConfiguredBaseModel):
@@ -234,12 +235,12 @@ class ReasoningMessage(ConfiguredBaseModel):
     encrypted_value: Optional[str] = None
 ```
 
-| Property          | Type                    | Description                                        |
-| ----------------- | ----------------------- | -------------------------------------------------- |
-| `id`              | `str`                   | Unique identifier for the reasoning message        |
-| `role`            | `Literal["reasoning"]`  | Fixed discriminator identifying the reasoning role |
-| `content`         | `str`                   | The reasoning/thinking content                     |
-| `encrypted_value` | `Optional[str]`         | Optional encrypted value attached via signature    |
+| Property          | Type                   | Description                                        |
+| ----------------- | ---------------------- | -------------------------------------------------- |
+| `id`              | `str`                  | Unique identifier for the reasoning message        |
+| `role`            | `Literal["reasoning"]` | Fixed discriminator identifying the reasoning role |
+| `content`         | `str`                  | The reasoning/thinking content                     |
+| `encrypted_value` | `Optional[str]`        | Optional encrypted value attached via signature    |
 
 ### Message
 
