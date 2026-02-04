@@ -334,8 +334,4 @@ export const createReasoningEndEvent = (props: ReasoningEndEventProps): Reasonin
 export const createReasoningEncryptedValueEvent = (
   props: ReasoningEncryptedValueEventProps,
 ): ReasoningEncryptedValueEvent =>
-  buildEvent(
-    EventType.REASONING_ENCRYPTED_VALUE,
-    ReasoningEncryptedValueEventSchema,
-    props,
-  );
+  buildEvent(EventType.REASONING_ENCRYPTED_VALUE, ReasoningEncryptedValueEventSchema, props);

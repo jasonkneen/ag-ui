@@ -646,12 +646,7 @@ export const defaultApplyEvents = (
             try {
               const baseContent = structuredClone_(existingActivityMessage.content ?? {});
 
-              const result = applyPatch(
-                baseContent,
-                activityEvent.patch ?? [],
-                true,
-                false,
-              );
+              const result = applyPatch(baseContent, activityEvent.patch ?? [], true, false);
               const updatedContent = result.newDocument as ActivityMessage["content"];
 
               messages[existingIndex] = {

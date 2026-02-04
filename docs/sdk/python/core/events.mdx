@@ -86,12 +86,12 @@ class RunStartedEvent(BaseEvent):
     input: Optional[RunAgentInput] = None
 ```
 
-| Property         | Type                       | Description                                                                                                                              |
-| ---------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `thread_id`      | `str`                      | ID of the conversation thread                                                                                                            |
-| `run_id`         | `str`                      | ID of the agent run                                                                                                                      |
-| `parent_run_id`  | `Optional[str]`            | (Optional) Lineage pointer for branching/time travel. If present, refers to a prior run within the same thread                          |
-| `input`          | `Optional[RunAgentInput]`  | (Optional) The exact agent input payload sent to the agent for this run. May omit messages already in history                            |
+| Property        | Type                      | Description                                                                                                    |
+| --------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `thread_id`     | `str`                     | ID of the conversation thread                                                                                  |
+| `run_id`        | `str`                     | ID of the agent run                                                                                            |
+| `parent_run_id` | `Optional[str]`           | (Optional) Lineage pointer for branching/time travel. If present, refers to a prior run within the same thread |
+| `input`         | `Optional[RunAgentInput]` | (Optional) The exact agent input payload sent to the agent for this run. May omit messages already in history  |
 
 ### RunFinishedEvent
 
@@ -370,11 +370,11 @@ class ActivitySnapshotEvent(BaseEvent):
     replace: bool = True
 ```
 
-| Property        | Type  | Description                                           |
-| --------------- | ----- | ----------------------------------------------------- |
-| `message_id`    | `str` | Identifier for the target `ActivityMessage`           |
-| `activity_type` | `str` | Activity discriminator such as `"PLAN"` or `"SEARCH"` |
-| `content`       | `Any` | Structured payload describing the full activity state |
+| Property        | Type                    | Description                                                                        |
+| --------------- | ----------------------- | ---------------------------------------------------------------------------------- |
+| `message_id`    | `str`                   | Identifier for the target `ActivityMessage`                                        |
+| `activity_type` | `str`                   | Activity discriminator such as `"PLAN"` or `"SEARCH"`                              |
+| `content`       | `Any`                   | Structured payload describing the full activity state                              |
 | `replace`       | `bool` (default `True`) | When `False`, the snapshot is ignored if a message with the same ID already exists |
 
 ### ActivityDeltaEvent
@@ -391,11 +391,11 @@ class ActivityDeltaEvent(BaseEvent):
     patch: List[Any]
 ```
 
-| Property        | Type         | Description                                                          |
-| --------------- | ------------ | -------------------------------------------------------------------- |
-| `message_id`    | `str`        | Identifier for the target `ActivityMessage`                          |
-| `activity_type` | `str`        | Activity discriminator mirroring the most recent snapshot            |
-| `patch`         | `List[Any]`  | JSON Patch operations applied to the structured activity content     |
+| Property        | Type        | Description                                                      |
+| --------------- | ----------- | ---------------------------------------------------------------- |
+| `message_id`    | `str`       | Identifier for the target `ActivityMessage`                      |
+| `activity_type` | `str`       | Activity discriminator mirroring the most recent snapshot        |
+| `patch`         | `List[Any]` | JSON Patch operations applied to the structured activity content |
 
 ## Special Events
 
@@ -437,16 +437,17 @@ class CustomEvent(BaseEvent):
 
 ## Reasoning Events
 
-These events represent the lifecycle of reasoning/thinking processes within an agent.
-Reasoning events allow agents to expose their internal thought process to the frontend,
-creating `ReasoningMessage` objects that persist in the message history with the role `"reasoning"`.
+These events represent the lifecycle of reasoning/thinking processes within an
+agent. Reasoning events allow agents to expose their internal thought process to
+the frontend, creating `ReasoningMessage` objects that persist in the message
+history with the role `"reasoning"`.
 
 ### ReasoningStartEvent
 
 `from ag_ui.core import ReasoningStartEvent`
 
-Signals the start of a reasoning phase. This is a pass-through event that notifies
-subscribers but does not create messages.
+Signals the start of a reasoning phase. This is a pass-through event that
+notifies subscribers but does not create messages.
 
 ```python
 class ReasoningStartEvent(BaseEvent):
@@ -462,8 +463,8 @@ class ReasoningStartEvent(BaseEvent):
 
 `from ag_ui.core import ReasoningMessageStartEvent`
 
-Signals the start of a reasoning message. Creates a new `ReasoningMessage` in the
-message history.
+Signals the start of a reasoning message. Creates a new `ReasoningMessage` in
+the message history.
 
 ```python
 class ReasoningMessageStartEvent(BaseEvent):
@@ -472,9 +473,9 @@ class ReasoningMessageStartEvent(BaseEvent):
     role: Literal["assistant"]
 ```
 
-| Property     | Type                    | Description                       |
-| ------------ | ----------------------- | --------------------------------- |
-| `message_id` | `str`                   | Unique identifier for the message |
+| Property     | Type                   | Description                       |
+| ------------ | ---------------------- | --------------------------------- |
+| `message_id` | `str`                  | Unique identifier for the message |
 | `role`       | `Literal["assistant"]` | Role is always "assistant"        |
 
 ### ReasoningMessageContentEvent
@@ -526,6 +527,7 @@ class ReasoningMessageChunkEvent(BaseEvent):
 ```
 
 Behavior
+
 - Convenience: Some consumers (e.g., the JS/TS client) expand chunk events into
   the standard start/content/end sequence automatically.
 - First chunk requirements: The first chunk for a given message must include
@@ -554,8 +556,8 @@ class ReasoningEndEvent(BaseEvent):
 
 `from ag_ui.core import ReasoningEncryptedValueEvent`
 
-Attaches an encrypted value to a message or tool call. When this
-event is emitted, it finds the referenced entity by `entity_id` and sets its
+Attaches an encrypted value to a message or tool call. When this event is
+emitted, it finds the referenced entity by `entity_id` and sets its
 `encrypted_value` field.
 
 ```python
@@ -616,6 +618,7 @@ Event = Annotated[
 
 This allows for runtime validation of events and type checking at development
 time.
+
 ### TextMessageChunkEvent
 
 Convenience event for complete text messages without manually emitting
@@ -632,6 +635,7 @@ class TextMessageChunkEvent(BaseEvent):
 ```
 
 Behavior
+
 - Convenience: Some consumers (e.g., the JS/TS client) expand chunk events into
   the standard start/content/end sequence automatically, allowing producers to
   omit explicit start/end events when using chunks.
@@ -657,6 +661,7 @@ class ToolCallChunkEvent(BaseEvent):
 ```
 
 Behavior
+
 - Convenience: Consumers may expand chunk sequences into the standard
   start/args/end triad (the JS/TS client does this automatically).
 - First chunk requirements: Include both `tool_call_id` and `tool_call_name` on

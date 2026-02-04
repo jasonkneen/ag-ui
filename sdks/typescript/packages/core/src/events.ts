@@ -211,7 +211,7 @@ export const StepFinishedEventSchema = BaseEventSchema.extend({
 // Schema for the encrypted signature subtype
 export const ReasoningEncryptedValueSubtypeSchema = z.union([
   z.literal("tool-call"),
-  z.literal("message") 
+  z.literal("message"),
 ]);
 
 export const ReasoningStartEventSchema = BaseEventSchema.extend({
@@ -339,7 +339,9 @@ export type TextMessageStartEventProps = EventProps<typeof TextMessageStartEvent
 export type TextMessageContentEventProps = EventProps<typeof TextMessageContentEventSchema>;
 export type TextMessageEndEventProps = EventProps<typeof TextMessageEndEventSchema>;
 export type TextMessageChunkEventProps = EventProps<typeof TextMessageChunkEventSchema>;
-export type ThinkingTextMessageStartEventProps = EventProps<typeof ThinkingTextMessageStartEventSchema>;
+export type ThinkingTextMessageStartEventProps = EventProps<
+  typeof ThinkingTextMessageStartEventSchema
+>;
 export type ThinkingTextMessageContentEventProps = EventProps<
   typeof ThinkingTextMessageContentEventSchema
 >;
@@ -365,7 +367,9 @@ export type StepStartedEventProps = EventProps<typeof StepStartedEventSchema>;
 export type StepFinishedEventProps = EventProps<typeof StepFinishedEventSchema>;
 export type ReasoningStartEventProps = EventProps<typeof ReasoningStartEventSchema>;
 export type ReasoningMessageStartEventProps = EventProps<typeof ReasoningMessageStartEventSchema>;
-export type ReasoningMessageContentEventProps = EventProps<typeof ReasoningMessageContentEventSchema>;
+export type ReasoningMessageContentEventProps = EventProps<
+  typeof ReasoningMessageContentEventSchema
+>;
 export type ReasoningMessageEndEventProps = EventProps<typeof ReasoningMessageEndEventSchema>;
 export type ReasoningMessageChunkEventProps = EventProps<typeof ReasoningMessageChunkEventSchema>;
 export type ReasoningEndEventProps = EventProps<typeof ReasoningEndEventSchema>;
@@ -406,6 +410,4 @@ export type ReasoningMessageEndEvent = z.infer<typeof ReasoningMessageEndEventSc
 export type ReasoningMessageChunkEvent = z.infer<typeof ReasoningMessageChunkEventSchema>;
 export type ReasoningEndEvent = z.infer<typeof ReasoningEndEventSchema>;
 export type ReasoningEncryptedValueEvent = z.infer<typeof ReasoningEncryptedValueEventSchema>;
-export type ReasoningEncryptedValueSubtype = z.infer<
-  typeof ReasoningEncryptedValueSubtypeSchema
->;
+export type ReasoningEncryptedValueSubtype = z.infer<typeof ReasoningEncryptedValueSubtypeSchema>;
