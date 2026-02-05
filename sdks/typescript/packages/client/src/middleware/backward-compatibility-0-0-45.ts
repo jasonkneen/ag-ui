@@ -35,7 +35,7 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
   private warnAboutTransformation(from: string, to: string) {
     if (process.env.SUPPRESS_TRANSFORMATION_WARNINGS) return;
     console.warn(
-      `AG-UI is converting ${from} to ${to}. To suppress this warning, upgrade your AG-UI package, switch over to REASONING_* events, ask your integration provider to update their event system or set SUPPRESS_TRANSFORMATION_WARNINGS=true in your .env file.`,
+      `AG-UI is converting ${from} to ${to}. To suppress this warning, upgrade your AG-UI integration package, switch over to REASONING_* events, ask your integration provider to update their event system or set SUPPRESS_TRANSFORMATION_WARNINGS=true in your .env file.`,
     );
   }
   override run(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
