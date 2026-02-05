@@ -181,6 +181,12 @@ interface ReasoningMessage {
 }
 ```
 
+<Tip>
+  Unlike Activity messages, Reasoning messages are intended to represent the
+  agent's internal thought process and may be encrypted for privacy and are
+  meant to be sent back to the agent for further processing on subsequent turns.
+</Tip>
+
 Key points:
 
 - Emitted via `REASONING_MESSAGE_START`, `REASONING_MESSAGE_CONTENT`, and

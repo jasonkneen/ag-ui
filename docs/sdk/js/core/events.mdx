@@ -397,42 +397,6 @@ type ActivityDeltaEvent = BaseEvent & {
 | `activityType` | `string` | Activity discriminator mirroring the most recent snapshot        |
 | `patch`        | `any[]`  | JSON Patch operations applied to the structured activity payload |
 
-## Special Events
-
-### RawEvent
-
-Used to pass through events from external systems.
-
-```typescript
-type RawEvent = BaseEvent & {
-  type: EventType.RAW
-  event: any
-  source?: string
-}
-```
-
-| Property | Type                | Description         |
-| -------- | ------------------- | ------------------- |
-| `event`  | `any`               | Original event data |
-| `source` | `string` (optional) | Source of the event |
-
-### CustomEvent
-
-Used for application-specific custom events.
-
-```typescript
-type CustomEvent = BaseEvent & {
-  type: EventType.CUSTOM
-  name: string
-  value: any
-}
-```
-
-| Property | Type     | Description                     |
-| -------- | -------- | ------------------------------- |
-| `name`   | `string` | Name of the custom event        |
-| `value`  | `any`    | Value associated with the event |
-
 ## Reasoning Events
 
 These events represent the lifecycle of reasoning/thinking processes within an
@@ -566,6 +530,42 @@ type ReasoningEncryptedValueEvent = BaseEvent & {
 | `subtype`        | `"tool-call" \| "message"` | The type of entity this value belongs to           |
 | `entityId`       | `string`                   | ID of the tool call or message to attach the value |
 | `encryptedValue` | `string`                   | The encrypted value to attach to the entity        |
+
+## Special Events
+
+### RawEvent
+
+Used to pass through events from external systems.
+
+```typescript
+type RawEvent = BaseEvent & {
+  type: EventType.RAW
+  event: any
+  source?: string
+}
+```
+
+| Property | Type                | Description         |
+| -------- | ------------------- | ------------------- |
+| `event`  | `any`               | Original event data |
+| `source` | `string` (optional) | Source of the event |
+
+### CustomEvent
+
+Used for application-specific custom events.
+
+```typescript
+type CustomEvent = BaseEvent & {
+  type: EventType.CUSTOM
+  name: string
+  value: any
+}
+```
+
+| Property | Type     | Description                     |
+| -------- | -------- | ------------------------------- |
+| `name`   | `string` | Name of the custom event        |
+| `value`  | `any`    | Value associated with the event |
 
 ## Deprecated Events
 
