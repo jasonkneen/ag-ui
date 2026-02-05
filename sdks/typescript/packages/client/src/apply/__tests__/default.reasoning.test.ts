@@ -1,3 +1,4 @@
+import { describe, expect, it, vi } from "vitest";
 import { Subject } from "rxjs";
 import { toArray } from "rxjs/operators";
 import { firstValueFrom } from "rxjs";
@@ -262,7 +263,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onNewMessageMock = jest.fn();
+    const onNewMessageMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onNewMessage: onNewMessageMock,
     };
@@ -343,7 +344,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onReasoningEncryptedValueMock = jest.fn();
+    const onReasoningEncryptedValueMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onReasoningEncryptedValueEvent: onReasoningEncryptedValueMock,
     };
@@ -389,7 +390,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onReasoningEncryptedValueMock = jest.fn();
+    const onReasoningEncryptedValueMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onReasoningEncryptedValueEvent: onReasoningEncryptedValueMock,
     };
@@ -433,7 +434,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onReasoningEncryptedValueMock = jest.fn();
+    const onReasoningEncryptedValueMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onReasoningEncryptedValueEvent: onReasoningEncryptedValueMock,
     };
@@ -576,8 +577,8 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onReasoningStartMock = jest.fn();
-    const onReasoningEndMock = jest.fn();
+    const onReasoningStartMock = vi.fn();
+    const onReasoningEndMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onReasoningStartEvent: onReasoningStartMock,
       onReasoningEndEvent: onReasoningEndMock,
@@ -809,7 +810,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const consoleWarnSpy = jest.spyOn(console, "warn").mockImplementation();
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const agent = createAgent(initialState.messages);
     const result$ = defaultApplyEvents(initialState, events$, agent, []);
@@ -850,7 +851,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const consoleWarnSpy = jest.spyOn(console, "warn").mockImplementation();
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const agent = createAgent(initialState.messages);
     const result$ = defaultApplyEvents(initialState, events$, agent, []);
@@ -1023,7 +1024,7 @@ describe("defaultApplyEvents with reasoning events", () => {
       context: [],
     };
 
-    const onNewMessageMock = jest.fn();
+    const onNewMessageMock = vi.fn();
     const subscriber: AgentSubscriber = {
       onReasoningMessageEndEvent: () => {
         return { stopPropagation: true };

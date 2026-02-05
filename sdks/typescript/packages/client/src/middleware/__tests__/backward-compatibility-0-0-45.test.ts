@@ -1,12 +1,14 @@
+import { beforeEach, expect, it, vi } from "vitest";
 import { AbstractAgent } from "@/agent";
 import { BaseEvent, EventType, Message, RunAgentInput } from "@ag-ui/core";
 import { Observable, of, from } from "rxjs";
 import { BackwardCompatibility_0_0_45 } from "../backward-compatibility-0-0-45";
+import { describe } from "vitest";
 import { lastValueFrom, toArray } from "rxjs";
 
 // Mock uuid module
-jest.mock("uuid", () => ({
-  v4: jest.fn().mockReturnValue("mock-uuid"),
+vi.mock("uuid", () => ({
+  v4: vi.fn().mockReturnValue("mock-uuid"),
 }));
 
 // String constants for deprecated THINKING events
@@ -38,7 +40,7 @@ describe("BackwardCompatibility_0_0_45", () => {
 
   beforeEach(() => {
     middleware = new BackwardCompatibility_0_0_45();
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
 
   const createInput = (): RunAgentInput => ({
