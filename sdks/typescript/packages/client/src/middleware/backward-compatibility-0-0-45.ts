@@ -32,6 +32,12 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
   private currentReasoningId: string | null = null;
   private currentMessageId: string | null = null;
 
+  private warnAboutTransformation(from: string, to: string) {
+    if (process.env.SUPPRESS_TRANSFORMATION_WARNINGS) return;
+    console.warn(
+      `AG-UI is converting ${from} to ${to}. To suppress this warning, switch over to REASONING_* events, ask your integration provider to update their event system or set SUPPRESS_TRANSFORMATION_WARNINGS=true in your .env file.`,
+    );
+  }
   override run(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
     // Reset state for each run
     this.currentReasoningId = null;
@@ -47,6 +53,7 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
       case THINKING_START: {
         this.currentReasoningId = randomUUID();
         const { title, ...rest } = event as BaseEvent & { title?: string };
+        this.warnAboutTransformation(THINKING_START, EventType.REASONING_START);
         return {
           ...rest,
           type: EventType.REASONING_START,
@@ -56,6 +63,10 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
 
       case THINKING_TEXT_MESSAGE_START: {
         this.currentMessageId = randomUUID();
+        this.warnAboutTransformation(
+          THINKING_TEXT_MESSAGE_START,
+          EventType.REASONING_MESSAGE_START,
+        );
         return {
           ...event,
           type: EventType.REASONING_MESSAGE_START,
@@ -66,6 +77,10 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
 
       case THINKING_TEXT_MESSAGE_CONTENT: {
         const { delta, ...rest } = event as BaseEvent & { delta: string };
+        this.warnAboutTransformation(
+          THINKING_TEXT_MESSAGE_CONTENT,
+          EventType.REASONING_MESSAGE_CONTENT,
+        );
         return {
           ...rest,
           type: EventType.REASONING_MESSAGE_CONTENT,
@@ -76,6 +91,7 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
 
       case THINKING_TEXT_MESSAGE_END: {
         const messageId = this.currentMessageId ?? randomUUID();
+        this.warnAboutTransformation(THINKING_TEXT_MESSAGE_END, EventType.REASONING_MESSAGE_END);
         return {
           ...event,
           type: EventType.REASONING_MESSAGE_END,
@@ -85,6 +101,7 @@ export class BackwardCompatibility_0_0_45 extends Middleware {
 
       case THINKING_END: {
         const reasoningId = this.currentReasoningId ?? randomUUID();
+        this.warnAboutTransformation(THINKING_END, EventType.REASONING_END);
         return {
           ...event,
           type: EventType.REASONING_END,
