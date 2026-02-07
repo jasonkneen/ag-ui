@@ -252,7 +252,7 @@ export const ReasoningStartEventSchema = BaseEventSchema.extend({
 export const ReasoningMessageStartEventSchema = BaseEventSchema.extend({
   type: z.literal(EventType.REASONING_MESSAGE_START),
   messageId: z.string(),
-  role: z.literal("assistant"),
+  role: z.literal("reasoning"),
 });
 
 export const ReasoningMessageContentEventSchema = BaseEventSchema.extend({
