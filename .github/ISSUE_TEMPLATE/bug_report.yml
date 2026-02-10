@@ -19,83 +19,13 @@ body:
           required: true
         - label: I am using the **latest** version of the relevant AG-UI packages.
           required: true
-        - label: I can reproduce this with a minimal setup (not just in my production app).
-          required: false
-
-  - type: dropdown
-    id: area
-    attributes:
-      label: Which area is this bug related to?
-      description: Select the most relevant area. If unsure, pick your best guess.
-      options:
-        - "@ag-ui/core"
-        - "@ag-ui/client"
-        - "@ag-ui/encoder"
-        - "@ag-ui/proto"
-        - "ag-ui-protocol (Python SDK)"
-        - "Integration: LangGraph"
-        - "Integration: Mastra"
-        - "Integration: CrewAI"
-        - "Integration: Pydantic AI"
-        - "Integration: LangChain"
-        - "Integration: LlamaIndex"
-        - "Integration: Vercel AI SDK"
-        - "Integration: A2A"
-        - "Integration: Agno"
-        - "Integration: AWS Strands"
-        - "Integration: ADK"
-        - "Integration: Spring AI"
-        - "Integration: Other"
-        - "Documentation"
-        - "Other / Not sure"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: sdk
-    attributes:
-      label: Which SDK are you using?
-      options:
-        - "TypeScript"
-        - "Python"
-        - "Both"
-        - "N/A"
-    validations:
-      required: true
-
-  - type: textarea
-    id: environment
-    attributes:
-      label: Environment & Versions
-      description: |
-        Paste the relevant versions from your project. You can get AG-UI package versions from your `package.json` or `pip show ag-ui-protocol`.
-      placeholder: |
-        AG-UI package(s) & version(s): @ag-ui/core@0.0.44, @ag-ui/client@0.0.44
-        Framework: Next.js 15.x / Vite 6.x / FastAPI 0.x / etc.
-        Runtime: Node 22.x / Python 3.12
-        Integration framework (if applicable): LangGraph 0.x / CrewAI 0.x / Mastra 1.x / etc.
-        Transport: SSE / WebSocket / HTTP binary
-        Browser (if UI-related): Chrome 131 / Firefox 134 / Safari 18
-        OS: macOS 15 / Ubuntu 24.04 / Windows 11
-      render: text
-    validations:
-      required: true
 
   - type: textarea
     id: description
     attributes:
       label: Describe the Bug
-      description: A clear description of what went wrong. Include error messages, console output, or screenshots if they help.
-      placeholder: "When I do X, Y happens instead of Z. Here's the error I see in the console: ..."
-    validations:
-      required: true
-
-  - type: textarea
-    id: expected
-    attributes:
-      label: Expected Behavior
-      description: What did you expect to happen?
-      placeholder: "I expected X to happen when..."
+      description: A clear description of what went wrong.
+      placeholder: "When I do X, Y happens instead of Z."
     validations:
       required: true
 
@@ -103,60 +33,52 @@ body:
     id: steps
     attributes:
       label: Steps to Reproduce
-      description: |
-        Walk us through exactly how to trigger this bug. The more specific, the faster we can fix it.
+      description: Walk us through exactly how to trigger this bug.
       placeholder: |
-        1. Install `@ag-ui/client` and `@ag-ui/core`
+        1. Install `@ag-ui/client`
         2. Create an HttpAgent pointing at `http://localhost:8000/agent`
-        3. Call `agent.run(...)` with the following input: ...
-        4. Subscribe to the returned Observable
-        5. Observe the error when a TEXT_MESSAGE_CONTENT event arrives
+        3. Call `agent.run(...)` with ...
+        4. Observe the error
     validations:
       required: true
 
   - type: textarea
-    id: relevant-code
+    id: expected
     attributes:
-      label: Relevant Code
-      description: |
-        If applicable, paste the minimal code that triggers the bug. Use fenced code blocks.
+      label: Expected Behavior
+      description: What did you expect to happen instead?
+      placeholder: "I expected X to happen when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Tell us what you're working with so we can reproduce your setup.
       placeholder: |
-        ```typescript
-        import { HttpAgent } from "@ag-ui/client";
-
-        const agent = new HttpAgent({ url: "http://localhost:8000/agent" });
-        const response = agent.run({ threadId: "123", runId: "abc", messages: [] });
-
-        response.subscribe({
-          next: (event) => console.log(event),
-          error: (err) => console.error(err), // <-- error occurs here
-        });
-        ```
+        AG-UI package(s) & version(s): e.g. @ag-ui/core@0.0.44
+        Runtime: e.g. Node 22 / Python 3.12
+        OS: e.g. macOS 15 / Ubuntu 24.04
       render: text
     validations:
-      required: false
+      required: true
 
   - type: input
     id: reproduction
     attributes:
-      label: Minimal Reproduction URL
+      label: Reproduction URL
       description: |
-        Provide a link to a repo, StackBlitz, or CodeSandbox that reproduces the issue with the **minimum** code needed. [Why is a reproduction required?](https://antfu.me/posts/why-reproductions-are-required)
-      placeholder: "https://stackblitz.com/edit/... or https://github.com/your-username/repro-repo"
+        Link to a minimal repo, StackBlitz, or CodeSandbox that reproduces the issue. [Why?](https://antfu.me/posts/why-reproductions-are-required)
+      placeholder: "https://github.com/your-username/repro-repo"
     validations:
       required: false
-
-  - type: markdown
-    attributes:
-      value: |
-        > **Issues without a reproduction may take significantly longer to investigate.** If we can't reproduce it, we'll ask for one before we can dig in.
 
   - type: textarea
     id: logs
     attributes:
-      label: Logs & Error Output
-      description: |
-        Paste any relevant log output, stack traces, or error messages. This will be automatically formatted as code.
+      label: Logs & Errors
+      description: Paste any relevant stack traces or error output. Auto-formatted as code.
       render: shell
     validations:
       required: false
@@ -165,16 +87,6 @@ body:
     id: additional
     attributes:
       label: Additional Context
-      description: Anything else that might help — workarounds you've tried, related issues, relevant config snippets, network traces, etc.
-      placeholder: "I noticed this started happening after upgrading from v0.0.40 to v0.0.44..."
+      description: Anything else — workarounds, screenshots, related issues, etc.
     validations:
       required: false
-
-  - type: checkboxes
-    id: contribution
-    attributes:
-      label: Contribution
-      description: Would you like to help fix this?
-      options:
-        - label: I'm willing to submit a PR to fix this issue.
-          required: false
