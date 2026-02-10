@@ -1,4 +1,4 @@
-name: "Bug Report"
+name: "🐛 Bug Report"
 description: "Something isn't working as expected? Let us know so we can fix it."
 title: "[Bug]: "
 labels: ["bug", "triage"]
@@ -15,9 +15,9 @@ body:
     attributes:
       label: Pre-flight Checklist
       options:
-        - label: I have searched existing issues and this hasn't been reported yet.
+        - label: I have searched [existing issues](https://github.com/ag-ui-protocol/ag-ui/issues) and this hasn't been reported yet.
           required: true
-        - label: I am using the **latest** version of the relevant AG-UI packages.
+        - label: I am using the **latest** version AG-UI.
           required: true
 
   - type: textarea
@@ -59,20 +59,14 @@ body:
       placeholder: |
         AG-UI package(s) & version(s): e.g. @ag-ui/core@0.0.44
         Runtime: e.g. Node 22 / Python 3.12
-        OS: e.g. macOS 15 / Ubuntu 24.04
       render: text
     validations:
       required: true
 
-  - type: input
-    id: reproduction
+  - type: textarea
     attributes:
-      label: Reproduction URL
-      description: |
-        Link to a minimal repo, StackBlitz, or CodeSandbox that reproduces the issue. [Why?](https://antfu.me/posts/why-reproductions-are-required)
-      placeholder: "https://github.com/your-username/repro-repo"
-    validations:
-      required: false
+      label: Screenshots
+      description: If applicable, add screenshots to help explain your problem.
 
   - type: textarea
     id: logs
