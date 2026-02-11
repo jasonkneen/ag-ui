@@ -1,53 +1,53 @@
+import type { AbstractAgent } from "@/agent/agent";
 import {
-  EventType,
-  TextMessageStartEvent,
-  TextMessageContentEvent,
-  Message,
-  DeveloperMessage,
-  SystemMessage,
-  AssistantMessage,
-  UserMessage,
-  ToolCallStartEvent,
-  ToolCallArgsEvent,
-  StateSnapshotEvent,
-  StateDeltaEvent,
-  MessagesSnapshotEvent,
-  CustomEvent,
-  BaseEvent,
-  ToolCallResultEvent,
-  ToolMessage,
-  RunAgentInput,
-  TextMessageEndEvent,
-  ToolCallEndEvent,
-  RawEvent,
-  RunStartedEvent,
-  RunFinishedEvent,
-  RunErrorEvent,
-  StepStartedEvent,
-  StepFinishedEvent,
-  ActivitySnapshotEvent,
-  ActivityDeltaEvent,
-  ActivityMessage,
-  ReasoningStartEvent,
-  ReasoningMessageStartEvent,
-  ReasoningMessageContentEvent,
-  ReasoningMessageEndEvent,
-  ReasoningEndEvent,
-  ReasoningEncryptedValueEvent,
-  ReasoningMessage,
-} from "@ag-ui/core";
-import { mergeMap, mergeAll, defaultIfEmpty, concatMap } from "rxjs/operators";
-import { of, EMPTY } from "rxjs";
-import { structuredClone_ } from "../utils";
-import { applyPatch } from "fast-json-patch";
-import {
-  AgentStateMutation,
-  AgentSubscriber,
+  type AgentStateMutation,
+  type AgentSubscriber,
   runSubscribersWithMutation,
 } from "@/agent/subscriber";
-import { Observable } from "rxjs";
-import { AbstractAgent } from "@/agent/agent";
+import {
+  type ActivityDeltaEvent,
+  type ActivityMessage,
+  type ActivitySnapshotEvent,
+  type AssistantMessage,
+  type BaseEvent,
+  type CustomEvent,
+  DeveloperMessage,
+  EventType,
+  type Message,
+  type MessagesSnapshotEvent,
+  type RawEvent,
+  type ReasoningEncryptedValueEvent,
+  type ReasoningEndEvent,
+  type ReasoningMessage,
+  type ReasoningMessageContentEvent,
+  type ReasoningMessageEndEvent,
+  type ReasoningMessageStartEvent,
+  type ReasoningStartEvent,
+  type RunAgentInput,
+  type RunErrorEvent,
+  type RunFinishedEvent,
+  type RunStartedEvent,
+  type StateDeltaEvent,
+  type StateSnapshotEvent,
+  type StepFinishedEvent,
+  type StepStartedEvent,
+  SystemMessage,
+  type TextMessageContentEvent,
+  type TextMessageEndEvent,
+  type TextMessageStartEvent,
+  type ToolCallArgsEvent,
+  type ToolCallEndEvent,
+  type ToolCallResultEvent,
+  type ToolCallStartEvent,
+  type ToolMessage,
+  UserMessage,
+} from "@ag-ui/core";
+import * as jsonpatch from "fast-json-patch";
+import { EMPTY, of } from "rxjs";
+import type { Observable } from "rxjs";
+import { concatMap, defaultIfEmpty, mergeAll, mergeMap } from "rxjs/operators";
 import untruncateJson from "untruncate-json";
+import { structuredClone_ } from "../utils";
 
 export const defaultApplyEvents = (
   input: RunAgentInput,
@@ -289,7 +289,7 @@ export const defaultApplyEvents = (
           }
 
           // Find the specific tool call
-          const targetToolCall = targetMessage.toolCalls!.find((tc) => tc.id === toolCallId);
+          const targetToolCall = targetMessage.toolCalls?.find((tc) => tc.id === toolCallId);
           if (!targetToolCall) {
             console.warn(`TOOL_CALL_ARGS: No tool call found with ID '${toolCallId}'`);
             return emitUpdates();
@@ -347,7 +347,7 @@ export const defaultApplyEvents = (
           }
 
           // Find the specific tool call
-          const targetToolCall = targetMessage.toolCalls!.find((tc) => tc.id === toolCallId);
+          const targetToolCall = targetMessage.toolCalls?.find((tc) => tc.id === toolCallId);
           if (!targetToolCall) {
             console.warn(`TOOL_CALL_END: No tool call found with ID '${toolCallId}'`);
             return emitUpdates();
@@ -488,16 +488,13 @@ export const defaultApplyEvents = (
 
             try {
               // Apply the JSON Patch operations to the current state without mutating the original
-              const result = applyPatch(state, delta, true, false);
+              const result = jsonpatch.applyPatch(state, delta, true, false);
               state = result.newDocument;
               applyMutation({ state });
             } catch (error: unknown) {
               const errorMessage = error instanceof Error ? error.message : String(error);
               console.warn(
-                `Failed to apply state patch:\n` +
-                  `Current state: ${JSON.stringify(state, null, 2)}\n` +
-                  `Patch operations: ${JSON.stringify(delta, null, 2)}\n` +
-                  `Error: ${errorMessage}`,
+                `Failed to apply state patch:\nCurrent state: ${JSON.stringify(state, null, 2)}\nPatch operations: ${JSON.stringify(delta, null, 2)}\nError: ${errorMessage}`,
               );
               // If patch failed, only emit updates if there were subscriber mutations
               // This prevents emitting updates when both patch fails AND no subscriber mutations
@@ -646,7 +643,12 @@ export const defaultApplyEvents = (
             try {
               const baseContent = structuredClone_(existingActivityMessage.content ?? {});
 
-              const result = applyPatch(baseContent, activityEvent.patch ?? [], true, false);
+              const result = jsonpatch.applyPatch(
+                baseContent,
+                activityEvent.patch ?? [],
+                true,
+                false,
+              );
               const updatedContent = result.newDocument as ActivityMessage["content"];
 
               messages[existingIndex] = {

@@ -8,7 +8,7 @@ alwaysApply: true
 
 This monorepo project utilizes:
 
-- Turborepo for build system orchestration
+- Nx for build system orchestration
 - PNPM for package management
 - Vitest for unit testing
 
