@@ -10,7 +10,7 @@ This monorepo project utilizes:
 
 - Nx for build system orchestration
 - PNPM for package management
-- Jest for unit testing
+- Vitest for unit testing
 
 Test files are located in `__tests__` directories alongside their corresponding implementation files.
 

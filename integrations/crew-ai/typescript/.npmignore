@@ -9,6 +9,6 @@ __tests__
 src
 tsdown.config.ts
 tsconfig.json
-jest.config.js
+vitest.config.ts
 server
 python
