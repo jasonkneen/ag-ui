@@ -627,7 +627,23 @@ class ClaudeAgentAdapter:
                             self._current_state = updated_state
                         async for event in tool_events:
                             yield event
-                    
+
+                        # Check for frontend tool halt (same logic as streaming path)
+                        block_display_name = strip_mcp_prefix(getattr(block, 'name', '') or '')
+                        if block_display_name and block_display_name in frontend_tool_names:
+                            flush_pending_msg()
+                            if current_message_id and has_streamed_text:
+                                yield TextMessageEndEvent(
+                                    type=EventType.TEXT_MESSAGE_END,
+                                    thread_id=thread_id,
+                                    run_id=run_id,
+                                    message_id=current_message_id,
+                                )
+                                current_message_id = None
+                            logger.debug(f"Frontend tool halt (non-streaming): {block_display_name}")
+                            halt_event_stream = True
+                            break
+
                     elif isinstance(block, ToolResultBlock):
                         tool_use_id = getattr(block, 'tool_use_id', None)
                         block_content = getattr(block, 'content', None)

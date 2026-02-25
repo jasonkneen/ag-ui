@@ -637,6 +637,26 @@ export class ClaudeAgentAdapter extends AbstractAgent {
             );
             if (toolBlock.id) processedToolIds.add(toolBlock.id);
             if (updatedState !== null) this.currentState = updatedState;
+
+            // Check for frontend tool halt (same logic as streaming path)
+            const blockDisplayName = stripMcpPrefix(toolBlock.name ?? "");
+            if (blockDisplayName && frontendToolNames.has(blockDisplayName)) {
+              flushPendingMsg();
+
+              if (currentMessageId && hasStreamedText) {
+                subscriber.next({
+                  type: EventType.TEXT_MESSAGE_END,
+                  threadId,
+                  runId,
+                  messageId: currentMessageId,
+                });
+                currentMessageId = null;
+              }
+
+              console.debug(`[ClaudeAdapter] Frontend tool halt (non-streaming): ${blockDisplayName}`);
+              haltEventStream = true;
+              break;
+            }
           }
         }
         // Handle user messages (tool results)

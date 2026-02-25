@@ -122,7 +122,18 @@ async def handle_tool_use_block(
                 tool_call_id=tool_id,
                 delta=args_json,
             )
-    
+
+        # Emit TOOL_CALL_END so the runtime doesn't think the tool call is still active.
+        # In the streaming path this is emitted at content_block_stop, but when tools
+        # arrive only via the complete AssistantMessage (non-streaming), this fallback
+        # is the only place that closes the tool call.
+        yield ToolCallEndEvent(
+            type=EventType.TOOL_CALL_END,
+            thread_id=thread_id,
+            run_id=run_id,
+            tool_call_id=tool_id,
+        )
+
     return current_state, event_gen()
 
 

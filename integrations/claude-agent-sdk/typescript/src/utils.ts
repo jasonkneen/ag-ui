@@ -193,7 +193,7 @@ function jsonSchemaTypeToZod(
       zodType = z.array(z.any());
       break;
     case "object":
-      zodType = z.record(z.any());
+      zodType = z.record(z.string(), z.any());
       break;
     default:
       zodType = z.any();
@@ -213,13 +213,13 @@ function jsonSchemaTypeToZod(
  */
 function jsonSchemaToZodShape(
   schema: Record<string, unknown>
-): z.ZodRawShape {
+): Record<string, z.ZodTypeAny> {
   const properties = (schema.properties ?? {}) as Record<
     string,
     Record<string, unknown>
   >;
   const required = (schema.required ?? []) as string[];
-  const shape: z.ZodRawShape = {};
+  const shape: Record<string, z.ZodTypeAny> = {};
 
   for (const [key, prop] of Object.entries(properties)) {
     let zodType = jsonSchemaTypeToZod(prop);
@@ -271,7 +271,7 @@ export function createStateManagementTool(): any {
   return tool(
     "ag_ui_update_state",
     "Update the shared application state. Use this to persist changes that should be visible in the UI. Pass the complete updated state object.",
-    { state_updates: z.record(z.unknown()) },
+    { state_updates: z.record(z.string(), z.unknown()) },
     async () => ({
       content: [
         { type: "text" as const, text: "State updated successfully" },
