@@ -20,7 +20,6 @@
     "@ag-ui/a2ui-middleware": "workspace:*",
     "@ag-ui/adk": "workspace:*",
     "@ag-ui/ag2": "workspace:*",
-    "@ag-ui/agent-spec": "workspace:*",
     "@ag-ui/agno": "workspace:*",
     "@ag-ui/aws-strands": "workspace:*",
     "@ag-ui/crewai": "workspace:*",

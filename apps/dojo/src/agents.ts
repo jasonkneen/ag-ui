@@ -20,7 +20,6 @@ import { PydanticAIAgent } from "@ag-ui/pydantic-ai";
 import { ADKAgent } from "@ag-ui/adk";
 import { SpringAiAgent } from "@ag-ui/spring-ai";
 import { HttpAgent } from "@ag-ui/client";
-import { AgentSpecAgent } from "@ag-ui/agent-spec";
 import { A2AMiddlewareAgent } from "@ag-ui/a2a-middleware";
 import { AWSStrandsAgent } from "@ag-ui/aws-strands";
 import { A2AAgent } from "@ag-ui/a2a";
@@ -257,9 +256,15 @@ export const agentsIntegrations = {
 
   "agent-spec-langgraph": async () =>
     mapAgents(
-      (path) => new AgentSpecAgent({
-        url: `${envVars.agentSpecUrl}/langgraph/${path}`,
-      }),
+      (path) => {
+        const agent = new HttpAgent({
+          url: `${envVars.agentSpecUrl}/langgraph/${path}`,
+        });
+        if (path === "a2ui_chat") {
+          agent.use(new A2UIMiddleware({ injectA2UITool: true }));
+        }
+        return agent;
+      },
       {
         agentic_chat: "agentic_chat",
         backend_tool_rendering: "backend_tool_rendering",
@@ -271,9 +276,15 @@ export const agentsIntegrations = {
 
   "agent-spec-wayflow": async () =>
     mapAgents(
-      (path) => new AgentSpecAgent({
-        url: `${envVars.agentSpecUrl}/wayflow/${path}`,
-      }),
+      (path) => {
+        const agent = new HttpAgent({
+          url: `${envVars.agentSpecUrl}/wayflow/${path}`,
+        });
+        if (path === "a2ui_chat") {
+          agent.use(new A2UIMiddleware({ injectA2UITool: true }));
+        }
+        return agent;
+      },
       {
         agentic_chat: "agentic_chat",
         backend_tool_rendering: "backend_tool_rendering",
