@@ -4,7 +4,6 @@ import { sendChatMessage, awaitLLMResponseDone } from '../../utils/copilot-actio
 
 export class SubgraphsPage {
   readonly page: Page;
-  readonly travelPlannerButton: Locator;
   readonly chatInput: Locator;
   readonly sendButton: Locator;
   readonly agentGreeting: Locator;
@@ -39,8 +38,7 @@ export class SubgraphsPage {
 
   constructor(page: Page) {
     this.page = page;
-    this.travelPlannerButton = page.getByRole('button', { name: /subgraphs/i });
-    this.agentGreeting = page.getByText(/travel.*planning|supervisor.*coordinate/i);
+    this.agentGreeting = page.getByText(/Ready to plan an amazing trip/i);
     this.chatInput = CopilotSelectors.chatTextarea(page);
     this.sendButton = CopilotSelectors.sendButton(page);
     this.agentMessage = CopilotSelectors.assistantMessages(page);
@@ -74,7 +72,8 @@ export class SubgraphsPage {
   }
 
   async openChat() {
-    await this.travelPlannerButton.click();
+    // V2 sidebar opens by default (chatDefaultOpen=true), so just wait for it
+    await expect(this.agentGreeting).toBeVisible();
   }
 
   async sendMessage(message: string) {
