@@ -5,7 +5,6 @@ import { sendChatMessage, awaitLLMResponseDone } from '../../utils/copilot-actio
 export class AgenticGenUIPage {
   readonly page: Page;
   readonly chatInput: Locator;
-  readonly planTaskButton: Locator;
   readonly agentMessage: Locator;
   readonly userMessage: Locator;
   readonly agentGreeting: Locator;
@@ -14,12 +13,11 @@ export class AgenticGenUIPage {
 
   constructor(page: Page) {
     this.page = page;
-    this.planTaskButton = page.getByRole('button', { name: 'Agentic Generative UI' });
     this.chatInput = CopilotSelectors.chatTextarea(page);
     this.sendButton = CopilotSelectors.sendButton(page);
     this.agentMessage = CopilotSelectors.assistantMessages(page);
     this.userMessage = CopilotSelectors.userMessages(page);
-    this.agentGreeting = page.getByText('This agent demonstrates');
+    this.agentGreeting = page.getByText(/I can help you with anything you need/i);
     this.agentPlannerContainer = page.getByTestId('task-progress');
   }
 
@@ -35,7 +33,8 @@ export class AgenticGenUIPage {
   }
 
   async openChat() {
-    await expect(this.planTaskButton).toBeVisible();
+    // V2 CopilotChat renders inline (no toggle button), so just wait for it to be ready
+    await expect(this.agentGreeting).toBeVisible();
   }
 
   async sendMessage(message: string) {
