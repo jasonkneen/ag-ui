@@ -9,12 +9,15 @@ import { awaitLLMResponseDone } from "./utils/copilot-actions";
 async function dumpPageAIState(page: Page) {
   try {
     const state = await page.evaluate(() => {
+      // Use data-testid selectors (work with both V1 and V2 CopilotChat)
       const assistantMsgs = Array.from(
-        document.querySelectorAll(".copilotKitAssistantMessage")
+        document.querySelectorAll('[data-testid="copilot-assistant-message"]')
       );
       const userMsgs = Array.from(
-        document.querySelectorAll(".copilotKitUserMessage")
+        document.querySelectorAll('[data-testid="copilot-user-message"]')
       );
+      const chatContainer = document.querySelector('[data-testid="copilot-chat"]');
+      const isRunning = chatContainer?.getAttribute('data-copilot-running');
       return {
         assistantMessages: assistantMsgs.map((el, i) => ({
           index: i,
@@ -25,10 +28,15 @@ async function dumpPageAIState(page: Page) {
           text: el.textContent?.trim().slice(0, 200) || "(empty)",
         })),
         url: window.location.href,
+        copilotRunning: isRunning,
+        chatContainerFound: chatContainer !== null,
       };
     });
 
     console.log("\n[AI State Dump] URL:", state.url);
+    console.log(
+      `[AI State Dump] Chat container: ${state.chatContainerFound ? "found" : "NOT FOUND"}, copilot-running: ${state.copilotRunning ?? "N/A"}`
+    );
     console.log(
       `[AI State Dump] ${state.userMessages.length} user message(s), ${state.assistantMessages.length} assistant message(s)`
     );
@@ -132,7 +140,7 @@ export async function waitForAssistantMessage(
   await page.waitForFunction(
     (min: number) => {
       const messages = document.querySelectorAll(
-        ".copilotKitAssistantMessage"
+        '[data-testid="copilot-assistant-message"]'
       );
       if (messages.length < min) return false;
       const lastMessage = messages[messages.length - 1];
