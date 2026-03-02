@@ -1,3 +1,4 @@
+import { awaitLLMResponseDone } from "../../utils/copilot-actions";
 import { test, expect } from "@playwright/test";
 import { AgenticGenUIPage } from "../../pages/awsStrandsPages/AgenticUIGenPage";
 
@@ -14,24 +15,12 @@ test.describe("Agent Generative UI Feature", () => {
 
     await genUIAgent.openChat();
     await genUIAgent.sendMessage("Hi");
-    await genUIAgent.sendButton.click();
     await genUIAgent.assertAgentReplyVisible(/Hello/);
 
     await genUIAgent.sendMessage("give me a plan to make brownies");
-    await genUIAgent.sendButton.click();
-    await expect(genUIAgent.agentPlannerContainer).toBeVisible({ timeout: 15000 });
+    await expect(genUIAgent.agentPlannerContainer).toBeVisible();
     await genUIAgent.plan();
-
-    await page.waitForFunction(
-      () => {
-        const messages = Array.from(document.querySelectorAll('.copilotKitAssistantMessage'));
-        const lastMessage = messages[messages.length - 1];
-        const content = lastMessage?.textContent?.trim() || '';
-
-        return messages.length >= 3 && content.length > 0;
-      },
-      { timeout: 30000 }
-    );
+    await awaitLLMResponseDone(page);
   });
 
   test("[Strands] should interact with the chat using predefined prompts and perform steps", async ({
@@ -45,24 +34,12 @@ test.describe("Agent Generative UI Feature", () => {
 
     await genUIAgent.openChat();
     await genUIAgent.sendMessage("Hi");
-    await genUIAgent.sendButton.click();
     await genUIAgent.assertAgentReplyVisible(/Hello/);
 
     await genUIAgent.sendMessage("Go to Mars");
-    await genUIAgent.sendButton.click();
 
-    await expect(genUIAgent.agentPlannerContainer).toBeVisible({ timeout: 15000 });
+    await expect(genUIAgent.agentPlannerContainer).toBeVisible();
     await genUIAgent.plan();
-
-    await page.waitForFunction(
-      () => {
-        const messages = Array.from(document.querySelectorAll('.copilotKitAssistantMessage'));
-        const lastMessage = messages[messages.length - 1];
-        const content = lastMessage?.textContent?.trim() || '';
-
-        return messages.length >= 3 && content.length > 0;
-      },
-      { timeout: 30000 }
-    );
+    await awaitLLMResponseDone(page);
   });
 });
