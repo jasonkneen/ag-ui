@@ -10,7 +10,7 @@ function logStamp(...args) {
 
 class CleanReporter {
   onBegin(config, suite) {
-    console.log(`\n Running ${suite.allTests().length} tests...\n`);
+    console.log(`\n🎭 Running ${suite.allTests().length} tests...\n`);
   }
 
   onTestEnd(test, result) {
@@ -25,17 +25,17 @@ class CleanReporter {
       .trim();
 
     if (result.status === "passed") {
-      logStamp(`PASS ${cleanSuite}: ${testName}`);
+      logStamp(`✅ PASS ${cleanSuite}: ${testName}`);
       return;
     }
 
     if (result.status === "skipped") {
-      console.log(`SKIP ${cleanSuite}: ${testName} (skipped)`);
+      console.log(`⚠️ SKIP ${cleanSuite}: ${testName} (skipped)`);
       return;
     }
 
     // Handle all failure modes: "failed", "timedOut", "interrupted"
-    const icon = result.status === "timedOut" ? "TIMEOUT" : "FAIL";
+    const icon = result.status === "timedOut" ? "⏰ TIMEOUT" : "❌ FAIL";
     logStamp(`${icon} ${cleanSuite}: ${testName}`);
 
     // Extract the most relevant error info
@@ -62,7 +62,7 @@ class CleanReporter {
       }
 
       // Show just the key error info
-      console.log(`   ERROR: ${errorMsg.split("\n")[0]}`);
+      console.log(`💥   ERROR: ${errorMsg.split("\n")[0]}`);
 
       // If it's an AI/API issue, make it clear
       if (
@@ -104,7 +104,7 @@ class CleanReporter {
 
   onEnd(result) {
     console.log("\n" + "=".repeat(60));
-    logStamp(`TEST SUMMARY`);
+    logStamp(`📊 TEST SUMMARY`);
     console.log("=".repeat(60));
 
     if (!process.env.CI) {
