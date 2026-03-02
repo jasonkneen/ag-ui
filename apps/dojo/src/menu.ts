@@ -60,7 +60,7 @@ export const menuIntegrations = [
       "v1_agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
-      "agentic_chat_reasoning",
+
       "agentic_generative_ui",
       "predictive_state_updates",
       "shared_state",

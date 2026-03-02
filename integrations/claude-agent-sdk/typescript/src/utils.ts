@@ -336,7 +336,7 @@ function isStateManagementTool(name: string): boolean {
  * Convert a complete Claude SDK AssistantMessage into an AG-UI AssistantMessage.
  *
  * Extracts text from TextBlocks and builds ToolCall objects from ToolUseBlocks.
- * Filters out internal state management tool calls and thinking blocks since
+ * Filters out internal state management tool calls and reasoning blocks since
  * they are not part of the user-visible conversation history.
  *
  * @returns AG-UI AssistantMessage, or null if the message has no user-visible content.
@@ -371,10 +371,10 @@ export function buildAguiAssistantMessage(
         },
       });
     }
-    // ThinkingBlocks are intentionally skipped — not conversation history
+    // Reasoning/ThinkingBlocks are intentionally skipped — not conversation history
   }
 
-  // Nothing user-visible (e.g. thinking-only message)
+  // Nothing user-visible (e.g. reasoning-only message)
   if (!textContent && toolCalls.length === 0) {
     return null;
   }

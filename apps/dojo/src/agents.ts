@@ -150,7 +150,6 @@ export const agentsIntegrations = {
         predictive_state_updates: "predictive_state_updates",
         shared_state: "shared_state",
         tool_based_generative_ui: "tool_based_generative_ui",
-        agentic_chat_reasoning: "agentic_chat_reasoning",
         subgraphs: "subgraphs",
       }
     ),

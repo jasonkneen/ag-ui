@@ -37,7 +37,7 @@ events$.subscribe({
 - **Streaming tool arguments** - Real-time TOOL_CALL_ARGS emission as JSON arguments stream in
 - **Bidirectional state sync** - Shared state management via ag_ui_update_state tool
 - **Context injection** - Context and state injected into prompts for agent awareness
-- **Event cleanup** - Hanging events (tool calls, thinking blocks) automatically closed on stream end
+- **Event cleanup** - Hanging events (tool calls, reasoning blocks) automatically closed on stream end
 - **Observable pattern** - RxJS Observable for event streaming
 - **Custom tools via MCP** - Define custom tools using Claude SDK's tool() function
 - **Forwarded props** - Per-run option overrides with security whitelist

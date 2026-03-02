@@ -316,7 +316,7 @@ def build_agui_assistant_message(
     Convert a complete Claude SDK AssistantMessage into an AG-UI AssistantMessage.
 
     Extracts text from TextBlocks and builds ToolCall objects from ToolUseBlocks.
-    Filters out internal state management tool calls and thinking blocks since
+    Filters out internal state management tool calls and reasoning blocks since
     they are not part of the user-visible conversation history.
 
     Args:
@@ -357,9 +357,9 @@ def build_agui_assistant_message(
                     ),
                 )
             )
-        # ThinkingBlocks are intentionally skipped — not conversation history
+        # Reasoning/ThinkingBlocks are intentionally skipped — not conversation history
 
-    # Nothing user-visible (e.g. thinking-only message)
+    # Nothing user-visible (e.g. reasoning-only message)
     if not text_content and not tool_calls:
         return None
 

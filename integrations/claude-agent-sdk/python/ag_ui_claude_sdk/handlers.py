@@ -21,11 +21,6 @@ from ag_ui.core import (
     ToolCallResultEvent,
     StateSnapshotEvent,
     CustomEvent,
-    ThinkingTextMessageStartEvent,
-    ThinkingTextMessageContentEvent,
-    ThinkingTextMessageEndEvent,
-    ThinkingStartEvent,
-    ThinkingEndEvent,
 )
 
 from .config import STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME
@@ -211,58 +206,6 @@ async def handle_tool_result_block(
             tool_call_id=tool_use_id,
             content=result_str,
             role="tool",
-        )
-
-
-async def handle_thinking_block(
-    block: Any,
-    thread_id: str,
-    run_id: str,
-) -> AsyncIterator[BaseEvent]:
-    """
-    Handle ThinkingBlock from Claude SDK.
-    
-    Emits THINKING_TEXT_MESSAGE events and optional signature custom event.
-    
-    Args:
-        block: ThinkingBlock from Claude SDK
-        thread_id: Thread identifier
-        run_id: Run identifier
-        
-    Yields:
-        AG-UI thinking events
-    """
-    thinking_text = getattr(block, 'thinking', '')
-    signature = getattr(block, 'signature', '')
-    
-    # Emit proper ThinkingTextMessage events for thinking blocks
-    if thinking_text:
-        # Emit THINKING_START/END wrappers (like LangGraph pattern)
-        yield ThinkingStartEvent(
-            type=EventType.THINKING_START,
-        )
-        yield ThinkingTextMessageStartEvent(
-            type=EventType.THINKING_TEXT_MESSAGE_START,
-        )
-        yield ThinkingTextMessageContentEvent(
-            type=EventType.THINKING_TEXT_MESSAGE_CONTENT,
-            delta=thinking_text,
-        )
-        yield ThinkingTextMessageEndEvent(
-            type=EventType.THINKING_TEXT_MESSAGE_END,
-        )
-        yield ThinkingEndEvent(
-            type=EventType.THINKING_END,
-        )
-    
-    # Also emit signature as custom event if present
-    if signature:
-        yield CustomEvent(
-            type=EventType.CUSTOM,
-            thread_id=thread_id,
-            run_id=run_id,
-            name="thinking_signature",
-            value={"signature": signature},
         )
 
 

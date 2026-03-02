@@ -316,9 +316,10 @@ export class ClaudeAgentAdapter extends AbstractAgent {
   ): Promise<void> {
     // Per-run state (local to this invocation)
     let currentMessageId: string | null = null;
-    let inThinkingBlock = false;
+    let inReasoningBlock = false;
+    let reasoningMessageId: string | null = null;
     let hasStreamedText = false;
-    let accumulatedThinkingText = "";
+    let accumulatedSignature = "";
 
     // Tool call streaming state
     let currentToolCallId: string | null = null;
@@ -407,12 +408,17 @@ export class ClaudeAgentAdapter extends AbstractAgent {
               }
             } else if (deltaType === "thinking_delta") {
               const thinking = delta.thinking as string | undefined;
-              if (thinking) {
-                accumulatedThinkingText += thinking;
+              if (thinking && reasoningMessageId) {
                 subscriber.next({
-                  type: EventType.THINKING_TEXT_MESSAGE_CONTENT,
+                  type: EventType.REASONING_MESSAGE_CONTENT,
+                  messageId: reasoningMessageId,
                   delta: thinking,
                 });
+              }
+            } else if (deltaType === "signature_delta") {
+              const sig = delta.signature as string | undefined;
+              if (sig) {
+                accumulatedSignature += sig;
               }
             } else if (deltaType === "input_json_delta") {
               const partialJson = delta.partial_json as string | undefined;
@@ -432,12 +438,16 @@ export class ClaudeAgentAdapter extends AbstractAgent {
               (event.content_block as Record<string, unknown>) ?? {};
 
             if (block.type === "thinking") {
-              inThinkingBlock = true;
+              inReasoningBlock = true;
+              reasoningMessageId = randomUUID();
               subscriber.next({
-                type: EventType.THINKING_START,
+                type: EventType.REASONING_START,
+                messageId: reasoningMessageId,
               });
               subscriber.next({
-                type: EventType.THINKING_TEXT_MESSAGE_START,
+                type: EventType.REASONING_MESSAGE_START,
+                messageId: reasoningMessageId,
+                role: "reasoning",
               });
             } else if (block.type === "tool_use") {
               currentToolCallId = (block.id as string) ?? null;
@@ -460,20 +470,23 @@ export class ClaudeAgentAdapter extends AbstractAgent {
               }
             }
           } else if (eventType === "content_block_stop") {
-            if (inThinkingBlock) {
-              inThinkingBlock = false;
-              subscriber.next({ type: EventType.THINKING_TEXT_MESSAGE_END });
-              subscriber.next({ type: EventType.THINKING_END });
+            if (inReasoningBlock && reasoningMessageId) {
+              inReasoningBlock = false;
+              subscriber.next({ type: EventType.REASONING_MESSAGE_END, messageId: reasoningMessageId });
+              subscriber.next({ type: EventType.REASONING_END, messageId: reasoningMessageId });
 
-              // Persist thinking content
-              if (accumulatedThinkingText) {
-                upsertMessage({
-                  id: randomUUID(),
-                  role: "developer" as const,
-                  content: accumulatedThinkingText,
+              // Emit encrypted signature if present
+              if (accumulatedSignature && currentMessageId) {
+                subscriber.next({
+                  type: EventType.REASONING_ENCRYPTED_VALUE,
+                  subtype: "message",
+                  entityId: currentMessageId,
+                  encryptedValue: accumulatedSignature,
                 });
-                accumulatedThinkingText = "";
               }
+
+              accumulatedSignature = "";
+              reasoningMessageId = null;
             }
 
             // Close tool call if we were streaming one
@@ -767,11 +780,12 @@ export class ClaudeAgentAdapter extends AbstractAgent {
         currentToolCallId = null;
       }
 
-      if (inThinkingBlock) {
-        console.debug("[ClaudeAdapter] Cleanup: closing hanging thinking block");
-        subscriber.next({ type: EventType.THINKING_TEXT_MESSAGE_END });
-        subscriber.next({ type: EventType.THINKING_END });
-        inThinkingBlock = false;
+      if (inReasoningBlock && reasoningMessageId) {
+        console.debug("[ClaudeAdapter] Cleanup: closing hanging reasoning block");
+        subscriber.next({ type: EventType.REASONING_MESSAGE_END, messageId: reasoningMessageId });
+        subscriber.next({ type: EventType.REASONING_END, messageId: reasoningMessageId });
+        inReasoningBlock = false;
+        reasoningMessageId = null;
       }
 
       if (hasStreamedText && currentMessageId) {

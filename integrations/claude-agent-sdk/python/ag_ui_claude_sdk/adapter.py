@@ -25,11 +25,12 @@ from ag_ui.core import (
     ToolCallEndEvent,
     StateSnapshotEvent,
     MessagesSnapshotEvent,
-    ThinkingTextMessageStartEvent,
-    ThinkingTextMessageContentEvent,
-    ThinkingTextMessageEndEvent,
-    ThinkingStartEvent,
-    ThinkingEndEvent,
+    ReasoningStartEvent,
+    ReasoningMessageStartEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningEndEvent,
+    ReasoningEncryptedValueEvent,
 )
 
 if TYPE_CHECKING:
@@ -332,7 +333,8 @@ class ClaudeAgentAdapter:
         """Translate a Claude SDK message stream into AG-UI events."""
         # Per-run state (local to this invocation)
         current_message_id: Optional[str] = None
-        in_thinking_block: bool = False
+        in_reasoning_block: bool = False
+        reasoning_message_id: Optional[str] = None
         has_streamed_text: bool = False
         
         # Tool call streaming state
@@ -350,7 +352,7 @@ class ClaudeAgentAdapter:
         # ── MESSAGES_SNAPSHOT accumulation ──
         run_messages: List[Any] = []
         pending_msg: Optional[Dict[str, Any]] = None
-        accumulated_thinking_text = ""
+        accumulated_signature = ""
 
         def _get_msg_id(msg):
             """Extract message ID from either a dict or an object."""
@@ -450,12 +452,16 @@ class ClaudeAgentAdapter:
                             )
                     elif delta_type == 'thinking_delta':
                         thinking_chunk = delta_data.get('thinking', '')
-                        if thinking_chunk:
-                            accumulated_thinking_text += thinking_chunk
-                            yield ThinkingTextMessageContentEvent(
-                                type=EventType.THINKING_TEXT_MESSAGE_CONTENT,
+                        if thinking_chunk and reasoning_message_id:
+                            yield ReasoningMessageContentEvent(
+                                type=EventType.REASONING_MESSAGE_CONTENT,
+                                message_id=reasoning_message_id,
                                 delta=thinking_chunk,
                             )
+                    elif delta_type == 'signature_delta':
+                        sig = delta_data.get('signature', '')
+                        if sig:
+                            accumulated_signature += sig
                     elif delta_type == 'input_json_delta':
                         partial_json = delta_data.get('partial_json', '')
                         if partial_json and current_tool_call_id:
@@ -473,9 +479,17 @@ class ClaudeAgentAdapter:
                     block_type = block_data.get('type', '')
                     
                     if block_type == 'thinking':
-                        in_thinking_block = True
-                        yield ThinkingStartEvent(type=EventType.THINKING_START)
-                        yield ThinkingTextMessageStartEvent(type=EventType.THINKING_TEXT_MESSAGE_START)
+                        in_reasoning_block = True
+                        reasoning_message_id = str(uuid.uuid4())
+                        yield ReasoningStartEvent(
+                            type=EventType.REASONING_START,
+                            message_id=reasoning_message_id,
+                        )
+                        yield ReasoningMessageStartEvent.model_construct(
+                            type=EventType.REASONING_MESSAGE_START,
+                            message_id=reasoning_message_id,
+                            role="reasoning",
+                        )
                     elif block_type == 'tool_use':
                         current_tool_call_id = block_data.get('id')
                         current_tool_call_name = block_data.get('name', 'unknown')
@@ -495,19 +509,28 @@ class ClaudeAgentAdapter:
                             )
                 
                 elif event_type == 'content_block_stop':
-                    if in_thinking_block:
-                        in_thinking_block = False
-                        yield ThinkingTextMessageEndEvent(type=EventType.THINKING_TEXT_MESSAGE_END)
-                        yield ThinkingEndEvent(type=EventType.THINKING_END)
+                    if in_reasoning_block and reasoning_message_id:
+                        in_reasoning_block = False
+                        yield ReasoningMessageEndEvent(
+                            type=EventType.REASONING_MESSAGE_END,
+                            message_id=reasoning_message_id,
+                        )
+                        yield ReasoningEndEvent(
+                            type=EventType.REASONING_END,
+                            message_id=reasoning_message_id,
+                        )
 
-                        if accumulated_thinking_text:
-                            from ag_ui.core import DeveloperMessage
-                            upsert_message(DeveloperMessage(
-                                id=str(uuid.uuid4()),
-                                role="developer",
-                                content=accumulated_thinking_text,
-                            ))
-                            accumulated_thinking_text = ""
+                        # Emit encrypted signature if present
+                        if accumulated_signature and current_message_id:
+                            yield ReasoningEncryptedValueEvent(
+                                type=EventType.REASONING_ENCRYPTED_VALUE,
+                                subtype="message",
+                                entity_id=current_message_id,
+                                encrypted_value=accumulated_signature,
+                            )
+
+                        accumulated_signature = ""
+                        reasoning_message_id = None
                     
                     # Close tool call if we were streaming one
                     if current_tool_call_id:
@@ -712,11 +735,18 @@ class ClaudeAgentAdapter:
             )
             current_tool_call_id = None
 
-        if in_thinking_block:
-            logger.debug("Cleanup: closing hanging thinking block")
-            yield ThinkingTextMessageEndEvent(type=EventType.THINKING_TEXT_MESSAGE_END)
-            yield ThinkingEndEvent(type=EventType.THINKING_END)
-            in_thinking_block = False
+        if in_reasoning_block and reasoning_message_id:
+            logger.debug("Cleanup: closing hanging reasoning block")
+            yield ReasoningMessageEndEvent(
+                type=EventType.REASONING_MESSAGE_END,
+                message_id=reasoning_message_id,
+            )
+            yield ReasoningEndEvent(
+                type=EventType.REASONING_END,
+                message_id=reasoning_message_id,
+            )
+            in_reasoning_block = False
+            reasoning_message_id = None
 
         if has_streamed_text and current_message_id:
             logger.debug(f"Cleanup: closing hanging TEXT_MESSAGE_START for {current_message_id}")

@@ -28,7 +28,7 @@ add_claude_fastapi_endpoint(app=app, adapter=adapter, path="/my_agent")
 - **Streaming tool arguments** - Real-time TOOL_CALL_ARGS emission as JSON arguments stream in
 - **Bidirectional state sync** - Shared state management via ag_ui_update_state tool
 - **Context injection** - Context and state injected into prompts for agent awareness
-- **Event cleanup** - Hanging events (tool calls, thinking blocks) automatically closed on stream end
+- **Event cleanup** - Hanging events (tool calls, reasoning blocks) automatically closed on stream end
 - **Custom tools via MCP** - Define custom tools using Claude SDK's @tool decorator
 - **Forwarded props** - Per-run option overrides with security whitelist
 

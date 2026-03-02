@@ -18,11 +18,12 @@ import type {
   ToolCallArgsEvent,
   ToolCallEndEvent,
   ToolCallResultEvent,
-  ThinkingTextMessageStartEvent,
-  ThinkingTextMessageContentEvent,
-  ThinkingTextMessageEndEvent,
-  ThinkingStartEvent,
-  ThinkingEndEvent,
+  ReasoningStartEvent,
+  ReasoningMessageStartEvent,
+  ReasoningMessageContentEvent,
+  ReasoningMessageEndEvent,
+  ReasoningEndEvent,
+  ReasoningEncryptedValueEvent,
   StateSnapshotEvent,
   MessagesSnapshotEvent,
   CustomEvent,
@@ -67,11 +68,12 @@ export type ProcessedEvent =
   | ToolCallArgsEvent
   | ToolCallEndEvent
   | ToolCallResultEvent
-  | ThinkingTextMessageStartEvent
-  | ThinkingTextMessageContentEvent
-  | ThinkingTextMessageEndEvent
-  | ThinkingStartEvent
-  | ThinkingEndEvent
+  | ReasoningStartEvent
+  | ReasoningMessageStartEvent
+  | ReasoningMessageContentEvent
+  | ReasoningMessageEndEvent
+  | ReasoningEndEvent
+  | ReasoningEncryptedValueEvent
   | StateSnapshotEvent
   | MessagesSnapshotEvent
   | CustomEvent;
