@@ -1,13 +1,15 @@
 "use client";
 import React, { useState, useEffect } from "react";
-import "@copilotkit/react-ui/styles.css";
-import "./style.css";
-import {
-  CopilotKit,
+import "@copilotkit/react-core/v2/styles.css";
+import { 
   useHumanInTheLoop,
-  useLangGraphInterrupt,
-} from "@copilotkit/react-core";
-import { CopilotChat } from "@copilotkit/react-ui";
+  useConfigureSuggestions,
+  CopilotChat,
+  CopilotChatConfigurationProvider,
+} from "@copilotkit/react-core/v2";
+import { CopilotKit,
+useLangGraphInterrupt } from "@copilotkit/react-core";
+import { z } from "zod";
 import { useTheme } from "next-themes";
 
 interface HumanInTheLoopProps {
@@ -23,7 +25,6 @@ const HumanInTheLoop: React.FC<HumanInTheLoopProps> = ({ params }) => {
     <CopilotKit
       runtimeUrl={`/api/copilotkit/${integrationId}`}
       showDevConsole={false}
-      // agent lock to the relevant agent
       agent="human_in_the_loop"
     >
       <Chat integrationId={integrationId} />
@@ -328,37 +329,43 @@ const InterruptHumanInTheLoop: React.FC<{
 };
 
 const Chat = ({ integrationId }: { integrationId: string }) => {
+  return (
+    <CopilotChatConfigurationProvider agentId="human_in_the_loop">
+      <ChatContent />
+    </CopilotChatConfigurationProvider>
+  );
+};
+
+const ChatContent = () => {
+  useConfigureSuggestions({
+    suggestions: [
+      { title: "Simple plan", message: "Please plan a trip to mars in 5 steps." },
+      { title: "Complex plan", message: "Please plan a pasta dish in 10 steps." },
+    ],
+    available: "always",
+  });
+
   // Langgraph uses it's own hook to handle human-in-the-loop interactions via langgraph interrupts,
   // This hook won't do anything for other integrations.
   useLangGraphInterrupt({
+    
     render: ({ event, resolve }) => <InterruptHumanInTheLoop event={event} resolve={resolve} />,
   });
   useHumanInTheLoop({
+    agentId: "human_in_the_loop",
     name: "generate_task_steps",
     description: "Generates a list of steps for the user to perform",
-    parameters: [
-      {
-        name: "steps",
-        type: "object[]",
-        attributes: [
-          {
-            name: "description",
-            type: "string",
-          },
-          {
-            name: "status",
-            type: "string",
-            enum: ["enabled", "disabled", "executing"],
-          },
-        ],
-      },
-    ],
-    // Langgraph uses it's own hook to handle human-in-the-loop interactions via langgraph interrupts,
-    // so don't use this action for langgraph integration.
-    available: ["langgraph", "langgraph-fastapi", "langgraph-typescript"].includes(integrationId)
-      ? "disabled"
-      : "enabled",
-    render: ({ args, respond, status }) => {
+     parameters: z.object({
+      steps: z.array(
+        z.object({
+          description: z.string(),
+          status: z.enum(["enabled", "disabled", "executing"]),
+        }),
+      ),
+    })  ,
+    // Note: In v1, `available` was used to disable this for langgraph integrations.
+    // In v2, availability is handled at the agent/backend level.
+    render: ({ args, respond, status }: any) => {
       return <StepsFeedback args={args} respond={respond} status={status} />;
     },
   });
@@ -367,13 +374,10 @@ const Chat = ({ integrationId }: { integrationId: string }) => {
     <div className="flex justify-center items-center h-full w-full">
       <div className="h-full w-full md:w-8/10 md:h-8/10 rounded-lg">
         <CopilotChat
-          suggestions={[
-            { title: "Simple plan", message: "Please plan a trip to mars in 5 steps." },
-            { title: "Complex plan", message: "Please plan a pasta dish in 10 steps." },
-          ]}
+          agentId="human_in_the_loop"
           className="h-full rounded-2xl max-w-6xl mx-auto"
           labels={{
-            initial:
+            welcomeMessageText:
               "Hi, I'm an agent specialized in helping you with your tasks. How can I help you?",
           }}
         />
@@ -388,16 +392,16 @@ const StepsFeedback = ({ args, respond, status }: { args: any; respond: any; sta
   const [accepted, setAccepted] = useState<boolean | null>(null);
 
   useEffect(() => {
-    if (status === "executing" && localSteps.length === 0) {
+    if (status === "executing" && localSteps.length === 0 && Array.isArray(args?.steps) && args.steps.length > 0) {
       setLocalSteps(args.steps);
     }
-  }, [status, args.steps, localSteps]);
+  }, [status, args?.steps, localSteps]);
 
-  if (args.steps === undefined || args.steps.length === 0) {
+  if (!Array.isArray(args?.steps) || args.steps.length === 0) {
     return <></>;
   }
 
-  const steps = localSteps.length > 0 ? localSteps : args.steps;
+  const steps = Array.isArray(localSteps) && localSteps.length > 0 ? localSteps : args.steps;
   const enabledCount = steps.filter((step: any) => step.status === "enabled").length;
 
   const handleStepToggle = (index: number) => {

@@ -1,8 +1,12 @@
 "use client";
 import React, { useState } from "react";
-import "@copilotkit/react-ui/styles.css";
-import { CopilotKit, useCopilotAction } from "@copilotkit/react-core";
-import { CopilotSidebar } from "@copilotkit/react-ui";
+import "@copilotkit/react-core/v2/styles.css";
+import { 
+  useFrontendTool,
+  useConfigureSuggestions,
+  CopilotSidebar,
+} from "@copilotkit/react-core/v2";
+import { z } from "zod";
 import {
   Carousel,
   CarouselContent,
@@ -11,6 +15,7 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 import { useURLParams } from "@/contexts/url-params-context";
+import { CopilotKit } from "@copilotkit/react-core";
 
 interface ToolBasedGenerativeUIProps {
   params: Promise<{
@@ -29,29 +34,37 @@ export default function ToolBasedGenerativeUI({ params }: ToolBasedGenerativeUIP
   const { integrationId } = React.use(params);
   const { chatDefaultOpen } = useURLParams();
 
-  const chatProps = {
-    defaultOpen: chatDefaultOpen,
-    labels: {
-      title: "Haiku Generator",
-      initial: "I'm a haiku generator 👋. How can I help you?",
-    },
-    clickOutsideToClose: false,
-    suggestions: [
-      { title: "Nature Haiku", message: "Write me a haiku about nature." },
-      { title: "Ocean Haiku", message: "Create a haiku about the ocean." },
-      { title: "Spring Haiku", message: "Generate a haiku about spring." },
-    ],
-  };
-
   return (
     <CopilotKit
       runtimeUrl={`/api/copilotkit/${integrationId}`}
       showDevConsole={false}
       agent="tool_based_generative_ui"
     >
-      <CopilotSidebar {...chatProps} />
+      <SidebarWithSuggestions defaultOpen={chatDefaultOpen} />
       <HaikuDisplay />
     </CopilotKit>
+  );
+}
+
+function SidebarWithSuggestions({ defaultOpen }: { defaultOpen: boolean }) {
+  useConfigureSuggestions({
+    suggestions: [
+      { title: "Nature Haiku", message: "Write me a haiku about nature." },
+      { title: "Ocean Haiku", message: "Create a haiku about the ocean." },
+      { title: "Spring Haiku", message: "Generate a haiku about spring." },
+    ],
+    available: "always",
+  });
+
+  return (
+    <CopilotSidebar
+      agentId="tool_based_generative_ui"
+      defaultOpen={defaultOpen}
+      labels={{
+        modalHeaderTitle: "Haiku Generator",
+        welcomeMessageText: "I'm a haiku generator. How can I help you?",
+      }}
+    />
   );
 }
 
@@ -79,37 +92,18 @@ function HaikuDisplay() {
     },
   ]);
 
-  useCopilotAction(
+  useFrontendTool(
     {
+      agentId: "tool_based_generative_ui",
       name: "generate_haiku",
-      parameters: [
-        {
-          name: "japanese",
-          type: "string[]",
-          required: true,
-          description: "3 lines of haiku in Japanese",
-        },
-        {
-          name: "english",
-          type: "string[]",
-          required: true,
-          description: "3 lines of haiku translated to English",
-        },
-        {
-          name: "image_name",
-          type: "string",
-          required: true,
-          description: `One relevant image name from: ${VALID_IMAGE_NAMES.join(", ")}`,
-        },
-        {
-          name: "gradient",
-          type: "string",
-          required: true,
-          description: "CSS Gradient color for the background",
-        },
-      ],
+       parameters: z.object({
+        japanese: z.array(z.string()).describe("3 lines of haiku in Japanese"),
+        english: z.array(z.string()).describe("3 lines of haiku translated to English"),
+        image_name: z.string().describe(`One relevant image name from: ${VALID_IMAGE_NAMES.join(", ")}`),
+        gradient: z.string().describe("CSS Gradient color for the background"),
+      })  ,
       followUp: false,
-      handler: async ({ japanese, english, image_name, gradient }) => {
+      handler: async ({ japanese, english, image_name, gradient }: { japanese: string[]; english: string[]; image_name: string; gradient: string }) => {
         const newHaiku: Haiku = {
           japanese: japanese || [],
           english: english || [],
@@ -123,7 +117,7 @@ function HaikuDisplay() {
         setActiveIndex(0);
         return "Haiku generated!";
       },
-      render: ({ args }) => {
+      render: ({ args }: { args: Partial<Haiku> }) => {
         if (!args.japanese) return <></>;
         return <HaikuCard haiku={args as Haiku} />;
       },

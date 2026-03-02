@@ -1,13 +1,18 @@
 "use client";
-import { CopilotKit, useCoAgent, useCopilotChat } from "@copilotkit/react-core";
-import { CopilotChat, CopilotSidebar } from "@copilotkit/react-ui";
+import { 
+  useAgent,
+  UseAgentUpdate,
+  useCopilotKit,
+  CopilotChat,
+  CopilotSidebar,
+} from "@copilotkit/react-core/v2";
 import React, { useState, useEffect, useRef } from "react";
-import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
-import "@copilotkit/react-ui/styles.css";
+import "@copilotkit/react-core/v2/styles.css";
 import "./style.css";
 import { useMobileView } from "@/utils/use-mobile-view";
 import { useMobileChat } from "@/utils/use-mobile-chat";
 import { useURLParams } from "@/contexts/url-params-context";
+import { CopilotKit } from "@copilotkit/react-core";
 
 interface SharedStateProps {
   params: Promise<{
@@ -31,7 +36,6 @@ export default function SharedState({ params }: SharedStateProps) {
     <CopilotKit
       runtimeUrl={`/api/copilotkit/${integrationId}`}
       showDevConsole={false}
-      // agent lock to the relevant agent
       agent="shared_state"
     >
       <div className="min-h-screen w-full flex items-center justify-center">
@@ -124,9 +128,10 @@ export default function SharedState({ params }: SharedStateProps) {
               {/* Chat Content - Flexible container for messages and input */}
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden pb-16">
                 <CopilotChat
+                  agentId="shared_state"
                   className="h-full flex flex-col"
                   labels={{
-                    initial: initialLabel,
+                    welcomeMessageText: initialLabel,
                   }}
                 />
               </div>
@@ -139,12 +144,12 @@ export default function SharedState({ params }: SharedStateProps) {
           </>
         ) : (
           <CopilotSidebar
+            agentId="shared_state"
             defaultOpen={chatDefaultOpen}
             labels={{
-              title: chatTitle,
-              initial: initialLabel,
+              modalHeaderTitle: chatTitle,
+              welcomeMessageText: initialLabel,
             }}
-            clickOutsideToClose={false}
           />
         )}
       </div>
@@ -219,19 +224,30 @@ const INITIAL_STATE: RecipeAgentState = {
 
 function Recipe() {
   const { isMobile } = useMobileView();
-  const { state: agentState, setState: setAgentState } = useCoAgent<RecipeAgentState>({
-    name: "shared_state",
-    initialState: INITIAL_STATE,
+  const { agent } = useAgent({
+    agentId: "shared_state",
+    updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged],
   });
+  const { copilotkit } = useCopilotKit();
+
+  const agentState = agent.state as RecipeAgentState | undefined;
+  const setAgentState = (s: RecipeAgentState) => agent.setState(s);
+  const isLoading = agent.isRunning;
+
+  // Set initial state on mount
+  useEffect(() => {
+    if (!agentState?.recipe) {
+      setAgentState(INITIAL_STATE);
+    }
+  }, []);
 
   const [recipe, setRecipe] = useState(INITIAL_STATE.recipe);
-  const { appendMessage, isLoading } = useCopilotChat();
   const [editingInstructionIndex, setEditingInstructionIndex] = useState<number | null>(null);
   const newInstructionRef = useRef<HTMLTextAreaElement>(null);
 
   const updateRecipe = (partialRecipe: Partial<Recipe>) => {
     setAgentState({
-      ...agentState,
+      ...(agentState || INITIAL_STATE),
       recipe: {
         ...recipe,
         ...partialRecipe,
@@ -575,12 +591,12 @@ function Recipe() {
           type="button"
           onClick={() => {
             if (!isLoading) {
-              appendMessage(
-                new TextMessage({
-                  content: "Improve the recipe",
-                  role: Role.User,
-                }),
-              );
+              agent.addMessage({
+                id: crypto.randomUUID(),
+                role: "user",
+                content: "Improve the recipe",
+              });
+              copilotkit.runAgent({ agent });
             }
           }}
           disabled={isLoading}
