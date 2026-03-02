@@ -83,8 +83,8 @@ class CleanReporter {
       "[PageError]",
       "[BrowserConsole]",
       "[Test Cleanup]",
-      "[User ",
-      "[Assistant ",
+      "[User]",
+      "[Assistant]",
     ];
     const stdout = (result.stdout || [])
       .map((chunk) => (typeof chunk === "string" ? chunk : chunk.toString("utf-8")))
