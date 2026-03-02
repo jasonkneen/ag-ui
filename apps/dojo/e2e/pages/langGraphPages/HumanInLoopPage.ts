@@ -4,7 +4,6 @@ import { sendChatMessage, awaitLLMResponseDone } from '../../utils/copilot-actio
 
 export class HumanInLoopPage {
   readonly page: Page;
-  readonly planTaskButton: Locator;
   readonly chatInput: Locator;
   readonly sendButton: Locator;
   readonly agentGreeting: Locator;
@@ -15,10 +14,10 @@ export class HumanInLoopPage {
 
   constructor(page: Page) {
     this.page = page;
-    this.planTaskButton = page.getByRole('button', { name: 'Human in the loop Plan a task' });
-    this.agentGreeting = page.getByText('This agent demonstrates human-in-the-loop');
     this.chatInput = CopilotSelectors.chatTextarea(page);
     this.sendButton = CopilotSelectors.sendButton(page);
+    // V2 CopilotChat renders inline with this welcome text
+    this.agentGreeting = page.getByText(/I'm an agent specialized in helping you with your tasks/i);
     this.plan = page.getByTestId('select-steps');
     this.performStepsButton = page.getByRole('button', { name: '✨Perform Steps' });
     this.agentMessage = CopilotSelectors.assistantMessages(page);
@@ -26,7 +25,8 @@ export class HumanInLoopPage {
   }
 
   async openChat() {
-    await this.planTaskButton.click();
+    // V2 CopilotChat renders inline (no toggle button), just wait for it to be ready
+    await expect(this.agentGreeting).toBeVisible();
   }
 
   async sendMessage(message: string) {
