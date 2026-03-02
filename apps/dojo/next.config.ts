@@ -1,6 +1,5 @@
 import type { NextConfig } from "next";
 import createMDX from "@next/mdx";
-import path from "path";
 
 const withMDX = createMDX({
   extension: /\.mdx?$/,
@@ -25,14 +24,6 @@ const nextConfig: NextConfig = {
       test: /agent\/demo\/crew_enterprise\/ui\/.*\.(ts|tsx|js|jsx)$/,
       loader: "ignore-loader",
     });
-
-    // Force all @ag-ui/client imports (including those inside CopilotKit's
-    // pre-bundled code) to resolve to the local workspace version.
-    config.resolve.alias = config.resolve.alias || {};
-    config.resolve.alias["@ag-ui/client"] = path.resolve(
-      __dirname,
-      "../../sdks/typescript/packages/client",
-    );
 
     return config;
   },

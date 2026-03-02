@@ -193,7 +193,7 @@ const ALL_SERVICES = {
     },
   }],
   'dojo-dev': [{
-    command: 'pnpm nx run demo-viewer:dev',
+    command: 'pnpm run dev --filter=demo-viewer...',
     name: 'Dojo (dev)',
     cwd: gitRoot,
     env: {

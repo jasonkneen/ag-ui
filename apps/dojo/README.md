@@ -30,11 +30,8 @@ curl -fsSL https://get.pnpm.io/install.sh | sh -
 The first time you want to run, you need to build all of the dojos dependencies throught the repository.
 ```
 # from the ag-ui repository root
-pnpm install
-pnpm build
-
-# optionally, to build only Dojo (+ its deps):
-pnpm build --projects=demo-viewer
+pnpm i
+pnpm build --filter=demo-viewer
 ```
 
 ### Run the Demo Viewer
@@ -55,14 +52,8 @@ The dojo will start on port 3000 by default
 Note that some agents may run on colliding ports
 
 #### Run the dev script for the entire repo, and run the agent(s) separately
-In one terminal, you can run Dojo from the *repository root* via Nx:
-`pnpm nx run demo-viewer:dev`
-
-In another terminal (optional), you can run watchers to auto-rebuild packages you’re editing:
-- `pnpm dev` (SDKs)
-- `pnpm dev:integrations` (TypeScript integrations)
-- `pnpm dev:middlewares` (TypeScript middlewares)
-
+In one terminal, you can run `pnpm dev` from the *repository root*
+This WILL automatically rebuild dependencies, for example if you change the mastra integration, it will automatically rebuild and be bundled into the dojo with HMR.
 In another terminal, you'll need to run any other agents you want to test separately, see "Run Agents" below.
 The dojo will start on port 3000 by default
 
