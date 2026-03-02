@@ -4,6 +4,10 @@ const { execSync } = require('child_process');
 const path = require('path');
 const concurrently = require('concurrently');
 
+// Pinned: @langchain/langgraph-api@1.1.14 regressed schema extraction, causing
+// worker timeouts on CI runners. Re-evaluate when a newer version fixes the issue.
+const LANGGRAPH_CLI_VERSION = '1.1.13';
+
 // Parse command line arguments
 const args = process.argv.slice(2);
 const showHelp = args.includes('--help') || args.includes('-h');
@@ -85,13 +89,13 @@ const ALL_SERVICES = {
     env: { PORT: 8004 },
   }],
   'langgraph-platform-python': [{
-    command: 'pnpx @langchain/langgraph-cli@latest dev --no-browser --host 127.0.0.1 --port 8005',
+    command: `pnpx @langchain/langgraph-cli@${LANGGRAPH_CLI_VERSION} dev --no-browser --host 127.0.0.1 --port 8005`,
     name: 'LG Platform Py',
     cwd: path.join(integrationsRoot, 'langgraph/python/examples'),
     env: { PORT: 8005 },
   }],
   'langgraph-platform-typescript': [{
-    command: 'pnpx @langchain/langgraph-cli@latest dev --no-browser --host 127.0.0.1 --port 8006',
+    command: `pnpx @langchain/langgraph-cli@${LANGGRAPH_CLI_VERSION} dev --no-browser --host 127.0.0.1 --port 8006`,
     name: 'LG Platform TS',
     cwd: path.join(integrationsRoot, 'langgraph/typescript/examples'),
     env: { PORT: 8006 },
