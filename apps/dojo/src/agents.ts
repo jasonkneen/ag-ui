@@ -24,8 +24,7 @@ import { A2AMiddlewareAgent } from "@ag-ui/a2a-middleware";
 import { AWSStrandsAgent } from "@ag-ui/aws-strands";
 import { A2AAgent } from "@ag-ui/a2a";
 import { A2AClient } from "@a2a-js/sdk/client";
-import { LangChainAgent } from "@ag-ui/langchain";
-import { LangGraphAgent as CpkLangGraphAgent } from "@copilotkit/runtime/langgraph";
+import { LangChainAgent } from "@ag-ui/langchain"; 
 import { BuiltInAgent } from "@copilotkit/runtime/v2";
 import { A2UIMiddleware, A2UI_PROMPT } from "@ag-ui/a2ui-middleware";
 import { Ag2Agent } from "@ag-ui/ag2";
@@ -92,14 +91,18 @@ export const agentsIntegrations = {
     });
 
     return MastraAgent.getRemoteAgents({
-      mastraClient,
+      // Cast needed: pnpm may resolve separate @mastra/client-js installations
+      // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
+      mastraClient: mastraClient as any,
       resourceId: "mastra-agent-remote"
     }) as Promise<Record<"agentic_chat" | "backend_tool_rendering" | "human_in_the_loop" | "tool_based_generative_ui", AbstractAgent>>;
   },
 
   "mastra-agent-local": async () => {
     return MastraAgent.getLocalAgents({
-      mastra,
+      // Cast needed: pnpm may resolve separate @mastra/core installations
+      // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
+      mastra: mastra as any,
       resourceId: "mastra-agent-local"
     }) as Record<"agentic_chat" | "backend_tool_rendering" | "human_in_the_loop" | "shared_state" | "tool_based_generative_ui", AbstractAgent>;
   },
@@ -112,9 +115,6 @@ export const agentsIntegrations = {
   langgraph: async () => ({
     ...mapAgents(
       (graphId) => {
-        if (graphId === 'agentic_chat') {
-          return new CpkLangGraphAgent({ deploymentUrl: envVars.langgraphPythonUrl, graphId })
-        }
         return new LangGraphAgent({ deploymentUrl: envVars.langgraphPythonUrl, graphId })
       },
       {
@@ -172,9 +172,6 @@ export const agentsIntegrations = {
   "langgraph-typescript": async () =>
     mapAgents(
       (graphId) => {
-        if (graphId === 'agentic_chat') {
-          return new CpkLangGraphAgent({ deploymentUrl: envVars.langgraphTypescriptUrl, graphId })
-        }
         return new LangGraphAgent({ deploymentUrl: envVars.langgraphTypescriptUrl, graphId })
       },
       {
