@@ -266,11 +266,17 @@ class AgUiSpanProcessor(SpanProcessor):
                     tool_call_id = self._tool_run_id_to_tool_call_id[event.request_id]
                 else:
                     tool_call_id = event.request_id
-                message_id = self._started_tool_calls[tool_call_id]["message_id"]
                 content = _normalize_tool_output(event.outputs)
+                # Tool results are emitted as separate "tool" messages on the client.
+                # Use a unique message_id here (not the parent assistant message id), otherwise
+                # the message list can contain duplicate IDs (assistant + tool), which breaks
+                # React keys and message deduping logic downstream.
+                #
+                # Generate a fresh id so tool results never collide with assistant/user ids.
+                tool_message_id = str(uuid.uuid4())
                 events.append(
                     ToolCallResultEvent(
-                        message_id=message_id,
+                        message_id=tool_message_id,
                         tool_call_id=tool_call_id,
                         content=content,
                         role="tool",
