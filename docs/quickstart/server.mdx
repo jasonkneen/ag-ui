@@ -228,9 +228,8 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
-Awesome! We are already sending `RunStartedEvent` and `RunFinishedEvent` events,
-which gives us a basic AG-UI compliant endpoint. Now let's make it do something
-useful.
+Awesome! We are already sending a `RunStartedEvent`, which is the first step
+toward an AG-UI compliant endpoint. Now let's make it do something useful.
 
 ## Implementing Basic Chat
 
@@ -242,7 +241,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from ag_ui.core import (
     RunAgentInput,
-    Message,
     EventType,
     RunStartedEvent,
     RunFinishedEvent,
@@ -253,17 +251,19 @@ from ag_ui.core import (
 from ag_ui.encoder import EventEncoder
 import uuid
 from openai import OpenAI
-import dotenv
 import os
 
 app = FastAPI(title="AG-UI Endpoint")
 
-@app.post("/awp")
-async def my_endpoint(input_data: RunAgentInput):
-    async def event_generator():
-        # Create an event encoder to properly format SSE events
-        encoder = EventEncoder()
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+@app.post("/")
+async def agentic_chat_endpoint(input_data: RunAgentInput, request: Request):
+    accept_header = request.headers.get("accept")
+    encoder = EventEncoder(accept=accept_header)
+
+    async def event_generator():
         # Send run started event
         yield encoder.encode(
             RunStartedEvent(
@@ -273,9 +273,6 @@ async def my_endpoint(input_data: RunAgentInput):
             )
         )
 
-        # Initialize OpenAI client
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
         # Convert AG-UI messages to OpenAI messages format
         openai_messages = []
         for msg in input_data.messages:
@@ -284,6 +281,13 @@ async def my_endpoint(input_data: RunAgentInput):
                     "role": msg.role,
                     "content": msg.content or ""
                 })
+
+        # Call OpenAI with streaming enabled
+        stream = client.chat.completions.create(
+            model="gpt-4o",
+            stream=True,
+            messages=openai_messages,
+        )
 
         # Generate a message ID for the assistant's response
         message_id = str(uuid.uuid4())
@@ -297,22 +301,14 @@ async def my_endpoint(input_data: RunAgentInput):
             )
         )
 
-        yield encoder.encode(
-            TextMessageContentEvent(
-                type=EventType.TEXT_MESSAGE_CONTENT,
-                message_id=message_id,
-                delta="Hello world!"
-            )
-        )
-
         # Process the streaming response and send content events
         for chunk in stream:
-            if (chunk.choices and 
-                len(chunk.choices) > 0 and 
-                chunk.choices[0].delta and 
-                hasattr(chunk.choices[0].delta, 'content') and 
+            if (chunk.choices and
+                len(chunk.choices) > 0 and
+                chunk.choices[0].delta and
+                hasattr(chunk.choices[0].delta, 'content') and
                 chunk.choices[0].delta.content):
-                
+
                 content = chunk.choices[0].delta.content
                 yield encoder.encode(
                     TextMessageContentEvent(
@@ -522,7 +518,7 @@ Let's break down what your server is doing:
 
 Test your endpoint with:
 ```bash
-curl -X POST http://localhost:8000/awp \
+curl -X POST http://localhost:8000/ \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
   -d '{
