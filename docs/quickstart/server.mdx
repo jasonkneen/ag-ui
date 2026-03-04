@@ -142,7 +142,8 @@ export const agentsIntegrations: AgentIntegrationConfig[] = [
 
 ## Step 2 – Add package to dojo dependencies
 
-Open `apps/dojo/package.json` and add the package `@ag-ui/openai-server`:
+Open `apps/dojo/package.json` and add `"@ag-ui/openai-server": "workspace:*"` to
+the `dependencies` object:
 
 ```json
 {
@@ -163,9 +164,8 @@ Open `apps/dojo/package.json` and add the package `@ag-ui/openai-server`:
     "@ag-ui/server-starter": "workspace:*",
     "@ag-ui/server-starter-all-features": "workspace:*",
     "@ag-ui/vercel-ai-sdk": "workspace:*",
-    "@ag-ui/openai-server": "workspace:*", // Add this line
-
-  ... rest of package.json
+    "@ag-ui/openai-server": "workspace:*"
+  }
 }
 ```
 
