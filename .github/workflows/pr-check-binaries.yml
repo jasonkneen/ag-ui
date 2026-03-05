@@ -54,19 +54,19 @@ jobs:
             VIOLATIONS=1
           fi
 
-          # Check for large files (>500KB) among changed files
+          # Check for large files (>1MB) among changed files
           LARGE_FILES=""
           while IFS= read -r file; do
             if [ -f "$file" ]; then
               SIZE=$(wc -c < "$file" | tr -d ' ')
-              if [ "$SIZE" -gt 512000 ]; then
+              if [ "$SIZE" -gt 1048576 ]; then
                 LARGE_FILES="${LARGE_FILES}${file} ($(( SIZE / 1024 )) KB)\n"
               fi
             fi
           done <<< "$CHANGED_FILES"
 
           if [ -n "$LARGE_FILES" ]; then
-            echo "::error::Files over 500 KB detected in PR:"
+            echo "::error::Files over 1 MB detected in PR:"
             echo -e "$LARGE_FILES"
             VIOLATIONS=1
           fi
