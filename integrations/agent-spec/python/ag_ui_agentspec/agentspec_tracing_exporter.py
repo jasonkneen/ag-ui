@@ -21,6 +21,7 @@ import os
 import json
 import uuid
 import logging
+import traceback
 from contextvars import ContextVar
 from typing import Any, Dict, List
 from json_repair import repair_json
@@ -286,7 +287,7 @@ class AgUiSpanProcessor(SpanProcessor):
                 raise RuntimeError(
                     "[AG-UI SpanProcessor] ExceptionRaised occurred during agent execution:"
                     + event.exception_message
-                    + f"\n\nStacktrace: {event.exception_stacktrace}"
+                    + f"\n\nStacktrace: {traceback.format_exc()}"
                 )
             case _:
                 return events

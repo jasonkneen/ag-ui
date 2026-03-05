@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Any, Dict
 
@@ -74,17 +73,16 @@ async def run_wayflow(agent: Any, input_data: RunAgentInput) -> None:
 
     elif isinstance(agent, WayflowFlow):
         flow_input = prepare_wayflow_flow_input(input_data)
-
-        def _invoke_with_context(fi):
-            token = EVENT_QUEUE.set(current_queue)
-            try:
-                with register_event_listeners([AgentSpecEventListener()]):
-                    conversation = agent.start_conversation(fi)
-                    _ = conversation.execute()
-            finally:
-                EVENT_QUEUE.reset(token)
-
-        await asyncio.to_thread(_invoke_with_context, flow_input)
+        token = EVENT_QUEUE.set(current_queue)
+        try:
+            with register_event_listeners([AgentSpecEventListener()]):
+                conversation = agent.start_conversation(flow_input)
+                await conversation.execute_async()
+        except Exception as e:
+            logger.exception("[AG-UI Agent Spec] Wayflow flow crashed with error: %s", repr(e))
+            raise
+        finally:
+            EVENT_QUEUE.reset(token)
 
     else:
         raise NotImplementedError("Unsupported Wayflow component type")
