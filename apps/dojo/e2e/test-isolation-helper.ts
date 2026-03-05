@@ -20,6 +20,15 @@ async function dumpPageAIState(page: Page) {
         '[data-testid="copilot-chat"]',
       );
       const isRunning = chatContainer?.getAttribute("data-copilot-running");
+      // Check for HITL confirm modals
+      const confirmModals = Array.from(
+        document.querySelectorAll("div.bg-white.rounded.shadow-lg"),
+      );
+      const confirmButtons = Array.from(
+        document.querySelectorAll("button"),
+      ).filter((b) => /confirm|reject|accept/i.test(b.textContent || ""));
+      // Check for tiptap editor content
+      const tiptapEditor = document.querySelector("div.tiptap.ProseMirror");
       return {
         assistantMessages: assistantMsgs.map((el, i) => ({
           index: i,
@@ -32,6 +41,16 @@ async function dumpPageAIState(page: Page) {
         url: window.location.href,
         copilotRunning: isRunning,
         chatContainerFound: chatContainer !== null,
+        confirmModals: confirmModals.length,
+        confirmModalTexts: confirmModals.map(
+          (m) => m.textContent?.trim().slice(0, 100) || "(empty)",
+        ),
+        confirmButtons: confirmButtons.map((b) => ({
+          text: b.textContent?.trim(),
+          disabled: b.disabled,
+        })),
+        tiptapContent:
+          tiptapEditor?.textContent?.trim().slice(0, 100) || "(none)",
       };
     });
 
@@ -44,17 +63,75 @@ async function dumpPageAIState(page: Page) {
       `[AI State Dump] ${state.userMessages.length} user message(s), ${state.assistantMessages.length} assistant message(s)`,
     );
     for (const msg of state.userMessages) {
-      console.log(`  [User ${msg.index}] ${msg.text}`);
+      console.log(`[AI State Dump] User[${msg.index}]: ${msg.text}`);
     }
     for (const msg of state.assistantMessages) {
-      console.log(`  [Assistant ${msg.index}] ${msg.text}`);
+      console.log(`[AI State Dump] Assistant[${msg.index}]: ${msg.text}`);
     }
     if (state.assistantMessages.length === 0) {
       console.log("  [Assistant] (no messages — LLM may not have responded)");
     }
+    console.log(
+      `[AI State Dump] Confirm modals: ${state.confirmModals}, buttons: ${JSON.stringify(state.confirmButtons)}`,
+    );
+    console.log(`[AI State Dump] Tiptap editor: ${state.tiptapContent}`);
+    if (state.confirmModals > 0) {
+      for (const t of state.confirmModalTexts) {
+        console.log(`  [Modal] ${t}`);
+      }
+    }
   } catch {
     console.log(
       "[AI State Dump] Could not read page state (page may have navigated away)",
+    );
+  }
+}
+
+/**
+ * Dump LLMock journal entries on test failure so CI logs show what the mock
+ * server received and returned.
+ */
+async function dumpLLMockJournal() {
+  try {
+    const res = await fetch("http://localhost:5555/v1/_requests?limit=20");
+    if (!res.ok) {
+      console.log(
+        `[LLMock Journal] Non-OK response: ${res.status} ${res.statusText}`,
+      );
+      return;
+    }
+    const entries = (await res.json()) as Array<{
+      method: string;
+      path: string;
+      body: {
+        model?: string;
+        messages?: Array<{ role: string; content?: unknown }>;
+      };
+      response: {
+        status: number;
+        fixture?: {
+          match?: { userMessage?: string };
+          response?: unknown;
+        } | null;
+      };
+    }>;
+    console.log(`\n[LLMock Journal] ${entries.length} request(s) recorded:`);
+    for (const [i, entry] of entries.entries()) {
+      const msgs = entry.body?.messages ?? [];
+      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+      const lastUserText =
+        typeof lastUser?.content === "string"
+          ? lastUser.content.slice(0, 80)
+          : "(non-string)";
+      const fixtureName =
+        entry.response?.fixture?.match?.userMessage ?? "(predicate)";
+      console.log(
+        `  [${i}] ${entry.method} ${entry.path} → ${entry.response?.status} | model=${entry.body?.model ?? "?"} msgs=${msgs.length} lastUser="${lastUserText}" fixture="${fixtureName}"`,
+      );
+    }
+  } catch {
+    console.log(
+      "[LLMock Journal] Could not fetch journal (server may be down)",
     );
   }
 }
@@ -70,6 +147,7 @@ export const test = base.extend<{}, {}>({
     // instead of manifesting as opaque timeouts.
     const pageErrors: Error[] = [];
     const networkErrors: string[] = [];
+    const agentPosts: string[] = [];
 
     page.on("pageerror", (error) => {
       console.error(`[PageError] ${error.message}`);
@@ -83,15 +161,33 @@ export const test = base.extend<{}, {}>({
       }
     });
 
-    // Log failed network requests to CopilotKit/agent endpoints
-    page.on("response", (response) => {
+    // Log ALL POST requests to agent backends (helps debug hung SSE streams)
+    page.on("request", (request) => {
       if (
-        response.status() >= 400 &&
-        /copilotkit|agui|agent/i.test(response.url())
+        request.method() === "POST" &&
+        /copilotkit|agui|agent/i.test(request.url())
       ) {
-        const msg = `${response.status()} ${response.url()}`;
-        console.error(`[NetworkError] ${msg}`);
-        networkErrors.push(msg);
+        const ts = new Date().toISOString().slice(11, 23);
+        const msg = `[AgentPOST] ${ts} → ${request.url()}`;
+        console.log(msg);
+        agentPosts.push(msg);
+      }
+    });
+
+    // Log ALL responses from agent backends (including SSE stream starts)
+    page.on("response", (response) => {
+      if (/copilotkit|agui|agent/i.test(response.url())) {
+        const ts = new Date().toISOString().slice(11, 23);
+        if (response.status() >= 400) {
+          const msg = `${response.status()} ${response.url()}`;
+          console.error(`[NetworkError] ${msg}`);
+          networkErrors.push(msg);
+        }
+        if (response.request().method() === "POST") {
+          console.log(
+            `[AgentResp] ${ts} ← ${response.status()} ${response.url()}`,
+          );
+        }
       }
     });
 
@@ -100,6 +196,7 @@ export const test = base.extend<{}, {}>({
     // On failure: dump what the LLM actually did so CI logs are actionable
     if (testInfo.status !== testInfo.expectedStatus) {
       await dumpPageAIState(page);
+      await dumpLLMockJournal();
     }
 
     // After each test - report collected errors
@@ -114,6 +211,15 @@ export const test = base.extend<{}, {}>({
         `[Test Cleanup] ${networkErrors.length} network error(s) during test:`,
         networkErrors,
       );
+    }
+    if (
+      testInfo.status !== testInfo.expectedStatus &&
+      agentPosts.length > 0
+    ) {
+      console.log(
+        `[Test Cleanup] ${agentPosts.length} agent POST(s) during test:`,
+      );
+      for (const msg of agentPosts) console.log(`  ${msg}`);
     }
     await page.context().clearCookies();
   },

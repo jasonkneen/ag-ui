@@ -1,9 +1,6 @@
 import { Page, Locator, expect } from "@playwright/test";
 import { CopilotSelectors } from "../../utils/copilot-selectors";
-import {
-  sendChatMessage,
-  awaitLLMResponseDone,
-} from "../../utils/copilot-actions";
+import { sendAndAwaitResponse } from "../../utils/copilot-actions";
 import { DEFAULT_WELCOME_MESSAGE } from "../../lib/constants";
 
 export class HumanInLoopPage {
@@ -36,8 +33,7 @@ export class HumanInLoopPage {
   }
 
   async sendMessage(message: string) {
-    await sendChatMessage(this.page, message);
-    await awaitLLMResponseDone(this.page);
+    await sendAndAwaitResponse(this.page, message);
   }
 
   async selectItemsInPlanner() {
@@ -93,6 +89,26 @@ export class HumanInLoopPage {
   async performSteps() {
     await this.performStepsButton.click();
     await this.performStepsButton.waitFor({ state: "hidden" });
+  }
+
+  async performStepsAndAwait() {
+    const countBefore = await this.page
+      .locator('[data-testid="copilot-assistant-message"]')
+      .count();
+    await this.performStepsButton.click();
+    await this.performStepsButton.waitFor({ state: "hidden" });
+    await this.page.waitForFunction(
+      (before) =>
+        document.querySelectorAll('[data-testid="copilot-assistant-message"]')
+          .length > before,
+      countBefore,
+      { timeout: 30000 },
+    );
+    await this.page.waitForFunction(
+      () => document.querySelector('[data-copilot-running="false"]') !== null,
+      null,
+      { timeout: 60000 },
+    );
   }
 
   async assertAgentReplyVisible(expectedText: RegExp) {
