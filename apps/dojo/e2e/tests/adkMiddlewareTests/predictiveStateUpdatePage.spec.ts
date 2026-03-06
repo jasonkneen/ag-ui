@@ -1,8 +1,7 @@
 import { test, expect } from "../../test-isolation-helper";
 import { PredictiveStateUpdatesPage } from "../../pages/adkMiddlewarePages/PredictiveStateUpdatesPage";
 
-// TODO: Re-enable when ADK middleware agent is uncommented in agents.ts and menu.ts
-test.describe.skip("Predictive State Updates Feature", () => {
+test.describe("Predictive State Updates Feature", () => {
   test("[ADK Middleware] should interact with agent and approve asked changes", async ({
     page,
   }) => {
@@ -27,9 +26,7 @@ test.describe.skip("Predictive State Updates Feature", () => {
     await page.waitForTimeout(2000);
     await predictiveStateUpdates.verifyHighlightedText();
     await predictiveStateUpdates.getUserApproval();
-    await expect(
-      predictiveStateUpdates.confirmedChangesResponse.nth(1),
-    ).toBeVisible();
+    await expect(predictiveStateUpdates.confirmedChangesResponse).toBeVisible();
     const dragonNameNew =
       await predictiveStateUpdates.verifyAgentResponse("Lola");
     expect(dragonNameNew).not.toBe(dragonName);
@@ -45,8 +42,9 @@ test.describe.skip("Predictive State Updates Feature", () => {
     await predictiveStateUpdates.openChat();
 
     await predictiveStateUpdates.sendMessage(
-      "Give me a story for a dragon called called Atlantis in document",
+      "Give me a story for a dragon called Atlantis in document",
     );
+    await page.waitForTimeout(2000);
     await predictiveStateUpdates.getPredictiveResponse();
     await predictiveStateUpdates.getUserApproval();
     await expect(predictiveStateUpdates.confirmedChangesResponse).toBeVisible();

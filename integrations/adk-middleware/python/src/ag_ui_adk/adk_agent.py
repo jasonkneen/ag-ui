@@ -1489,7 +1489,7 @@ class ADKAgent:
                         execution.thread_id, tool_call_id, app_name, user_id
                     )
             logger.debug(f"Finished streaming events for execution {execution.thread_id}")
-            
+
             # Emit RUN_FINISHED
             logger.debug(f"Emitting RUN_FINISHED for thread {input.thread_id}, run {input.run_id}")
             yield RunFinishedEvent(
@@ -2261,12 +2261,26 @@ class ADKAgent:
                 except Exception as snapshot_error:
                     logger.warning(f"Failed to emit MESSAGES_SNAPSHOT for thread {input.thread_id}: {snapshot_error}")
 
-            # Emit any deferred confirm_changes events LAST, right before completion
-            # This ensures the frontend sees confirm_changes as the last tool call event,
-            # keeping the confirmation dialog in "executing" status with buttons enabled
-            for deferred_event in event_translator.get_and_clear_deferred_confirm_events():
+            # Emit any deferred confirm_changes events, followed by a state
+            # snapshot.  The extra StateSnapshotEvent creates a processing gap
+            # between the confirm_changes TOOL_CALL_END and RUN_FINISHED, giving
+            # the CopilotKit frontend time to render the HITL dialog in
+            # "executing" status before the run completes.  (This mirrors what
+            # LangGraph does — it also emits StateSnapshot + MessagesSnapshot
+            # between the last TOOL_CALL_END and RUN_FINISHED.)
+            deferred_events = event_translator.get_and_clear_deferred_confirm_events()
+            for deferred_event in deferred_events:
                 logger.debug(f"Emitting deferred confirm_changes event: {type(deferred_event).__name__}")
                 await event_queue.put(deferred_event)
+
+            if deferred_events:
+                # Re-emit state snapshot after confirm_changes events for timing
+                if final_state or accumulated_predict_state:
+                    state_for_snapshot = {**(final_state or {}), **accumulated_predict_state}
+                    await event_queue.put(
+                        event_translator._create_state_snapshot_event(state_for_snapshot)
+                    )
+                    logger.debug("Emitted post-confirm StateSnapshotEvent for timing separation")
 
             # Signal completion - ADK execution is done
             logger.debug(f"Background task sending completion signal for thread {input.thread_id}")
