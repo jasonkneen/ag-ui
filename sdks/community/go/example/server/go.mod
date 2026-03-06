@@ -2,6 +2,8 @@ module github.com/ag-ui-protocol/ag-ui/sdks/community/go/example/server
 
 go 1.24.4
 
+replace github.com/ag-ui-protocol/ag-ui/sdks/community/go => ../../
+
 require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260305052815-7d95cd7654bc
 	github.com/gofiber/fiber/v3 v3.0.0-beta.5
