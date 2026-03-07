@@ -19,7 +19,7 @@
     "dev": "tsup --watch",
     "clean": "rm -rf dist .turbo node_modules",
     "typecheck": "tsc --noEmit",
-    "test": "jest",
+    "test": "vitest run",
     "link:global": "pnpm link --global",
     "unlink:global": "pnpm unlink --global"
   },
@@ -40,6 +40,7 @@
     "@types/node": "^20.11.19",
     "tsup": "^8.0.2",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }

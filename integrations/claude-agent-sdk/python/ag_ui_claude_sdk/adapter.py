@@ -5,6 +5,7 @@ import os
 import logging
 import json
 import uuid
+from datetime import datetime
 from typing import AsyncIterator, Optional, List, Dict, Any, Union, TYPE_CHECKING
 
 from ag_ui.core import (
@@ -25,6 +26,7 @@ from ag_ui.core import (
     ToolCallEndEvent,
     StateSnapshotEvent,
     MessagesSnapshotEvent,
+    CustomEvent,
     ReasoningStartEvent,
     ReasoningMessageStartEvent,
     ReasoningMessageContentEvent,
@@ -45,6 +47,7 @@ from .utils import (
     strip_mcp_prefix,
     build_agui_assistant_message,
     build_agui_tool_message,
+    _is_state_management_tool,
 )
 from .config import (
     ALLOWED_FORWARDED_PROPS,
@@ -81,28 +84,65 @@ class ClaudeAgentAdapter:
         name: str,
         options: Union["ClaudeAgentOptions", dict, None] = None,
         description: str = "",
+        max_workers: int = 1000,
+        worker_ttl_seconds: float = 1800,   # 30 min
+        query_timeout_seconds: Optional[float] = None,
     ):
         self.name = name
         self.description = description
         self._options = options
-        self._last_result_data: Optional[Dict[str, Any]] = None
-        self._current_state: Optional[Any] = None
-        self._workers: Dict[str, SessionWorker] = {}
+        self._last_result_data = None
+        self._current_state = None
+        self._max_workers = max_workers
+        self._worker_ttl_seconds = worker_ttl_seconds
+        self._query_timeout_seconds = query_timeout_seconds
+        self._workers: Dict[str, Dict] = {}  # changed from Dict[str, SessionWorker]
+        self._state_locks: Dict[str, asyncio.Lock] = {}
 
     async def interrupt(self, thread_id: Optional[str] = None) -> None:
         """Interrupt the active query for a thread, or all workers if no thread specified."""
         if thread_id and thread_id in self._workers:
-            await self._workers[thread_id].interrupt()
+            await self._workers[thread_id]["worker"].interrupt()
         else:
-            for worker in self._workers.values():
-                await worker.interrupt()
-                break
+            for entry in self._workers.values():
+                await entry["worker"].interrupt()
 
     async def shutdown(self) -> None:
         """Gracefully stop all session workers. Call on server shutdown."""
-        for worker in list(self._workers.values()):
-            await worker.stop()
+        for entry in list(self._workers.values()):
+            await entry["worker"].stop()
         self._workers.clear()
+        self._state_locks.clear()
+
+    def _evict_workers(self) -> None:
+        """Evict idle workers by TTL and LRU cap."""
+        now = datetime.now()
+        # TTL eviction: remove idle workers older than TTL
+        to_remove = [
+            tid for tid, entry in self._workers.items()
+            if not entry["active"] and (now - entry["last_used"]).total_seconds() > self._worker_ttl_seconds
+        ]
+        for tid in to_remove:
+            entry = self._workers.pop(tid)
+            asyncio.create_task(entry["worker"].stop())
+            self._state_locks.pop(tid, None)
+
+        # LRU eviction: if still over cap, remove oldest idle entries
+        while len(self._workers) > self._max_workers:
+            idle = [(tid, e) for tid, e in self._workers.items() if not e["active"]]
+            if not idle:
+                break
+            oldest_tid = min(idle, key=lambda x: x[1]["last_used"])[0]
+            entry = self._workers.pop(oldest_tid)
+            asyncio.create_task(entry["worker"].stop())
+            self._state_locks.pop(oldest_tid, None)
+
+    async def clear_session(self, thread_id: str) -> None:
+        """Stop and remove the session worker for a thread."""
+        entry = self._workers.pop(thread_id, None)
+        if entry:
+            await entry["worker"].stop()
+        self._state_locks.pop(thread_id, None)
 
     async def run(self, input_data: RunAgentInput) -> AsyncIterator[BaseEvent]:
         """Run the agent and yield AG-UI events."""
@@ -116,14 +156,19 @@ class ClaudeAgentAdapter:
         
         try:
             # Get or create worker for this thread
-            worker = self._workers.get(thread_id)
-            if worker is None:
+            entry = self._workers.get(thread_id)
+            if entry is None:
                 options = self.build_options(input_data, thread_id=thread_id)
                 worker = SessionWorker(thread_id, options)
                 await worker.start()
-                self._workers[thread_id] = worker
+                entry = {"worker": worker, "last_used": datetime.now(), "active": True}
+                self._workers[thread_id] = entry
+                self._evict_workers()
                 logger.debug(f"Created worker for thread={thread_id}")
             else:
+                entry["active"] = True
+                entry["last_used"] = datetime.now()
+                worker = entry["worker"]
                 logger.debug(f"Reusing worker for thread={thread_id}")
 
             prompt, _ = process_messages(input_data)
@@ -166,10 +211,17 @@ class ClaudeAgentAdapter:
                 )
             
             # Translate Claude SDK messages into AG-UI events
-            async for event in self._stream_claude_sdk(
-                message_stream, thread_id, run_id, input_data, frontend_tool_names
-            ):
-                yield event
+            if self._query_timeout_seconds:
+                async with asyncio.timeout(self._query_timeout_seconds):
+                    async for event in self._stream_claude_sdk(
+                        message_stream, thread_id, run_id, input_data, frontend_tool_names
+                    ):
+                        yield event
+            else:
+                async for event in self._stream_claude_sdk(
+                    message_stream, thread_id, run_id, input_data, frontend_tool_names
+                ):
+                    yield event
             
             # Emit RUN_FINISHED
             yield RunFinishedEvent(
@@ -179,18 +231,32 @@ class ClaudeAgentAdapter:
                 result=self._last_result_data,
             )
             
+        except asyncio.TimeoutError as e:
+            logger.error(f"Query timeout in run for thread={thread_id}: {e}")
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                thread_id=thread_id,
+                run_id=run_id,
+                message=f"Query timed out after {self._query_timeout_seconds}s",
+            )
         except Exception as e:
             logger.error(f"Error in run: {e}")
             # Evict broken worker
-            broken = self._workers.pop(thread_id, None)
-            if broken:
-                await broken.stop()
+            broken_entry = self._workers.pop(thread_id, None)
+            if broken_entry:
+                await broken_entry["worker"].stop()
+            self._state_locks.pop(thread_id, None)
             yield RunErrorEvent(
                 type=EventType.RUN_ERROR,
                 thread_id=thread_id,
                 run_id=run_id,
                 message=str(e),
             )
+        finally:
+            entry = self._workers.get(thread_id)
+            if entry:
+                entry["active"] = False
+                entry["last_used"] = datetime.now()
 
     def build_options(self, input_data: Optional[RunAgentInput] = None, thread_id: Optional[str] = None) -> "ClaudeAgentOptions":
         """Build ClaudeAgentOptions from base config + RunAgentInput."""
@@ -535,30 +601,37 @@ class ClaudeAgentAdapter:
                     # Close tool call if we were streaming one
                     if current_tool_call_id:
                         # Check if this is the state management tool
-                        if current_tool_call_name in (STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME):
+                        if _is_state_management_tool(current_tool_call_name):
                             try:
                                 state_updates = json.loads(accumulated_tool_json)
                                 if isinstance(state_updates, dict):
                                     updates = state_updates.get("state_updates", state_updates)
                                     if isinstance(updates, str):
                                         updates = json.loads(updates)
-                                    if isinstance(self._current_state, dict) and isinstance(updates, dict):
-                                        self._current_state = {**self._current_state, **updates}
-                                    else:
-                                        self._current_state = updates
-                                    yield StateSnapshotEvent(
-                                        type=EventType.STATE_SNAPSHOT,
-                                        snapshot=self._current_state
-                                    )
+                                    lock = self._state_locks.setdefault(thread_id, asyncio.Lock())
+                                    async with lock:
+                                        new_state = {**self._current_state, **updates} if isinstance(self._current_state, dict) and isinstance(updates, dict) else updates
+                                        has_state_diff = json.dumps(new_state, sort_keys=True) != json.dumps(self._current_state, sort_keys=True)
+                                        if has_state_diff:
+                                            self._current_state = new_state
+                                            yield StateSnapshotEvent(
+                                                type=EventType.STATE_SNAPSHOT,
+                                                snapshot=self._current_state,
+                                            )
                             except (json.JSONDecodeError, ValueError) as e:
                                 logger.warning(f"Failed to parse tool JSON for state update: {e}")
-                        
+                                yield CustomEvent(
+                                    type=EventType.CUSTOM,
+                                    name="state_update_error",
+                                    value={"error": str(e)},
+                                )
+
                         # Push tool call onto in-flight message (skip state management)
                         if (
                             pending_msg is not None
                             and current_tool_call_id
                             and current_tool_display_name
-                            and current_tool_call_name not in (STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME)
+                            and not _is_state_management_tool(current_tool_call_name)
                         ):
                             pending_msg["tool_calls"].append(
                                 AguiToolCall(

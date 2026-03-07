@@ -325,7 +325,7 @@ export function applyForwardedProps(
 /**
  * Check whether a tool name is the internal state management tool.
  */
-function isStateManagementTool(name: string): boolean {
+export function isStateManagementTool(name: string): boolean {
   return (
     name === STATE_MANAGEMENT_TOOL_NAME ||
     name === STATE_MANAGEMENT_TOOL_FULL_NAME

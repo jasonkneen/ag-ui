@@ -23,8 +23,7 @@ from ag_ui.core import (
     CustomEvent,
 )
 
-from .config import STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME
-from .utils import strip_mcp_prefix
+from .utils import strip_mcp_prefix, _is_state_management_tool
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ async def handle_tool_use_block(
         nonlocal current_state
         
         # Intercept state management tool calls (check both prefixed and unprefixed names)
-        if tool_name in (STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME):
+        if _is_state_management_tool(tool_name):
             logger.debug("Intercepting ag_ui_update_state tool call")
             
             # Extract state updates from tool input
@@ -82,6 +81,11 @@ async def handle_tool_use_block(
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse state_updates JSON: {e}")
                     state_updates = {}
+                    yield CustomEvent(
+                        type=EventType.CUSTOM,
+                        name="state_update_error",
+                        value={"error": str(e)},
+                    )
             
             # Update current state
             if isinstance(current_state, dict) and isinstance(state_updates, dict):

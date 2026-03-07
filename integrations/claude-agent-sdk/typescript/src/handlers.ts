@@ -7,11 +7,7 @@
 import { Subscriber } from "rxjs";
 import { EventType, randomUUID } from "@ag-ui/client";
 import type { BetaToolUseBlock } from "@anthropic-ai/sdk/resources/beta/messages/messages";
-import {
-  STATE_MANAGEMENT_TOOL_NAME,
-  STATE_MANAGEMENT_TOOL_FULL_NAME,
-} from "./config";
-import { stripMcpPrefix } from "./utils";
+import { stripMcpPrefix, isStateManagementTool } from "./utils";
 import type { ProcessedEvent } from "./types";
 
 /**
@@ -51,10 +47,7 @@ export function handleToolUseBlock(
   console.debug(`[ClaudeAdapter] ToolUseBlock detected: ${toolName}`);
 
   // Intercept state management tool calls (check both prefixed and unprefixed names)
-  if (
-    toolName === STATE_MANAGEMENT_TOOL_NAME ||
-    toolName === STATE_MANAGEMENT_TOOL_FULL_NAME
-  ) {
+  if (isStateManagementTool(toolName)) {
     console.debug(
       "[ClaudeAdapter] Intercepting ag_ui_update_state tool call"
     );
@@ -73,6 +66,11 @@ export function handleToolUseBlock(
         console.warn(
           "[ClaudeAdapter] Failed to parse state_updates JSON"
         );
+        subscriber.next({
+          type: EventType.CUSTOM,
+          name: "state_update_error",
+          value: { error: "Failed to parse state update" },
+        } as any);
         stateUpdates = {};
       }
     }
@@ -93,13 +91,14 @@ export function handleToolUseBlock(
       newState = stateUpdates;
     }
 
-    // Emit STATE_SNAPSHOT with updated state
-    subscriber.next({
-      type: EventType.STATE_SNAPSHOT,
-      snapshot: newState,
-    });
-
-    console.debug("[ClaudeAdapter] Emitted STATE_SNAPSHOT with updated state");
+    // Emit STATE_SNAPSHOT only if state actually changed (mirrors LangGraph pattern)
+    if (JSON.stringify(newState) !== JSON.stringify(currentState)) {
+      subscriber.next({
+        type: EventType.STATE_SNAPSHOT,
+        snapshot: newState,
+      });
+      console.debug("[ClaudeAdapter] Emitted STATE_SNAPSHOT with updated state");
+    }
     return { updatedState: newState };
   }
 

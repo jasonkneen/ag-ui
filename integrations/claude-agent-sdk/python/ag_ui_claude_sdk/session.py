@@ -51,6 +51,7 @@ class SessionWorker:
 
         client = ClaudeSDKClient(options=self._options)
         self._client = client
+        output_queue: Optional[asyncio.Queue] = None
 
         try:
             await client.connect()
@@ -80,6 +81,9 @@ class SessionWorker:
 
         except Exception as exc:
             logger.error(f"Session worker fatal error for thread={self.thread_id}: {exc}")
+            if output_queue is not None:
+                await output_queue.put(WorkerError(exc))
+                await output_queue.put(None)  # signal end-of-stream to consumer
         finally:
             self._client = None
             await self._graceful_disconnect(client)
@@ -89,8 +93,8 @@ class SessionWorker:
     async def _graceful_disconnect(client: Any) -> None:
         try:
             await client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[SessionWorker] Graceful disconnect error (ignored): {exc}")
 
     async def query(self, prompt: str, session_id: str = "default") -> AsyncIterator[Any]:
         """Send prompt to the worker and yield SDK Message objects."""

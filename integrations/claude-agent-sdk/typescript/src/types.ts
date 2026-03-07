@@ -52,7 +52,14 @@ import type {
  * };
  * ```
  */
-export type ClaudeAgentAdapterConfig = AgentConfig & Options;
+export type ClaudeAgentAdapterConfig = AgentConfig & Options & {
+  /** Maximum number of idle sessions to keep. Default: 1000 */
+  maxSessions?: number;
+  /** TTL in ms for idle sessions. Default: 30 minutes */
+  sessionTtlMs?: number;
+  /** Timeout in ms for query() calls. Default: undefined (no timeout) */
+  queryTimeoutMs?: number;
+};
 
 /**
  * Union of all AG-UI event types this adapter can emit.

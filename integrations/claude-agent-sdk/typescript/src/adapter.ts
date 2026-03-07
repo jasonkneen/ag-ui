@@ -35,6 +35,7 @@ import {
   hasState,
   buildAguiAssistantMessage,
   buildAguiToolMessage,
+  isStateManagementTool,
 } from "./utils";
 import {
   handleToolUseBlock,
@@ -49,15 +50,47 @@ import {
  * Observable of AG-UI events.
  */
 export class ClaudeAgentAdapter extends AbstractAgent {
+  private static readonly DEFAULT_MAX_SESSIONS = 1000;
+  private static readonly DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000;
+
   private config: ClaudeAgentAdapterConfig;
   private currentState: unknown = null;
   private lastResultData: Record<string, unknown> | undefined;
   private activeQuery: Query | null = null;
-  private sessions = new Map<string, string>();
+  private sessions = new Map<string, { sessionId: string; lastUsed: number; active: boolean }>();
 
   constructor(config: ClaudeAgentAdapterConfig = {}) {
     super(config);
     this.config = config;
+  }
+
+  private evictSessions(): void {
+    const ttlMs = this.config.sessionTtlMs ?? ClaudeAgentAdapter.DEFAULT_SESSION_TTL_MS;
+    const maxSessions = this.config.maxSessions ?? ClaudeAgentAdapter.DEFAULT_MAX_SESSIONS;
+    const now = Date.now();
+
+    // Remove idle entries older than TTL
+    for (const [key, entry] of this.sessions.entries()) {
+      if (!entry.active && now - entry.lastUsed > ttlMs) {
+        this.sessions.delete(key);
+      }
+    }
+
+    // If still over the limit, remove oldest idle entries
+    if (this.sessions.size > maxSessions) {
+      const idle = [...this.sessions.entries()]
+        .filter(([, e]) => !e.active)
+        .sort(([, a], [, b]) => a.lastUsed - b.lastUsed);
+
+      for (const [key] of idle) {
+        if (this.sessions.size <= maxSessions) break;
+        this.sessions.delete(key);
+      }
+    }
+  }
+
+  public clearSession(threadId: string): void {
+    this.sessions.delete(threadId);
   }
 
   public clone(): ClaudeAgentAdapter {
@@ -75,25 +108,36 @@ export class ClaudeAgentAdapter extends AbstractAgent {
       // Inject resume for known threads
       const threadId = input.threadId ?? "default";
       let runInput = input;
-      const sessionId = this.sessions.get(threadId);
-      if (sessionId) {
+      const sessionEntry = this.sessions.get(threadId);
+      if (sessionEntry) {
         runInput = {
           ...input,
           forwardedProps: {
             ...(input.forwardedProps ?? {}),
-            resume: sessionId,
+            resume: sessionEntry.sessionId,
           },
         };
+        // Mark existing session as active
+        sessionEntry.active = true;
       }
 
       const { userMessage } = processMessages(runInput);
       const options = this.buildOptions(runInput);
+
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const abortController = this.config.queryTimeoutMs
+        ? new AbortController()
+        : undefined;
+      if (abortController) {
+        timeoutHandle = setTimeout(() => abortController.abort(), this.config.queryTimeoutMs!);
+      }
 
       const queryStream = query({
         prompt: userMessage,
         options: {
           ...options,
           model: options.model ?? "claude-sonnet-4-20250514",
+          ...(abortController ? { abortController } : {}),
         },
       });
 
@@ -104,6 +148,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
           subscriber.error(error);
         })
         .finally(() => {
+          if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
           this.activeQuery = null;
         });
     });
@@ -492,10 +537,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
             // Close tool call if we were streaming one
             if (currentToolCallId) {
               // Check if this is the state management tool
-              if (
-                currentToolCallName === STATE_MANAGEMENT_TOOL_NAME ||
-                currentToolCallName === STATE_MANAGEMENT_TOOL_FULL_NAME
-              ) {
+              if (isStateManagementTool(currentToolCallName ?? "")) {
                 // Parse accumulated JSON and emit STATE_SNAPSHOT
                 try {
                   const stateArgs = JSON.parse(accumulatedToolJson);
@@ -508,30 +550,27 @@ export class ClaudeAgentAdapter extends AbstractAgent {
                       updates = JSON.parse(updates);
                     }
 
-                    // Update current state
-                    if (
-                      typeof this.currentState === "object" &&
-                      this.currentState !== null &&
-                      typeof updates === "object" &&
-                      updates !== null
-                    ) {
-                      this.currentState = {
-                        ...(this.currentState as Record<string, unknown>),
-                        ...(updates as Record<string, unknown>),
-                      };
-                    } else {
-                      this.currentState = updates;
+                    // Compute new state and only emit if changed
+                    const newState = typeof this.currentState === "object" && this.currentState !== null
+                      ? { ...(this.currentState as Record<string, unknown>), ...(updates as Record<string, unknown>) }
+                      : updates;
+                    if (JSON.stringify(newState) !== JSON.stringify(this.currentState)) {
+                      this.currentState = newState;
+                      subscriber.next({
+                        type: EventType.STATE_SNAPSHOT,
+                        snapshot: this.currentState,
+                      });
                     }
-
-                    subscriber.next({
-                      type: EventType.STATE_SNAPSHOT,
-                      snapshot: this.currentState,
-                    });
                   }
                 } catch {
                   console.warn(
                     "[ClaudeAdapter] Failed to parse tool JSON for state update"
                   );
+                  subscriber.next({
+                    type: EventType.CUSTOM,
+                    name: "state_update_error",
+                    value: { error: "Failed to parse state update" },
+                  } as any);
                 }
               }
 
@@ -540,8 +579,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
                 pendingMsg &&
                 currentToolCallId &&
                 currentToolDisplayName &&
-                currentToolCallName !== STATE_MANAGEMENT_TOOL_NAME &&
-                currentToolCallName !== STATE_MANAGEMENT_TOOL_FULL_NAME
+                !isStateManagementTool(currentToolCallName ?? "")
               ) {
                 pendingMsg.toolCalls.push({
                   id: currentToolCallId,
@@ -715,7 +753,8 @@ export class ClaudeAgentAdapter extends AbstractAgent {
           if (subtype === "init") {
             const sid = (raw.session_id ?? data?.session_id) as string | undefined;
             if (sid) {
-              this.sessions.set(threadId, sid);
+              this.sessions.set(threadId, { sessionId: sid, lastUsed: Date.now(), active: false });
+              this.evictSessions();
               console.debug(`[ClaudeAdapter] Captured session_id=${sid} for thread=${threadId}`);
             }
           }
@@ -799,6 +838,14 @@ export class ClaudeAgentAdapter extends AbstractAgent {
       }
 
       flushPendingMsg();
+
+      // Mark session as idle after run completes and run TTL/LRU eviction
+      const idleEntry = this.sessions.get(threadId);
+      if (idleEntry) {
+        idleEntry.active = false;
+        idleEntry.lastUsed = Date.now();
+        this.evictSessions();
+      }
     }
 
     // Emit MESSAGES_SNAPSHOT with input messages + new messages from this run
