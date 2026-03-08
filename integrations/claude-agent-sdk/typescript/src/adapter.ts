@@ -39,7 +39,6 @@ import {
 } from "./utils";
 import {
   handleToolUseBlock,
-  emitSystemMessageEvents,
 } from "./handlers";
 
 /**
@@ -550,12 +549,25 @@ export class ClaudeAgentAdapter extends AbstractAgent {
                       updates = JSON.parse(updates);
                     }
 
-                    // Compute new state and only emit if changed
-                    const newState = typeof this.currentState === "object" && this.currentState !== null
-                      ? { ...(this.currentState as Record<string, unknown>), ...(updates as Record<string, unknown>) }
-                      : updates;
-                    if (JSON.stringify(newState) !== JSON.stringify(this.currentState)) {
-                      this.currentState = newState;
+                    const prevStateJson = JSON.stringify(this.currentState);
+
+                    if (
+                      typeof this.currentState === "object" &&
+                      this.currentState !== null &&
+                      typeof updates === "object" &&
+                      updates !== null
+                    ) {
+                      this.currentState = {
+                        ...(this.currentState as Record<string, unknown>),
+                        ...(updates as Record<string, unknown>),
+                      };
+                    } else {
+                      this.currentState = updates;
+                    }
+
+                    const newStateJson = JSON.stringify(this.currentState);
+
+                    if (newStateJson !== prevStateJson) {
                       subscriber.next({
                         type: EventType.STATE_SNAPSHOT,
                         snapshot: this.currentState,
@@ -759,17 +771,12 @@ export class ClaudeAgentAdapter extends AbstractAgent {
             }
           }
 
-          const msgText = (data?.message as string) ?? (data?.text as string) ?? "";
-          if (msgText) {
-            const sysMsgId = randomUUID();
-            emitSystemMessageEvents(subscriber, threadId, runId, msgText);
-
-            upsertMessage({
-              id: sysMsgId,
-              role: "system" as const,
-              content: msgText,
-            });
-          }
+          // Emit system messages as CUSTOM events with the raw SDK data
+          subscriber.next({
+            type: EventType.CUSTOM,
+            name: `system:${subtype ?? "unknown"}`,
+            value: data ?? raw,
+          } as any);
         }
         // Handle result messages
         else if (message.type === "result") {

@@ -91,7 +91,6 @@ export function handleToolUseBlock(
       newState = stateUpdates;
     }
 
-    // Emit STATE_SNAPSHOT only if state actually changed (mirrors LangGraph pattern)
     if (JSON.stringify(newState) !== JSON.stringify(currentState)) {
       subscriber.next({
         type: EventType.STATE_SNAPSHOT,

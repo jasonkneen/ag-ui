@@ -26,7 +26,8 @@ export function hasState(state: unknown): boolean {
   if (state == null) return false;
   if (typeof state !== "object") return true;
   if (Array.isArray(state)) return state.length > 0;
-  return Object.keys(state as Record<string, unknown>).length > 0;
+  // Empty objects ({}) count as "has state"
+  return true;
 }
 
 /**

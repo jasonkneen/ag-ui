@@ -14,7 +14,6 @@ import type { RunAgentInput } from "@ag-ui/core";
 import type { ClaudeAgentAdapter } from "../src";
 
 import { createAgenticChatAdapter } from "./agentic_chat";
-import { createAgenticChatReasoningAdapter } from "./agentic_chat_reasoning";
 import { createBackendToolAdapter } from "./backend_tool_rendering";
 import { createSharedStateAdapter } from "./shared_state";
 import { createHumanInTheLoopAdapter } from "./human_in_the_loop";
@@ -22,7 +21,6 @@ import { createToolBasedGenerativeUiAdapter } from "./tool_based_generative_ui";
 
 const adapters: Record<string, ClaudeAgentAdapter> = {
   agentic_chat: createAgenticChatAdapter(),
-  agentic_chat_reasoning: createAgenticChatReasoningAdapter(),
   backend_tool_rendering: createBackendToolAdapter(),
   shared_state: createSharedStateAdapter(),
   human_in_the_loop: createHumanInTheLoopAdapter(),

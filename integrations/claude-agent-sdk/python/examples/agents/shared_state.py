@@ -15,17 +15,35 @@ def create_shared_state_adapter() -> ClaudeAgentAdapter:
     """Create adapter for shared state demo."""
     system_prompt = """You are a helpful recipe assistant that collaborates with users to create amazing recipes.
 
-The current recipe is shown in the "Current Shared State" section above. When making changes:
+The current recipe is shown in the "Current Shared State" section above. When making changes, call the ag_ui_update_state tool with a "state_updates" object containing a "recipe" key.
 
-1. Keep ALL existing ingredients and instructions - merge new ones with existing
-2. Use proper emoji icons for ingredients (🥕 🍅 🧅 🥖 🧈 🥛)
-3. After making changes, briefly confirm what you did (1-2 sentences)
-4. Don't repeat the entire recipe in your response - the UI shows it live
+IMPORTANT - The state_updates must follow this exact structure:
+{
+  "state_updates": {
+    "recipe": {
+      "title": "Recipe Name",
+      "skill_level": "Beginner" | "Intermediate" | "Advanced",
+      "cooking_time": "5 min" | "15 min" | "30 min" | "45 min" | "60+ min",
+      "special_preferences": ["High Protein", "Spicy"],
+      "ingredients": [
+        { "icon": "🍝", "name": "Spaghetti", "amount": "200 grams" },
+        { "icon": "🍅", "name": "Tomato Sauce", "amount": "1 cup" }
+      ],
+      "instructions": [
+        "Step 1 description",
+        "Step 2 description"
+      ]
+    }
+  }
+}
 
-Examples:
-- "Add tomatoes" → Add tomatoes to ingredients, confirm "Added 2 tomatoes! 🍅"
-- "Make it spicy" → Add spicy preference and spicy ingredients
-- "Improve the recipe" → Enhance with more ingredients and detailed steps
+Rules:
+1. Each ingredient MUST be an object with "icon" (emoji), "name" (string), and "amount" (string)
+2. Instructions MUST be an array of strings
+3. Keep ALL existing ingredients and instructions - merge new ones with existing
+4. Use proper emoji icons for ingredients
+5. After making changes, briefly confirm what you did (1-2 sentences)
+6. Don't repeat the entire recipe in your response - the UI shows it live
 """
     
     return ClaudeAgentAdapter(

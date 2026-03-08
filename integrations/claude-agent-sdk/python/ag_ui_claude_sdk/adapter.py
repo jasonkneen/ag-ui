@@ -51,14 +51,12 @@ from .utils import (
 )
 from .config import (
     ALLOWED_FORWARDED_PROPS,
-    STATE_MANAGEMENT_TOOL_NAME,
     STATE_MANAGEMENT_TOOL_FULL_NAME,
     AG_UI_MCP_SERVER_NAME,
 )
 from .handlers import (
     handle_tool_use_block,
     handle_tool_result_block,
-    emit_system_message_events,
 )
 from .session import SessionWorker
 
@@ -204,7 +202,7 @@ class ClaudeAgentAdapter:
                 logger.debug(f"Frontend tools detected: {frontend_tool_names}")
             
             # Emit initial state snapshot if provided
-            if input_data.state:
+            if input_data.state is not None:
                 yield StateSnapshotEvent(
                     type=EventType.STATE_SNAPSHOT,
                     snapshot=input_data.state
@@ -302,12 +300,12 @@ class ClaudeAgentAdapter:
                 logger.debug(f"Appended state/context ({len(addendum)} chars) to system_prompt")
         
         # Ensure ag_ui tools are always allowed (frontend tools + state management)
-        if input_data and (input_data.state or input_data.tools):
+        if input_data and (input_data.state is not None or input_data.tools):
             allowed_tools = merged_kwargs.get("allowed_tools", [])
             tools_to_add = []
             
             # Add state management tool if state is provided
-            if input_data.state and STATE_MANAGEMENT_TOOL_FULL_NAME not in allowed_tools:
+            if input_data.state is not None and STATE_MANAGEMENT_TOOL_FULL_NAME not in allowed_tools:
                 tools_to_add.append(STATE_MANAGEMENT_TOOL_FULL_NAME)
             
             # Add frontend tools (prefixed with mcp__ag_ui__)
@@ -351,7 +349,7 @@ class ClaudeAgentAdapter:
                         logger.warning(f"Failed to convert tool: {e}")
             
             # Add state management tool if state is provided
-            if input_data.state:
+            if input_data.state is not None:
                 logger.debug("Adding ag_ui_update_state tool for state management")
                 state_tool = create_state_management_tool()
                 ag_ui_tools.append(state_tool)
@@ -610,10 +608,10 @@ class ClaudeAgentAdapter:
                                         updates = json.loads(updates)
                                     lock = self._state_locks.setdefault(thread_id, asyncio.Lock())
                                     async with lock:
+                                        prev_state_json = json.dumps(self._current_state, sort_keys=True, default=str)
                                         new_state = {**self._current_state, **updates} if isinstance(self._current_state, dict) and isinstance(updates, dict) else updates
-                                        has_state_diff = json.dumps(new_state, sort_keys=True) != json.dumps(self._current_state, sort_keys=True)
-                                        if has_state_diff:
-                                            self._current_state = new_state
+                                        self._current_state = new_state
+                                        if json.dumps(self._current_state, sort_keys=True, default=str) != prev_state_json:
                                             yield StateSnapshotEvent(
                                                 type=EventType.STATE_SNAPSHOT,
                                                 snapshot=self._current_state,
@@ -753,19 +751,12 @@ class ClaudeAgentAdapter:
                 subtype = getattr(message, 'subtype', '')
                 data = getattr(message, 'data', {}) or {}
                 
-                msg_text = (data.get('message') or data.get('text') or '') if data else ''
-                
-                if msg_text:
-                    sys_msg_id = str(uuid.uuid4())
-                    for evt in emit_system_message_events(thread_id, run_id, msg_text):
-                        yield evt
-                    
-                    from ag_ui.core import SystemMessage as AguiSystemMessage
-                    upsert_message(AguiSystemMessage(
-                        id=sys_msg_id,
-                        role="system",
-                        content=msg_text,
-                    ))
+                # Emit system messages as CUSTOM events with the raw SDK data
+                yield CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=f"system:{subtype or 'unknown'}",
+                    value=data or {},
+                )
             
             elif isinstance(message, ResultMessage):
                 is_error = getattr(message, 'is_error', None)

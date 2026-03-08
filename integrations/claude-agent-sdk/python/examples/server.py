@@ -13,7 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from ag_ui_claude_sdk import add_claude_fastapi_endpoint
 
 from agents.agentic_chat import create_agentic_chat_adapter
-from agents.agentic_chat_reasoning import create_agentic_chat_reasoning_adapter
 from agents.backend_tool_rendering import create_backend_tool_adapter
 from agents.shared_state import create_shared_state_adapter
 from agents.human_in_the_loop import create_human_in_the_loop_adapter
@@ -31,7 +30,6 @@ app.add_middleware(
 
 adapters = {
     "agentic_chat": create_agentic_chat_adapter(),
-    "agentic_chat_reasoning": create_agentic_chat_reasoning_adapter(),
     "backend_tool_rendering": create_backend_tool_adapter(),
     "shared_state": create_shared_state_adapter(),
     "human_in_the_loop": create_human_in_the_loop_adapter(),

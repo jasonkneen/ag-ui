@@ -7,7 +7,7 @@ Breaks down stream processing into focused handler functions.
 import json
 import logging
 import uuid
-from typing import AsyncIterator, Any, Dict, Optional
+from typing import AsyncIterator, Any, Optional
 
 from ag_ui.core import (
     EventType,

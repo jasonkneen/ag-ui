@@ -5,6 +5,7 @@ test.describe("Shared State Feature", () => {
   test("[Claude Agent SDK Python] should interact with the chat to get a recipe on prompt", async ({
     page,
   }) => {
+    test.slow(); // Claude Agent SDK responses go through CLI subprocess
     const sharedStateAgent = new SharedStatePage(page);
 
     await page.goto("/claude-agent-sdk-python/feature/shared_state");
@@ -14,7 +15,20 @@ test.describe("Shared State Feature", () => {
       'Please give me a pasta recipe of your choosing, but one of the ingredients should be "Pasta"'
     );
     await sharedStateAgent.loader();
-    await sharedStateAgent.awaitIngredientCard("Pasta");
+
+    // Use longer timeout than SharedStatePage.awaitIngredientCard default (15s)
+    // Claude Agent SDK responses go through a CLI subprocess and are slower
+    await page.waitForFunction(
+      (ingredientName) => {
+        const inputs = document.querySelectorAll('.ingredient-card input.ingredient-name-input');
+        return Array.from(inputs).some(
+          (input: HTMLInputElement) => input.value.toLowerCase().includes(ingredientName.toLowerCase())
+        );
+      },
+      "Pasta",
+      { timeout: 60000 }
+    );
+
     await sharedStateAgent.getInstructionItems(
       sharedStateAgent.instructionsContainer
     );
@@ -23,6 +37,7 @@ test.describe("Shared State Feature", () => {
   test("[Claude Agent SDK Python] should share state between UI and chat", async ({
     page,
   }) => {
+    test.slow(); // Claude Agent SDK responses go through CLI subprocess
     const sharedStateAgent = new SharedStatePage(page);
 
     await page.goto("/claude-agent-sdk-python/feature/shared_state");
@@ -47,6 +62,6 @@ test.describe("Shared State Feature", () => {
     // Verify chat response includes the new ingredient
     await expect(
       sharedStateAgent.agentMessage.getByText(/Potatoes/)
-    ).toBeVisible({ timeout: 15000 });
+    ).toBeVisible({ timeout: 30000 });
   });
 });
