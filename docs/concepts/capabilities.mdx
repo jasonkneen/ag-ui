@@ -86,6 +86,8 @@ when multiple agents are available and users need to pick one.
 interface IdentityCapabilities {
   /** Human-readable name shown in UIs and agent selectors. */
   name?: string
+  /** The framework or platform powering this agent (e.g., "langgraph", "mastra", "crewai"). */
+  type?: string
   /** What this agent does — helps users and routing logic decide when to use it. */
   description?: string
   /** Semantic version of the agent (e.g., "1.2.0"). Useful for compatibility checks. */
@@ -325,35 +327,6 @@ class MyAgent extends AbstractAgent {
   // ... run() implementation
 }
 ```
-
-### HttpAgent
-
-`HttpAgent` implements `getCapabilities()` by making a `GET` request to a
-conventional endpoint:
-
-```typescript
-const agent = new HttpAgent({
-  url: "https://my-agent.example.com/api",
-})
-
-// Fetches GET https://my-agent.example.com/api/capabilities
-const capabilities = await agent.getCapabilities()
-```
-
-The endpoint defaults to `{url}/capabilities` but can be overridden via
-`endpoints`:
-
-```typescript
-const agent = new HttpAgent({
-  url: "https://my-agent.example.com/api",
-  endpoints: {
-    capabilities: "https://my-agent.example.com/api/v2/caps",
-  },
-})
-```
-
-Remote agents should expose a `GET /capabilities` endpoint that returns the
-`AgentCapabilities` JSON object.
 
 ### Dynamic Capabilities
 

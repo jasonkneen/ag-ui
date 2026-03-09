@@ -17,6 +17,8 @@ export const SubAgentInfoSchema = z.object({
 export const IdentityCapabilitiesSchema = z.object({
   /** Human-readable name shown in UIs and agent selectors. */
   name: z.string().optional(),
+  /** The framework or platform powering this agent (e.g., "langgraph", "mastra", "crewai"). */
+  type: z.string().optional(),
   /** What this agent does — helps users and routing logic decide when to use it. */
   description: z.string().optional(),
   /** Semantic version of the agent (e.g., "1.2.0"). Useful for compatibility checks. */
