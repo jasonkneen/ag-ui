@@ -107,6 +107,9 @@ class ADKAgent:
 
         # Streaming function call arguments (Gemini 3+ via Vertex AI)
         streaming_function_call_arguments: bool = False,
+
+        # Session identity
+        use_thread_id_as_session_id: bool = False,
     ):
         """Initialize the ADKAgent.
 
@@ -146,6 +149,10 @@ class ADKAgent:
                 partial arguments, allowing the UI to show progressive updates.
                 Requires google-adk >= 1.24.0 and stream_function_call_arguments=True
                 in the model's GenerateContentConfig. Defaults to False.
+            use_thread_id_as_session_id: When True, use the AG-UI thread_id directly
+                as the ADK session_id instead of letting the backend generate one.
+                Eliminates the O(n) list_sessions scan for session recovery after
+                middleware restarts. Defaults to False for backward compatibility.
 
             Note:
             If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
@@ -189,7 +196,8 @@ class ADKAgent:
             cleanup_interval_seconds=cleanup_interval_seconds,
             max_sessions_per_user=max_sessions_per_user,
             delete_session_on_cleanup=delete_session_on_cleanup,
-            save_session_to_memory_on_cleanup=save_session_to_memory_on_cleanup
+            save_session_to_memory_on_cleanup=save_session_to_memory_on_cleanup,
+            use_thread_id_as_session_id=use_thread_id_as_session_id,
         )
         
         # Tool execution tracking
@@ -301,6 +309,8 @@ class ADKAgent:
         predict_state: Optional[Iterable[PredictStateMapping]] = None,
         emit_messages_snapshot: bool = False,
         streaming_function_call_arguments: bool = False,
+        # Session identity
+        use_thread_id_as_session_id: bool = False,
     ) -> "ADKAgent":
         """Create ADKAgent from an ADK App instance.
 
@@ -334,6 +344,8 @@ class ADKAgent:
             emit_messages_snapshot: Whether to emit MessagesSnapshotEvent at end of runs
             streaming_function_call_arguments: Whether to enable streaming of function
                 call arguments from Gemini 3+ models. Requires google-adk >= 1.24.0.
+            use_thread_id_as_session_id: When True, use the AG-UI thread_id directly
+                as the ADK session_id. See ADKAgent.__init__ for details.
 
         Returns:
             ADKAgent instance configured to use the App
@@ -377,6 +389,7 @@ class ADKAgent:
             predict_state=predict_state,
             emit_messages_snapshot=emit_messages_snapshot,
             streaming_function_call_arguments=streaming_function_call_arguments,
+            use_thread_id_as_session_id=use_thread_id_as_session_id,
         )
         # Store App for per-request App creation with modified agents
         instance._app = app
@@ -1517,6 +1530,34 @@ class ADKAgent:
                     if not has_pending:
                         del self._active_executions[input.thread_id]
     
+    @staticmethod
+    def _shallow_copy_agent_tree(agent: Any) -> Any:
+        """Shallow-copy an agent and its sub-agent tree.
+
+        Creates new model instances so that fields like ``instruction``,
+        ``tools``, and ``sub_agents`` can be reassigned per-execution without
+        mutating the originals.  Tool objects themselves are shared by
+        reference, which avoids errors with non-deep-copyable tools (e.g.
+        ADK ``McpToolset`` whose ``errlog`` field holds an unpicklable
+        ``TextIOWrapper``).
+        """
+        try:
+            copied = agent.model_copy(deep=False)
+        except AttributeError:
+            # Agent is not a Pydantic model (e.g. a Mock in tests);
+            # return as-is since it cannot be shallow-copied.
+            return agent
+
+        tools = getattr(copied, 'tools', None)
+        if isinstance(tools, (list, tuple)):
+            copied.tools = list(tools)
+
+        sub_agents = getattr(copied, 'sub_agents', None)
+        if isinstance(sub_agents, (list, tuple)):
+            copied.sub_agents = [ADKAgent._shallow_copy_agent_tree(sa) for sa in sub_agents]
+
+        return copied
+
     async def _start_background_execution(
         self,
         input: RunAgentInput,
@@ -1537,9 +1578,12 @@ class ADKAgent:
         # Extract necessary information
         user_id = self._get_user_id(input)
         app_name = self._get_app_name(input)
-        
-        # Use a deep copy of the ADK agent so we can modify it per-execution
-        adk_agent = self._adk_agent.model_copy(deep=True)
+
+        # Shallow-copy the agent tree so we can modify instruction/tools
+        # per-execution without mutating the original.  Tool objects are
+        # shared by reference (not deep-copied) to avoid errors with
+        # non-picklable tools such as ADK McpToolset.
+        adk_agent = self._shallow_copy_agent_tree(self._adk_agent)
 
         # Handle SystemMessage if it's the first message - append to agent instructions
         if input.messages and isinstance(input.messages[0], SystemMessage):
