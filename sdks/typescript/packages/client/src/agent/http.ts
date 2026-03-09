@@ -1,7 +1,7 @@
 import { AbstractAgent, RunAgentResult } from "./agent";
 import { runHttpRequest } from "@/run/http-request";
-import { HttpAgentConfig, RunAgentParameters } from "./types";
-import { RunAgentInput, BaseEvent } from "@ag-ui/core";
+import { HttpAgentConfig, HttpAgentEndpoints, RunAgentParameters } from "./types";
+import { RunAgentInput, BaseEvent, AgentCapabilities } from "@ag-ui/core";
 import { structuredClone_ } from "@/utils";
 import { transformHttpEventStream } from "@/transform/http";
 import { Observable } from "rxjs";
@@ -14,6 +14,7 @@ interface RunHttpAgentConfig extends RunAgentParameters {
 export class HttpAgent extends AbstractAgent {
   public url: string;
   public headers: Record<string, string>;
+  public endpoints: HttpAgentEndpoints;
   public abortController: AbortController = new AbortController();
 
   /**
@@ -52,6 +53,19 @@ export class HttpAgent extends AbstractAgent {
     super(config);
     this.url = config.url;
     this.headers = structuredClone_(config.headers ?? {});
+    this.endpoints = config.endpoints ?? {};
+  }
+
+  async getCapabilities(): Promise<AgentCapabilities> {
+    const url = this.endpoints.capabilities ?? `${this.url}/capabilities`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: this.headers,
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch capabilities: HTTP ${response.status}`);
+    }
+    return response.json();
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -63,6 +77,7 @@ export class HttpAgent extends AbstractAgent {
     const cloned = super.clone() as HttpAgent;
     cloned.url = this.url;
     cloned.headers = structuredClone_(this.headers ?? {});
+    cloned.endpoints = { ...this.endpoints };
 
     const newController = new AbortController();
     const originalSignal = this.abortController.signal as AbortSignal & { reason?: unknown };

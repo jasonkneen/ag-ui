@@ -1,5 +1,5 @@
 import { defaultApplyEvents } from "@/apply/default";
-import { Message, State, RunAgentInput, BaseEvent, ToolCall, AssistantMessage } from "@ag-ui/core";
+import { Message, State, RunAgentInput, BaseEvent, ToolCall, AssistantMessage, AgentCapabilities } from "@ag-ui/core";
 
 import { AgentConfig, RunAgentParameters } from "./types";
 import { v4 as uuidv4 } from "uuid";
@@ -84,6 +84,12 @@ export abstract class AbstractAgent {
   }
 
   abstract run(input: RunAgentInput): Observable<BaseEvent>;
+
+  /**
+   * Returns the agent's current capabilities.
+   * Optional — subclasses implement this to advertise what they support.
+   */
+  async getCapabilities?(): Promise<AgentCapabilities>;
 
   public use(...middlewares: (Middleware | MiddlewareFunction)[]): this {
     const normalizedMiddlewares = middlewares.map((middleware) =>

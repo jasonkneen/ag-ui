@@ -21,6 +21,11 @@ When creating an HTTP agent, you need to provide an `HttpAgentConfig` object:
 interface HttpAgentConfig extends AgentConfig {
   url: string // Endpoint URL for the agent service
   headers?: Record<string, string> // Optional HTTP headers
+  endpoints?: HttpAgentEndpoints // Override specific endpoint URLs
+}
+
+interface HttpAgentEndpoints {
+  capabilities?: string // Override the capabilities discovery endpoint
 }
 ```
 
@@ -73,6 +78,18 @@ subscribe(subscriber: AgentSubscriber): { unsubscribe: () => void }
 Returns an object with an `unsubscribe()` method to remove the subscriber when
 no longer needed.
 
+### getCapabilities()
+
+Discovers the remote agent's capabilities by making a `GET` request to
+`{url}/capabilities` (or the configured `capabilitiesUrl`).
+
+```typescript
+async getCapabilities(): Promise<AgentCapabilities>
+```
+
+See [Capabilities](/concepts/capabilities) for usage patterns and the full type
+definition.
+
 ### abortRun()
 
 Cancels the current HTTP request using the AbortController.
@@ -119,4 +136,5 @@ run(input: RunAgentInput): RunAgent
 
 - `url`: The endpoint URL for the agent service
 - `headers`: HTTP headers to include with requests
+- `endpoints`: Optional overrides for specific endpoint URLs (e.g., `capabilities`)
 - `abortController`: AbortController instance for request cancellation
