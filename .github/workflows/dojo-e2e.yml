@@ -137,11 +137,11 @@ jobs:
           - suite: claude-agent-sdk-python
             test_path: tests/claudeAgentSdkPythonTests
             services: ["dojo", "claude-agent-sdk-python"]
-            wait_on: http://localhost:9999,tcp:localhost:8888
+            wait_on: http://localhost:9999,tcp:localhost:8019
           - suite: claude-agent-sdk-typescript
             test_path: tests/claudeAgentSdkTypescriptTests
             services: ["dojo", "claude-agent-sdk-typescript"]
-            wait_on: http://localhost:9999,tcp:localhost:8889
+            wait_on: http://localhost:9999,tcp:localhost:8020
           # - suite: vercel-ai-sdk
           #   test_path: tests/vercelAISdkTests
           #   services: ["dojo"]

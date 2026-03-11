@@ -53,9 +53,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
   private static readonly DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000;
 
   private config: ClaudeAgentAdapterConfig;
-  private currentState: unknown = null;
-  private lastResultData: Record<string, unknown> | undefined;
-  private activeQuery: Query | null = null;
+  private activeQueries = new Map<string, Query>();
   private sessions = new Map<string, { sessionId: string; lastUsed: number; active: boolean }>();
 
   constructor(config: ClaudeAgentAdapterConfig = {}) {
@@ -99,7 +97,9 @@ export class ClaudeAgentAdapter extends AbstractAgent {
   }
 
   public async interrupt(): Promise<void> {
-    await this.activeQuery?.interrupt();
+    for (const q of this.activeQueries.values()) {
+      await q.interrupt();
+    }
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -135,12 +135,12 @@ export class ClaudeAgentAdapter extends AbstractAgent {
         prompt: userMessage,
         options: {
           ...options,
-          model: options.model ?? "claude-sonnet-4-20250514",
+          model: options.model, // SDK picks default if omitted
           ...(abortController ? { abortController } : {}),
         },
       });
 
-      this.activeQuery = queryStream;
+      this.activeQueries.set(threadId, queryStream);
 
       this.translateStream(runInput, queryStream, subscriber)
         .catch((error) => {
@@ -148,7 +148,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
         })
         .finally(() => {
           if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-          this.activeQuery = null;
+          this.activeQueries.delete(threadId);
         });
     });
   }
@@ -161,8 +161,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
     const threadId = input.threadId ?? randomUUID();
     const runId = input.runId ?? randomUUID();
 
-    this.lastResultData = undefined;
-    this.currentState = hasState(input.state) ? input.state : null;
+    const runCtx = { currentState: hasState(input.state) ? input.state : null, lastResultData: undefined as Record<string, unknown> | undefined };
 
     try {
       if (input.parentRunId) {
@@ -199,14 +198,15 @@ export class ClaudeAgentAdapter extends AbstractAgent {
         runId,
         input,
         frontendToolNames,
-        subscriber
+        subscriber,
+        runCtx
       );
 
       subscriber.next({
         type: EventType.RUN_FINISHED,
         threadId,
         runId,
-        result: this.lastResultData,
+        result: runCtx.lastResultData,
       });
 
       subscriber.complete();
@@ -356,7 +356,8 @@ export class ClaudeAgentAdapter extends AbstractAgent {
     runId: string,
     input: RunAgentInput,
     frontendToolNames: Set<string>,
-    subscriber: Subscriber<ProcessedEvent>
+    subscriber: Subscriber<ProcessedEvent>,
+    runCtx: { currentState: unknown; lastResultData: Record<string, unknown> | undefined }
   ): Promise<void> {
     // Per-run state (local to this invocation)
     let currentMessageId: string | null = null;
@@ -549,28 +550,28 @@ export class ClaudeAgentAdapter extends AbstractAgent {
                       updates = JSON.parse(updates);
                     }
 
-                    const prevStateJson = JSON.stringify(this.currentState);
+                    const prevStateJson = JSON.stringify(runCtx.currentState);
 
                     if (
-                      typeof this.currentState === "object" &&
-                      this.currentState !== null &&
+                      typeof runCtx.currentState === "object" &&
+                      runCtx.currentState !== null &&
                       typeof updates === "object" &&
                       updates !== null
                     ) {
-                      this.currentState = {
-                        ...(this.currentState as Record<string, unknown>),
+                      runCtx.currentState = {
+                        ...(runCtx.currentState as Record<string, unknown>),
                         ...(updates as Record<string, unknown>),
                       };
                     } else {
-                      this.currentState = updates;
+                      runCtx.currentState = updates;
                     }
 
-                    const newStateJson = JSON.stringify(this.currentState);
+                    const newStateJson = JSON.stringify(runCtx.currentState);
 
                     if (newStateJson !== prevStateJson) {
                       subscriber.next({
                         type: EventType.STATE_SNAPSHOT,
-                        snapshot: this.currentState,
+                        snapshot: runCtx.currentState,
                       });
                     }
                   }
@@ -582,7 +583,7 @@ export class ClaudeAgentAdapter extends AbstractAgent {
                     type: EventType.CUSTOM,
                     name: "state_update_error",
                     value: { error: "Failed to parse state update" },
-                  } as any);
+                  });
                 }
               }
 
@@ -696,10 +697,10 @@ export class ClaudeAgentAdapter extends AbstractAgent {
             const { updatedState } = handleToolUseBlock(
               toolBlock,
               assistantMsg.parent_tool_use_id ?? undefined,
-              threadId, runId, this.currentState, subscriber
+              threadId, runId, runCtx.currentState, subscriber
             );
             if (toolBlock.id) processedToolIds.add(toolBlock.id);
-            if (updatedState !== null) this.currentState = updatedState;
+            if (updatedState !== null) runCtx.currentState = updatedState;
 
             // Check for frontend tool halt (same logic as streaming path)
             const blockDisplayName = stripMcpPrefix(toolBlock.name ?? "");
@@ -776,14 +777,14 @@ export class ClaudeAgentAdapter extends AbstractAgent {
             type: EventType.CUSTOM,
             name: `system:${subtype ?? "unknown"}`,
             value: data ?? raw,
-          } as any);
+          });
         }
         // Handle result messages
         else if (message.type === "result") {
           const resultMsg = message as SDKResultMessage;
 
           
-          this.lastResultData = {
+          runCtx.lastResultData = {
             isError: (resultMsg as { is_error?: boolean }).is_error ?? false,
             durationMs: (resultMsg as { duration_ms?: number }).duration_ms,
             durationApiMs: (resultMsg as { duration_api_ms?: number })

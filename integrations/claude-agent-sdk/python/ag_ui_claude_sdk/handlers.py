@@ -1,4 +1,5 @@
 """
+import uuid
 Event handlers for Claude SDK stream processing.
 
 Breaks down stream processing into focused handler functions.
@@ -6,15 +7,11 @@ Breaks down stream processing into focused handler functions.
 
 import json
 import logging
-import uuid
 from typing import AsyncIterator, Any, Optional
 
 from ag_ui.core import (
     EventType,
     BaseEvent,
-    TextMessageStartEvent,
-    TextMessageContentEvent,
-    TextMessageEndEvent,
     ToolCallStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
@@ -211,44 +208,3 @@ async def handle_tool_result_block(
             content=result_str,
             role="tool",
         )
-
-
-def emit_system_message_events(
-    thread_id: str, 
-    run_id: str, 
-    message: str
-) -> list[BaseEvent]:
-    """
-    Create system message events.
-    
-    Args:
-        thread_id: Thread identifier
-        run_id: Run identifier
-        message: System message text
-        
-    Returns:
-        List of events to yield
-    """
-    msg_id = str(uuid.uuid4())
-    return [
-        TextMessageStartEvent(
-            type=EventType.TEXT_MESSAGE_START,
-            thread_id=thread_id,
-            run_id=run_id,
-            message_id=msg_id,
-            role="system",
-        ),
-        TextMessageContentEvent(
-            type=EventType.TEXT_MESSAGE_CONTENT,
-            thread_id=thread_id,
-            run_id=run_id,
-            message_id=msg_id,
-            delta=message,
-        ),
-        TextMessageEndEvent(
-            type=EventType.TEXT_MESSAGE_END,
-            thread_id=thread_id,
-            run_id=run_id,
-            message_id=msg_id,
-        ),
-    ]

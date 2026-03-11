@@ -89,13 +89,13 @@ class ClaudeAgentAdapter:
         self.name = name
         self.description = description
         self._options = options
-        self._last_result_data = None
-        self._current_state = None
         self._max_workers = max_workers
         self._worker_ttl_seconds = worker_ttl_seconds
         self._query_timeout_seconds = query_timeout_seconds
         self._workers: Dict[str, Dict] = {}  # changed from Dict[str, SessionWorker]
         self._state_locks: Dict[str, asyncio.Lock] = {}
+        self._per_thread_state: Dict[str, Any] = {}  # thread_id -> current state
+        self._per_thread_result: Dict[str, Any] = {}  # thread_id -> last result data
 
     async def interrupt(self, thread_id: Optional[str] = None) -> None:
         """Interrupt the active query for a thread, or all workers if no thread specified."""
@@ -122,8 +122,11 @@ class ClaudeAgentAdapter:
         ]
         for tid in to_remove:
             entry = self._workers.pop(tid)
-            asyncio.create_task(entry["worker"].stop())
+            task = asyncio.create_task(entry["worker"].stop())
+            task.add_done_callback(lambda t: t.exception() and logger.warning(f"Worker eviction error: {t.exception()}"))
             self._state_locks.pop(tid, None)
+            self._per_thread_state.pop(tid, None)
+            self._per_thread_result.pop(tid, None)
 
         # LRU eviction: if still over cap, remove oldest idle entries
         while len(self._workers) > self._max_workers:
@@ -132,7 +135,8 @@ class ClaudeAgentAdapter:
                 break
             oldest_tid = min(idle, key=lambda x: x[1]["last_used"])[0]
             entry = self._workers.pop(oldest_tid)
-            asyncio.create_task(entry["worker"].stop())
+            task = asyncio.create_task(entry["worker"].stop())
+            task.add_done_callback(lambda t: t.exception() and logger.warning(f"Worker eviction error: {t.exception()}"))
             self._state_locks.pop(oldest_tid, None)
 
     async def clear_session(self, thread_id: str) -> None:
@@ -149,8 +153,8 @@ class ClaudeAgentAdapter:
         thread_id = input_data.thread_id or str(uuid.uuid4())
         run_id = input_data.run_id or str(uuid.uuid4())
         
-        self._last_result_data = None
-        self._current_state = input_data.state
+        self._per_thread_state[thread_id] = input_data.state
+        self._per_thread_result[thread_id] = None
         
         try:
             # Get or create worker for this thread
@@ -226,7 +230,7 @@ class ClaudeAgentAdapter:
                 type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id,
-                result=self._last_result_data,
+                result=self._per_thread_result.get(thread_id, None),
             )
             
         except asyncio.TimeoutError as e:
@@ -608,13 +612,13 @@ class ClaudeAgentAdapter:
                                         updates = json.loads(updates)
                                     lock = self._state_locks.setdefault(thread_id, asyncio.Lock())
                                     async with lock:
-                                        prev_state_json = json.dumps(self._current_state, sort_keys=True, default=str)
-                                        new_state = {**self._current_state, **updates} if isinstance(self._current_state, dict) and isinstance(updates, dict) else updates
-                                        self._current_state = new_state
-                                        if json.dumps(self._current_state, sort_keys=True, default=str) != prev_state_json:
+                                        prev_state_json = json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str)
+                                        new_state = {**self._per_thread_state.get(thread_id), **updates} if isinstance(self._per_thread_state.get(thread_id), dict) and isinstance(updates, dict) else updates
+                                        self._per_thread_state[thread_id] = new_state
+                                        if json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str) != prev_state_json:
                                             yield StateSnapshotEvent(
                                                 type=EventType.STATE_SNAPSHOT,
-                                                snapshot=self._current_state,
+                                                snapshot=self._per_thread_state.get(thread_id),
                                             )
                             except (json.JSONDecodeError, ValueError) as e:
                                 logger.warning(f"Failed to parse tool JSON for state update: {e}")
@@ -672,6 +676,14 @@ class ClaudeAgentAdapter:
                             halt_event_stream = True
                             continue
                         
+                        # Emit TOOL_CALL_END for regular backend tools
+                        yield ToolCallEndEvent(
+                            type=EventType.TOOL_CALL_END,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            tool_call_id=current_tool_call_id,
+                        )
+
                         # Reset tool streaming state
                         current_tool_call_id = None
                         current_tool_call_name = None
@@ -713,12 +725,12 @@ class ClaudeAgentAdapter:
                         if tool_id and tool_id in processed_tool_ids:
                             continue
                         updated_state, tool_events = await handle_tool_use_block(
-                            block, message, thread_id, run_id, self._current_state
+                            block, message, thread_id, run_id, self._per_thread_state.get(thread_id)
                         )
                         if tool_id:
                             processed_tool_ids.add(tool_id)
                         if updated_state is not None:
-                            self._current_state = updated_state
+                            self._per_thread_state[thread_id] = updated_state
                         async for event in tool_events:
                             yield event
 
@@ -763,7 +775,7 @@ class ClaudeAgentAdapter:
                 result_text = getattr(message, 'result', None)
                 
                 # Capture metadata for RunFinished event
-                self._last_result_data = {
+                self._per_thread_result[thread_id] = {
                     "is_error": is_error,
                     "duration_ms": getattr(message, 'duration_ms', None),
                     "duration_api_ms": getattr(message, 'duration_api_ms', None),

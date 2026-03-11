@@ -70,7 +70,7 @@ export function handleToolUseBlock(
           type: EventType.CUSTOM,
           name: "state_update_error",
           value: { error: "Failed to parse state update" },
-        } as any);
+        });
         stateUpdates = {};
       }
     }
@@ -135,34 +135,3 @@ export function handleToolUseBlock(
   return { updatedState: null };
 }
 
-/**
- * Emit a system message as AG-UI text message events.
- */
-export function emitSystemMessageEvents(
-  subscriber: Subscriber<ProcessedEvent>,
-  threadId: string,
-  runId: string,
-  message: string
-): void {
-  const msgId = randomUUID();
-  subscriber.next({
-    type: EventType.TEXT_MESSAGE_START,
-    threadId,
-    runId,
-    messageId: msgId,
-    role: "system",
-  });
-  subscriber.next({
-    type: EventType.TEXT_MESSAGE_CONTENT,
-    threadId,
-    runId,
-    messageId: msgId,
-    delta: message,
-  });
-  subscriber.next({
-    type: EventType.TEXT_MESSAGE_END,
-    threadId,
-    runId,
-    messageId: msgId,
-  });
-}
