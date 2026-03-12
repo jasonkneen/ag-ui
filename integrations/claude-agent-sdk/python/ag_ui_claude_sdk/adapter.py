@@ -48,6 +48,8 @@ from .utils import (
     build_agui_assistant_message,
     build_agui_tool_message,
     _is_state_management_tool,
+    fix_surrogates,
+    fix_surrogates_deep,
 )
 from .config import (
     ALLOWED_FORWARDED_PROPS,
@@ -497,7 +499,7 @@ class ClaudeAgentAdapter:
                     delta_type = delta_data.get('type', '')
                     
                     if delta_type == 'text_delta':
-                        text_chunk = delta_data.get('text', '')
+                        text_chunk = fix_surrogates(delta_data.get('text', ''))
                         if text_chunk and current_message_id:
                             if not has_streamed_text:
                                 yield TextMessageStartEvent(
@@ -510,7 +512,7 @@ class ClaudeAgentAdapter:
                             has_streamed_text = True
                             if pending_msg is not None:
                                 pending_msg["content"] += text_chunk
-                            
+
                             yield TextMessageContentEvent(
                                 type=EventType.TEXT_MESSAGE_CONTENT,
                                 thread_id=thread_id,
@@ -534,12 +536,19 @@ class ClaudeAgentAdapter:
                         partial_json = delta_data.get('partial_json', '')
                         if partial_json and current_tool_call_id:
                             accumulated_tool_json += partial_json
+                            # Fix surrogates before Pydantic serialization.
+                            # JS String.slice() splits emoji into surrogate
+                            # pairs across chunks. Lone surrogates in a
+                            # single chunk can't be reassembled, so replace
+                            # them — the full JSON is fixed later via
+                            # fix_surrogates() on accumulated_tool_json.
+                            safe_delta = fix_surrogates(partial_json)
                             yield ToolCallArgsEvent(
                                 type=EventType.TOOL_CALL_ARGS,
                                 thread_id=thread_id,
                                 run_id=run_id,
                                 tool_call_id=current_tool_call_id,
-                                delta=partial_json,
+                                delta=safe_delta,
                             )
                 
                 elif event_type == 'content_block_start':
@@ -605,7 +614,7 @@ class ClaudeAgentAdapter:
                         # Check if this is the state management tool
                         if _is_state_management_tool(current_tool_call_name):
                             try:
-                                state_updates = json.loads(accumulated_tool_json)
+                                state_updates = json.loads(fix_surrogates(accumulated_tool_json))
                                 if isinstance(state_updates, dict):
                                     updates = state_updates.get("state_updates", state_updates)
                                     if isinstance(updates, str):
@@ -614,6 +623,7 @@ class ClaudeAgentAdapter:
                                     async with lock:
                                         prev_state_json = json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str)
                                         new_state = {**self._per_thread_state.get(thread_id), **updates} if isinstance(self._per_thread_state.get(thread_id), dict) and isinstance(updates, dict) else updates
+                                        new_state = fix_surrogates_deep(new_state)
                                         self._per_thread_state[thread_id] = new_state
                                         if json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str) != prev_state_json:
                                             yield StateSnapshotEvent(

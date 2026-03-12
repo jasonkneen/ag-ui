@@ -20,7 +20,7 @@ from ag_ui.core import (
     CustomEvent,
 )
 
-from .utils import strip_mcp_prefix, _is_state_management_tool
+from .utils import strip_mcp_prefix, _is_state_management_tool, fix_surrogates, fix_surrogates_deep
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,10 @@ async def handle_tool_use_block(
                 current_state = {**current_state, **state_updates}
             else:
                 current_state = state_updates
-            
+
+            # Fix any UTF-16 surrogates before Pydantic serialisation
+            current_state = fix_surrogates_deep(current_state)
+
             # Emit STATE_SNAPSHOT with updated state
             yield StateSnapshotEvent(
                 type=EventType.STATE_SNAPSHOT,
@@ -187,7 +190,9 @@ async def handle_tool_result_block(
                 result_str = json.dumps(content)
         except (TypeError, ValueError):
             result_str = str(content)
-    
+
+    result_str = fix_surrogates(result_str)
+
     if tool_use_id:
         # Emit ToolCallEnd to signal completion
         yield ToolCallEndEvent(

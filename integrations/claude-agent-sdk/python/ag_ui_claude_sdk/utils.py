@@ -14,6 +14,36 @@ from .config import STATE_MANAGEMENT_TOOL_NAME, STATE_MANAGEMENT_TOOL_FULL_NAME
 logger = logging.getLogger(__name__)
 
 
+def fix_surrogates(s: str) -> str:
+    """Re-assemble lone UTF-16 surrogate pairs into proper Unicode codepoints.
+
+    LLMock (JavaScript) chunks JSON via ``String.slice()`` which operates on
+    16-bit code units.  Emoji outside the BMP (e.g. U+1F35D 🍝) are two code
+    units in JS (a surrogate pair), and ``slice`` can split them.  When the
+    chunks are reassembled in Python the string contains *paired* surrogates
+    (e.g. ``\\ud83c\\udf5d``) rather than a single codepoint.  Pydantic rejects
+    these during JSON serialisation.
+
+    Round-tripping through UTF-16 reassembles the pairs.
+    """
+    try:
+        return s.encode("utf-16", "surrogatepass").decode("utf-16")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        # Fallback: strip surrogates entirely (shouldn't happen for paired ones)
+        return s.encode("utf-8", "replace").decode("utf-8")
+
+
+def fix_surrogates_deep(obj: Any) -> Any:
+    """Recursively fix UTF-16 surrogates in all strings within a data structure."""
+    if isinstance(obj, str):
+        return fix_surrogates(obj)
+    if isinstance(obj, dict):
+        return {fix_surrogates(k) if isinstance(k, str) else k: fix_surrogates_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [fix_surrogates_deep(item) for item in obj]
+    return obj
+
+
 def extract_tool_names(tools: List[Any]) -> List[str]:
     """
     Extract tool names from AG-UI tool definitions.
