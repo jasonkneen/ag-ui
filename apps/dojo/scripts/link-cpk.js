@@ -10,20 +10,11 @@ if (!fs.existsSync(cpkPath)) {
   process.exit(1);
 }
 
-// Detect whether we got a packages root (has v1/ and v2/ subdirs) or a direct V1 path.
-const hasV1Subdir = fs.existsSync(path.join(cpkPath, "v1"));
-const hasV2Subdir = fs.existsSync(path.join(cpkPath, "v2"));
-const isPackagesRoot = hasV1Subdir && hasV2Subdir;
-
-// Build namespace → directory mapping
-const namespaceDirs = {};
-if (isPackagesRoot) {
-  namespaceDirs["@copilotkit/"] = path.join(cpkPath, "v1");
-  namespaceDirs["@copilotkitnext/"] = path.join(cpkPath, "v2");
-} else {
-  // Backward compat: single path = V1 only (original behavior)
-  namespaceDirs["@copilotkit/"] = cpkPath;
-}
+// All @copilotkit/* packages now live in a flat packages/ directory.
+// The old v1/v2 split was removed in CopilotKit PR #3409.
+const namespaceDirs = {
+  "@copilotkit/": cpkPath,
+};
 
 const gitRoot = execSync("git rev-parse --show-toplevel", {
   encoding: "utf-8",
