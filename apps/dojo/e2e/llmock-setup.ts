@@ -611,14 +611,17 @@ export async function setupLLMock(): Promise<void> {
     },
   });
 
-  // Claude Agent SDK shared state: the adapter registers ag_ui_update_state,
-  // not updateWorkingMemory. Arguments use {state_updates: {recipe: {...}}}.
+  // Claude Agent SDK shared state: the adapter registers ag_ui_update_state
+  // via an MCP server named "ag_ui", so the CLI sends the tool as
+  // mcp__ag_ui__ag_ui_update_state. Match both bare and MCP-prefixed names.
   mockServer.addFixture({
     match: {
       predicate: (req) => {
         const lastUser = req.messages.filter((m) => m.role === "user").pop();
         const hasClaudeSdkTool = req.tools?.some(
-          (t) => t.function.name === "ag_ui_update_state",
+          (t) =>
+            t.function.name === "ag_ui_update_state" ||
+            t.function.name.endsWith("__ag_ui_update_state"),
         );
         return (
           !!hasClaudeSdkTool &&

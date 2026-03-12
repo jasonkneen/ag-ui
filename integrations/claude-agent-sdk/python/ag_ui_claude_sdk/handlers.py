@@ -194,14 +194,12 @@ async def handle_tool_result_block(
     result_str = fix_surrogates(result_str)
 
     if tool_use_id:
-        # Emit ToolCallEnd to signal completion
-        yield ToolCallEndEvent(
-            type=EventType.TOOL_CALL_END,
-            thread_id=thread_id,
-            run_id=run_id,
-            tool_call_id=tool_use_id,
-        )
-        
+        # NOTE: Do NOT emit TOOL_CALL_END here — it was already emitted
+        # during content_block_stop (streaming path) or by handle_tool_use_block
+        # (non-streaming path). Emitting it again causes "No active tool call"
+        # errors in the CopilotKit runtime. The TS adapter follows the same
+        # pattern: tool result handling only emits TOOL_CALL_RESULT.
+
         # Emit ToolCallResult with the actual result content
         result_message_id = f"{tool_use_id}-result"
         yield ToolCallResultEvent(
