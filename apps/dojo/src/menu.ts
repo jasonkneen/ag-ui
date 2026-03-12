@@ -60,7 +60,7 @@ export const menuIntegrations = [
       "v1_agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
-      "agentic_chat_reasoning",
+
       "agentic_generative_ui",
       "predictive_state_updates",
       "shared_state",
@@ -289,6 +289,28 @@ export const menuIntegrations = [
       "agentic_generative_ui",
       "shared_state",
       "human_in_the_loop",
+    ],
+  },
+  {
+    id: "claude-agent-sdk-python",
+    name: "Claude Agent SDK (Python)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "shared_state",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
+    id: "claude-agent-sdk-typescript",
+    name: "Claude Agent SDK (Typescript)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "shared_state",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
     ],
   },
   {
