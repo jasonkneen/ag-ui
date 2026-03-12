@@ -235,25 +235,17 @@ jobs:
         if: steps.cache-playwright.outputs.cache-hit == 'true'
         run: pnpm exec playwright install-deps chromium
 
-      - name: write langgraph env files
-        working-directory: integrations/langgraph
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
-        if: ${{ contains(join(matrix.services, ','), 'langgraph-fastapi') || contains(join(matrix.services, ','), 'langgraph-platform-python') || contains(join(matrix.services, ','), 'langgraph-platform-typescript') }}
+      - name: Create langgraph stub .env files
+        if: ${{ contains(join(matrix.services, ','), 'langgraph-platform-python') || contains(join(matrix.services, ','), 'langgraph-platform-typescript') }}
         run: |
-          echo "OPENAI_API_KEY=${OPENAI_API_KEY}" > python/examples/.env
-          echo "LANGSMITH_API_KEY=${LANGSMITH_API_KEY}" >> python/examples/.env
-          echo "OPENAI_API_KEY=${OPENAI_API_KEY}" > typescript/examples/.env
-          echo "LANGSMITH_API_KEY=${LANGSMITH_API_KEY}" >> typescript/examples/.env
+          # langgraph.json declares "env": ".env" — the CLI requires this file
+          # to exist on disk. Values don't matter since run-dojo-everything.js
+          # injects LLMock env vars into the process environment.
+          touch integrations/langgraph/python/examples/.env
+          touch integrations/langgraph/typescript/examples/.env
 
       - name: Run dojo+agents
         uses: JarvusInnovations/background-action@v1
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         if: ${{ join(matrix.services, ',') != '' && contains(join(matrix.services, ','), 'dojo') }}
         with:
           run: |
