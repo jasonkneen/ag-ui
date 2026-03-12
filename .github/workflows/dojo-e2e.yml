@@ -90,6 +90,10 @@ jobs:
             test_path: tests/crewAITests
             services: ["dojo", "crew-ai"]
             wait_on: http://localhost:9999,tcp:localhost:8003
+          - suite: langroid
+            test_path: tests/langroidTests
+            services: ["dojo", "langroid"]
+            wait_on: http://localhost:9999,tcp:localhost:8021
           - suite: langgraph-python
             test_path: tests/langgraphPythonTests
             services: ["dojo", "langgraph-platform-python"]
@@ -243,6 +247,14 @@ jobs:
           # injects LLMock env vars into the process environment.
           touch integrations/langgraph/python/examples/.env
           touch integrations/langgraph/typescript/examples/.env
+
+      - name: write langroid env files
+        working-directory: integrations/langroid/python/examples
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        if: ${{ contains(join(matrix.services, ','), 'langroid') }}
+        run: |
+          echo "OPENAI_API_KEY=${OPENAI_API_KEY}" > .env
 
       - name: Run dojo+agents
         uses: JarvusInnovations/background-action@v1
