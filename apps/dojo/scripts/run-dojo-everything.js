@@ -110,7 +110,11 @@ const ALL_SERVICES = {
     command: 'npm run dev',
     name: 'Mastra',
     cwd: path.join(integrationsRoot, 'mastra/typescript/examples'),
-    env: { PORT: 8008 },
+    env: {
+      PORT: 8008,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY || 'test-key',
+      ...(!process.env.OPENAI_API_KEY && { OPENAI_BASE_URL: 'http://localhost:5555/v1' }),
+    },
   }],
   'pydantic-ai': [{
     command: 'uv run dev',
@@ -158,13 +162,21 @@ const ALL_SERVICES = {
     command: 'uv run dev',
     name: 'Claude Agent SDK (Python)',
     cwd: path.join(integrationsRoot, 'claude-agent-sdk/python/examples'),
-    env: { PORT: 8019 },
+    env: {
+      PORT: 8019,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-ant-api03-test-key-for-llmock-000000000000000000000000000000000000000000000000-000000000000AA',
+      ...(!process.env.ANTHROPIC_API_KEY && { ANTHROPIC_BASE_URL: 'http://localhost:5555' }),
+    },
   }],
   'claude-agent-sdk-typescript': [{
     command: 'npx tsx examples/server.ts',
     name: 'Claude Agent SDK (TypeScript)',
     cwd: path.join(integrationsRoot, 'claude-agent-sdk/typescript'),
-    env: { PORT: 8020 },
+    env: {
+      PORT: 8020,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-ant-api03-test-key-for-llmock-000000000000000000000000000000000000000000000000-000000000000AA',
+      ...(!process.env.ANTHROPIC_API_KEY && { ANTHROPIC_BASE_URL: 'http://localhost:5555' }),
+    },
   }],
   'microsoft-agent-framework-python': [{
     command: 'uv run dev',
@@ -268,6 +280,25 @@ async function main() {
     selectedKeys= selectedKeys.filter(x => x != "dojo-dev");
   }
 
+  // LLMock: inject OPENAI_BASE_URL, OPENAI_API_BASE, and OPENAI_API_KEY
+  // defaults so all framework agents route OpenAI API calls to the mock server
+  // when running.  OPENAI_API_BASE is the legacy env var used by llama-index
+  // (via resolve_openai_credentials) and litellm (used by crew-ai).
+  const openaiEnvDefaults = {
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL || 'http://localhost:5555/v1',
+    OPENAI_API_BASE: process.env.OPENAI_API_BASE || 'http://localhost:5555/v1',
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY || 'sk-mock',
+  };
+
+  // LLMock: inject GOOGLE_GEMINI_BASE_URL so ADK middleware agents (which keep
+  // their native Gemini model strings) route to the mock server via the genai
+  // client's built-in env var support. No /v1 suffix — the genai client appends
+  // the full /v1beta/models/{model}:generateContent path itself.
+  const geminiEnvDefaults = {
+    GOOGLE_GEMINI_BASE_URL: process.env.GOOGLE_GEMINI_BASE_URL || 'http://localhost:5555',
+    GOOGLE_API_KEY: process.env.GOOGLE_API_KEY || 'fake-gemini-key',
+  };
+
   // Build processes, warn for unknown keys
   const procs = [];
   for (const key of selectedKeys) {
@@ -275,6 +306,9 @@ async function main() {
     if (!svcs || svcs.length === 0) {
       console.warn(`Skipping unknown service: ${key}`);
       continue;
+    }
+    for (const svc of svcs) {
+      svc.env = { ...openaiEnvDefaults, ...geminiEnvDefaults, ...svc.env };
     }
     procs.push(...svcs);
   }
