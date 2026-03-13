@@ -10,11 +10,20 @@ if (!fs.existsSync(cpkPath)) {
   process.exit(1);
 }
 
-// All @copilotkit/* packages now live in a flat packages/ directory.
-// The old v1/v2 split was removed in CopilotKit PR #3409.
-const namespaceDirs = {
-  "@copilotkit/": cpkPath,
-};
+// Detect whether the CopilotKit repo uses the old v1/v2 split or the new flat structure.
+const hasV1Subdir = fs.existsSync(path.join(cpkPath, "v1"));
+const hasV2Subdir = fs.existsSync(path.join(cpkPath, "v2"));
+const isOldStructure = hasV1Subdir && hasV2Subdir;
+
+const namespaceDirs = {};
+if (isOldStructure) {
+  // Old CopilotKit structure: v1/ and v2/ subdirs
+  namespaceDirs["@copilotkit/"] = path.join(cpkPath, "v1");
+  namespaceDirs["@copilotkitnext/"] = path.join(cpkPath, "v2");
+} else {
+  // New flat structure (CopilotKit PR #3409): all packages under @copilotkit/
+  namespaceDirs["@copilotkit/"] = cpkPath;
+}
 
 const gitRoot = execSync("git rev-parse --show-toplevel", {
   encoding: "utf-8",
