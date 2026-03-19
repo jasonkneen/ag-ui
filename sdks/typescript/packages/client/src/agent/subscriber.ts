@@ -215,10 +215,10 @@ export async function runSubscribersWithMutation(
     state: State,
   ) => MaybePromise<AgentStateMutation | void>,
 ): Promise<AgentStateMutation> {
-  const messages0 = structuredClone_(initialMessages);
-  const state0 = structuredClone_(initialState);
-  let messages: Message[] = messages0;
-  let state: State = state0;
+  const baselineMessages = structuredClone_(initialMessages);
+  const baselineState = structuredClone_(initialState);
+  let messages: Message[] = baselineMessages;
+  let state: State = baselineState;
 
   let stopPropagation: boolean | undefined = undefined;
 
@@ -259,8 +259,8 @@ export async function runSubscribersWithMutation(
   }
 
   return {
-    ...(messages !== messages0 ? { messages } : {}),
-    ...(state !== state0 ? { state } : {}),
+    ...(messages !== baselineMessages ? { messages } : {}),
+    ...(state !== baselineState ? { state } : {}),
     ...(stopPropagation !== undefined ? { stopPropagation } : {}),
   };
 }
