@@ -1306,7 +1306,7 @@ describe("AgentSubscriber", () => {
     it("should not report changes when subscriber returns the same messages reference", async () => {
       const passThroughSubscriber: AgentSubscriber = {
         onEvent: ({ messages }) => ({
-          messages,
+          messages: messages as Message[],
         }),
       };
 
@@ -1333,7 +1333,7 @@ describe("AgentSubscriber", () => {
       const inPlaceMutator: AgentSubscriber = {
         onEvent: ({ messages }) => {
           // In-place mutation without returning — evades change detection
-          messages.push({
+          (messages as Message[]).push({
             id: "injected",
             role: "assistant",
             content: "injected",
@@ -1355,7 +1355,7 @@ describe("AgentSubscriber", () => {
       const inPlaceMutator: AgentSubscriber = {
         onEvent: ({ messages }) => {
           try {
-            messages.push({ id: "bad", role: "assistant", content: "bad" });
+            (messages as Message[]).push({ id: "bad", role: "assistant", content: "bad" });
           } catch (e) {
             caughtError = e;
             throw e;

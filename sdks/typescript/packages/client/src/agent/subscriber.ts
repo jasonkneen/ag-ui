@@ -41,8 +41,8 @@ export interface AgentStateMutation {
 }
 
 export interface AgentSubscriberParams {
-  messages: Message[];
-  state: State;
+  messages: ReadonlyArray<Readonly<Message>>;
+  state: Readonly<State>;
   agent: AbstractAgent;
   input: RunAgentInput;
 }
@@ -223,8 +223,8 @@ export async function runSubscribersWithMutation(
   initialState: State,
   executor: (
     subscriber: AgentSubscriber,
-    messages: Message[],
-    state: State,
+    messages: ReadonlyArray<Readonly<Message>>,
+    state: Readonly<State>,
   ) => MaybePromise<AgentStateMutation | void>,
 ): Promise<AgentStateMutation> {
   const isDev =
