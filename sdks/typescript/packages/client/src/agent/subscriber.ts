@@ -233,12 +233,13 @@ export async function runSubscribersWithMutation(
         continue;
       }
 
-      // Replace with a defensive copy of the subscriber's mutation
-      if (mutation.messages !== undefined) {
+      // Replace with a defensive copy of the subscriber's mutation,
+      // but skip if the subscriber returned the same reference (no-op).
+      if (mutation.messages !== undefined && mutation.messages !== messages) {
         messages = structuredClone_(mutation.messages);
       }
 
-      if (mutation.state !== undefined) {
+      if (mutation.state !== undefined && mutation.state !== state) {
         state = structuredClone_(mutation.state);
       }
 

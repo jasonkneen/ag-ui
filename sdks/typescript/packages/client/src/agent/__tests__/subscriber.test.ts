@@ -1,5 +1,5 @@
 import { AbstractAgent } from "../agent";
-import { AgentSubscriber } from "../subscriber";
+import { AgentSubscriber, runSubscribersWithMutation } from "../subscriber";
 import {
   BaseEvent,
   EventType,
@@ -1259,6 +1259,96 @@ describe("AgentSubscriber", () => {
       expect(trackingSubscriber.onTextMessageStartEvent).toHaveBeenCalledTimes(2);
       expect(trackingSubscriber.onToolCallStartEvent).toHaveBeenCalledTimes(1);
     });
+  });
+
+  describe("runSubscribersWithMutation isolation contract", () => {
+    const runWith = (
+      subscribers: AgentSubscriber[],
+      messages: Message[] = [{ id: "orig", role: "user", content: "hi" }],
+      state: Record<string, any> = {},
+    ) =>
+      runSubscribersWithMutation(subscribers, messages, state, (subscriber, msgs, st) =>
+        subscriber.onEvent?.({
+          messages: msgs,
+          state: st,
+          agent: {} as any,
+          input: {} as any,
+          event: { type: EventType.RUN_STARTED } as any,
+        }),
+      );
+
+    it("should detect changes when subscriber returns a new messages array with same content", async () => {
+      const cloningSubscriber: AgentSubscriber = {
+        onEvent: ({ messages }) => ({
+          messages: [...messages],
+        }),
+      };
+
+      const result = await runWith([cloningSubscriber]);
+
+      // Reference equality means a new array is detected as a change
+      // (trade-off: may cause extra onMessagesChanged callbacks, but avoids JSON.stringify cost)
+      expect(result.messages).toBeDefined();
+    });
+
+    it("should detect changes when subscriber returns a new state object with same content", async () => {
+      const cloningSubscriber: AgentSubscriber = {
+        onEvent: ({ state }) => ({
+          state: { ...state },
+        }),
+      };
+
+      const result = await runWith([cloningSubscriber]);
+
+      expect(result.state).toBeDefined();
+    });
+
+    it("should not report changes when subscriber returns the same messages reference", async () => {
+      const passThroughSubscriber: AgentSubscriber = {
+        onEvent: ({ messages }) => ({
+          messages,
+        }),
+      };
+
+      const result = await runWith([passThroughSubscriber]);
+
+      // Same reference returned — detected as no-op, no clone needed
+      expect(result.messages).toBeUndefined();
+    });
+
+    it("should not report changes when subscriber returns the same state reference", async () => {
+      const passThroughSubscriber: AgentSubscriber = {
+        onEvent: ({ state }) => ({
+          state,
+        }),
+      };
+
+      const result = await runWith([passThroughSubscriber]);
+
+      // Same reference returned — detected as no-op, no clone needed
+      expect(result.state).toBeUndefined();
+    });
+
+    it("should not report in-place mutations that are not returned", async () => {
+      const inPlaceMutator: AgentSubscriber = {
+        onEvent: ({ messages }) => {
+          // In-place mutation without returning — evades change detection
+          messages.push({
+            id: "injected",
+            role: "assistant",
+            content: "injected",
+          });
+          // Return void — no mutation communicated
+        },
+      };
+
+      const result = await runWith([inPlaceMutator]);
+
+      // The in-place push is NOT reported in the result (silent data loss)
+      // This documents the contract: subscribers must return mutations, not mutate in-place
+      expect(result.messages).toBeUndefined();
+    });
+
   });
 
   describe("EmptyError Bug Reproduction", () => {
