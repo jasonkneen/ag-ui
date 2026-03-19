@@ -224,6 +224,8 @@ export async function runSubscribersWithMutation(
 
   for (const subscriber of subscribers) {
     try {
+      // Subscribers receive shared references and must not mutate them in-place.
+      // Mutations should only be communicated via the return value.
       const mutation = await executor(subscriber, messages, state);
 
       if (mutation === undefined) {
@@ -231,7 +233,7 @@ export async function runSubscribersWithMutation(
         continue;
       }
 
-      // Merge messages/state so next subscriber sees latest view
+      // Replace with a defensive copy of the subscriber's mutation
       if (mutation.messages !== undefined) {
         messages = structuredClone_(mutation.messages);
       }
@@ -253,7 +255,7 @@ export async function runSubscribersWithMutation(
       if (!isTestEnvironment) {
         console.error("Subscriber error:", error);
       }
-      // Continue to next subscriber unless we want to stop propagation
+      // Skip this subscriber's mutation and continue
       continue;
     }
   }
