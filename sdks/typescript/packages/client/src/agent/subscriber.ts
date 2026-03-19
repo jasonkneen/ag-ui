@@ -205,6 +205,18 @@ export interface AgentSubscriber {
   ): MaybePromise<void>;
 }
 
+function devOnlyDeepFreeze<T>(obj: T): T {
+  Object.freeze(obj);
+  if (obj !== null && typeof obj === "object") {
+    for (const value of Object.values(obj)) {
+      if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+        devOnlyDeepFreeze(value);
+      }
+    }
+  }
+  return obj;
+}
+
 export async function runSubscribersWithMutation(
   subscribers: AgentSubscriber[],
   initialMessages: Message[],
@@ -215,6 +227,10 @@ export async function runSubscribersWithMutation(
     state: State,
   ) => MaybePromise<AgentStateMutation | void>,
 ): Promise<AgentStateMutation> {
+  const isDev =
+    process.env.NODE_ENV === "development" ||
+    process.env.NODE_ENV === "test" ||
+    process.env.VITEST_WORKER_ID !== undefined;
   const baselineMessages = structuredClone_(initialMessages);
   const baselineState = structuredClone_(initialState);
   let messages: Message[] = baselineMessages;
@@ -226,6 +242,11 @@ export async function runSubscribersWithMutation(
     try {
       // Subscribers receive shared references and must not mutate them in-place.
       // Mutations should only be communicated via the return value.
+      // In development mode, freeze inputs to catch accidental in-place mutations.
+      if (isDev) {
+        devOnlyDeepFreeze(messages);
+        devOnlyDeepFreeze(state);
+      }
       const mutation = await executor(subscriber, messages, state);
 
       if (mutation === undefined) {

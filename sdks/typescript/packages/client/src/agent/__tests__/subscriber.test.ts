@@ -1349,6 +1349,25 @@ describe("AgentSubscriber", () => {
       expect(result.messages).toBeUndefined();
     });
 
+    it("should throw TypeError when subscriber mutates frozen inputs in dev/test mode", async () => {
+      let caughtError: unknown;
+
+      const inPlaceMutator: AgentSubscriber = {
+        onEvent: ({ messages }) => {
+          try {
+            messages.push({ id: "bad", role: "assistant", content: "bad" });
+          } catch (e) {
+            caughtError = e;
+            throw e;
+          }
+        },
+      };
+
+      await runWith([inPlaceMutator]);
+
+      expect(caughtError).toBeInstanceOf(TypeError);
+    });
+
   });
 
   describe("EmptyError Bug Reproduction", () => {
