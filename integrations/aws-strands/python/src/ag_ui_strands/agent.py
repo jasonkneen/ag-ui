@@ -260,6 +260,7 @@ class StrandsAgent:
             message_id = str(uuid.uuid4())
             message_started = False
             tool_calls_seen = {}
+            current_state = dict(input_data.state or {})  # Track state for final snapshot
             stop_text_streaming = False
             halt_event_stream = False
 
@@ -358,7 +359,15 @@ class StrandsAgent:
                             if not result_tool_id or result_data is None:
                                 continue
 
+                            # Direct lookup works for backend tools (keyed by Strands ID).
+                            # Frontend tools are keyed by a generated UUID, so we fall back
+                            # to scanning by strands_tool_id when the direct lookup misses.
                             call_info = tool_calls_seen.get(result_tool_id, {})
+                            if not call_info:
+                                for _tid, _data in tool_calls_seen.items():
+                                    if _data.get("strands_tool_id") == result_tool_id:
+                                        call_info = _data
+                                        break
                             tool_name = call_info.get("name")
                             tool_args = call_info.get("args")
                             tool_input = call_info.get("input")
@@ -404,6 +413,7 @@ class StrandsAgent:
                                         behavior.state_from_result(result_context)
                                     )
                                     if snapshot:
+                                        current_state.update(snapshot)
                                         yield StateSnapshotEvent(
                                             type=EventType.STATE_SNAPSHOT,
                                             snapshot=snapshot,
@@ -553,6 +563,7 @@ class StrandsAgent:
                                             behavior.state_from_args(call_context)
                                         )
                                         if snapshot:
+                                            current_state.update(snapshot)
                                             yield StateSnapshotEvent(
                                                 type=EventType.STATE_SNAPSHOT,
                                                 snapshot=snapshot,
@@ -582,6 +593,15 @@ class StrandsAgent:
                                     )
 
                                 if not has_pending_tool_result:
+                                    # Close any open text message before starting a tool call
+                                    # so each segment has clean start/end boundaries.
+                                    if message_started:
+                                        yield TextMessageEndEvent(
+                                            type=EventType.TEXT_MESSAGE_END, message_id=message_id
+                                        )
+                                        message_started = False
+                                        message_id = str(uuid.uuid4())
+
                                     logger.debug(
                                         f"Emitting tool call events for {tool_name} (tool_use_id={tool_use_id}, thread_id={input_data.thread_id})"
                                     )
@@ -678,6 +698,12 @@ class StrandsAgent:
                 yield TextMessageEndEvent(
                     type=EventType.TEXT_MESSAGE_END, message_id=message_id
                 )
+
+            # Final state snapshot before finishing
+            yield StateSnapshotEvent(
+                type=EventType.STATE_SNAPSHOT,
+                snapshot=current_state,
+            )
 
             # Always finish the run - frontend handles keeping action executing
             yield RunFinishedEvent(
