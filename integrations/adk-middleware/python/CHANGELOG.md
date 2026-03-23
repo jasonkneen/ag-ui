@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FIX**: Key session lookup cache by `(thread_id, user_id)` to prevent cross-user collision (#1323)
+  - `_session_lookup_cache` and `_active_executions` are now keyed by a `(thread_id, user_id)` tuple instead of `thread_id` alone, preventing one user's session from being returned to another when both share the same thread ID
+  - All internal helpers (`_get_session_metadata`, `_get_backend_session_id`, `_remove_pending_tool_call`, `_get_pending_tool_call_ids`, `_has_pending_tool_calls`) now require `user_id` as a mandatory parameter — no silent `""` defaults that could mask cache misses
+  - Adds test coverage for two users sharing the same thread ID receiving separate sessions
+  - Thanks to **@themavik** for this contribution!
+
 - **FIX**: Remove double JSON encoding of `state` and `messages` in `/agents/state` endpoint (#1347)
   - `AgentStateResponse` declared `state` and `messages` as `str`, and the handler wrapped them with `json.dumps()` before passing to `JSONResponse`, which serializes again
   - Consumers received doubly-encoded strings (e.g. `"[{...}]"`) instead of native objects (`[{...}]`), breaking CopilotKit's message snapshot functionality
