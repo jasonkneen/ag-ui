@@ -235,9 +235,29 @@ class StrandsAgent:
                     last_msg_had_tool_calls = False
                     strands_messages.append(strands_msg)
 
-            # Get the latest user message for state context builder
+            # Build a lookup of tool_call_id -> tool_name from the input messages
+            # directly (the assistant message in Run 2 already carries the tool name).
+            _tool_call_id_to_name: dict = {}
+            for _msg in (input_data.messages or []):
+                if _msg.role == "assistant" and hasattr(_msg, "tool_calls") and _msg.tool_calls:
+                    for tc in _msg.tool_calls:
+                        tc_name = tc.function.get("name") if isinstance(tc.function, dict) else tc.function.name
+                        if tc.id and tc_name:
+                            _tool_call_id_to_name[tc.id] = tc_name
+
+            # Get the latest user message for state context builder.
+            # For continuation runs (has_pending_tool_result), derive a meaningful
+            # message from the frontend tool that was just executed so the agent
+            # understands the context and can generate a proper conclusion.
             user_message = "Hello"
-            if input_data.messages:
+            if has_pending_tool_result and input_data.messages:
+                for msg in reversed(input_data.messages):
+                    if msg.role == "tool" and hasattr(msg, "tool_call_id"):
+                        tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
+                        if tool_name and tool_name in frontend_tool_names:
+                            user_message = f"{tool_name} executed successfully with no return value."
+                        break
+            elif input_data.messages:
                 for msg in reversed(input_data.messages):
                     if (msg.role == "user" or msg.role == "tool") and msg.content:
                         user_message = msg.content
@@ -387,11 +407,13 @@ class StrandsAgent:
                                 continue
 
                             # Emit ToolCallResultEvent WITHOUT role field to complete the tool in UI
-                            # but prevent it from being added to conversation history
+                            # but prevent it from being added to conversation history.
+                            # A fresh message ID is used so CopilotKit creates a proper standalone
+                            # ToolMessage and closes the spinner correctly.
                             yield ToolCallResultEvent(
                                 type=EventType.TOOL_CALL_RESULT,
                                 tool_call_id=result_tool_id,
-                                message_id=message_id,
+                                message_id=str(uuid.uuid4()),
                                 content=json.dumps(result_data),
                                 # role is intentionally omitted - without role="tool",
                                 # the frontend won't add this to conversation history
