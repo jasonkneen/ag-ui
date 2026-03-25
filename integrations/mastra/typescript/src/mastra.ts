@@ -93,22 +93,39 @@ export class MastraAgent extends AbstractAgent {
         // Note: input.forwardedProps is typed as ZodAny, so no cast needed
         const forwardedCommand = input.forwardedProps?.command;
         if (forwardedCommand?.resume != null && forwardedCommand?.interruptEvent) {
-          const interruptEvent =
-            typeof forwardedCommand.interruptEvent === "string"
-              ? JSON.parse(forwardedCommand.interruptEvent)
-              : forwardedCommand.interruptEvent;
-
-          if (!this.isLocalMastraAgent(this.agent)) {
-            // TODO: Remote agent resume not yet implemented
-            console.warn(
-              "Resume from interrupt is not yet supported for remote Mastra agents",
+          // #2: Safely parse interruptEvent — client-supplied data
+          let interruptEvent: any;
+          try {
+            interruptEvent =
+              typeof forwardedCommand.interruptEvent === "string"
+                ? JSON.parse(forwardedCommand.interruptEvent)
+                : forwardedCommand.interruptEvent;
+          } catch (err) {
+            subscriber.error(
+              new Error("Invalid interruptEvent: malformed JSON", {
+                cause: err,
+              }),
             );
-            subscriber.next({
-              type: EventType.RUN_FINISHED,
-              threadId: input.threadId,
-              runId: input.runId,
-            } as RunFinishedEvent);
-            subscriber.complete();
+            return;
+          }
+
+          // #6: Validate required fields for resume
+          if (!interruptEvent?.toolCallId || !interruptEvent?.runId) {
+            subscriber.error(
+              new Error(
+                "Invalid interruptEvent: missing toolCallId or runId",
+              ),
+            );
+            return;
+          }
+
+          // #3: Remote agent resume is not yet supported — error, don't fake success
+          if (!this.isLocalMastraAgent(this.agent)) {
+            subscriber.error(
+              new Error(
+                "Resume from interrupt is not yet supported for remote Mastra agents",
+              ),
+            );
             return;
           }
 
@@ -126,15 +143,21 @@ export class MastraAgent extends AbstractAgent {
               },
             );
 
-            if (response && typeof response === "object") {
-              const callbacks = this.makeStreamCallbacks(
-                subscriber,
-                () => messageId,
-                (id) => { messageId = id; },
-                input.runId,
+            // #5: Null/invalid response from resumeStream is an error
+            if (!response || typeof response !== "object") {
+              subscriber.error(
+                new Error("resumeStream returned no valid response"),
               );
-              await this.processFullStream(response.fullStream, callbacks);
+              return;
             }
+
+            const callbacks = this.makeStreamCallbacks(
+              subscriber,
+              () => messageId,
+              (id) => { messageId = id; },
+              input.runId,
+            );
+            await this.processFullStream(response.fullStream, callbacks);
 
             subscriber.next({
               type: EventType.RUN_FINISHED,
@@ -143,7 +166,7 @@ export class MastraAgent extends AbstractAgent {
             } as RunFinishedEvent);
             subscriber.complete();
           } catch (error) {
-            console.error("Resume stream error:", error);
+            // #9: Let subscriber.error carry the event — no console.error
             subscriber.error(error);
           }
           return;
@@ -266,8 +289,6 @@ export class MastraAgent extends AbstractAgent {
               messageId = randomUUID();
             },
             onError: (error) => {
-              console.error("error", error);
-              // Handle error
               subscriber.error(error);
             },
             onRunFinished: async () => {
@@ -324,7 +345,6 @@ export class MastraAgent extends AbstractAgent {
             },
           });
         } catch (error) {
-          console.error("Stream error:", error);
           subscriber.error(error);
         }
       };
@@ -459,9 +479,12 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "error": {
-          flushPendingToolCall();
-          callbacks.onError?.(new Error(chunk.payload.error as string));
-          break;
+          // Exit the stream entirely — continuing after error = state corruption
+          const error = new Error(chunk.payload.error as string);
+          if (callbacks.onError) {
+            callbacks.onError(error);
+          }
+          return;
         }
         case "tool-call-suspended": {
           // Suppress the buffered tool-call — tool didn't execute

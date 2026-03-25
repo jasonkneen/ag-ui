@@ -389,4 +389,73 @@ describe("interrupt bridge: resume path", () => {
 
     expect(error.message).toBe("Resume failed: no snapshot");
   });
+
+  it("errors on malformed interruptEvent JSON", async () => {
+    const { agent } = makeFakeLocalAgentWithResumeStream([]);
+
+    const { error } = await collectError(
+      agent,
+      makeInput({
+        forwardedProps: {
+          command: {
+            resume: { approved: true },
+            interruptEvent: "{not valid json",
+          },
+        },
+      }),
+    );
+
+    expect(error.message).toContain("Invalid interruptEvent");
+  });
+
+  it("errors when interruptEvent is missing toolCallId", async () => {
+    const { agent } = makeFakeLocalAgentWithResumeStream([]);
+
+    const { error } = await collectError(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", runId: "run-1" }), // no toolCallId
+    );
+
+    expect(error.message).toContain("missing toolCallId or runId");
+  });
+
+  it("errors when interruptEvent is missing runId", async () => {
+    const { agent } = makeFakeLocalAgentWithResumeStream([]);
+
+    const { error } = await collectError(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1" }), // no runId
+    );
+
+    expect(error.message).toContain("missing toolCallId or runId");
+  });
+
+  it("errors when resumeStream returns null", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    (fakeAgent as any).resumeStream = async () => null;
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const { error } = await collectError(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1", runId: "run-1" }),
+    );
+
+    expect(error.message).toContain("resumeStream returned no valid response");
+  });
+
+  it("errors for remote agent resume (not yet supported)", async () => {
+    const agent = makeRemoteMastraAgent({ streamChunks: [] });
+
+    const { error } = await collectError(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1", runId: "run-1" }),
+    );
+
+    expect(error.message).toContain("not yet supported for remote");
+  });
 });
