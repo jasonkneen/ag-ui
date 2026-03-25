@@ -378,38 +378,43 @@ export class MastraAgent extends AbstractAgent {
   }
 
   /**
-   * Processes a Mastra fullStream, mapping chunks to AG-UI events via callbacks.
-   * Buffers tool-call chunks: if followed by tool-call-suspended, the TOOL_CALL_*
-   * events are suppressed (the tool hasn't executed yet — emitting them confuses
-   * CopilotKit's orchestration which expects a TOOL_CALL_RESULT to follow).
+   * Creates a stateful chunk processor that maps Mastra stream chunks to
+   * AG-UI events via callbacks. Buffers tool-call chunks: if followed by
+   * tool-call-suspended, the TOOL_CALL_* events are suppressed (the tool
+   * hasn't executed yet — emitting them confuses CopilotKit's orchestration
+   * which expects a TOOL_CALL_RESULT to follow).
+   *
+   * Used by both the local agent path (async iterable) and the remote agent
+   * path (processDataStream callback) — single source of truth for chunk
+   * handling and buffering logic.
+   *
+   * @returns handleChunk (returns true if processing should stop, e.g. on error)
+   *          and flush (emits any buffered tool-call at end of stream).
    */
-  private async processFullStream(
-    stream: AsyncIterable<any>,
-    callbacks: MastraAgentStreamOptions,
-  ): Promise<void> {
+  private createChunkProcessor(callbacks: MastraAgentStreamOptions) {
     let pendingToolCall: {
       toolCallId: string;
       toolName: string;
       args: any;
     } | null = null;
 
-    const flushPendingToolCall = () => {
+    const flush = () => {
       if (pendingToolCall) {
         callbacks.onToolCallPart?.(pendingToolCall);
         pendingToolCall = null;
       }
     };
 
-    for await (const chunk of stream) {
+    /** @returns true if processing should stop (error chunk received). */
+    const handleChunk = (chunk: any): boolean => {
       switch (chunk.type) {
         case "text-delta": {
-          flushPendingToolCall();
+          flush();
           callbacks.onTextPart?.(chunk.payload.text);
           break;
         }
         case "tool-call": {
-          // Buffer — don't emit yet, wait to see if suspend follows
-          flushPendingToolCall(); // flush any previous buffered call
+          flush();
           pendingToolCall = {
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,
@@ -418,7 +423,7 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "tool-result": {
-          flushPendingToolCall(); // tool executed normally, emit the call
+          flush();
           callbacks.onToolResultPart?.({
             toolCallId: chunk.payload.toolCallId,
             result: chunk.payload.result,
@@ -426,15 +431,13 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "error": {
-          // Exit the stream entirely — continuing after error = state corruption
           const error = new Error(chunk.payload.error as string);
           if (callbacks.onError) {
             callbacks.onError(error);
           }
-          return;
+          return true;
         }
         case "tool-call-suspended": {
-          // Suppress the buffered tool-call — tool didn't execute
           pendingToolCall = null;
           callbacks.onToolSuspended?.({
             toolCallId: chunk.payload.toolCallId,
@@ -446,14 +449,29 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "finish": {
-          flushPendingToolCall();
+          flush();
           callbacks.onFinishMessagePart?.();
           break;
         }
       }
+      return false;
+    };
+
+    return { handleChunk, flush };
+  }
+
+  /**
+   * Processes a Mastra fullStream (async iterable) using createChunkProcessor.
+   */
+  private async processFullStream(
+    stream: AsyncIterable<any>,
+    callbacks: MastraAgentStreamOptions,
+  ): Promise<void> {
+    const { handleChunk, flush } = this.createChunkProcessor(callbacks);
+    for await (const chunk of stream) {
+      if (handleChunk(chunk)) return;
     }
-    // Flush any remaining buffered tool call at end of stream
-    flushPendingToolCall();
+    flush();
   }
 
   /**
@@ -536,67 +554,24 @@ export class MastraAgent extends AbstractAgent {
           requestContext,
         });
 
-        // Remote agents use processDataStream (callback-based), not an
-        // async iterable — can't use processFullStream directly. Buffer
-        // tool-call chunks with the same logic as processFullStream.
+        // Remote agents use processDataStream (callback-based) — share
+        // chunk handling logic via createChunkProcessor.
         if (response && typeof response.processDataStream === "function") {
-          let pendingToolCall: {
-            toolCallId: string;
-            toolName: string;
-            args: any;
-          } | null = null;
-          const flushPendingToolCall = () => {
-            if (pendingToolCall) {
-              onToolCallPart?.(pendingToolCall);
-              pendingToolCall = null;
-            }
-          };
+          const { handleChunk, flush } = this.createChunkProcessor({
+            onTextPart,
+            onFinishMessagePart,
+            onToolCallPart,
+            onToolResultPart,
+            onToolSuspended,
+            onError,
+          });
 
           await response.processDataStream({
             onChunk: async (chunk: any) => {
-              switch (chunk.type) {
-                case "text-delta": {
-                  flushPendingToolCall();
-                  onTextPart?.(chunk.payload.text);
-                  break;
-                }
-                case "tool-call": {
-                  flushPendingToolCall();
-                  pendingToolCall = {
-                    toolCallId: chunk.payload.toolCallId,
-                    toolName: chunk.payload.toolName,
-                    args: chunk.payload.args,
-                  };
-                  break;
-                }
-                case "tool-result": {
-                  flushPendingToolCall();
-                  onToolResultPart?.({
-                    toolCallId: chunk.payload.toolCallId,
-                    result: chunk.payload.result,
-                  });
-                  break;
-                }
-                case "tool-call-suspended": {
-                  pendingToolCall = null;
-                  onToolSuspended?.({
-                    toolCallId: chunk.payload.toolCallId,
-                    toolName: chunk.payload.toolName,
-                    suspendPayload: chunk.payload.suspendPayload,
-                    args: chunk.payload.args,
-                    resumeSchema: chunk.payload.resumeSchema,
-                  });
-                  break;
-                }
-                case "finish": {
-                  flushPendingToolCall();
-                  onFinishMessagePart?.();
-                  break;
-                }
-              }
+              handleChunk(chunk);
             },
           });
-          flushPendingToolCall();
+          flush();
           await onRunFinished?.();
         } else {
           throw new Error("Invalid response from remote agent");
