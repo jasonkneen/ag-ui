@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 # Get all workspace packages as JSON
-PACKAGES=$(cd "$REPO_ROOT" && pnpm list -r --json --depth=-1) || { echo "ERROR: pnpm list failed" >&2; exit 1; }
+PACKAGES=$(cd "$REPO_ROOT" && pnpm list -r --json) || { echo "ERROR: pnpm list failed" >&2; exit 1; }
 if [ -z "$PACKAGES" ] || [ "$PACKAGES" = "[]" ]; then
   echo "ERROR: pnpm list returned no packages" >&2; exit 1
 fi

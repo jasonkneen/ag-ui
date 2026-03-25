@@ -173,9 +173,7 @@ jobs:
             TAGS+=("$TAG")
             echo "Tagged $TAG"
           done < <(echo "$PACKAGES" | jq -c '.[]')
-          for t in "${TAGS[@]}"; do
-            git push origin "$t"
-          done
+          git push origin "${TAGS[@]}"
 
       - name: Create GitHub Release
         if: steps.detect.outputs.count != '0' && (github.event.inputs.dry_run != 'true')
