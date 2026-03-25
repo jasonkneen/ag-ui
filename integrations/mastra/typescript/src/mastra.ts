@@ -226,68 +226,15 @@ export class MastraAgent extends AbstractAgent {
         }
 
         try {
+          const streamCallbacks = this.makeStreamCallbacks(
+            subscriber,
+            () => messageId,
+            (id) => { messageId = id; },
+            input.runId,
+          );
+
           await this.streamMastraAgent(input, {
-            onTextPart: (text) => {
-              const event: TextMessageChunkEvent = {
-                type: EventType.TEXT_MESSAGE_CHUNK,
-                role: "assistant",
-                messageId,
-                delta: text,
-              };
-              subscriber.next(event);
-            },
-            onToolCallPart: (streamPart) => {
-              const startEvent: ToolCallStartEvent = {
-                type: EventType.TOOL_CALL_START,
-                parentMessageId: messageId,
-                toolCallId: streamPart.toolCallId,
-                toolCallName: streamPart.toolName,
-              };
-              subscriber.next(startEvent);
-
-              const argsEvent: ToolCallArgsEvent = {
-                type: EventType.TOOL_CALL_ARGS,
-                toolCallId: streamPart.toolCallId,
-                delta: JSON.stringify(streamPart.args),
-              };
-              subscriber.next(argsEvent);
-
-              const endEvent: ToolCallEndEvent = {
-                type: EventType.TOOL_CALL_END,
-                toolCallId: streamPart.toolCallId,
-              };
-              subscriber.next(endEvent);
-            },
-            onToolResultPart(streamPart) {
-              const toolCallResultEvent: ToolCallResultEvent = {
-                type: EventType.TOOL_CALL_RESULT,
-                toolCallId: streamPart.toolCallId,
-                content: JSON.stringify(streamPart.result),
-                messageId: randomUUID(),
-                role: "tool",
-              };
-
-              subscriber.next(toolCallResultEvent);
-            },
-            onToolSuspended: (payload) => {
-              const event: CustomEvent = {
-                type: EventType.CUSTOM,
-                name: "on_interrupt",
-                value: JSON.stringify({
-                  type: "mastra_suspend",
-                  toolCallId: payload.toolCallId,
-                  toolName: payload.toolName,
-                  suspendPayload: payload.suspendPayload,
-                  args: payload.args,
-                  resumeSchema: payload.resumeSchema,
-                  runId: input.runId,
-                }),
-              };
-              subscriber.next(event);
-            },
-            onFinishMessagePart: async () => {
-              messageId = randomUUID();
-            },
+            ...streamCallbacks,
             onError: (error) => {
               subscriber.error(error);
             },
