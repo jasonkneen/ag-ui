@@ -50,7 +50,7 @@ interface MastraAgentStreamOptions {
   onToolResultPart?: (streamPart: { toolCallId: string; result: any }) => void;
   onError: (error: Error) => void;
   onRunFinished?: () => Promise<void>;
-  onToolSuspended?: (payload: {
+  onToolSuspended: (payload: {
     toolCallId: string;
     toolName: string;
     suspendPayload: any;
@@ -90,12 +90,14 @@ export class MastraAgent extends AbstractAgent {
         subscriber.next(runStartedEvent);
 
         // CopilotKit passes resume data via forwardedProps.command (convention
-        // shared with LangGraph's interrupt bridge). forwardedProps is ZodAny.
+        // shared with LangGraph's interrupt bridge). forwardedProps is untyped
+        // (any) — the caller is responsible for shape validation.
         const forwardedCommand = input.forwardedProps?.command;
 
         // resume: false means the user explicitly declined the tool call.
         // Close the run cleanly without calling resumeStream.
         if (forwardedCommand?.resume === false && forwardedCommand?.interruptEvent) {
+          await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
           subscriber.next({
             type: EventType.RUN_FINISHED,
             threadId: input.threadId,
@@ -106,7 +108,7 @@ export class MastraAgent extends AbstractAgent {
         }
 
         if (forwardedCommand?.resume != null && forwardedCommand?.interruptEvent) {
-          // #2: Safely parse interruptEvent — client-supplied data
+          // Safely parse interruptEvent — client-supplied data
           let interruptEvent: any;
           try {
             interruptEvent =
@@ -122,7 +124,7 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
-          // #6: Validate required fields for resume
+          // Validate required fields for resume
           if (!interruptEvent?.toolCallId || !interruptEvent?.runId) {
             subscriber.error(
               new Error(
@@ -132,7 +134,7 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
-          // #3: Remote agent resume is not yet supported — error, don't fake success
+          // Remote agent resume is not yet supported — error, don't fake success
           if (!this.isLocalMastraAgent(this.agent)) {
             subscriber.error(
               new Error(
@@ -156,7 +158,7 @@ export class MastraAgent extends AbstractAgent {
               },
             );
 
-            // #5: Null/invalid response from resumeStream is an error
+            // Null/invalid response from resumeStream is an error
             if (!response || typeof response !== "object" || !response.fullStream) {
               subscriber.error(
                 new Error("resumeStream returned no valid response (missing fullStream)"),
@@ -187,7 +189,7 @@ export class MastraAgent extends AbstractAgent {
               subscriber.complete();
             }
           } catch (error) {
-            // #9: Let subscriber.error carry the event — no console.error
+            // Let subscriber.error carry the event
             subscriber.error(error);
           }
           return;
@@ -278,7 +280,13 @@ export class MastraAgent extends AbstractAgent {
         }
       };
 
-      run().catch((err) => subscriber.error(err));
+      run().catch((err) => {
+        try {
+          subscriber.error(err);
+        } catch {
+          // Subscriber already closed — error was already delivered
+        }
+      });
 
       return () => {};
     });
@@ -294,10 +302,8 @@ export class MastraAgent extends AbstractAgent {
    * Fetches working memory from a local agent and emits a STATE_SNAPSHOT event
    * if valid working memory is available.
    *
-   * Best-effort: returns false on failure so callers can proceed with
-   * RUN_FINISHED even when the snapshot could not be delivered.
-   *
-   * @returns true if snapshot was emitted (or skipped cleanly), false on error.
+   * Best-effort: logs a warning and returns gracefully on failure so callers
+   * can proceed with RUN_FINISHED even when the snapshot could not be delivered.
    */
   private async emitWorkingMemorySnapshot(
     subscriber: { next: (event: BaseEvent) => void },
@@ -340,7 +346,11 @@ export class MastraAgent extends AbstractAgent {
         }
       }
       return true;
-    } catch {
+    } catch (error) {
+      console.warn(
+        `[MastraAgent] Failed to emit working memory snapshot for thread ${threadId}:`,
+        error,
+      );
       return false;
     }
   }
@@ -348,8 +358,8 @@ export class MastraAgent extends AbstractAgent {
   /**
    * Creates the callback set used by processFullStream to emit AG-UI events.
    * messageId is accessed/mutated via getter/setter closures so that when
-   * onFinishMessagePart rotates the ID, subsequent callbacks in the same
-   * run() invocation see the updated value.
+   * onFinishMessagePart replaces the ID with a new UUID, subsequent callbacks
+   * in the same run() invocation see the updated value.
    */
   private makeStreamCallbacks(
     subscriber: { next: (event: BaseEvent) => void },
@@ -442,8 +452,15 @@ export class MastraAgent extends AbstractAgent {
       }
     };
 
-    /** @returns true if processing should stop (error chunk received). */
     const handleChunk = (chunk: any): boolean => {
+      if (!chunk || !chunk.payload) {
+        callbacks.onError(
+          new Error(
+            `Malformed stream chunk: type=${chunk?.type ?? "undefined"}, missing payload`,
+          ),
+        );
+        return true;
+      }
       switch (chunk.type) {
         case "text-delta": {
           flush();
@@ -478,7 +495,7 @@ export class MastraAgent extends AbstractAgent {
           // call is orphaned (never executed) so emitting TOOL_CALL_START/
           // ARGS/END without a TOOL_CALL_RESULT would violate the protocol.
           pendingToolCall = null;
-          callbacks.onToolSuspended?.({
+          callbacks.onToolSuspended({
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,
             suspendPayload: chunk.payload.suspendPayload,
@@ -490,6 +507,17 @@ export class MastraAgent extends AbstractAgent {
         case "finish": {
           flush();
           callbacks.onFinishMessagePart?.();
+          break;
+        }
+        // Known Mastra lifecycle events with no AG-UI mapping — skip silently
+        case "start":
+        case "step-start":
+        case "step-finish":
+          break;
+        default: {
+          console.warn(
+            `[MastraAgent] Unrecognized stream chunk type: ${chunk.type}`,
+          );
           break;
         }
       }
@@ -519,7 +547,8 @@ export class MastraAgent extends AbstractAgent {
    * Streams a local or remote Mastra agent, emitting AG-UI events via callbacks.
    * For local agents, iterates fullStream with processFullStream.
    * For remote agents, uses processDataStream with createChunkProcessor.
-   * Calls onRunFinished on success or onError on failure.
+   * Calls onRunFinished on success. For errors, onError is called either from
+   * within stream processing (error chunks) or from the catch block (thrown exceptions).
    */
   private async streamMastraAgent(
     { threadId, runId, messages, tools, context: inputContext }: RunAgentInput,

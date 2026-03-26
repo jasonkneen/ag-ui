@@ -1,3 +1,4 @@
+import { vi } from "vitest";
 import { EventType } from "@ag-ui/client";
 import {
   FakeLocalAgent,
@@ -100,7 +101,7 @@ describe("interrupt bridge: emit path", () => {
       const event = events.find((e) => e.type === EventType.CUSTOM) as any;
       expect(event.name).toBe("on_interrupt");
 
-      // The value must be a JSON string (not an object) to match LangGraph convention
+      // CustomEvent.value is typed as string in AG-UI protocol (also matches LangGraph convention)
       expect(typeof event.value).toBe("string");
 
       const value = JSON.parse(event.value);
@@ -139,7 +140,7 @@ describe("interrupt bridge: emit path", () => {
 
   describe("tool-call-suspended WITHOUT preceding tool-call", () => {
     it("emits interrupt even when no tool-call chunk precedes it", async () => {
-      // Edge case: Mastra could theoretically emit suspend without tool-call
+      // Defensive: handle tool-call-suspended even without a preceding tool-call chunk
       const agent = makeLocalMastraAgent({
         streamChunks: [
           {
@@ -363,6 +364,56 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(JSON.parse((customEvents[1] as any).value).toolCallId).toBe("tc-y");
   });
 
+  it("errors with descriptive message when chunk has no payload", async () => {
+    const agent = makeLocalMastraAgent({
+      streamChunks: [
+        { type: "text-delta" }, // missing payload
+      ],
+    });
+
+    const { error, events } = await collectError(agent, makeInput());
+
+    expect(error.message).toContain("Malformed stream chunk");
+    expect(error.message).toContain("text-delta");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
+  it("errors with descriptive message when chunk is null", async () => {
+    const agent = makeLocalMastraAgent({
+      streamChunks: [null],
+    });
+
+    const { error, events } = await collectError(agent, makeInput());
+
+    expect(error.message).toContain("Malformed stream chunk");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
+  it("ignores unrecognized chunk types without crashing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const agent = makeLocalMastraAgent({
+      streamChunks: [
+        { type: "text-delta", payload: { text: "hello" } },
+        { type: "unknown-future-type", payload: { data: 123 } },
+        { type: "text-delta", payload: { text: " world" } },
+      ],
+    });
+
+    const events = await collectEvents(agent, makeInput());
+
+    // Both text chunks should be emitted — the unknown chunk is skipped
+    const textChunks = events.filter((e) => e.type === EventType.TEXT_MESSAGE_CHUNK);
+    expect(textChunks).toHaveLength(2);
+
+    // A warning should be logged for the unknown chunk type
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("unknown-future-type"),
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("buffers correctly for remote agents (processDataStream path)", async () => {
     const chunks = [
       { type: "tool-call", payload: { toolCallId: "tc-r", toolName: "remote-tool", args: {} } },
@@ -510,6 +561,44 @@ describe("interrupt bridge: resume path", () => {
     const types = events.map((e) => e.type);
     expect(types).toContain(EventType.RUN_STARTED);
     expect(types).toContain(EventType.RUN_FINISHED);
+  });
+
+  it("decline path emits STATE_SNAPSHOT before RUN_FINISHED when working memory is available", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    fakeAgent.memory.workingMemoryValue = JSON.stringify({ status: "pending_review" });
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const events = await collectEvents(
+      agent,
+      makeInput({
+        forwardedProps: {
+          command: {
+            resume: false,
+            interruptEvent: JSON.stringify({
+              type: "mastra_suspend",
+              toolCallId: "tc-1",
+              runId: "run-1",
+            }),
+          },
+        },
+      }),
+    );
+
+    const types = events.map((e) => e.type);
+
+    // STATE_SNAPSHOT should come before RUN_FINISHED
+    const snapshotIdx = types.indexOf(EventType.STATE_SNAPSHOT);
+    const finishedIdx = types.indexOf(EventType.RUN_FINISHED);
+    expect(snapshotIdx).toBeGreaterThan(-1);
+    expect(finishedIdx).toBeGreaterThan(snapshotIdx);
+
+    const snapshot = events.find((e) => e.type === EventType.STATE_SNAPSHOT) as any;
+    expect(snapshot.snapshot).toEqual({ status: "pending_review" });
   });
 
   it("does not enter resume path when command.resume is null", async () => {
@@ -677,7 +766,8 @@ describe("interrupt bridge: resume path", () => {
     expect(snapshot.snapshot).toEqual({ approved: true, notes: "lgtm" });
   });
 
-  it("still emits RUN_FINISHED when getWorkingMemory throws during resume", async () => {
+  it("still emits RUN_FINISHED when getWorkingMemory throws during resume, and warns", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
     // Make getWorkingMemory throw — simulates memory provider failure
     fakeAgent.memory.getWorkingMemory = async () => {
@@ -710,6 +800,14 @@ describe("interrupt bridge: resume path", () => {
     expect(types).toContain(EventType.RUN_FINISHED);
     // But no STATE_SNAPSHOT since memory failed
     expect(types).not.toContain(EventType.STATE_SNAPSHOT);
+
+    // A warning should be logged so operators can detect the issue
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to emit working memory snapshot"),
+      expect.any(Error),
+    );
+
+    warnSpy.mockRestore();
   });
 
   it("errors when resumeStream returns object without fullStream", async () => {
