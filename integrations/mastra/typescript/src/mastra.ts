@@ -159,6 +159,7 @@ export class MastraAgent extends AbstractAgent {
             );
             await this.processFullStream(response.fullStream, callbacks);
 
+            await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
             subscriber.next({
               type: EventType.RUN_FINISHED,
               threadId: input.threadId,
@@ -239,55 +240,12 @@ export class MastraAgent extends AbstractAgent {
               subscriber.error(error);
             },
             onRunFinished: async () => {
-              if (this.isLocalMastraAgent(this.agent)) {
-                try {
-                  const memory = await this.agent.getMemory({
-                    requestContext: this.requestContext,
-                  });
-                  if (memory) {
-                    const workingMemory = await memory.getWorkingMemory({
-                      resourceId: this.resourceId,
-                      threadId: input.threadId,
-                      memoryConfig: {
-                        workingMemory: {
-                          enabled: true,
-                        },
-                      },
-                    });
-
-                    if (typeof workingMemory === "string") {
-                      let snapshot: Record<string, any> | null = null;
-                      try {
-                        snapshot = JSON.parse(workingMemory);
-                      } catch {
-                        // Working memory is not valid JSON (e.g. markdown template)
-                        // Wrap it so the client still receives the state
-                        snapshot = { workingMemory };
-                      }
-
-                      if (snapshot && !("$schema" in snapshot)) {
-                        const stateSnapshotEvent: StateSnapshotEvent = {
-                          type: EventType.STATE_SNAPSHOT,
-                          snapshot,
-                        };
-
-                        subscriber.next(stateSnapshotEvent);
-                      }
-                    }
-                  }
-                } catch (error) {
-                  console.error("Error sending state snapshot", error);
-                }
-              }
-
-              // Emit run finished event
+              await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
               subscriber.next({
                 type: EventType.RUN_FINISHED,
                 threadId: input.threadId,
                 runId: input.runId,
               } as RunFinishedEvent);
-
-              // Complete the observable
               subscriber.complete();
             },
           });
@@ -306,6 +264,54 @@ export class MastraAgent extends AbstractAgent {
     agent: LocalMastraAgent | RemoteMastraAgent,
   ): agent is LocalMastraAgent {
     return "getMemory" in agent;
+  }
+
+  /**
+   * Fetches working memory from a local agent and emits a STATE_SNAPSHOT event
+   * if valid working memory is available. Errors are caught and logged to avoid
+   * disrupting the run lifecycle.
+   */
+  private async emitWorkingMemorySnapshot(
+    subscriber: { next: (event: BaseEvent) => void },
+    threadId: string,
+  ): Promise<void> {
+    if (!this.isLocalMastraAgent(this.agent)) return;
+    try {
+      const memory = await this.agent.getMemory({
+        requestContext: this.requestContext,
+      });
+      if (memory) {
+        const workingMemory = await memory.getWorkingMemory({
+          resourceId: this.resourceId,
+          threadId,
+          memoryConfig: {
+            workingMemory: {
+              enabled: true,
+            },
+          },
+        });
+
+        if (typeof workingMemory === "string") {
+          let snapshot: Record<string, any> | null = null;
+          try {
+            snapshot = JSON.parse(workingMemory);
+          } catch {
+            // Working memory is not valid JSON (e.g. markdown template)
+            // Wrap it so the client still receives the state
+            snapshot = { workingMemory };
+          }
+
+          if (snapshot && !("$schema" in snapshot)) {
+            subscriber.next({
+              type: EventType.STATE_SNAPSHOT,
+              snapshot,
+            } as StateSnapshotEvent);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error sending state snapshot", error);
+    }
   }
 
   /**
@@ -438,7 +444,11 @@ export class MastraAgent extends AbstractAgent {
           return true;
         }
         case "tool-call-suspended": {
-          pendingToolCall = null;
+          if (pendingToolCall?.toolCallId === chunk.payload.toolCallId) {
+            pendingToolCall = null;
+          } else {
+            flush();
+          }
           callbacks.onToolSuspended?.({
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,
@@ -565,13 +575,15 @@ export class MastraAgent extends AbstractAgent {
             onToolSuspended,
             onError,
           });
+          let stopped = false;
 
           await response.processDataStream({
             onChunk: async (chunk: any) => {
-              handleChunk(chunk);
+              if (stopped) return;
+              if (handleChunk(chunk)) stopped = true;
             },
           });
-          flush();
+          if (!stopped) flush();
           await onRunFinished?.();
         } else {
           throw new Error("Invalid response from remote agent");

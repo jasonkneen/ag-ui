@@ -240,6 +240,54 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(JSON.parse((customEvents[0] as any).value).toolCallId).toBe("tc-b");
   });
 
+  it("remote error chunk stops processing — no post-error events emitted", async () => {
+    const chunks = [
+      { type: "text-delta", payload: { text: "before" } },
+      { type: "error", payload: { error: "something went wrong" } },
+      { type: "text-delta", payload: { text: "after" } },
+    ];
+
+    const agent = makeRemoteMastraAgent({ streamChunks: chunks });
+    const { error, events } = await collectError(agent, makeInput());
+
+    expect(error.message).toBe("something went wrong");
+
+    // Only RUN_STARTED + the pre-error text chunk — no post-error text
+    const textChunks = events.filter((e) => e.type === EventType.TEXT_MESSAGE_CHUNK);
+    expect(textChunks).toHaveLength(1);
+    expect((textChunks[0] as any).delta).toBe("before");
+  });
+
+  it("flushes unrelated pending tool-call when tool-call-suspended has different toolCallId", async () => {
+    // tool-call(tc-A) → tool-call-suspended(tc-B): tc-A should be emitted, not silently discarded
+    const chunks = [
+      { type: "tool-call", payload: { toolCallId: "tc-A", toolName: "tool-a", args: { x: 1 } } },
+      {
+        type: "tool-call-suspended",
+        payload: {
+          toolCallId: "tc-B",
+          toolName: "tool-b",
+          suspendPayload: {},
+          args: {},
+          resumeSchema: "{}",
+        },
+      },
+    ];
+
+    const agent = makeLocalMastraAgent({ streamChunks: chunks });
+    const events = await collectEvents(agent, makeInput());
+
+    // tc-A should have been flushed (emitted) since tc-B is a different tool
+    const toolStarts = events.filter((e) => e.type === EventType.TOOL_CALL_START);
+    expect(toolStarts).toHaveLength(1);
+    expect((toolStarts[0] as any).toolCallId).toBe("tc-A");
+
+    // tc-B's suspend should still produce an interrupt
+    const customEvents = events.filter((e) => e.type === EventType.CUSTOM);
+    expect(customEvents).toHaveLength(1);
+    expect(JSON.parse((customEvents[0] as any).value).toolCallId).toBe("tc-B");
+  });
+
   it("buffers correctly for remote agents (processDataStream path)", async () => {
     const chunks = [
       { type: "tool-call", payload: { toolCallId: "tc-r", toolName: "remote-tool", args: {} } },
@@ -446,6 +494,44 @@ describe("interrupt bridge: resume path", () => {
     );
 
     expect(error.message).toContain("resumeStream returned no valid response");
+  });
+
+  it("emits STATE_SNAPSHOT before RUN_FINISHED when working memory is available", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    fakeAgent.memory.workingMemoryValue = JSON.stringify({ approved: true, notes: "lgtm" });
+
+    const calls: Array<{ resumeData: any; opts: any }> = [];
+    (fakeAgent as any).resumeStream = async (resumeData: any, opts: any) => {
+      calls.push({ resumeData, opts });
+      return {
+        fullStream: (async function* () {
+          yield { type: "text-delta", payload: { text: "Done." } };
+        })(),
+      };
+    };
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const events = await collectEvents(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1", runId: "run-1" }),
+    );
+
+    const types = events.map((e) => e.type);
+    // STATE_SNAPSHOT must come before RUN_FINISHED
+    const snapshotIdx = types.indexOf(EventType.STATE_SNAPSHOT);
+    const finishedIdx = types.indexOf(EventType.RUN_FINISHED);
+
+    expect(snapshotIdx).toBeGreaterThan(-1);
+    expect(finishedIdx).toBeGreaterThan(snapshotIdx);
+
+    // Verify snapshot content
+    const snapshot = events.find((e) => e.type === EventType.STATE_SNAPSHOT) as any;
+    expect(snapshot.snapshot).toEqual({ approved: true, notes: "lgtm" });
   });
 
   it("errors for remote agent resume (not yet supported)", async () => {
