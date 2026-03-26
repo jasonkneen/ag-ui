@@ -189,7 +189,6 @@ export class MastraAgent extends AbstractAgent {
               subscriber.complete();
             }
           } catch (error) {
-            // Let subscriber.error carry the event
             subscriber.error(error);
           }
           return;
@@ -281,11 +280,8 @@ export class MastraAgent extends AbstractAgent {
       };
 
       run().catch((err) => {
-        try {
-          subscriber.error(err);
-        } catch {
-          // Subscriber already closed — error was already delivered
-        }
+        if (subscriber.closed) return;
+        subscriber.error(err);
       });
 
       return () => {};
@@ -417,7 +413,7 @@ export class MastraAgent extends AbstractAgent {
           }),
         } as CustomEvent);
       },
-      onFinishMessagePart: async () => {
+      onFinishMessagePart: () => {
         setMessageId(randomUUID());
       },
     };
@@ -435,7 +431,7 @@ export class MastraAgent extends AbstractAgent {
    * handling and buffering logic.
    *
    * @returns An object with two methods:
-   *   - `handleChunk`: processes a single chunk; returns `true` if processing should stop (error received).
+   *   - `handleChunk`: processes a single chunk; returns `true` if processing should stop (error or malformed chunk).
    *   - `flush`: emits any buffered tool-call (call at end of stream).
    */
   private createChunkProcessor(callbacks: MastraAgentStreamOptions) {
@@ -495,6 +491,14 @@ export class MastraAgent extends AbstractAgent {
           // call is orphaned (never executed) so emitting TOOL_CALL_START/
           // ARGS/END without a TOOL_CALL_RESULT would violate the protocol.
           pendingToolCall = null;
+          if (!chunk.payload.toolCallId || !chunk.payload.toolName) {
+            callbacks.onError(
+              new Error(
+                `Malformed tool-call-suspended: missing toolCallId or toolName in payload`,
+              ),
+            );
+            return true;
+          }
           callbacks.onToolSuspended({
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,
@@ -529,7 +533,7 @@ export class MastraAgent extends AbstractAgent {
 
   /**
    * Processes a Mastra fullStream (async iterable) using createChunkProcessor.
-   * @returns true if processing stopped due to an error chunk.
+   * @returns true if processing stopped early (error chunk or malformed chunk).
    */
   private async processFullStream(
     stream: AsyncIterable<any>,
@@ -609,6 +613,7 @@ export class MastraAgent extends AbstractAgent {
         onError(error as Error);
       }
     } else {
+      let stopped = false;
       try {
         const response = await this.agent.stream(convertedMessages, {
           memory: {
@@ -631,7 +636,6 @@ export class MastraAgent extends AbstractAgent {
             onToolSuspended,
             onError,
           });
-          let stopped = false;
 
           await response.processDataStream({
             onChunk: async (chunk: any) => {
@@ -645,7 +649,7 @@ export class MastraAgent extends AbstractAgent {
           throw new Error("Invalid response from remote agent");
         }
       } catch (error) {
-        onError(error as Error);
+        if (!stopped) onError(error as Error);
       }
     }
   }

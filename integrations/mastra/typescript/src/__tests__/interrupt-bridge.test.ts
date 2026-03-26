@@ -389,6 +389,22 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(events[0]?.type).toBe(EventType.RUN_STARTED);
   });
 
+  it("errors when tool-call-suspended payload is missing toolCallId", async () => {
+    const agent = makeLocalMastraAgent({
+      streamChunks: [
+        {
+          type: "tool-call-suspended",
+          payload: { toolName: "some-tool", suspendPayload: {}, args: {}, resumeSchema: "{}" },
+        },
+      ],
+    });
+
+    const { error, events } = await collectError(agent, makeInput());
+
+    expect(error.message).toContain("Malformed tool-call-suspended");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
   it("ignores unrecognized chunk types without crashing", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -927,7 +943,7 @@ describe("interrupt bridge: resume path", () => {
     const agent = makeLocalMastraAgent({ streamChunks: [] });
 
     // Create input with a forwardedProps getter that throws — this hits
-    // line 94 (forwardedProps?.command) which is before any try-catch block.
+    // the forwardedProps?.command access before any try-catch in run().
     const input = makeInput();
     Object.defineProperty(input, "forwardedProps", {
       get() {
