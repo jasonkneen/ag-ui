@@ -678,6 +678,27 @@ describe("interrupt bridge: resume path", () => {
     expect((textChunks[0] as any).delta).toBe("Approving...");
   });
 
+  it("propagates memory management errors to subscriber", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    fakeAgent.getMemory = async () => {
+      throw new Error("Memory provider connection failed");
+    };
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const { error, events } = await collectError(
+      agent,
+      makeInput({ state: { someKey: "someValue" } }),
+    );
+
+    expect(error.message).toBe("Memory provider connection failed");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
   it("errors for remote agent resume (not yet supported)", async () => {
     const agent = makeRemoteMastraAgent({ streamChunks: [] });
 

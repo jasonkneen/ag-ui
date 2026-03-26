@@ -157,15 +157,22 @@ export class MastraAgent extends AbstractAgent {
               (id) => { messageId = id; },
               input.runId,
             );
-            await this.processFullStream(response.fullStream, callbacks);
+            const hadError = await this.processFullStream(response.fullStream, {
+              ...callbacks,
+              onError: (error) => {
+                subscriber.error(error);
+              },
+            });
 
-            await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
-            subscriber.next({
-              type: EventType.RUN_FINISHED,
-              threadId: input.threadId,
-              runId: input.runId,
-            } as RunFinishedEvent);
-            subscriber.complete();
+            if (!hadError) {
+              await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
+              subscriber.next({
+                type: EventType.RUN_FINISHED,
+                threadId: input.threadId,
+                runId: input.runId,
+              } as RunFinishedEvent);
+              subscriber.complete();
+            }
           } catch (error) {
             // #9: Let subscriber.error carry the event — no console.error
             subscriber.error(error);
@@ -175,54 +182,59 @@ export class MastraAgent extends AbstractAgent {
 
         // Handle local agent memory management (from Mastra implementation)
         if (this.isLocalMastraAgent(this.agent)) {
-          const memory = await this.agent.getMemory({
-            requestContext: this.requestContext,
-          });
-
-          if (
-            memory &&
-            input.state &&
-            Object.keys(input.state).length > 0
-          ) {
-            let thread: StorageThreadType | null = await memory.getThreadById({
-              threadId: input.threadId,
+          try {
+            const memory = await this.agent.getMemory({
+              requestContext: this.requestContext,
             });
 
-            if (!thread) {
-              thread = {
-                id: input.threadId,
-                title: "",
-                metadata: {},
-                resourceId: this.resourceId ?? input.threadId,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              };
-            }
+            if (
+              memory &&
+              input.state &&
+              Object.keys(input.state).length > 0
+            ) {
+              let thread: StorageThreadType | null = await memory.getThreadById({
+                threadId: input.threadId,
+              });
 
-            let existingMemory: Record<string, any> = {};
-            try {
-              existingMemory = JSON.parse(
-                (thread.metadata?.workingMemory as string) ?? "{}",
-              );
-            } catch {
-              // Working memory metadata is not valid JSON - start fresh
-            }
-            const { messages, ...rest } = input.state;
-            const workingMemory = JSON.stringify({
-              ...existingMemory,
-              ...rest,
-            });
+              if (!thread) {
+                thread = {
+                  id: input.threadId,
+                  title: "",
+                  metadata: {},
+                  resourceId: this.resourceId ?? input.threadId,
+                  createdAt: new Date(),
+                  updatedAt: new Date(),
+                };
+              }
 
-            // Update thread metadata with new working memory
-            await memory.saveThread({
-              thread: {
-                ...thread,
-                metadata: {
-                  ...thread.metadata,
-                  workingMemory,
+              let existingMemory: Record<string, any> = {};
+              try {
+                existingMemory = JSON.parse(
+                  (thread.metadata?.workingMemory as string) ?? "{}",
+                );
+              } catch {
+                // Working memory metadata is not valid JSON - start fresh
+              }
+              const { messages, ...rest } = input.state;
+              const workingMemory = JSON.stringify({
+                ...existingMemory,
+                ...rest,
+              });
+
+              // Update thread metadata with new working memory
+              await memory.saveThread({
+                thread: {
+                  ...thread,
+                  metadata: {
+                    ...thread.metadata,
+                    workingMemory,
+                  },
                 },
-              },
-            });
+              });
+            }
+          } catch (error) {
+            subscriber.error(error);
+            return;
           }
         }
 
