@@ -48,7 +48,7 @@ interface MastraAgentStreamOptions {
     args: any;
   }) => void;
   onToolResultPart?: (streamPart: { toolCallId: string; result: any }) => void;
-  onError?: (error: Error) => void;
+  onError: (error: Error) => void;
   onRunFinished?: () => Promise<void>;
   onToolSuspended?: (payload: {
     toolCallId: string;
@@ -335,7 +335,7 @@ export class MastraAgent extends AbstractAgent {
     getMessageId: () => string,
     setMessageId: (id: string) => void,
     runId: string,
-  ): MastraAgentStreamOptions {
+  ): Omit<MastraAgentStreamOptions, "onError" | "onRunFinished"> {
     return {
       onTextPart: (text) => {
         subscriber.next({
@@ -388,9 +388,6 @@ export class MastraAgent extends AbstractAgent {
       },
       onFinishMessagePart: async () => {
         setMessageId(randomUUID());
-      },
-      onError: (error) => {
-        throw error;
       },
     };
   }
@@ -450,9 +447,7 @@ export class MastraAgent extends AbstractAgent {
         }
         case "error": {
           const error = new Error(chunk.payload.error as string);
-          if (callbacks.onError) {
-            callbacks.onError(error);
-          }
+          callbacks.onError(error);
           return true;
         }
         case "tool-call-suspended": {
@@ -563,7 +558,7 @@ export class MastraAgent extends AbstractAgent {
           throw new Error("Invalid response from local agent");
         }
       } catch (error) {
-        onError?.(error as Error);
+        onError(error as Error);
       }
     } else {
       // Remote agent - use the remote agent's stream method
@@ -603,7 +598,7 @@ export class MastraAgent extends AbstractAgent {
           throw new Error("Invalid response from remote agent");
         }
       } catch (error) {
-        onError?.(error as Error);
+        onError(error as Error);
       }
     }
   }

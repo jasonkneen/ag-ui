@@ -1,6 +1,7 @@
 import { EventType } from "@ag-ui/client";
 import {
   FakeLocalAgent,
+  FakeRemoteAgent,
   FakeMemory,
   makeLocalMastraAgent,
   makeRemoteMastraAgent,
@@ -696,6 +697,45 @@ describe("interrupt bridge: resume path", () => {
     );
 
     expect(error.message).toBe("Memory provider connection failed");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
+  it("propagates error when local agent .stream() throws (not silently dropped)", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    // Override stream to throw — simulates a network/auth failure
+    fakeAgent.stream = async () => {
+      throw new Error("Connection refused");
+    };
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const { error, events } = await collectError(agent, makeInput());
+
+    // The error must reach the subscriber — not be silently swallowed
+    expect(error.message).toBe("Connection refused");
+    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
+  it("propagates error when remote agent .stream() throws (not silently dropped)", async () => {
+    const fakeAgent = new FakeRemoteAgent({ streamChunks: [] });
+    // Override stream to throw
+    fakeAgent.stream = async () => {
+      throw new Error("Remote auth failed");
+    };
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const { error, events } = await collectError(agent, makeInput());
+
+    expect(error.message).toBe("Remote auth failed");
     expect(events[0]?.type).toBe(EventType.RUN_STARTED);
   });
 
