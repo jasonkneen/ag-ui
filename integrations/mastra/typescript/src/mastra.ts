@@ -89,8 +89,8 @@ export class MastraAgent extends AbstractAgent {
 
         subscriber.next(runStartedEvent);
 
-        // Check for resume from interrupt
-        // Note: input.forwardedProps is typed as ZodAny, so no cast needed
+        // CopilotKit passes resume data via forwardedProps.command (convention
+        // shared with LangGraph's interrupt bridge). forwardedProps is ZodAny.
         const forwardedCommand = input.forwardedProps?.command;
         if (forwardedCommand?.resume != null && forwardedCommand?.interruptEvent) {
           // #2: Safely parse interruptEvent — client-supplied data
@@ -180,7 +180,7 @@ export class MastraAgent extends AbstractAgent {
           return;
         }
 
-        // Handle local agent memory management (from Mastra implementation)
+        // Sync AG-UI input state into Mastra's working memory before streaming
         if (this.isLocalMastraAgent(this.agent)) {
           try {
             const memory = await this.agent.getMemory({
@@ -221,7 +221,6 @@ export class MastraAgent extends AbstractAgent {
                 ...rest,
               });
 
-              // Update thread metadata with new working memory
               await memory.saveThread({
                 thread: {
                   ...thread,
@@ -266,7 +265,7 @@ export class MastraAgent extends AbstractAgent {
         }
       };
 
-      run();
+      run().catch((err) => subscriber.error(err));
 
       return () => {};
     });
@@ -280,14 +279,18 @@ export class MastraAgent extends AbstractAgent {
 
   /**
    * Fetches working memory from a local agent and emits a STATE_SNAPSHOT event
-   * if valid working memory is available. Errors are caught and logged to avoid
-   * disrupting the run lifecycle.
+   * if valid working memory is available.
+   *
+   * Best-effort: returns false on failure so callers can proceed with
+   * RUN_FINISHED even when the snapshot could not be delivered.
+   *
+   * @returns true if snapshot was emitted (or skipped cleanly), false on error.
    */
   private async emitWorkingMemorySnapshot(
     subscriber: { next: (event: BaseEvent) => void },
     threadId: string,
-  ): Promise<void> {
-    if (!this.isLocalMastraAgent(this.agent)) return;
+  ): Promise<boolean> {
+    if (!this.isLocalMastraAgent(this.agent)) return true;
     try {
       const memory = await this.agent.getMemory({
         requestContext: this.requestContext,
@@ -313,6 +316,8 @@ export class MastraAgent extends AbstractAgent {
             snapshot = { workingMemory };
           }
 
+          // Skip snapshots containing a JSON Schema definition ($schema) —
+          // these are Mastra's working-memory templates, not actual state.
           if (snapshot && !("$schema" in snapshot)) {
             subscriber.next({
               type: EventType.STATE_SNAPSHOT,
@@ -321,14 +326,17 @@ export class MastraAgent extends AbstractAgent {
           }
         }
       }
-    } catch (error) {
-      console.error("Error sending state snapshot", error);
+      return true;
+    } catch {
+      return false;
     }
   }
 
   /**
    * Creates the callback set used by processFullStream to emit AG-UI events.
-   * messageId is accessed/mutated via getter/setter to share state with run().
+   * messageId is accessed/mutated via getter/setter closures so that when
+   * onFinishMessagePart rotates the ID, subsequent callbacks in the same
+   * run() invocation see the updated value.
    */
   private makeStreamCallbacks(
     subscriber: { next: (event: BaseEvent) => void },
@@ -403,8 +411,9 @@ export class MastraAgent extends AbstractAgent {
    * path (processDataStream callback) — single source of truth for chunk
    * handling and buffering logic.
    *
-   * @returns handleChunk (returns true if processing should stop, e.g. on error)
-   *          and flush (emits any buffered tool-call at end of stream).
+   * @returns An object with two methods:
+   *   - `handleChunk`: processes a single chunk; returns `true` if processing should stop (error received).
+   *   - `flush`: emits any buffered tool-call (call at end of stream).
    */
   private createChunkProcessor(callbacks: MastraAgentStreamOptions) {
     let pendingToolCall: {
@@ -494,10 +503,10 @@ export class MastraAgent extends AbstractAgent {
   }
 
   /**
-   * Streams in process or remote mastra agent.
-   * @param input - The input for the mastra agent.
-   * @param options - The options for the mastra agent.
-   * @returns The stream of the mastra agent.
+   * Streams a local or remote Mastra agent, emitting AG-UI events via callbacks.
+   * For local agents, iterates fullStream with processFullStream.
+   * For remote agents, uses processDataStream with createChunkProcessor.
+   * Calls onRunFinished on success or onError on failure.
    */
   private async streamMastraAgent(
     { threadId, runId, messages, tools, context: inputContext }: RunAgentInput,
@@ -529,7 +538,6 @@ export class MastraAgent extends AbstractAgent {
     const requestContext = this.requestContext;
 
     if (this.isLocalMastraAgent(this.agent)) {
-      // Local agent - use the agent's stream method directly
       try {
         const response = await this.agent.stream(convertedMessages, {
           memory: {
@@ -541,8 +549,6 @@ export class MastraAgent extends AbstractAgent {
           requestContext,
         });
 
-        // For local agents, the response should already be a stream
-        // Process it using the agent's built-in streaming mechanism
         if (response && typeof response === "object") {
           const hadError = await this.processFullStream(response.fullStream, {
             onTextPart,
@@ -561,7 +567,6 @@ export class MastraAgent extends AbstractAgent {
         onError(error as Error);
       }
     } else {
-      // Remote agent - use the remote agent's stream method
       try {
         const response = await this.agent.stream(convertedMessages, {
           memory: {

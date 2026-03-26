@@ -377,6 +377,38 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(events.filter((e) => e.type === EventType.TOOL_CALL_START)).toHaveLength(0);
     expect(events.filter((e) => e.type === EventType.CUSTOM)).toHaveLength(1);
   });
+
+  it("flushes buffered tool-call when text-delta arrives between tool-call and tool-call-suspended", async () => {
+    // tool-call(tc-1) → text-delta → tool-call-suspended(tc-1)
+    // The text-delta flushes the buffered tool-call, so tc-1 IS emitted.
+    // The suspend still emits a CUSTOM event (no matching pending to suppress).
+    const chunks = [
+      { type: "tool-call", payload: { toolCallId: "tc-1", toolName: "slow-tool", args: { x: 1 } } },
+      { type: "text-delta", payload: { text: "Processing..." } },
+      {
+        type: "tool-call-suspended",
+        payload: { toolCallId: "tc-1", toolName: "slow-tool", suspendPayload: {}, args: { x: 1 }, resumeSchema: "{}" },
+      },
+    ];
+
+    const agent = makeLocalMastraAgent({ streamChunks: chunks });
+    const events = await collectEvents(agent, makeInput());
+
+    // tc-1 was flushed by the text-delta, so TOOL_CALL_START is present
+    const toolStarts = events.filter((e) => e.type === EventType.TOOL_CALL_START);
+    expect(toolStarts).toHaveLength(1);
+    expect((toolStarts[0] as any).toolCallId).toBe("tc-1");
+
+    // text-delta was emitted
+    const textChunks = events.filter((e) => e.type === EventType.TEXT_MESSAGE_CHUNK);
+    expect(textChunks).toHaveLength(1);
+    expect((textChunks[0] as any).delta).toBe("Processing...");
+
+    // The suspend still produces an interrupt
+    const customEvents = events.filter((e) => e.type === EventType.CUSTOM);
+    expect(customEvents).toHaveLength(1);
+    expect(JSON.parse((customEvents[0] as any).value).toolCallId).toBe("tc-1");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -638,6 +670,41 @@ describe("interrupt bridge: resume path", () => {
     expect(snapshot.snapshot).toEqual({ approved: true, notes: "lgtm" });
   });
 
+  it("still emits RUN_FINISHED when getWorkingMemory throws during resume", async () => {
+    const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+    // Make getWorkingMemory throw — simulates memory provider failure
+    fakeAgent.memory.getWorkingMemory = async () => {
+      throw new Error("Memory provider unavailable");
+    };
+
+    const calls: Array<{ resumeData: any; opts: any }> = [];
+    (fakeAgent as any).resumeStream = async (resumeData: any, opts: any) => {
+      calls.push({ resumeData, opts });
+      return {
+        fullStream: (async function* () {
+          yield { type: "text-delta", payload: { text: "Approved." } };
+        })(),
+      };
+    };
+
+    const agent = new MastraAgent({
+      agentId: "test-agent",
+      agent: fakeAgent as any,
+      resourceId: "resource-1",
+    });
+
+    const events = await collectEvents(
+      agent,
+      makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1", runId: "run-1" }),
+    );
+
+    const types = events.map((e) => e.type);
+    // Run should complete — memory failure is non-fatal
+    expect(types).toContain(EventType.RUN_FINISHED);
+    // But no STATE_SNAPSHOT since memory failed
+    expect(types).not.toContain(EventType.STATE_SNAPSHOT);
+  });
+
   it("errors when resumeStream returns object without fullStream", async () => {
     const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
     (fakeAgent as any).resumeStream = async () => ({ text: "done" }); // no fullStream
@@ -749,5 +816,21 @@ describe("interrupt bridge: resume path", () => {
 
     expect(error.message).toContain("not yet supported for remote");
     expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+  });
+
+  it("propagates errors thrown before any try-catch in run() to subscriber", async () => {
+    const agent = makeLocalMastraAgent({ streamChunks: [] });
+
+    // Create input with a forwardedProps getter that throws — this hits
+    // line 94 (forwardedProps?.command) which is before any try-catch block.
+    const input = makeInput();
+    Object.defineProperty(input, "forwardedProps", {
+      get() {
+        throw new Error("Unexpected getter failure");
+      },
+    });
+
+    const { error } = await collectError(agent, input);
+    expect(error.message).toBe("Unexpected getter failure");
   });
 });
