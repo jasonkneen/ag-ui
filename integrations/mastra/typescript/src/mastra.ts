@@ -92,6 +92,19 @@ export class MastraAgent extends AbstractAgent {
         // CopilotKit passes resume data via forwardedProps.command (convention
         // shared with LangGraph's interrupt bridge). forwardedProps is ZodAny.
         const forwardedCommand = input.forwardedProps?.command;
+
+        // resume: false means the user explicitly declined the tool call.
+        // Close the run cleanly without calling resumeStream.
+        if (forwardedCommand?.resume === false && forwardedCommand?.interruptEvent) {
+          subscriber.next({
+            type: EventType.RUN_FINISHED,
+            threadId: input.threadId,
+            runId: input.runId,
+          } as RunFinishedEvent);
+          subscriber.complete();
+          return;
+        }
+
         if (forwardedCommand?.resume != null && forwardedCommand?.interruptEvent) {
           // #2: Safely parse interruptEvent — client-supplied data
           let interruptEvent: any;
@@ -460,11 +473,11 @@ export class MastraAgent extends AbstractAgent {
           return true;
         }
         case "tool-call-suspended": {
-          if (pendingToolCall?.toolCallId === chunk.payload.toolCallId) {
-            pendingToolCall = null;
-          } else {
-            flush();
-          }
+          // Always discard the pending tool-call: if it matches, the tool
+          // was suspended before execution; if it doesn't match, the pending
+          // call is orphaned (never executed) so emitting TOOL_CALL_START/
+          // ARGS/END without a TOOL_CALL_RESULT would violate the protocol.
+          pendingToolCall = null;
           callbacks.onToolSuspended?.({
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,

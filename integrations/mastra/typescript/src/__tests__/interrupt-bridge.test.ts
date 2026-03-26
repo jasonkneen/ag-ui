@@ -304,8 +304,10 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(types).toEqual([EventType.RUN_STARTED, EventType.TEXT_MESSAGE_CHUNK]);
   });
 
-  it("flushes unrelated pending tool-call when tool-call-suspended has different toolCallId", async () => {
-    // tool-call(tc-A) → tool-call-suspended(tc-B): tc-A should be emitted, not silently discarded
+  it("discards pending tool-call when tool-call-suspended has different toolCallId (no orphaned emit)", async () => {
+    // tool-call(tc-A) → tool-call-suspended(tc-B): tc-A never executed,
+    // so emitting TOOL_CALL_START/ARGS/END without a TOOL_CALL_RESULT is
+    // a protocol violation. tc-A must be silently discarded.
     const chunks = [
       { type: "tool-call", payload: { toolCallId: "tc-A", toolName: "tool-a", args: { x: 1 } } },
       {
@@ -323,10 +325,9 @@ describe("interrupt bridge: tool-call buffering", () => {
     const agent = makeLocalMastraAgent({ streamChunks: chunks });
     const events = await collectEvents(agent, makeInput());
 
-    // tc-A should have been flushed (emitted) since tc-B is a different tool
+    // tc-A must NOT be emitted — no TOOL_CALL events at all
     const toolStarts = events.filter((e) => e.type === EventType.TOOL_CALL_START);
-    expect(toolStarts).toHaveLength(1);
-    expect((toolStarts[0] as any).toolCallId).toBe("tc-A");
+    expect(toolStarts).toHaveLength(0);
 
     // tc-B's suspend should still produce an interrupt
     const customEvents = events.filter((e) => e.type === EventType.CUSTOM);
@@ -480,12 +481,13 @@ describe("interrupt bridge: resume path", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("enters resume path when command.resume is false (falsy but not null/undefined)", async () => {
-    // resume: false passes the `!= null` guard — this is intentional because
-    // `false` is a valid resume value (e.g., "not approved")
+  it("treats resume: false as a decline — emits RUN_FINISHED without calling resumeStream", async () => {
+    // resume: false means the user declined the tool call. The adapter must
+    // NOT forward this to resumeStream (whose handling of `false` is
+    // undocumented) — instead it should cleanly close the run.
     const { agent, calls } = makeFakeLocalAgentWithResumeStream([]);
 
-    await collectEvents(
+    const events = await collectEvents(
       agent,
       makeInput({
         forwardedProps: {
@@ -501,8 +503,13 @@ describe("interrupt bridge: resume path", () => {
       }),
     );
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].resumeData).toBe(false);
+    // resumeStream must NOT be called
+    expect(calls).toHaveLength(0);
+
+    // Run should complete cleanly
+    const types = events.map((e) => e.type);
+    expect(types).toContain(EventType.RUN_STARTED);
+    expect(types).toContain(EventType.RUN_FINISHED);
   });
 
   it("does not enter resume path when command.resume is null", async () => {
