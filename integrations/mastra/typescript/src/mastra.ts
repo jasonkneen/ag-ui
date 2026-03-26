@@ -144,9 +144,9 @@ export class MastraAgent extends AbstractAgent {
             );
 
             // #5: Null/invalid response from resumeStream is an error
-            if (!response || typeof response !== "object") {
+            if (!response || typeof response !== "object" || !response.fullStream) {
               subscriber.error(
-                new Error("resumeStream returned no valid response"),
+                new Error("resumeStream returned no valid response (missing fullStream)"),
               );
               return;
             }
@@ -472,16 +472,18 @@ export class MastraAgent extends AbstractAgent {
 
   /**
    * Processes a Mastra fullStream (async iterable) using createChunkProcessor.
+   * @returns true if processing stopped due to an error chunk.
    */
   private async processFullStream(
     stream: AsyncIterable<any>,
     callbacks: MastraAgentStreamOptions,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { handleChunk, flush } = this.createChunkProcessor(callbacks);
     for await (const chunk of stream) {
-      if (handleChunk(chunk)) return;
+      if (handleChunk(chunk)) return true;
     }
     flush();
+    return false;
   }
 
   /**
@@ -535,7 +537,7 @@ export class MastraAgent extends AbstractAgent {
         // For local agents, the response should already be a stream
         // Process it using the agent's built-in streaming mechanism
         if (response && typeof response === "object") {
-          await this.processFullStream(response.fullStream, {
+          const hadError = await this.processFullStream(response.fullStream, {
             onTextPart,
             onFinishMessagePart,
             onToolCallPart,
@@ -544,7 +546,7 @@ export class MastraAgent extends AbstractAgent {
             onError,
           });
 
-          await onRunFinished?.();
+          if (!hadError) await onRunFinished?.();
         } else {
           throw new Error("Invalid response from local agent");
         }
@@ -584,7 +586,7 @@ export class MastraAgent extends AbstractAgent {
             },
           });
           if (!stopped) flush();
-          await onRunFinished?.();
+          if (!stopped) await onRunFinished?.();
         } else {
           throw new Error("Invalid response from remote agent");
         }
