@@ -42,6 +42,9 @@ export interface AgentStateMutation {
 
 export interface AgentSubscriberParams {
   messages: ReadonlyArray<Readonly<Message>>;
+  // NOTE: State resolves to `any` at the type level (z.infer<typeof z.any()>), so Readonly<State>
+  // provides no compile-time mutation protection. Runtime enforcement via deepFreeze in
+  // dev/test mode is the only guard against in-place mutation of state.
   state: Readonly<State>;
   agent: AbstractAgent;
   input: RunAgentInput;
@@ -205,12 +208,12 @@ export interface AgentSubscriber {
   ): MaybePromise<void>;
 }
 
-function devOnlyDeepFreeze<T>(obj: T): T {
+function deepFreeze<T>(obj: T): T {
   Object.freeze(obj);
   if (obj !== null && typeof obj === "object") {
     for (const value of Object.values(obj)) {
       if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-        devOnlyDeepFreeze(value);
+        deepFreeze(value);
       }
     }
   }
@@ -227,10 +230,12 @@ export async function runSubscribersWithMutation(
     state: Readonly<State>,
   ) => MaybePromise<AgentStateMutation | void>,
 ): Promise<AgentStateMutation> {
+  const isTestEnvironment =
+    process.env.NODE_ENV === "test" || Boolean(process.env.VITEST_WORKER_ID);
   const isDev =
     process.env.NODE_ENV === "development" ||
     process.env.NODE_ENV === "test" ||
-    process.env.VITEST_WORKER_ID !== undefined;
+    Boolean(process.env.VITEST_WORKER_ID);
   const baselineMessages = structuredClone_(initialMessages);
   const baselineState = structuredClone_(initialState);
   let messages: Message[] = baselineMessages;
@@ -242,10 +247,11 @@ export async function runSubscribersWithMutation(
     try {
       // Subscribers receive shared references and must not mutate them in-place.
       // Mutations should only be communicated via the return value.
-      // In development mode, freeze inputs to catch accidental in-place mutations.
+      // In dev/test mode only: deep-freeze inputs so accidental in-place mutations surface
+      // as TypeErrors immediately. In production, enforcement is type-level only.
       if (isDev) {
-        devOnlyDeepFreeze(messages);
-        devOnlyDeepFreeze(state);
+        deepFreeze(messages);
+        deepFreeze(state);
       }
       const mutation = await executor(subscriber, messages, state);
 
@@ -270,11 +276,20 @@ export async function runSubscribersWithMutation(
         break;
       }
     } catch (error) {
-      // Log subscriber errors but continue processing (silence during tests)
-      const isTestEnvironment =
-        process.env.NODE_ENV === "test" || process.env.VITEST_WORKER_ID !== undefined;
-
-      if (!isTestEnvironment) {
+      if (isDev && error instanceof TypeError) {
+        // Likely a freeze violation: subscriber attempted to mutate frozen inputs in-place.
+        // In test environments, re-throw so tests fail fast and the violation is visible.
+        // In development (non-test), log a specific message to distinguish freeze violations
+        // from ordinary subscriber errors.
+        if (isTestEnvironment) {
+          throw error;
+        }
+        console.error(
+          "AG-UI: Subscriber attempted to mutate frozen inputs in-place. " +
+            "Return mutations via AgentStateMutation instead of mutating directly.",
+          error,
+        );
+      } else if (!isTestEnvironment) {
         console.error("Subscriber error:", error);
       }
       // Skip this subscriber's mutation and continue
@@ -282,9 +297,16 @@ export async function runSubscribersWithMutation(
     }
   }
 
+  // In dev/test mode, the canonical messages/state references may have been
+  // frozen in-place (for subscriber mutation detection). Clone them before
+  // returning so callers receive a mutable copy, not a frozen one.
   return {
-    ...(messages !== baselineMessages ? { messages } : {}),
-    ...(state !== baselineState ? { state } : {}),
+    ...(messages !== baselineMessages
+      ? { messages: isDev && Object.isFrozen(messages) ? structuredClone_(messages) : messages }
+      : {}),
+    ...(state !== baselineState
+      ? { state: isDev && Object.isFrozen(state) ? structuredClone_(state) : state }
+      : {}),
     ...(stopPropagation !== undefined ? { stopPropagation } : {}),
   };
 }
