@@ -32,7 +32,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -104,7 +104,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -160,7 +160,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -228,7 +228,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -284,13 +284,11 @@ describe("verifyEvents multiple runs", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(false)(source$).subscribe({
+    const subscription = verifyEvents(undefined)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
-        expect(err.message).toContain(
-          "Cannot send 'RUN_STARTED' while a run is still active",
-        );
+        expect(err.message).toContain("Cannot send 'RUN_STARTED' while a run is still active");
         subscription.unsubscribe();
       },
     });
@@ -324,7 +322,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -376,13 +374,11 @@ describe("verifyEvents multiple runs", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(false)(source$).subscribe({
+    const subscription = verifyEvents(undefined)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
-        expect(err.message).toContain(
-          "The run has already errored with 'RUN_ERROR'",
-        );
+        expect(err.message).toContain("The run has already errored with 'RUN_ERROR'");
         subscription.unsubscribe();
       },
     });
@@ -420,7 +416,7 @@ describe("verifyEvents multiple runs", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(false)(source$).pipe(
+      verifyEvents(undefined)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;

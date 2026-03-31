@@ -48,14 +48,14 @@ import type { Observable } from "rxjs";
 import { concatMap, defaultIfEmpty, mergeAll, mergeMap } from "rxjs/operators";
 import untruncateJson from "untruncate-json";
 import { structuredClone_ } from "../utils";
-import type { ResolvedAgentDebugConfig } from "@/agent/types";
+import type { DebugLogger } from "@/debug-logger";
 
 export const defaultApplyEvents = (
   input: RunAgentInput,
   events$: Observable<BaseEvent>,
   agent: AbstractAgent,
   subscribers: AgentSubscriber[],
-  debug?: ResolvedAgentDebugConfig,
+  debugLogger?: DebugLogger,
 ): Observable<AgentStateMutation> => {
   let messages = structuredClone_(agent.messages);
   let state = structuredClone_(input.state);
@@ -92,22 +92,16 @@ export const defaultApplyEvents = (
       );
       applyMutation(mutation);
 
-      if (debug?.events) {
-        if (mutation.stopPropagation === true) {
-          console.debug("[APPLY] Event dropped:", {
-            type: event.type,
-            reason: "stopPropagation by subscriber",
-          });
-        } else {
-          if (debug.verbose) {
-            console.debug("[APPLY] Event applied:", JSON.stringify(event));
-          } else {
-            console.debug("[APPLY] Event applied:", {
-              type: event.type,
-              subscribers: subscribers.length,
-            });
-          }
-        }
+      if (mutation.stopPropagation === true) {
+        debugLogger?.event("APPLY", "Event dropped:", event, {
+          type: event.type,
+          reason: "stopPropagation by subscriber",
+        });
+      } else {
+        debugLogger?.event("APPLY", "Event applied:", event, {
+          type: event.type,
+          subscribers: subscribers.length,
+        });
       }
 
       if (mutation.stopPropagation === true) {

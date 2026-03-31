@@ -32,7 +32,7 @@ describe("transformChunks with roles", () => {
       };
 
       from([chunk, closeEvent])
-        .pipe(transformChunks(false), toArray())
+        .pipe(transformChunks(undefined), toArray())
         .subscribe({
           next: (events) => {
             expect(events).toHaveLength(4); // start, content, end, run_finished
@@ -72,7 +72,7 @@ describe("transformChunks with roles", () => {
       };
 
       from([chunk, closeEvent])
-        .pipe(transformChunks(false), toArray())
+        .pipe(transformChunks(undefined), toArray())
         .subscribe({
           next: (events) => {
             expect(events).toHaveLength(4);
@@ -113,7 +113,7 @@ describe("transformChunks with roles", () => {
       };
 
       from([chunk1, chunk2, closeEvent])
-        .pipe(transformChunks(false), toArray())
+        .pipe(transformChunks(undefined), toArray())
         .subscribe({
           next: (events) => {
             // Should have: start1, content1, end1, start2, content2, end2, run_finished

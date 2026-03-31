@@ -1,6 +1,6 @@
 import { Observable, Subject } from "rxjs";
 import { HttpEvent, HttpEventType } from "../run/http-request";
-import { ResolvedAgentDebugConfig } from "@/agent/types";
+import { DebugLogger } from "@/debug-logger";
 
 /**
  * Parses a stream of HTTP events into a stream of JSON objects using Server-Sent Events (SSE) format.
@@ -12,7 +12,7 @@ import { ResolvedAgentDebugConfig } from "@/agent/types";
  */
 export const parseSSEStream = (
   source$: Observable<HttpEvent>,
-  debug?: ResolvedAgentDebugConfig,
+  debugLogger?: DebugLogger,
 ): Observable<any> => {
   const jsonSubject = new Subject<any>();
   // Create TextDecoder with stream option set to true to handle split UTF-8 characters
@@ -79,13 +79,7 @@ export const parseSSEStream = (
         // Join multi-line data and parse JSON
         const jsonStr = dataLines.join("\n");
         const json = JSON.parse(jsonStr);
-        if (debug?.events) {
-          if (debug.verbose) {
-            console.debug("[SSE] Event received:", JSON.stringify(json));
-          } else {
-            console.debug("[SSE] Event received:", { type: json.type });
-          }
-        }
+        debugLogger?.event("SSE", "Event received:", json, { type: json.type });
         jsonSubject.next(json);
       } catch (err) {
         jsonSubject.error(err);

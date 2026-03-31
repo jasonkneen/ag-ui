@@ -25,7 +25,7 @@ export abstract class Middleware {
    */
   protected runNext(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
     return next.run(input).pipe(
-      transformChunks(false), // Always transform chunks to full events
+      transformChunks(undefined), // Always transform chunks to full events
     );
   }
 

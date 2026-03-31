@@ -5,14 +5,14 @@ import { parseSSEStream } from "./sse";
 import { parseProtoStream } from "./proto";
 import * as proto from "@ag-ui/proto";
 import { EventType } from "@ag-ui/core";
-import { ResolvedAgentDebugConfig } from "@/agent/types";
+import { DebugLogger } from "@/debug-logger";
 
 /**
  * Transforms HTTP events into BaseEvents using the appropriate format parser based on content type.
  */
 export const transformHttpEventStream = (
   source$: Observable<HttpEvent>,
-  debug?: ResolvedAgentDebugConfig,
+  debugLogger?: DebugLogger,
 ): Observable<BaseEvent> => {
   const eventSubject = new Subject<BaseEvent>();
 
@@ -33,12 +33,10 @@ export const transformHttpEventStream = (
         parserInitialized = true;
         const contentType = event.headers.get("content-type");
 
-        if (debug?.lifecycle) {
-          console.debug("[HTTP] Stream format detected:", {
-            contentType,
-            parser: contentType === proto.AGUI_MEDIA_TYPE ? "protobuf" : "sse",
-          });
-        }
+        debugLogger?.lifecycle("HTTP", "Stream format detected:", {
+          contentType,
+          parser: contentType === proto.AGUI_MEDIA_TYPE ? "protobuf" : "sse",
+        });
 
         // Choose parser based on content type
         if (contentType === proto.AGUI_MEDIA_TYPE) {
@@ -50,18 +48,17 @@ export const transformHttpEventStream = (
           });
         } else {
           // Use SSE JSON parser for all other cases
-          parseSSEStream(bufferSubject, debug).subscribe({
+          parseSSEStream(bufferSubject, debugLogger).subscribe({
             next: (json) => {
               try {
                 const parsedEvent = EventSchemas.parse(json);
-                if (debug?.events) {
-                  console.debug("[HTTP] Event validated:", { type: parsedEvent.type, valid: true });
-                }
+                debugLogger?.event("HTTP", "Event validated:", parsedEvent, {
+                  type: parsedEvent.type,
+                  valid: true,
+                });
                 eventSubject.next(parsedEvent as BaseEvent);
               } catch (err) {
-                if (debug?.events) {
-                  console.debug("[HTTP] Event invalid:", { json, error: String(err) });
-                }
+                debugLogger?.event("HTTP", "Event invalid:", { json, error: String(err) });
                 eventSubject.error(err);
               }
             },
