@@ -5,11 +5,15 @@ import { parseSSEStream } from "./sse";
 import { parseProtoStream } from "./proto";
 import * as proto from "@ag-ui/proto";
 import { EventType } from "@ag-ui/core";
+import { ResolvedAgentDebugConfig } from "@/agent/types";
 
 /**
  * Transforms HTTP events into BaseEvents using the appropriate format parser based on content type.
  */
-export const transformHttpEventStream = (source$: Observable<HttpEvent>): Observable<BaseEvent> => {
+export const transformHttpEventStream = (
+  source$: Observable<HttpEvent>,
+  debug?: ResolvedAgentDebugConfig,
+): Observable<BaseEvent> => {
   const eventSubject = new Subject<BaseEvent>();
 
   // Use ReplaySubject to buffer events until we decide on the parser
@@ -29,6 +33,13 @@ export const transformHttpEventStream = (source$: Observable<HttpEvent>): Observ
         parserInitialized = true;
         const contentType = event.headers.get("content-type");
 
+        if (debug?.lifecycle) {
+          console.debug("[HTTP] Stream format detected:", {
+            contentType,
+            parser: contentType === proto.AGUI_MEDIA_TYPE ? "protobuf" : "sse",
+          });
+        }
+
         // Choose parser based on content type
         if (contentType === proto.AGUI_MEDIA_TYPE) {
           // Use protocol buffer parser
@@ -39,12 +50,18 @@ export const transformHttpEventStream = (source$: Observable<HttpEvent>): Observ
           });
         } else {
           // Use SSE JSON parser for all other cases
-          parseSSEStream(bufferSubject).subscribe({
+          parseSSEStream(bufferSubject, debug).subscribe({
             next: (json) => {
               try {
                 const parsedEvent = EventSchemas.parse(json);
+                if (debug?.events) {
+                  console.debug("[HTTP] Event validated:", { type: parsedEvent.type, valid: true });
+                }
                 eventSubject.next(parsedEvent as BaseEvent);
               } catch (err) {
+                if (debug?.events) {
+                  console.debug("[HTTP] Event invalid:", { json, error: String(err) });
+                }
                 eventSubject.error(err);
               }
             },

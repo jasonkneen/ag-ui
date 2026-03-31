@@ -15,6 +15,7 @@ import {
   ReasoningMessageStartEvent,
 } from "@ag-ui/core";
 import { EventType } from "@ag-ui/core";
+import { ResolvedAgentDebugConfig } from "@/agent/types";
 
 interface TextMessageFields {
   messageId: string;
@@ -32,7 +33,7 @@ interface ReasoningMessageFields {
 }
 
 export const transformChunks =
-  (debug: boolean) =>
+  (debug: ResolvedAgentDebugConfig) =>
   (events$: Observable<BaseEvent>): Observable<BaseEvent> => {
     let textMessageFields: TextMessageFields | undefined;
     let toolCallFields: ToolCallFields | undefined;
@@ -50,8 +51,12 @@ export const transformChunks =
       mode = undefined;
       textMessageFields = undefined;
 
-      if (debug) {
-        console.debug("[TRANSFORM]: TEXT_MESSAGE_END", JSON.stringify(event));
+      if (debug.events) {
+        if (debug.verbose) {
+          console.debug("[TRANSFORM]: TEXT_MESSAGE_END", JSON.stringify(event));
+        } else {
+          console.debug("[TRANSFORM]: TEXT_MESSAGE_END", { messageId: event.messageId });
+        }
       }
 
       return event;
@@ -68,8 +73,12 @@ export const transformChunks =
       mode = undefined;
       toolCallFields = undefined;
 
-      if (debug) {
-        console.debug("[TRANSFORM]: TOOL_CALL_END", JSON.stringify(event));
+      if (debug.events) {
+        if (debug.verbose) {
+          console.debug("[TRANSFORM]: TOOL_CALL_END", JSON.stringify(event));
+        } else {
+          console.debug("[TRANSFORM]: TOOL_CALL_END", { toolCallId: event.toolCallId });
+        }
       }
 
       return event;
@@ -86,8 +95,12 @@ export const transformChunks =
       mode = undefined;
       reasoningMessageFields = undefined;
 
-      if (debug) {
-        console.debug("[TRANSFORM]: REASONING_MESSAGE_END", JSON.stringify(event));
+      if (debug.events) {
+        if (debug.verbose) {
+          console.debug("[TRANSFORM]: REASONING_MESSAGE_END", JSON.stringify(event));
+        } else {
+          console.debug("[TRANSFORM]: REASONING_MESSAGE_END", { messageId: event.messageId });
+        }
       }
 
       return event;
@@ -176,11 +189,15 @@ export const transformChunks =
 
               textMessageResult.push(textMessageStartEvent);
 
-              if (debug) {
-                console.debug(
-                  "[TRANSFORM]: TEXT_MESSAGE_START",
-                  JSON.stringify(textMessageStartEvent),
-                );
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug(
+                    "[TRANSFORM]: TEXT_MESSAGE_START",
+                    JSON.stringify(textMessageStartEvent),
+                  );
+                } else {
+                  console.debug("[TRANSFORM]: TEXT_MESSAGE_START", { messageId: messageChunkEvent.messageId });
+                }
               }
             }
 
@@ -193,11 +210,15 @@ export const transformChunks =
 
               textMessageResult.push(textMessageContentEvent);
 
-              if (debug) {
-                console.debug(
-                  "[TRANSFORM]: TEXT_MESSAGE_CONTENT",
-                  JSON.stringify(textMessageContentEvent),
-                );
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug(
+                    "[TRANSFORM]: TEXT_MESSAGE_CONTENT",
+                    JSON.stringify(textMessageContentEvent),
+                  );
+                } else {
+                  console.debug("[TRANSFORM]: TEXT_MESSAGE_CONTENT", { messageId: textMessageFields!.messageId });
+                }
               }
             }
 
@@ -239,8 +260,12 @@ export const transformChunks =
 
               toolMessageResult.push(toolCallStartEvent);
 
-              if (debug) {
-                console.debug("[TRANSFORM]: TOOL_CALL_START", JSON.stringify(toolCallStartEvent));
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug("[TRANSFORM]: TOOL_CALL_START", JSON.stringify(toolCallStartEvent));
+                } else {
+                  console.debug("[TRANSFORM]: TOOL_CALL_START", { toolCallId: toolCallChunkEvent.toolCallId, toolCallName: toolCallChunkEvent.toolCallName });
+                }
               }
             }
 
@@ -253,8 +278,12 @@ export const transformChunks =
 
               toolMessageResult.push(toolCallArgsEvent);
 
-              if (debug) {
-                console.debug("[TRANSFORM]: TOOL_CALL_ARGS", JSON.stringify(toolCallArgsEvent));
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug("[TRANSFORM]: TOOL_CALL_ARGS", JSON.stringify(toolCallArgsEvent));
+                } else {
+                  console.debug("[TRANSFORM]: TOOL_CALL_ARGS", { toolCallId: toolCallFields!.toolCallId });
+                }
               }
             }
 
@@ -290,11 +319,15 @@ export const transformChunks =
               } as ReasoningMessageStartEvent;
               reasoningMessageResult.push(reasoningMessageStartEvent);
 
-              if (debug) {
-                console.debug(
-                  "[TRANSFORM]: REASONING_MESSAGE_START",
-                  JSON.stringify(reasoningMessageStartEvent),
-                );
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug(
+                    "[TRANSFORM]: REASONING_MESSAGE_START",
+                    JSON.stringify(reasoningMessageStartEvent),
+                  );
+                } else {
+                  console.debug("[TRANSFORM]: REASONING_MESSAGE_START", { messageId: reasoningChunkEvent.messageId });
+                }
               }
             }
 
@@ -307,11 +340,15 @@ export const transformChunks =
 
               reasoningMessageResult.push(reasoningMessageContentEvent);
 
-              if (debug) {
-                console.debug(
-                  "[TRANSFORM]: REASONING_MESSAGE_CONTENT",
-                  JSON.stringify(reasoningMessageContentEvent),
-                );
+              if (debug.events) {
+                if (debug.verbose) {
+                  console.debug(
+                    "[TRANSFORM]: REASONING_MESSAGE_CONTENT",
+                    JSON.stringify(reasoningMessageContentEvent),
+                  );
+                } else {
+                  console.debug("[TRANSFORM]: REASONING_MESSAGE_CONTENT", { messageId: reasoningMessageFields!.messageId });
+                }
               }
             }
 

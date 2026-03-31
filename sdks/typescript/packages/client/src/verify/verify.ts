@@ -1,9 +1,10 @@
 import { BaseEvent, EventType, AGUIError } from "@ag-ui/core";
 import { Observable, throwError, of } from "rxjs";
 import { mergeMap } from "rxjs/operators";
+import { ResolvedAgentDebugConfig } from "@/agent/types";
 
 export const verifyEvents =
-  (debug: boolean) =>
+  (debug: ResolvedAgentDebugConfig) =>
   (source$: Observable<BaseEvent>): Observable<BaseEvent> => {
     // Declare variables in closure to maintain state across events
     let activeMessages = new Map<string, boolean>(); // Map of message ID -> active status
@@ -35,8 +36,12 @@ export const verifyEvents =
       mergeMap((event) => {
         const eventType = event.type;
 
-        if (debug) {
-          console.debug("[VERIFY]:", JSON.stringify(event));
+        if (debug.events) {
+          if (debug.verbose) {
+            console.debug("[VERIFY]:", JSON.stringify(event));
+          } else {
+            console.debug("[VERIFY]:", { type: event.type });
+          }
         }
 
         // Check if run has errored
