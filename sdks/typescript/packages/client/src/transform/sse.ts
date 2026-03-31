@@ -56,10 +56,10 @@ export const parseSSEStream = (
   /**
    * Helper function to process an SSE event.
    * Extracts and joins data lines, then parses the result as JSON.
-   * 
+   *
    * Follows the SSE spec by processing lines starting with 'data:',
    * ignoring a single space if it is present after the colon.
-   * 
+   *
    * @param eventText The raw event text to process
    */
   function processSSEEvent(eventText: string) {

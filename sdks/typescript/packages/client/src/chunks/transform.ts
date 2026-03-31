@@ -196,7 +196,9 @@ export const transformChunks =
                     JSON.stringify(textMessageStartEvent),
                   );
                 } else {
-                  console.debug("[TRANSFORM]: TEXT_MESSAGE_START", { messageId: messageChunkEvent.messageId });
+                  console.debug("[TRANSFORM]: TEXT_MESSAGE_START", {
+                    messageId: messageChunkEvent.messageId,
+                  });
                 }
               }
             }
@@ -217,7 +219,9 @@ export const transformChunks =
                     JSON.stringify(textMessageContentEvent),
                   );
                 } else {
-                  console.debug("[TRANSFORM]: TEXT_MESSAGE_CONTENT", { messageId: textMessageFields!.messageId });
+                  console.debug("[TRANSFORM]: TEXT_MESSAGE_CONTENT", {
+                    messageId: textMessageFields!.messageId,
+                  });
                 }
               }
             }
@@ -264,7 +268,10 @@ export const transformChunks =
                 if (debug.verbose) {
                   console.debug("[TRANSFORM]: TOOL_CALL_START", JSON.stringify(toolCallStartEvent));
                 } else {
-                  console.debug("[TRANSFORM]: TOOL_CALL_START", { toolCallId: toolCallChunkEvent.toolCallId, toolCallName: toolCallChunkEvent.toolCallName });
+                  console.debug("[TRANSFORM]: TOOL_CALL_START", {
+                    toolCallId: toolCallChunkEvent.toolCallId,
+                    toolCallName: toolCallChunkEvent.toolCallName,
+                  });
                 }
               }
             }
@@ -282,7 +289,9 @@ export const transformChunks =
                 if (debug.verbose) {
                   console.debug("[TRANSFORM]: TOOL_CALL_ARGS", JSON.stringify(toolCallArgsEvent));
                 } else {
-                  console.debug("[TRANSFORM]: TOOL_CALL_ARGS", { toolCallId: toolCallFields!.toolCallId });
+                  console.debug("[TRANSFORM]: TOOL_CALL_ARGS", {
+                    toolCallId: toolCallFields!.toolCallId,
+                  });
                 }
               }
             }
@@ -326,7 +335,9 @@ export const transformChunks =
                     JSON.stringify(reasoningMessageStartEvent),
                   );
                 } else {
-                  console.debug("[TRANSFORM]: REASONING_MESSAGE_START", { messageId: reasoningChunkEvent.messageId });
+                  console.debug("[TRANSFORM]: REASONING_MESSAGE_START", {
+                    messageId: reasoningChunkEvent.messageId,
+                  });
                 }
               }
             }
@@ -347,7 +358,9 @@ export const transformChunks =
                     JSON.stringify(reasoningMessageContentEvent),
                   );
                 } else {
-                  console.debug("[TRANSFORM]: REASONING_MESSAGE_CONTENT", { messageId: reasoningMessageFields!.messageId });
+                  console.debug("[TRANSFORM]: REASONING_MESSAGE_CONTENT", {
+                    messageId: reasoningMessageFields!.messageId,
+                  });
                 }
               }
             }

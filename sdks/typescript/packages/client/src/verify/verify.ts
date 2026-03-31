@@ -55,7 +55,11 @@ export const verifyEvents =
         }
 
         // Check if run has already finished (but allow new RUN_STARTED to start a new run)
-        if (runFinished && eventType !== EventType.RUN_ERROR && eventType !== EventType.RUN_STARTED) {
+        if (
+          runFinished &&
+          eventType !== EventType.RUN_ERROR &&
+          eventType !== EventType.RUN_STARTED
+        ) {
           return throwError(
             () =>
               new AGUIError(

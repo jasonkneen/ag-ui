@@ -76,7 +76,7 @@ export const transformHttpEventStream = (
                 eventSubject.complete();
                 return;
               }
-              return eventSubject.error(err)
+              return eventSubject.error(err);
             },
             complete: () => eventSubject.complete(),
           });

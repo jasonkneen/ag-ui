@@ -9,7 +9,12 @@ import {
   AgentCapabilities,
 } from "@ag-ui/core";
 
-import { AgentConfig, RunAgentParameters, ResolvedAgentDebugConfig, resolveAgentDebugConfig } from "./types";
+import {
+  AgentConfig,
+  RunAgentParameters,
+  ResolvedAgentDebugConfig,
+  resolveAgentDebugConfig,
+} from "./types";
 import { v4 as uuidv4 } from "uuid";
 import { structuredClone_ } from "@/utils";
 import { compareVersions } from "compare-versions";
