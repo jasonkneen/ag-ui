@@ -33,8 +33,9 @@ interface ReasoningMessageFields {
 }
 
 export const transformChunks =
-  (debugLogger: DebugLogger | undefined) =>
+  (debugLogger?: DebugLogger | false | null) =>
   (events$: Observable<BaseEvent>): Observable<BaseEvent> => {
+    const log = debugLogger || undefined;
     let textMessageFields: TextMessageFields | undefined;
     let toolCallFields: ToolCallFields | undefined;
     let reasoningMessageFields: ReasoningMessageFields | undefined;
@@ -51,7 +52,7 @@ export const transformChunks =
       mode = undefined;
       textMessageFields = undefined;
 
-      debugLogger?.event("TRANSFORM", "TEXT_MESSAGE_END", event, {
+      log?.event("TRANSFORM", "TEXT_MESSAGE_END", event, {
         messageId: event.messageId,
       });
 
@@ -69,7 +70,7 @@ export const transformChunks =
       mode = undefined;
       toolCallFields = undefined;
 
-      debugLogger?.event("TRANSFORM", "TOOL_CALL_END", event, {
+      log?.event("TRANSFORM", "TOOL_CALL_END", event, {
         toolCallId: event.toolCallId,
       });
 
@@ -87,7 +88,7 @@ export const transformChunks =
       mode = undefined;
       reasoningMessageFields = undefined;
 
-      debugLogger?.event("TRANSFORM", "REASONING_MESSAGE_END", event, {
+      log?.event("TRANSFORM", "REASONING_MESSAGE_END", event, {
         messageId: event.messageId,
       });
 
@@ -177,7 +178,7 @@ export const transformChunks =
 
               textMessageResult.push(textMessageStartEvent);
 
-              debugLogger?.event("TRANSFORM", "TEXT_MESSAGE_START", textMessageStartEvent, {
+              log?.event("TRANSFORM", "TEXT_MESSAGE_START", textMessageStartEvent, {
                 messageId: messageChunkEvent.messageId,
               });
             }
@@ -191,7 +192,7 @@ export const transformChunks =
 
               textMessageResult.push(textMessageContentEvent);
 
-              debugLogger?.event("TRANSFORM", "TEXT_MESSAGE_CONTENT", textMessageContentEvent, {
+              log?.event("TRANSFORM", "TEXT_MESSAGE_CONTENT", textMessageContentEvent, {
                 messageId: textMessageFields!.messageId,
               });
             }
@@ -234,7 +235,7 @@ export const transformChunks =
 
               toolMessageResult.push(toolCallStartEvent);
 
-              debugLogger?.event("TRANSFORM", "TOOL_CALL_START", toolCallStartEvent, {
+              log?.event("TRANSFORM", "TOOL_CALL_START", toolCallStartEvent, {
                 toolCallId: toolCallChunkEvent.toolCallId,
                 toolCallName: toolCallChunkEvent.toolCallName,
               });
@@ -249,7 +250,7 @@ export const transformChunks =
 
               toolMessageResult.push(toolCallArgsEvent);
 
-              debugLogger?.event("TRANSFORM", "TOOL_CALL_ARGS", toolCallArgsEvent, {
+              log?.event("TRANSFORM", "TOOL_CALL_ARGS", toolCallArgsEvent, {
                 toolCallId: toolCallFields!.toolCallId,
               });
             }
@@ -286,12 +287,9 @@ export const transformChunks =
               } as ReasoningMessageStartEvent;
               reasoningMessageResult.push(reasoningMessageStartEvent);
 
-              debugLogger?.event(
-                "TRANSFORM",
-                "REASONING_MESSAGE_START",
-                reasoningMessageStartEvent,
-                { messageId: reasoningChunkEvent.messageId },
-              );
+              log?.event("TRANSFORM", "REASONING_MESSAGE_START", reasoningMessageStartEvent, {
+                messageId: reasoningChunkEvent.messageId,
+              });
             }
 
             if (reasoningChunkEvent.delta !== undefined) {
@@ -303,12 +301,9 @@ export const transformChunks =
 
               reasoningMessageResult.push(reasoningMessageContentEvent);
 
-              debugLogger?.event(
-                "TRANSFORM",
-                "REASONING_MESSAGE_CONTENT",
-                reasoningMessageContentEvent,
-                { messageId: reasoningMessageFields!.messageId },
-              );
+              log?.event("TRANSFORM", "REASONING_MESSAGE_CONTENT", reasoningMessageContentEvent, {
+                messageId: reasoningMessageFields!.messageId,
+              });
             }
 
             return reasoningMessageResult;

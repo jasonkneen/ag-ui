@@ -34,7 +34,7 @@ describe("verifyEvents general validation", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -78,7 +78,7 @@ describe("verifyEvents general validation", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -117,7 +117,7 @@ describe("verifyEvents general validation", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -162,7 +162,7 @@ describe("verifyEvents general validation", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -201,7 +201,7 @@ describe("verifyEvents general validation", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(undefined)(source$).pipe(
+      verifyEvents(false)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -255,7 +255,7 @@ describe("verifyEvents general validation", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(undefined)(source$).pipe(
+      verifyEvents(false)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -313,7 +313,7 @@ describe("verifyEvents general validation", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(undefined)(source$).pipe(
+      verifyEvents(false)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -397,7 +397,7 @@ describe("verifyEvents events", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -441,7 +441,7 @@ describe("verifyEvents events", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -480,7 +480,7 @@ describe("verifyEvents events", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -525,7 +525,7 @@ describe("verifyEvents events", () => {
     const events: BaseEvent[] = [];
 
     // Create a subscription that will complete only after an error
-    const subscription = verifyEvents(undefined)(source$).subscribe({
+    const subscription = verifyEvents(false)(source$).subscribe({
       next: (event) => events.push(event),
       error: (err) => {
         expect(err).toBeInstanceOf(AGUIError);
@@ -564,7 +564,7 @@ describe("verifyEvents events", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(undefined)(source$).pipe(
+      verifyEvents(false)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;
@@ -623,7 +623,7 @@ describe("verifyEvents events", () => {
 
     // Set up subscription and collect events
     const promise = firstValueFrom(
-      verifyEvents(undefined)(source$).pipe(
+      verifyEvents(false)(source$).pipe(
         toArray(),
         catchError((err) => {
           throw err;

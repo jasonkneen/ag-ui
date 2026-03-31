@@ -12,8 +12,9 @@ import { DebugLogger } from "@/debug-logger";
  */
 export const parseSSEStream = (
   source$: Observable<HttpEvent>,
-  debugLogger?: DebugLogger,
+  debugLogger?: DebugLogger | false | null,
 ): Observable<any> => {
+  const log = debugLogger || undefined;
   const jsonSubject = new Subject<any>();
   // Create TextDecoder with stream option set to true to handle split UTF-8 characters
   const decoder = new TextDecoder("utf-8", { fatal: false });
@@ -79,7 +80,7 @@ export const parseSSEStream = (
         // Join multi-line data and parse JSON
         const jsonStr = dataLines.join("\n");
         const json = JSON.parse(jsonStr);
-        debugLogger?.event("SSE", "Event received:", json, { type: json.type });
+        log?.event("SSE", "Event received:", json, { type: json.type });
         jsonSubject.next(json);
       } catch (err) {
         jsonSubject.error(err);

@@ -12,8 +12,9 @@ import { DebugLogger } from "@/debug-logger";
  */
 export const transformHttpEventStream = (
   source$: Observable<HttpEvent>,
-  debugLogger?: DebugLogger,
+  debugLogger?: DebugLogger | false | null,
 ): Observable<BaseEvent> => {
+  const log = debugLogger || undefined;
   const eventSubject = new Subject<BaseEvent>();
 
   // Use ReplaySubject to buffer events until we decide on the parser
@@ -33,7 +34,7 @@ export const transformHttpEventStream = (
         parserInitialized = true;
         const contentType = event.headers.get("content-type");
 
-        debugLogger?.lifecycle("HTTP", "Stream format detected:", {
+        log?.lifecycle("HTTP", "Stream format detected:", {
           contentType,
           parser: contentType === proto.AGUI_MEDIA_TYPE ? "protobuf" : "sse",
         });
@@ -48,17 +49,17 @@ export const transformHttpEventStream = (
           });
         } else {
           // Use SSE JSON parser for all other cases
-          parseSSEStream(bufferSubject, debugLogger).subscribe({
+          parseSSEStream(bufferSubject, log).subscribe({
             next: (json) => {
               try {
                 const parsedEvent = EventSchemas.parse(json);
-                debugLogger?.event("HTTP", "Event validated:", parsedEvent, {
+                log?.event("HTTP", "Event validated:", parsedEvent, {
                   type: parsedEvent.type,
                   valid: true,
                 });
                 eventSubject.next(parsedEvent as BaseEvent);
               } catch (err) {
-                debugLogger?.event("HTTP", "Event invalid:", { json, error: String(err) });
+                log?.event("HTTP", "Event invalid:", { json, error: String(err) });
                 eventSubject.error(err);
               }
             },

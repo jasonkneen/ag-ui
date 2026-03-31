@@ -55,8 +55,9 @@ export const defaultApplyEvents = (
   events$: Observable<BaseEvent>,
   agent: AbstractAgent,
   subscribers: AgentSubscriber[],
-  debugLogger?: DebugLogger,
+  debugLogger?: DebugLogger | false | null,
 ): Observable<AgentStateMutation> => {
+  const log = debugLogger || undefined;
   let messages = structuredClone_(agent.messages);
   let state = structuredClone_(input.state);
   let currentMutation: AgentStateMutation = {};
@@ -93,12 +94,12 @@ export const defaultApplyEvents = (
       applyMutation(mutation);
 
       if (mutation.stopPropagation === true) {
-        debugLogger?.event("APPLY", "Event dropped:", event, {
+        log?.event("APPLY", "Event dropped:", event, {
           type: event.type,
           reason: "stopPropagation by subscriber",
         });
       } else {
-        debugLogger?.event("APPLY", "Event applied:", event, {
+        log?.event("APPLY", "Event applied:", event, {
           type: event.type,
           subscribers: subscribers.length,
         });

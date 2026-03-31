@@ -4,8 +4,9 @@ import { mergeMap } from "rxjs/operators";
 import { DebugLogger } from "@/debug-logger";
 
 export const verifyEvents =
-  (debugLogger: DebugLogger | undefined) =>
+  (debugLogger?: DebugLogger | false | null) =>
   (source$: Observable<BaseEvent>): Observable<BaseEvent> => {
+    const log = debugLogger || undefined;
     // Declare variables in closure to maintain state across events
     let activeMessages = new Map<string, boolean>(); // Map of message ID -> active status
     let activeToolCalls = new Map<string, boolean>(); // Map of tool call ID -> active status
@@ -36,7 +37,7 @@ export const verifyEvents =
       mergeMap((event) => {
         const eventType = event.type;
 
-        debugLogger?.event("VERIFY", "", event, { type: event.type });
+        log?.event("VERIFY", "", event, { type: event.type });
 
         // Check if run has errored
         if (runError) {

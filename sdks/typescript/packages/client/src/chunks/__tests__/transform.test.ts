@@ -35,7 +35,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(4);
@@ -81,7 +81,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk1, chunk2), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(5);
@@ -128,7 +128,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(4);
@@ -175,7 +175,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(textChunk, toolChunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(7);
@@ -202,7 +202,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(runStartEvent);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(1);
@@ -223,7 +223,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(textChunk, runStartEvent);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(4);
@@ -255,7 +255,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk1, chunk2), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(7);
@@ -291,7 +291,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(invalidChunk);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     await expect(firstValueFrom(transformed$)).rejects.toThrow(
       "First TEXT_MESSAGE_CHUNK must have a messageId",
@@ -305,7 +305,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(invalidChunk);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     await expect(firstValueFrom(transformed$)).rejects.toThrow(
       "First TOOL_CALL_CHUNK must have a toolCallId",
@@ -320,7 +320,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(invalidChunk);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     await expect(firstValueFrom(transformed$)).rejects.toThrow(
       "First TOOL_CALL_CHUNK must have a toolCallName",
@@ -344,7 +344,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(4);
@@ -378,7 +378,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = of(rawEvent);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(1);
@@ -418,7 +418,7 @@ describe("transformChunks", () => {
     ];
 
     const events$ = of(...events);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const result = await firstValueFrom(transformed$.pipe(toArray()));
     expect(result.length).toBe(10);
@@ -457,7 +457,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(3);
@@ -494,7 +494,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(3);
@@ -548,7 +548,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(...chunks), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const events = await firstValueFrom(transformed$.pipe(toArray()));
     expect(events.length).toBe(7); // 1 start + 4 content + 1 end + 1 close event
@@ -608,7 +608,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
     const events = await firstValueFrom(transformed$.pipe(toArray()));
 
     const startEvent = events[0] as TextMessageStartEvent;
@@ -630,7 +630,7 @@ describe("transformChunks", () => {
     };
 
     const events$ = concat(of(chunk), of(closeEvent));
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
     const events = await firstValueFrom(transformed$.pipe(toArray()));
 
     const startEvent = events[0] as TextMessageStartEvent;
@@ -695,7 +695,7 @@ describe("transformChunks", () => {
     ];
 
     const events$ = of(...events);
-    const transformed$ = transformChunks(undefined)(events$);
+    const transformed$ = transformChunks(false)(events$);
 
     const results = await firstValueFrom(transformed$.pipe(toArray()));
 
