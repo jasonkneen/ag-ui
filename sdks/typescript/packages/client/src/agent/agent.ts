@@ -9,7 +9,7 @@ import {
   AgentCapabilities,
 } from "@ag-ui/core";
 
-import { AgentConfig, RunAgentParameters } from "./types";
+import { AgentConfig, RunAgentParameters, ResolvedAgentDebugConfig, resolveAgentDebugConfig } from "./types";
 import { v4 as uuidv4 } from "uuid";
 import { structuredClone_ } from "@/utils";
 import { compareVersions } from "compare-versions";
@@ -44,7 +44,7 @@ export abstract class AbstractAgent {
   public threadId: string;
   public messages: Message[];
   public state: State;
-  public debug: boolean = false;
+  public debug: ResolvedAgentDebugConfig;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
   private middlewares: Middleware[] = [];
@@ -69,7 +69,7 @@ export abstract class AbstractAgent {
     this.threadId = threadId ?? uuidv4();
     this.messages = structuredClone_(initialMessages ?? []);
     this.state = structuredClone_(initialState ?? {});
-    this.debug = debug ?? false;
+    this.debug = resolveAgentDebugConfig(debug);
 
     if (compareVersions(this.maxVersion, "0.0.39") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_39());
@@ -115,6 +115,14 @@ export abstract class AbstractAgent {
       this.isRunning = true;
       this.agentId = this.agentId ?? uuidv4();
       const input = this.prepareRunAgentInput(parameters);
+
+      if (this.debug.lifecycle) {
+        console.debug("[LIFECYCLE] Run started:", {
+          agentId: this.agentId,
+          threadId: this.threadId,
+        });
+      }
+
       let result: any = undefined;
       const currentMessageIds = new Set(this.messages.map((message) => message.id));
 
@@ -167,10 +175,22 @@ export abstract class AbstractAgent {
         (source$) => this.apply(input, source$, subscribers),
         (source$) => this.processApplyEvents(input, source$, subscribers),
         catchError((error) => {
+          if (this.debug.lifecycle) {
+            console.debug("[LIFECYCLE] Run errored:", {
+              agentId: this.agentId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
           this.isRunning = false;
           return this.onError(input, error, subscribers);
         }),
         finalize(() => {
+          if (this.debug.lifecycle) {
+            console.debug("[LIFECYCLE] Run finished:", {
+              agentId: this.agentId,
+              threadId: this.threadId,
+            });
+          }
           this.isRunning = false;
           void this.onFinalize(input, subscribers);
           resolveActiveRunCompletion?.();
@@ -275,7 +295,7 @@ export abstract class AbstractAgent {
     events$: Observable<BaseEvent>,
     subscribers: AgentSubscriber[],
   ): Observable<AgentStateMutation> {
-    return defaultApplyEvents(input, events$, this, subscribers);
+    return defaultApplyEvents(input, events$, this, subscribers, this.debug);
   }
 
   protected processApplyEvents(
@@ -622,8 +642,12 @@ export abstract class AbstractAgent {
       (events$: Observable<LegacyRuntimeProtocolEvent>) => {
         return events$.pipe(
           map((event) => {
-            if (this.debug) {
-              console.debug("[LEGACY]:", JSON.stringify(event));
+            if (this.debug.events) {
+              if (this.debug.verbose) {
+                console.debug("[LEGACY]:", JSON.stringify(event));
+              } else {
+                console.debug("[LEGACY]:", { type: (event as any).type });
+              }
             }
             return event;
           }),
