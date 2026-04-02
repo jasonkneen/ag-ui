@@ -9,6 +9,7 @@ import {
 } from "@copilotkit/react-core/v2";
 import { CopilotKit,
 useLangGraphInterrupt } from "@copilotkit/react-core";
+import posthog from "posthog-js";
 import { z } from "zod";
 import { useTheme } from "next-themes";
 
@@ -291,6 +292,10 @@ const InterruptHumanInTheLoop: React.FC<{
     const selectedSteps = localSteps
       .filter((step) => step.status === "enabled")
       .map((step) => step.description);
+    posthog.capture("interrupt_steps_performed", {
+      selected_steps_count: selectedSteps.length,
+      total_steps_count: localSteps.length,
+    });
     resolve("The user selected the following steps: " + selectedSteps.join(", "));
   };
 
@@ -412,6 +417,9 @@ const StepsFeedback = ({ args, respond, status }: { args: any; respond: any; sta
 
   const handleReject = () => {
     if (respond) {
+      posthog.capture("human_in_the_loop_steps_rejected", {
+        total_steps_count: steps.length,
+      });
       setAccepted(false);
       respond({ accepted: false });
     }
@@ -419,8 +427,13 @@ const StepsFeedback = ({ args, respond, status }: { args: any; respond: any; sta
 
   const handleConfirm = () => {
     if (respond) {
+      const confirmedSteps = localSteps.filter((step) => step.status === "enabled");
+      posthog.capture("human_in_the_loop_steps_confirmed", {
+        confirmed_steps_count: confirmedSteps.length,
+        total_steps_count: steps.length,
+      });
       setAccepted(true);
-      respond({ accepted: true, steps: localSteps.filter((step) => step.status === "enabled") });
+      respond({ accepted: true, steps: confirmedSteps });
     }
   };
 
