@@ -12,10 +12,11 @@ import {
 import {
   AgentConfig,
   AgentDebugConfig,
-  NotificationThrottleConfig,
   RunAgentParameters,
   ResolvedAgentDebugConfig,
+  ResolvedNotificationThrottleConfig,
   resolveAgentDebugConfig,
+  resolveNotificationThrottleConfig,
 } from "./types";
 import { DebugLogger, createDebugLogger } from "@/debug-logger";
 import { v4 as uuidv4 } from "uuid";
@@ -52,7 +53,7 @@ export abstract class AbstractAgent {
   public state: State;
   private _debug: ResolvedAgentDebugConfig;
   private _debugLogger: DebugLogger | undefined;
-  public readonly notificationThrottle: NotificationThrottleConfig | undefined;
+  public readonly notificationThrottle: ResolvedNotificationThrottleConfig | undefined;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
   private middlewares: Middleware[] = [];
@@ -104,26 +105,7 @@ export abstract class AbstractAgent {
     this._debug = resolveAgentDebugConfig(debug);
     this._debugLogger = createDebugLogger(this._debug);
 
-    if (notificationThrottle) {
-      const { intervalMs, minChunkSize } = notificationThrottle;
-      if (!Number.isFinite(intervalMs) || intervalMs < 0) {
-        throw new Error(
-          `notificationThrottle.intervalMs must be a non-negative finite number, got ${intervalMs}`,
-        );
-      }
-      if (minChunkSize !== undefined && (!Number.isFinite(minChunkSize) || minChunkSize < 0)) {
-        throw new Error(
-          `notificationThrottle.minChunkSize must be a non-negative finite number, got ${minChunkSize}`,
-        );
-      }
-      // If both thresholds are zero, throttling is a no-op; skip activation
-      if (intervalMs > 0 || (minChunkSize ?? 0) > 0) {
-        this.notificationThrottle = {
-          intervalMs,
-          minChunkSize: minChunkSize ?? 0,
-        };
-      }
-    }
+    this.notificationThrottle = resolveNotificationThrottleConfig(notificationThrottle);
 
     if (compareVersions(this.maxVersion, "0.0.39") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_39());
@@ -429,7 +411,7 @@ export abstract class AbstractAgent {
     subscribers: AgentSubscriber[],
   ): Observable<AgentStateMutation> {
     const throttleMs = this.notificationThrottle!.intervalMs;
-    const minChunkSize = this.notificationThrottle!.minChunkSize ?? 0;
+    const minChunkSize = this.notificationThrottle!.minChunkSize;
 
     let lastNotifyTime = 0;
     let charsSinceLastNotify = 0;
