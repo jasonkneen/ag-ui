@@ -240,7 +240,12 @@ export abstract class AbstractAgent {
             threadId: this.threadId,
           });
           this.isRunning = false;
-          void this.onFinalize(input, subscribers);
+          this.onFinalize(input, subscribers).catch((err) => {
+            console.error("AG-UI: onFinalize error:", err);
+            this._debugLogger?.lifecycle("LIFECYCLE", "onFinalize error:", {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           resolveActiveRunCompletion?.();
           resolveActiveRunCompletion = undefined;
           this.activeRunCompletionPromise = undefined;
@@ -308,7 +313,12 @@ export abstract class AbstractAgent {
         }),
         finalize(() => {
           this.isRunning = false;
-          void this.onFinalize(input, subscribers);
+          this.onFinalize(input, subscribers).catch((err) => {
+            console.error("AG-UI: onFinalize error:", err);
+            this._debugLogger?.lifecycle("LIFECYCLE", "onFinalize error:", {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           resolveActiveRunCompletion?.();
           resolveActiveRunCompletion = undefined;
           this.activeRunCompletionPromise = undefined;
@@ -429,49 +439,63 @@ export abstract class AbstractAgent {
     let pendingState = false;
     let timerId: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
-    let streamErrored = false;
+    let streamCompleted = false;
 
-    const notify = (force = false) => {
-      if (disposed && !force) return;
-      try {
-        if (timerId !== null) {
-          clearTimeout(timerId);
-          timerId = null;
-        }
-        lastNotifyTime = Date.now();
-        charsSinceLastNotify = 0;
-
-        // Snapshot the content length of the current trailing assistant message
-        if (this.messages.length > 0) {
-          const lastMsg = this.messages[this.messages.length - 1];
-          if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
-            lastContentLength = lastMsg.content.length;
-            lastTrackedMessageId = lastMsg.id;
-          }
-        }
-
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-        if (pendingMessages) {
-          pendingMessages = false;
-          this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
-        }
-        if (pendingState) {
-          pendingState = false;
-          this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
-        }
-      } catch (err) {
-        console.error("AG-UI: Unexpected error in throttled notify():", err);
-        this._debugLogger?.lifecycle("LIFECYCLE", "Throttled notify error:", {
-          error: err instanceof Error ? err.message : String(err),
+    const notify = () => {
+      if (disposed) {
+        this._debugLogger?.lifecycle("LIFECYCLE", "Throttle: notify() skipped (disposed)", {
+          pendingMessages,
+          pendingState,
         });
+        return;
+      }
+
+      // Bookkeeping — if this fails it's a programming error; let it propagate
+      // rather than leaving pending flags in an inconsistent state.
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      lastNotifyTime = Date.now();
+      charsSinceLastNotify = 0;
+
+      // Snapshot the content length of the current trailing assistant message
+      if (this.messages.length > 0) {
+        const lastMsg = this.messages[this.messages.length - 1];
+        if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
+          lastContentLength = lastMsg.content.length;
+          lastTrackedMessageId = lastMsg.id;
+        }
+      }
+
+      // Subscriber notifications — isolated via notifySubscribers
+      const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+      if (pendingMessages) {
+        pendingMessages = false;
+        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+      }
+      if (pendingState) {
+        pendingState = false;
+        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
       }
     };
 
     const scheduleTrailing = () => {
       if (timerId !== null) return;
+      if (throttleMs <= 0) return;
       const elapsed = Date.now() - lastNotifyTime;
       const remaining = Math.max(0, throttleMs - elapsed);
-      timerId = setTimeout(notify, remaining);
+      timerId = setTimeout(() => {
+        timerId = null;
+        try {
+          notify();
+        } catch (err) {
+          console.error("AG-UI: Trailing timer notification failed:", err);
+          this._debugLogger?.lifecycle("LIFECYCLE", "Trailing timer error:", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }, remaining);
     };
 
     return mutated$.pipe(
@@ -499,7 +523,8 @@ export abstract class AbstractAgent {
           }
 
           const now = Date.now();
-          // Sentinel: lastNotifyTime is 0 only before the very first notification
+          // Sentinel: lastNotifyTime is 0 only before the very first notification.
+          // This ensures the first event always fires immediately (leading edge).
           const isLeading = lastNotifyTime === 0;
           const timeThresholdMet =
             throttleMs > 0 && now - lastNotifyTime >= throttleMs;
@@ -512,21 +537,30 @@ export abstract class AbstractAgent {
             scheduleTrailing();
           }
         },
-        error: () => {
-          streamErrored = true;
+        error: (err) => {
+          if (pendingMessages || pendingState) {
+            this._debugLogger?.lifecycle("LIFECYCLE", "Throttle: stream errored, discarding pending notifications", {
+              pendingMessages,
+              pendingState,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+        complete: () => {
+          streamCompleted = true;
         },
       }),
       finalize(() => {
-        disposed = true;
         if (timerId !== null) {
           clearTimeout(timerId);
           timerId = null;
         }
         // Only flush on normal completion; skip on error to avoid
         // delivering potentially inconsistent state to subscribers.
-        if (!streamErrored && (pendingMessages || pendingState)) {
-          notify(/* force */ true);
+        if (streamCompleted && (pendingMessages || pendingState)) {
+          notify();
         }
+        disposed = true;
       }),
     );
   }
@@ -561,26 +595,14 @@ export abstract class AbstractAgent {
       if (onRunInitializedMutation.messages) {
         this.messages = onRunInitializedMutation.messages;
         input.messages = onRunInitializedMutation.messages;
-        subscribers.forEach((subscriber) => {
-          subscriber.onMessagesChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-            input,
-          });
-        });
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
       }
       if (onRunInitializedMutation.state) {
         this.state = onRunInitializedMutation.state;
         input.state = onRunInitializedMutation.state;
-        subscribers.forEach((subscriber) => {
-          subscriber.onStateChanged?.({
-            state: this.state,
-            messages: this.messages,
-            agent: this,
-            input,
-          });
-        });
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
       }
     }
   }
@@ -600,25 +622,13 @@ export abstract class AbstractAgent {
         if (mutation.messages !== undefined || mutation.state !== undefined) {
           if (mutation.messages !== undefined) {
             this.messages = mutation.messages;
-            subscribers.forEach((subscriber) => {
-              subscriber.onMessagesChanged?.({
-                messages: this.messages,
-                state: this.state,
-                agent: this,
-                input,
-              });
-            });
+            const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+            this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
           }
           if (mutation.state !== undefined) {
             this.state = mutation.state;
-            subscribers.forEach((subscriber) => {
-              subscriber.onStateChanged?.({
-                state: this.state,
-                messages: this.messages,
-                agent: this,
-                input,
-              });
-            });
+            const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+            this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
           }
         }
 
@@ -648,25 +658,13 @@ export abstract class AbstractAgent {
     ) {
       if (onRunFinalizedMutation.messages !== undefined) {
         this.messages = onRunFinalizedMutation.messages;
-        subscribers.forEach((subscriber) => {
-          subscriber.onMessagesChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-            input,
-          });
-        });
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
       }
       if (onRunFinalizedMutation.state !== undefined) {
         this.state = onRunFinalizedMutation.state;
-        subscribers.forEach((subscriber) => {
-          subscriber.onStateChanged?.({
-            state: this.state,
-            messages: this.messages,
-            agent: this,
-            input,
-          });
-        });
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
       }
     }
   }
@@ -693,13 +691,11 @@ export abstract class AbstractAgent {
   }
 
   public addMessage(message: Message) {
-    // Add message to the messages array
     this.messages.push(message);
+    const subscriberSnapshot = [...this.subscribers];
 
-    // Notify subscribers sequentially in the background
     (async () => {
-      // Fire onNewMessage sequentially
-      for (const subscriber of this.subscribers) {
+      for (const subscriber of subscriberSnapshot) {
         try {
           await subscriber.onNewMessage?.({
             message,
@@ -712,10 +708,9 @@ export abstract class AbstractAgent {
         }
       }
 
-      // Fire onNewToolCall if the message is from assistant and contains tool calls
       if (message.role === "assistant" && message.toolCalls) {
         for (const toolCall of message.toolCalls) {
-          for (const subscriber of this.subscribers) {
+          for (const subscriber of subscriberSnapshot) {
             try {
               await subscriber.onNewToolCall?.({
                 toolCall,
@@ -730,8 +725,7 @@ export abstract class AbstractAgent {
         }
       }
 
-      // Fire onMessagesChanged sequentially
-      for (const subscriber of this.subscribers) {
+      for (const subscriber of subscriberSnapshot) {
         try {
           await subscriber.onMessagesChanged?.({
             messages: this.messages,
@@ -742,19 +736,18 @@ export abstract class AbstractAgent {
           console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
         }
       }
-    })();
+    })().catch((err) => {
+      console.error("AG-UI: Unhandled error in addMessage notification:", err);
+    });
   }
 
   public addMessages(messages: Message[]) {
-    // Add all messages to the messages array
     this.messages.push(...messages);
+    const subscriberSnapshot = [...this.subscribers];
 
-    // Notify subscribers sequentially in the background
     (async () => {
-      // Fire onNewMessage and onNewToolCall for each message sequentially
       for (const message of messages) {
-        // Fire onNewMessage sequentially
-        for (const subscriber of this.subscribers) {
+        for (const subscriber of subscriberSnapshot) {
           try {
             await subscriber.onNewMessage?.({
               message,
@@ -767,10 +760,9 @@ export abstract class AbstractAgent {
           }
         }
 
-        // Fire onNewToolCall if the message is from assistant and contains tool calls
         if (message.role === "assistant" && message.toolCalls) {
           for (const toolCall of message.toolCalls) {
-            for (const subscriber of this.subscribers) {
+            for (const subscriber of subscriberSnapshot) {
               try {
                 await subscriber.onNewToolCall?.({
                   toolCall,
@@ -786,8 +778,7 @@ export abstract class AbstractAgent {
         }
       }
 
-      // Fire onMessagesChanged once at the end sequentially
-      for (const subscriber of this.subscribers) {
+      for (const subscriber of subscriberSnapshot) {
         try {
           await subscriber.onMessagesChanged?.({
             messages: this.messages,
@@ -798,17 +789,17 @@ export abstract class AbstractAgent {
           console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
         }
       }
-    })();
+    })().catch((err) => {
+      console.error("AG-UI: Unhandled error in addMessages notification:", err);
+    });
   }
 
   public setMessages(messages: Message[]) {
-    // Replace the entire messages array
     this.messages = structuredClone_(messages);
+    const subscriberSnapshot = [...this.subscribers];
 
-    // Notify subscribers sequentially in the background
     (async () => {
-      // Fire onMessagesChanged sequentially
-      for (const subscriber of this.subscribers) {
+      for (const subscriber of subscriberSnapshot) {
         try {
           await subscriber.onMessagesChanged?.({
             messages: this.messages,
@@ -819,17 +810,17 @@ export abstract class AbstractAgent {
           console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
         }
       }
-    })();
+    })().catch((err) => {
+      console.error("AG-UI: Unhandled error in setMessages notification:", err);
+    });
   }
 
   public setState(state: State) {
-    // Replace the entire state
     this.state = structuredClone_(state);
+    const subscriberSnapshot = [...this.subscribers];
 
-    // Notify subscribers sequentially in the background
     (async () => {
-      // Fire onStateChanged sequentially
-      for (const subscriber of this.subscribers) {
+      for (const subscriber of subscriberSnapshot) {
         try {
           await subscriber.onStateChanged?.({
             messages: this.messages,
@@ -840,7 +831,9 @@ export abstract class AbstractAgent {
           console.error("AG-UI: Subscriber onStateChanged threw:", err);
         }
       }
-    })();
+    })().catch((err) => {
+      console.error("AG-UI: Unhandled error in setState notification:", err);
+    });
   }
 
   public legacy_to_be_removed_runAgentBridged(
