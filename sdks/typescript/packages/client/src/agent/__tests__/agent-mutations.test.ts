@@ -514,7 +514,7 @@ describe("Agent Mutations", () => {
 
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      agent.addMessage({ id: "m1", role: "user", content: "hi" } as any);
+      agent.addMessage({ id: "m1", role: "user" as const, content: "hi" });
 
       // Wait for async IIFE to complete
       await new Promise((r) => setTimeout(r, 10));

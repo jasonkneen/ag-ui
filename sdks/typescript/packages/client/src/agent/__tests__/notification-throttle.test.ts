@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { Observable, Subject } from "rxjs";
 import { AbstractAgent } from "../agent";
-import { BaseEvent, RunAgentInput, EventType } from "@ag-ui/core";
+import type { BaseEvent, Message, RunAgentInput, State } from "@ag-ui/core";
+import { EventType } from "@ag-ui/core";
 
 class TestAgent extends AbstractAgent {
   public subject = new Subject<BaseEvent>();
@@ -13,6 +14,33 @@ class TestAgent extends AbstractAgent {
 
 /** Wait one macrotask so runAgent's pipeline has subscribed to the subject */
 const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// ---------------------------------------------------------------------------
+// Helpers — eliminate duplication across tests
+// ---------------------------------------------------------------------------
+
+/** Extract the string content of the first assistant message, or "" */
+function firstAssistantContent(messages: readonly Message[]): string {
+  const msg = messages[0];
+  return msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
+}
+
+/** Extract the string content of the last assistant message, or "" */
+function lastAssistantContent(messages: readonly Message[]): string {
+  const msg = messages[messages.length - 1];
+  return msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
+}
+
+/** Emit `count` single-char TEXT_MESSAGE_CHUNK events (A, B, C, …) */
+function emitCharChunks(agent: TestAgent, count: number, messageId = "m1", startChar = 65) {
+  for (let i = 0; i < count; i++) {
+    agent.subject.next({
+      type: EventType.TEXT_MESSAGE_CHUNK,
+      messageId,
+      delta: String.fromCharCode(startChar + i),
+    } as BaseEvent);
+  }
+}
 
 describe("AbstractAgent notification throttle", () => {
   // ── Baseline (no throttle) ──────────────────────────────────────────
@@ -53,24 +81,14 @@ describe("AbstractAgent notification throttle", () => {
     const calls: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
     await tick();
 
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
-    for (let i = 0; i < 20; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 20);
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
 
@@ -89,24 +107,14 @@ describe("AbstractAgent notification throttle", () => {
     const calls: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
     await tick();
 
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
-    for (let i = 0; i < 20; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 20);
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
 
@@ -127,11 +135,7 @@ describe("AbstractAgent notification throttle", () => {
     const calls: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
@@ -169,24 +173,14 @@ describe("AbstractAgent notification throttle", () => {
     const notificationContents: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        notificationContents.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { notificationContents.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
     await tick();
 
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
-    for (let i = 0; i < 10; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 10);
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
 
@@ -195,10 +189,7 @@ describe("AbstractAgent notification throttle", () => {
     // Final notification must have all content
     expect(notificationContents[notificationContents.length - 1]).toBe("ABCDEFGHIJ");
     // agent.messages was current at the time of the finalize notification
-    expect(agent.messages[0]).toBeDefined();
-    const finalMsg = agent.messages[0];
-    const finalContent = finalMsg?.role === "assistant" && typeof finalMsg.content === "string" ? finalMsg.content : "";
-    expect(finalContent).toBe("ABCDEFGHIJ");
+    expect(firstAssistantContent(agent.messages)).toBe("ABCDEFGHIJ");
   });
 
   // ── State change notifications under throttle ───────────────────────
@@ -207,7 +198,7 @@ describe("AbstractAgent notification throttle", () => {
     const agent = new TestAgent({
       notificationThrottle: { intervalMs: 50 },
     });
-    const stateCalls: any[] = [];
+    const stateCalls: Record<string, unknown>[] = [];
 
     agent.subscribe({
       onStateChanged: ({ state }) => {
@@ -257,11 +248,7 @@ describe("AbstractAgent notification throttle", () => {
       },
     });
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        goodCalls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { goodCalls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
@@ -356,12 +343,7 @@ describe("AbstractAgent notification throttle", () => {
       const calls: string[] = [];
 
       agent.subscribe({
-        onMessagesChanged: ({ messages }) => {
-          const msg = messages[0];
-          const content =
-            msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-          calls.push(content);
-        },
+        onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
       });
 
       const runPromise = agent.runAgent();
@@ -403,7 +385,7 @@ describe("AbstractAgent notification throttle", () => {
     const agent = new TestAgent({
       notificationThrottle: { intervalMs: 50 },
     });
-    const goodCalls: any[] = [];
+    const goodCalls: Record<string, unknown>[] = [];
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     agent.subscribe({
@@ -460,22 +442,10 @@ describe("AbstractAgent notification throttle", () => {
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
 
     // Emit 4 chars on m1 (below minChunkSize=5)
-    for (let i = 0; i < 4; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 4, "m1");
 
     // Switch to m2 — 6 chars (above minChunkSize=5, should trigger notification)
-    for (let i = 0; i < 6; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m2",
-        delta: String.fromCharCode(75 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 6, "m2", 75);
 
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
@@ -499,12 +469,7 @@ describe("AbstractAgent notification throttle", () => {
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content =
-          msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
@@ -588,7 +553,7 @@ describe("AbstractAgent notification throttle", () => {
       notificationThrottle: { intervalMs: 5000 },
     });
     const msgCalls: number[] = [];
-    const stateCalls: any[] = [];
+    const stateCalls: Record<string, unknown>[] = [];
 
     agent.subscribe({
       onMessagesChanged: ({ messages }) => { msgCalls.push(messages.length); },
@@ -638,11 +603,7 @@ describe("AbstractAgent notification throttle", () => {
     const calls: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const msg = messages[0];
-        const content = msg?.role === "assistant" && typeof msg.content === "string" ? msg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); },
     });
 
     const runPromise = agent.runAgent();
@@ -650,13 +611,7 @@ describe("AbstractAgent notification throttle", () => {
 
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
     // 15 single-char chunks → should fire roughly every 5 chars
-    for (let i = 0; i < 15; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 15);
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
 
@@ -677,11 +632,7 @@ describe("AbstractAgent notification throttle", () => {
     const calls: string[] = [];
 
     agent.subscribe({
-      onMessagesChanged: ({ messages }) => {
-        const lastMsg = messages[messages.length - 1];
-        const content = lastMsg?.role === "assistant" && typeof lastMsg.content === "string" ? lastMsg.content : "";
-        calls.push(content);
-      },
+      onMessagesChanged: ({ messages }) => { calls.push(lastAssistantContent(messages)); },
     });
 
     // First run
@@ -700,7 +651,7 @@ describe("AbstractAgent notification throttle", () => {
     const callsAfterRun1 = calls.length;
 
     // Second run — new subject needed since the old one completed
-    (agent as any).subject = new Subject<BaseEvent>();
+    agent.subject = new Subject<BaseEvent>();
 
     const run2 = agent.runAgent();
     await tick();
@@ -735,16 +686,7 @@ describe("AbstractAgent notification throttle", () => {
     await tick();
 
     agent.subject.next({ type: EventType.RUN_STARTED } as BaseEvent);
-    // Emit chunks — the message will have string content from TEXT_MESSAGE_CHUNK,
-    // but the minChunkSize logic only tracks the last assistant message.
-    // This test verifies no crash occurs and notifications still fire.
-    for (let i = 0; i < 10; i++) {
-      agent.subject.next({
-        type: EventType.TEXT_MESSAGE_CHUNK,
-        messageId: "m1",
-        delta: String.fromCharCode(65 + i),
-      } as BaseEvent);
-    }
+    emitCharChunks(agent, 10);
     agent.subject.next({ type: EventType.RUN_FINISHED } as BaseEvent);
     agent.subject.complete();
 
@@ -753,8 +695,6 @@ describe("AbstractAgent notification throttle", () => {
     // Should get at least leading + flush
     expect(calls.length).toBeGreaterThanOrEqual(1);
     // agent.messages should have the full content
-    const lastMsg = agent.messages[agent.messages.length - 1];
-    const content = lastMsg?.role === "assistant" && typeof lastMsg.content === "string" ? lastMsg.content : "";
-    expect(content).toBe("ABCDEFGHIJ");
+    expect(firstAssistantContent(agent.messages)).toBe("ABCDEFGHIJ");
   });
 });
