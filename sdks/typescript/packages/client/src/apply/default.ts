@@ -48,16 +48,16 @@ import type { Observable } from "rxjs";
 import { concatMap, defaultIfEmpty, mergeAll, mergeMap } from "rxjs/operators";
 import untruncateJson from "untruncate-json";
 import { structuredClone_ } from "../utils";
-import type { DebugLogger } from "@/debug-logger";
+import { type DebugLoggerInput, resolveDebugLogger } from "@/debug-logger";
 
 export const defaultApplyEvents = (
   input: RunAgentInput,
   events$: Observable<BaseEvent>,
   agent: AbstractAgent,
   subscribers: AgentSubscriber[],
-  debugLogger?: DebugLogger | false | null,
+  debugLogger?: DebugLoggerInput,
 ): Observable<AgentStateMutation> => {
-  const log = debugLogger || undefined;
+  const log = resolveDebugLogger(debugLogger);
   let messages = structuredClone_(agent.messages);
   let state = structuredClone_(input.state);
   let currentMutation: AgentStateMutation = {};
