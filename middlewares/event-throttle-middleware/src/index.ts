@@ -11,7 +11,7 @@ import { Observable } from "rxjs";
 // Config types
 // ---------------------------------------------------------------------------
 
-export interface NotificationThrottleConfig {
+export interface EventThrottleConfig {
   /** Time-based throttle window in ms (e.g. 16 = ~60fps). */
   readonly intervalMs: number;
   /** Min new characters to accumulate before flushing. Default: 0. */
@@ -43,18 +43,18 @@ const IMMEDIATE_EVENT_TYPES: ReadonlySet<string> = new Set([
 // Middleware
 // ---------------------------------------------------------------------------
 
-export class NotificationThrottleMiddleware extends Middleware {
+export class EventThrottleMiddleware extends Middleware {
   private readonly intervalMs: number;
   private readonly minChunkSize: number;
   private readonly isNoop: boolean;
 
-  constructor(config: NotificationThrottleConfig) {
+  constructor(config: EventThrottleConfig) {
     super();
 
     const { intervalMs, minChunkSize } = config;
     if (!Number.isFinite(intervalMs) || intervalMs < 0) {
       throw new Error(
-        `notificationThrottle.intervalMs must be a non-negative finite number, got ${intervalMs}`,
+        `intervalMs must be a non-negative finite number, got ${intervalMs}`,
       );
     }
     if (
@@ -62,7 +62,7 @@ export class NotificationThrottleMiddleware extends Middleware {
       (!Number.isFinite(minChunkSize) || minChunkSize < 0)
     ) {
       throw new Error(
-        `notificationThrottle.minChunkSize must be a non-negative finite number, got ${minChunkSize}`,
+        `minChunkSize must be a non-negative finite number, got ${minChunkSize}`,
       );
     }
 
@@ -72,6 +72,10 @@ export class NotificationThrottleMiddleware extends Middleware {
   }
 
   run(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
+    // Use next.run() directly instead of this.runNext() because runNext applies
+    // transformChunks, which converts TEXT_MESSAGE_CHUNK into TEXT_MESSAGE_START/
+    // CONTENT/END sequences — eliminating the chunk events we need to buffer.
+    // The agent's own apply() pipeline normalizes chunks downstream.
     const events$ = next.run(input);
 
     if (this.isNoop) {

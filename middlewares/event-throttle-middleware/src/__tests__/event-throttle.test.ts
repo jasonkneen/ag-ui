@@ -85,7 +85,7 @@ function setup(middleware?: Middleware) {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("NotificationThrottleMiddleware", () => {
+describe("EventThrottleMiddleware", () => {
   describe("baseline (no middleware)", () => {
     it("without middleware, every event passes through 1:1", async () => {
       const { agent, events, done } = setup();
@@ -104,8 +104,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("time-based throttle", () => {
     it("with intervalMs, fewer events emitted than chunks sent", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 50 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 50 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -130,8 +130,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("chunk-size throttle", () => {
     it("with minChunkSize, notifications wait until enough chars accumulate", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000, minChunkSize: 10 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000, minChunkSize: 10 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -159,8 +159,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("combined thresholds", () => {
     it("fires when either time or chunk threshold is hit first", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 10000, minChunkSize: 5 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 10000, minChunkSize: 5 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -186,8 +186,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("leading edge", () => {
     it("first buffered event fires immediately when no prior flush", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
 
       // Use setup WITHOUT sending RUN_STARTED first to test true leading edge
       const agent = new TestAgent();
@@ -232,8 +232,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("immediate events flush buffer", () => {
     it("TOOL_CALL_START flushes pending chunks before passing through", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -263,8 +263,8 @@ describe("NotificationThrottleMiddleware", () => {
     it("pending events flush after the time window", async () => {
       vi.useFakeTimers();
       try {
-        const { NotificationThrottleMiddleware } = await import("../index");
-        const mw = new NotificationThrottleMiddleware({ intervalMs: 50 });
+        const { EventThrottleMiddleware } = await import("../index");
+        const mw = new EventThrottleMiddleware({ intervalMs: 50 });
         const { agent, events } = setup(mw);
 
         agent.subject.next(runStarted());
@@ -294,8 +294,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("stream completion", () => {
     it("remaining buffer is flushed on complete", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -318,8 +318,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("stream error", () => {
     it("buffer is discarded on error, no flush", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -344,31 +344,31 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("validation", () => {
     it("throws on negative intervalMs", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      expect(() => new NotificationThrottleMiddleware({ intervalMs: -1 })).toThrow(
+      const { EventThrottleMiddleware } = await import("../index");
+      expect(() => new EventThrottleMiddleware({ intervalMs: -1 })).toThrow(
         "non-negative finite number",
       );
     });
 
     it("throws on NaN intervalMs", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      expect(() => new NotificationThrottleMiddleware({ intervalMs: NaN })).toThrow(
+      const { EventThrottleMiddleware } = await import("../index");
+      expect(() => new EventThrottleMiddleware({ intervalMs: NaN })).toThrow(
         "non-negative finite number",
       );
     });
 
     it("throws on Infinity intervalMs", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
+      const { EventThrottleMiddleware } = await import("../index");
       expect(
-        () => new NotificationThrottleMiddleware({ intervalMs: Infinity }),
+        () => new EventThrottleMiddleware({ intervalMs: Infinity }),
       ).toThrow("non-negative finite number");
     });
 
     it("throws on negative minChunkSize", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
+      const { EventThrottleMiddleware } = await import("../index");
       expect(
         () =>
-          new NotificationThrottleMiddleware({
+          new EventThrottleMiddleware({
             intervalMs: 16,
             minChunkSize: -5,
           }),
@@ -376,8 +376,8 @@ describe("NotificationThrottleMiddleware", () => {
     });
 
     it("intervalMs: 0 with no minChunkSize is a no-op passthrough", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 0 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 0 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -393,8 +393,8 @@ describe("NotificationThrottleMiddleware", () => {
     });
 
     it("intervalMs: 0 with minChunkSize > 0 throttles by chunk size", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({
         intervalMs: 0,
         minChunkSize: 5,
       });
@@ -422,8 +422,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("state events", () => {
     it("STATE_SNAPSHOT events are buffered and flushed correctly", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
       const { agent, events, done } = setup(mw);
 
       agent.subject.next(runStarted());
@@ -446,8 +446,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("message ID change resets chunk tracking", () => {
     it("minChunkSize resets when messageId changes", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({
         intervalMs: 5000,
         minChunkSize: 5,
       });
@@ -475,8 +475,8 @@ describe("NotificationThrottleMiddleware", () => {
 
   describe("multiple runs", () => {
     it("second run on same middleware gets fresh throttle state", async () => {
-      const { NotificationThrottleMiddleware } = await import("../index");
-      const mw = new NotificationThrottleMiddleware({ intervalMs: 5000 });
+      const { EventThrottleMiddleware } = await import("../index");
+      const mw = new EventThrottleMiddleware({ intervalMs: 5000 });
 
       const run1 = setup(mw);
       run1.agent.subject.next(runStarted());
