@@ -12,6 +12,7 @@ import {
 import {
   AgentConfig,
   AgentDebugConfig,
+  NotificationThrottleConfig,
   RunAgentParameters,
   ResolvedAgentDebugConfig,
   resolveAgentDebugConfig,
@@ -20,9 +21,7 @@ import { DebugLogger, createDebugLogger } from "@/debug-logger";
 import { v4 as uuidv4 } from "uuid";
 import { structuredClone_ } from "@/utils";
 import { compareVersions } from "compare-versions";
-import { catchError, map, tap } from "rxjs/operators";
-import { finalize } from "rxjs/operators";
-import { takeUntil } from "rxjs/operators";
+import { catchError, finalize, map, takeUntil, tap } from "rxjs/operators";
 import { pipe, Observable, from, of, EMPTY, Subject, defer } from "rxjs";
 import { verifyEvents } from "@/verify";
 import { convertToLegacyEvents } from "@/legacy/convert";
@@ -53,6 +52,7 @@ export abstract class AbstractAgent {
   public state: State;
   private _debug: ResolvedAgentDebugConfig;
   private _debugLogger: DebugLogger | undefined;
+  public readonly notificationThrottle: NotificationThrottleConfig | undefined;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
   private middlewares: Middleware[] = [];
@@ -94,6 +94,7 @@ export abstract class AbstractAgent {
     initialMessages,
     initialState,
     debug,
+    notificationThrottle,
   }: AgentConfig = {}) {
     this.agentId = agentId;
     this.description = description ?? "";
@@ -102,6 +103,27 @@ export abstract class AbstractAgent {
     this.state = structuredClone_(initialState ?? {});
     this._debug = resolveAgentDebugConfig(debug);
     this._debugLogger = createDebugLogger(this._debug);
+
+    if (notificationThrottle) {
+      const { intervalMs, minChunkSize } = notificationThrottle;
+      if (!Number.isFinite(intervalMs) || intervalMs < 0) {
+        throw new Error(
+          `notificationThrottle.intervalMs must be a non-negative finite number, got ${intervalMs}`,
+        );
+      }
+      if (minChunkSize !== undefined && (!Number.isFinite(minChunkSize) || minChunkSize < 0)) {
+        throw new Error(
+          `notificationThrottle.minChunkSize must be a non-negative finite number, got ${minChunkSize}`,
+        );
+      }
+      // If both thresholds are zero, throttling is a no-op; skip activation
+      if (intervalMs > 0 || (minChunkSize ?? 0) > 0) {
+        this.notificationThrottle = {
+          intervalMs,
+          minChunkSize: minChunkSize ?? 0,
+        };
+      }
+    }
 
     if (compareVersions(this.maxVersion, "0.0.39") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_39());
@@ -318,6 +340,27 @@ export abstract class AbstractAgent {
     await completion;
   }
 
+  /**
+   * Safely notify all subscribers via the given callback, catching and
+   * logging any errors so one failing subscriber never breaks the rest.
+   */
+  private notifySubscribers(
+    subscribers: AgentSubscriber[],
+    callbackName: string,
+    callback: (subscriber: AgentSubscriber) => void,
+  ): void {
+    for (const subscriber of subscribers) {
+      try {
+        callback(subscriber);
+      } catch (err) {
+        console.error(`AG-UI: Subscriber ${callbackName} threw:`, err);
+        this._debugLogger?.lifecycle("LIFECYCLE", `Subscriber ${callbackName} error:`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   protected apply(
     input: RunAgentInput,
     events$: Observable<BaseEvent>,
@@ -331,29 +374,158 @@ export abstract class AbstractAgent {
     events$: Observable<AgentStateMutation>,
     subscribers: AgentSubscriber[],
   ): Observable<AgentStateMutation> {
-    return events$.pipe(
+    // Step 1: Always apply mutations immediately (agent.messages/state stay current)
+    const mutated$ = events$.pipe(
       tap((event) => {
+        if (event.messages) this.messages = event.messages;
+        if (event.state) this.state = event.state;
+      }),
+    );
+
+    // Step 2: Notify subscribers — throttled when configured, immediate otherwise
+    if (this.notificationThrottle) {
+      return this.processThrottledNotifications(mutated$, input, subscribers);
+    }
+
+    return mutated$.pipe(
+      tap((event) => {
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
         if (event.messages) {
-          this.messages = event.messages;
-          subscribers.forEach((subscriber) => {
-            subscriber.onMessagesChanged?.({
-              messages: this.messages,
-              state: this.state,
-              agent: this,
-              input,
-            });
-          });
+          this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
         }
         if (event.state) {
-          this.state = event.state;
-          subscribers.forEach((subscriber) => {
-            subscriber.onStateChanged?.({
-              state: this.state,
-              messages: this.messages,
-              agent: this,
-              input,
-            });
-          });
+          this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
+        }
+      }),
+    );
+  }
+
+  /**
+   * Throttled notification layer.
+   *
+   * The first event always fires immediately (leading edge). Subsequent
+   * notifications fire when any condition is met:
+   *   - `intervalMs` has elapsed since the last notification, OR
+   *   - `minChunkSize` new characters have accumulated on the active assistant message
+   *
+   * A trailing timer ensures pending notifications are flushed after each
+   * window. On normal stream completion, any remaining pending notification
+   * is delivered. On stream error, pending notifications are discarded to
+   * avoid delivering potentially inconsistent state.
+   */
+  private processThrottledNotifications(
+    mutated$: Observable<AgentStateMutation>,
+    input: RunAgentInput,
+    subscribers: AgentSubscriber[],
+  ): Observable<AgentStateMutation> {
+    const throttleMs = this.notificationThrottle!.intervalMs;
+    const minChunkSize = this.notificationThrottle!.minChunkSize ?? 0;
+
+    let lastNotifyTime = 0;
+    let charsSinceLastNotify = 0;
+    let lastContentLength = 0;
+    let lastTrackedMessageId: string | null = null;
+    let pendingMessages = false;
+    let pendingState = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
+    let streamErrored = false;
+
+    const notify = (force = false) => {
+      if (disposed && !force) return;
+      try {
+        if (timerId !== null) {
+          clearTimeout(timerId);
+          timerId = null;
+        }
+        lastNotifyTime = Date.now();
+        charsSinceLastNotify = 0;
+
+        // Snapshot the content length of the current trailing assistant message
+        if (this.messages.length > 0) {
+          const lastMsg = this.messages[this.messages.length - 1];
+          if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
+            lastContentLength = lastMsg.content.length;
+            lastTrackedMessageId = lastMsg.id;
+          }
+        }
+
+        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
+        if (pendingMessages) {
+          pendingMessages = false;
+          this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+        }
+        if (pendingState) {
+          pendingState = false;
+          this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
+        }
+      } catch (err) {
+        console.error("AG-UI: Unexpected error in throttled notify():", err);
+        this._debugLogger?.lifecycle("LIFECYCLE", "Throttled notify error:", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
+    const scheduleTrailing = () => {
+      if (timerId !== null) return;
+      const elapsed = Date.now() - lastNotifyTime;
+      const remaining = Math.max(0, throttleMs - elapsed);
+      timerId = setTimeout(notify, remaining);
+    };
+
+    return mutated$.pipe(
+      tap({
+        next: (event) => {
+          if (event.messages) {
+            if (minChunkSize > 0 && this.messages.length > 0) {
+              const lastMsg = this.messages[this.messages.length - 1];
+              if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
+                // Reset tracking when the message identity changes
+                if (lastMsg.id !== lastTrackedMessageId) {
+                  lastTrackedMessageId = lastMsg.id;
+                  lastContentLength = 0;
+                }
+                charsSinceLastNotify = Math.max(
+                  0,
+                  lastMsg.content.length - lastContentLength,
+                );
+              }
+            }
+            pendingMessages = true;
+          }
+          if (event.state) {
+            pendingState = true;
+          }
+
+          const now = Date.now();
+          // Sentinel: lastNotifyTime is 0 only before the very first notification
+          const isLeading = lastNotifyTime === 0;
+          const timeThresholdMet =
+            throttleMs > 0 && now - lastNotifyTime >= throttleMs;
+          const chunkThresholdMet =
+            minChunkSize > 0 && charsSinceLastNotify >= minChunkSize;
+
+          if (isLeading || timeThresholdMet || chunkThresholdMet) {
+            notify();
+          } else {
+            scheduleTrailing();
+          }
+        },
+        error: () => {
+          streamErrored = true;
+        },
+      }),
+      finalize(() => {
+        disposed = true;
+        if (timerId !== null) {
+          clearTimeout(timerId);
+          timerId = null;
+        }
+        // Only flush on normal completion; skip on error to avoid
+        // delivering potentially inconsistent state to subscribers.
+        if (!streamErrored && (pendingMessages || pendingState)) {
+          notify(/* force */ true);
         }
       }),
     );
@@ -509,6 +681,10 @@ export abstract class AbstractAgent {
     cloned.state = structuredClone_(this.state);
     cloned._debug = this._debug;
     cloned._debugLogger = this._debugLogger;
+    // cloned is untyped (Object.create), so the readonly TS constraint does not apply
+    cloned.notificationThrottle = this.notificationThrottle
+      ? { ...this.notificationThrottle }
+      : undefined;
     cloned.isRunning = this.isRunning;
     cloned.subscribers = [...this.subscribers];
     cloned.middlewares = [...this.middlewares];
@@ -524,35 +700,47 @@ export abstract class AbstractAgent {
     (async () => {
       // Fire onNewMessage sequentially
       for (const subscriber of this.subscribers) {
-        await subscriber.onNewMessage?.({
-          message,
-          messages: this.messages,
-          state: this.state,
-          agent: this,
-        });
+        try {
+          await subscriber.onNewMessage?.({
+            message,
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+          });
+        } catch (err) {
+          console.error("AG-UI: Subscriber onNewMessage threw:", err);
+        }
       }
 
       // Fire onNewToolCall if the message is from assistant and contains tool calls
       if (message.role === "assistant" && message.toolCalls) {
         for (const toolCall of message.toolCalls) {
           for (const subscriber of this.subscribers) {
-            await subscriber.onNewToolCall?.({
-              toolCall,
-              messages: this.messages,
-              state: this.state,
-              agent: this,
-            });
+            try {
+              await subscriber.onNewToolCall?.({
+                toolCall,
+                messages: this.messages,
+                state: this.state,
+                agent: this,
+              });
+            } catch (err) {
+              console.error("AG-UI: Subscriber onNewToolCall threw:", err);
+            }
           }
         }
       }
 
       // Fire onMessagesChanged sequentially
       for (const subscriber of this.subscribers) {
-        await subscriber.onMessagesChanged?.({
-          messages: this.messages,
-          state: this.state,
-          agent: this,
-        });
+        try {
+          await subscriber.onMessagesChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+          });
+        } catch (err) {
+          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
+        }
       }
     })();
   }
@@ -567,24 +755,32 @@ export abstract class AbstractAgent {
       for (const message of messages) {
         // Fire onNewMessage sequentially
         for (const subscriber of this.subscribers) {
-          await subscriber.onNewMessage?.({
-            message,
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-          });
+          try {
+            await subscriber.onNewMessage?.({
+              message,
+              messages: this.messages,
+              state: this.state,
+              agent: this,
+            });
+          } catch (err) {
+            console.error("AG-UI: Subscriber onNewMessage threw:", err);
+          }
         }
 
         // Fire onNewToolCall if the message is from assistant and contains tool calls
         if (message.role === "assistant" && message.toolCalls) {
           for (const toolCall of message.toolCalls) {
             for (const subscriber of this.subscribers) {
-              await subscriber.onNewToolCall?.({
-                toolCall,
-                messages: this.messages,
-                state: this.state,
-                agent: this,
-              });
+              try {
+                await subscriber.onNewToolCall?.({
+                  toolCall,
+                  messages: this.messages,
+                  state: this.state,
+                  agent: this,
+                });
+              } catch (err) {
+                console.error("AG-UI: Subscriber onNewToolCall threw:", err);
+              }
             }
           }
         }
@@ -592,11 +788,15 @@ export abstract class AbstractAgent {
 
       // Fire onMessagesChanged once at the end sequentially
       for (const subscriber of this.subscribers) {
-        await subscriber.onMessagesChanged?.({
-          messages: this.messages,
-          state: this.state,
-          agent: this,
-        });
+        try {
+          await subscriber.onMessagesChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+          });
+        } catch (err) {
+          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
+        }
       }
     })();
   }
@@ -609,11 +809,15 @@ export abstract class AbstractAgent {
     (async () => {
       // Fire onMessagesChanged sequentially
       for (const subscriber of this.subscribers) {
-        await subscriber.onMessagesChanged?.({
-          messages: this.messages,
-          state: this.state,
-          agent: this,
-        });
+        try {
+          await subscriber.onMessagesChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+          });
+        } catch (err) {
+          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
+        }
       }
     })();
   }
@@ -626,11 +830,15 @@ export abstract class AbstractAgent {
     (async () => {
       // Fire onStateChanged sequentially
       for (const subscriber of this.subscribers) {
-        await subscriber.onStateChanged?.({
-          messages: this.messages,
-          state: this.state,
-          agent: this,
-        });
+        try {
+          await subscriber.onStateChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+          });
+        } catch (err) {
+          console.error("AG-UI: Subscriber onStateChanged threw:", err);
+        }
       }
     })();
   }
