@@ -14,15 +14,15 @@ import {
   AgentDebugConfig,
   RunAgentParameters,
   ResolvedAgentDebugConfig,
-  ResolvedNotificationThrottleConfig,
   resolveAgentDebugConfig,
-  resolveNotificationThrottleConfig,
 } from "./types";
 import { DebugLogger, createDebugLogger } from "@/debug-logger";
 import { v4 as uuidv4 } from "uuid";
 import { structuredClone_ } from "@/utils";
 import { compareVersions } from "compare-versions";
-import { catchError, finalize, map, takeUntil, tap } from "rxjs/operators";
+import { catchError, map, tap } from "rxjs/operators";
+import { finalize } from "rxjs/operators";
+import { takeUntil } from "rxjs/operators";
 import { pipe, Observable, from, of, EMPTY, Subject, defer } from "rxjs";
 import { verifyEvents } from "@/verify";
 import { convertToLegacyEvents } from "@/legacy/convert";
@@ -53,7 +53,6 @@ export abstract class AbstractAgent {
   public state: State;
   private _debug: ResolvedAgentDebugConfig;
   private _debugLogger: DebugLogger | undefined;
-  public readonly notificationThrottle: ResolvedNotificationThrottleConfig | undefined;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
   private middlewares: Middleware[] = [];
@@ -95,7 +94,6 @@ export abstract class AbstractAgent {
     initialMessages,
     initialState,
     debug,
-    notificationThrottle,
   }: AgentConfig = {}) {
     this.agentId = agentId;
     this.description = description ?? "";
@@ -104,8 +102,6 @@ export abstract class AbstractAgent {
     this.state = structuredClone_(initialState ?? {});
     this._debug = resolveAgentDebugConfig(debug);
     this._debugLogger = createDebugLogger(this._debug);
-
-    this.notificationThrottle = resolveNotificationThrottleConfig(notificationThrottle);
 
     if (compareVersions(this.maxVersion, "0.0.39") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_39());
@@ -222,12 +218,7 @@ export abstract class AbstractAgent {
             threadId: this.threadId,
           });
           this.isRunning = false;
-          this.onFinalize(input, subscribers).catch((err) => {
-            console.error("AG-UI: onFinalize error:", err);
-            this._debugLogger?.lifecycle("LIFECYCLE", "onFinalize error:", {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
+          void this.onFinalize(input, subscribers);
           resolveActiveRunCompletion?.();
           resolveActiveRunCompletion = undefined;
           this.activeRunCompletionPromise = undefined;
@@ -295,12 +286,7 @@ export abstract class AbstractAgent {
         }),
         finalize(() => {
           this.isRunning = false;
-          this.onFinalize(input, subscribers).catch((err) => {
-            console.error("AG-UI: onFinalize error:", err);
-            this._debugLogger?.lifecycle("LIFECYCLE", "onFinalize error:", {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
+          void this.onFinalize(input, subscribers);
           resolveActiveRunCompletion?.();
           resolveActiveRunCompletion = undefined;
           this.activeRunCompletionPromise = undefined;
@@ -332,39 +318,6 @@ export abstract class AbstractAgent {
     await completion;
   }
 
-  /**
-   * Safely notify all subscribers via the given callback, catching and
-   * logging any errors so one failing subscriber never breaks the rest.
-   * Handles both synchronous throws and asynchronous rejections (subscriber
-   * callbacks are typed as `MaybePromise<void>`).
-   */
-  private notifySubscribers(
-    subscribers: AgentSubscriber[],
-    callbackName: string,
-    callback: (subscriber: AgentSubscriber) => void,
-  ): void {
-    for (const subscriber of subscribers) {
-      try {
-        const result = callback(subscriber);
-        // Subscriber callbacks are MaybePromise<void> — catch async rejections
-        // that the synchronous try/catch cannot intercept.
-        if (result != null && typeof (result as any).catch === "function") {
-          (result as Promise<void>).catch((err) => {
-            console.error(`AG-UI: Subscriber ${callbackName} async error:`, err);
-            this._debugLogger?.lifecycle("LIFECYCLE", `Subscriber ${callbackName} async error:`, {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
-      } catch (err) {
-        console.error(`AG-UI: Subscriber ${callbackName} threw:`, err);
-        this._debugLogger?.lifecycle("LIFECYCLE", `Subscriber ${callbackName} error:`, {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-  }
-
   protected apply(
     input: RunAgentInput,
     events$: Observable<BaseEvent>,
@@ -378,196 +331,29 @@ export abstract class AbstractAgent {
     events$: Observable<AgentStateMutation>,
     subscribers: AgentSubscriber[],
   ): Observable<AgentStateMutation> {
-    // Step 1: Always apply mutations immediately (agent.messages/state stay current)
-    const mutated$ = events$.pipe(
+    return events$.pipe(
       tap((event) => {
-        if (event.messages) this.messages = event.messages;
-        if (event.state) this.state = event.state;
-      }),
-    );
-
-    // Step 2: Notify subscribers — throttled when configured, immediate otherwise
-    if (this.notificationThrottle) {
-      return this.processThrottledNotifications(mutated$, input, subscribers);
-    }
-
-    return mutated$.pipe(
-      tap((event) => {
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
         if (event.messages) {
-          this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+          this.messages = event.messages;
+          subscribers.forEach((subscriber) => {
+            subscriber.onMessagesChanged?.({
+              messages: this.messages,
+              state: this.state,
+              agent: this,
+              input,
+            });
+          });
         }
         if (event.state) {
-          this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
-        }
-      }),
-    );
-  }
-
-  /**
-   * Throttled notification layer.
-   *
-   * The first event of each run always fires immediately (leading edge);
-   * subsequent throttle windows do not have a leading-edge trigger.
-   * After the leading edge, notifications fire when any condition is met:
-   *   - `intervalMs` has elapsed since the last notification, OR
-   *   - `minChunkSize` new characters have accumulated on the trailing assistant message
-   *
-   * A trailing timer ensures pending notifications are flushed after each
-   * time window. When `intervalMs` is 0 with `minChunkSize > 0`, there is
-   * no time-based fallback — sub-threshold characters remain pending until
-   * the chunk threshold is met or the stream completes.
-   *
-   * Timer cleanup happens unconditionally in finalize (both error and
-   * completion paths); only the notification flush is conditional on
-   * normal completion. On stream error, pending notifications are discarded
-   * to avoid delivering potentially inconsistent state.
-   */
-  private processThrottledNotifications(
-    mutated$: Observable<AgentStateMutation>,
-    input: RunAgentInput,
-    subscribers: AgentSubscriber[],
-  ): Observable<AgentStateMutation> {
-    const throttleMs = this.notificationThrottle!.intervalMs;
-    const minChunkSize = this.notificationThrottle!.minChunkSize;
-
-    let lastNotifyTime = 0;
-    let charsSinceLastNotify = 0;
-    let lastContentLength = 0;
-    let lastTrackedMessageId: string | null = null;
-    let pendingMessages = false;
-    let pendingState = false;
-    let timerId: ReturnType<typeof setTimeout> | null = null;
-    let disposed = false;
-    let streamCompleted = false;
-
-    const notify = () => {
-      if (disposed) {
-        this._debugLogger?.lifecycle("LIFECYCLE", "Throttle: notify() skipped (disposed)", {
-          pendingMessages,
-          pendingState,
-        });
-        return;
-      }
-
-      // Reset throttle bookkeeping before delivering notifications.
-      if (timerId !== null) {
-        clearTimeout(timerId);
-        timerId = null;
-      }
-      lastNotifyTime = Date.now();
-      charsSinceLastNotify = 0;
-
-      // Snapshot the content length of the current trailing assistant message
-      if (this.messages.length > 0) {
-        const lastMsg = this.messages[this.messages.length - 1];
-        if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
-          lastContentLength = lastMsg.content.length;
-          lastTrackedMessageId = lastMsg.id;
-        }
-      }
-
-      // Subscriber notifications — isolated via notifySubscribers
-      const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-      if (pendingMessages) {
-        pendingMessages = false;
-        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
-      }
-      if (pendingState) {
-        pendingState = false;
-        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
-      }
-    };
-
-    const scheduleTrailing = () => {
-      if (timerId !== null) return;
-      if (throttleMs <= 0) return;
-      const elapsed = Date.now() - lastNotifyTime;
-      const remaining = Math.max(0, throttleMs - elapsed);
-      timerId = setTimeout(() => {
-        timerId = null;
-        if (disposed) return;
-        try {
-          notify();
-        } catch (err) {
-          console.error("AG-UI: Trailing timer notification failed:", err);
-          this._debugLogger?.lifecycle("LIFECYCLE", "Trailing timer error:", {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }, remaining);
-    };
-
-    return mutated$.pipe(
-      tap({
-        next: (event) => {
-          if (event.messages) {
-            if (minChunkSize > 0 && this.messages.length > 0) {
-              const lastMsg = this.messages[this.messages.length - 1];
-              if (lastMsg.role === "assistant" && typeof lastMsg.content === "string") {
-                // Reset tracking when the message identity changes
-                if (lastMsg.id !== lastTrackedMessageId) {
-                  lastTrackedMessageId = lastMsg.id;
-                  lastContentLength = 0;
-                }
-                charsSinceLastNotify = Math.max(
-                  0,
-                  lastMsg.content.length - lastContentLength,
-                );
-              }
-            }
-            pendingMessages = true;
-          }
-          if (event.state) {
-            pendingState = true;
-          }
-
-          const now = Date.now();
-          // Sentinel: lastNotifyTime is 0 only before the very first notification.
-          // This ensures the first event always fires immediately (leading edge).
-          const isLeading = lastNotifyTime === 0;
-          const timeThresholdMet =
-            throttleMs > 0 && now - lastNotifyTime >= throttleMs;
-          const chunkThresholdMet =
-            minChunkSize > 0 && charsSinceLastNotify >= minChunkSize;
-
-          if (isLeading || timeThresholdMet || chunkThresholdMet) {
-            notify();
-          } else {
-            scheduleTrailing();
-          }
-        },
-        error: (err) => {
-          if (pendingMessages || pendingState) {
-            this._debugLogger?.lifecycle("LIFECYCLE", "Throttle: stream errored, discarding pending notifications", {
-              pendingMessages,
-              pendingState,
-              error: err instanceof Error ? err.message : String(err),
+          this.state = event.state;
+          subscribers.forEach((subscriber) => {
+            subscriber.onStateChanged?.({
+              state: this.state,
+              messages: this.messages,
+              agent: this,
+              input,
             });
-          }
-        },
-        complete: () => {
-          streamCompleted = true;
-        },
-      }),
-      finalize(() => {
-        try {
-          if (timerId !== null) {
-            clearTimeout(timerId);
-            timerId = null;
-          }
-          // Only flush on normal completion; skip on error to avoid
-          // delivering potentially inconsistent state to subscribers.
-          if (streamCompleted && (pendingMessages || pendingState)) {
-            notify();
-          }
-        } catch (err) {
-          console.error("AG-UI: Throttle finalize flush error:", err);
-          this._debugLogger?.lifecycle("LIFECYCLE", "Throttle finalize flush error:", {
-            error: err instanceof Error ? err.message : String(err),
           });
-        } finally {
-          disposed = true;
         }
       }),
     );
@@ -603,14 +389,26 @@ export abstract class AbstractAgent {
       if (onRunInitializedMutation.messages) {
         this.messages = onRunInitializedMutation.messages;
         input.messages = onRunInitializedMutation.messages;
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+        subscribers.forEach((subscriber) => {
+          subscriber.onMessagesChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+            input,
+          });
+        });
       }
       if (onRunInitializedMutation.state) {
         this.state = onRunInitializedMutation.state;
         input.state = onRunInitializedMutation.state;
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
+        subscribers.forEach((subscriber) => {
+          subscriber.onStateChanged?.({
+            state: this.state,
+            messages: this.messages,
+            agent: this,
+            input,
+          });
+        });
       }
     }
   }
@@ -630,13 +428,25 @@ export abstract class AbstractAgent {
         if (mutation.messages !== undefined || mutation.state !== undefined) {
           if (mutation.messages !== undefined) {
             this.messages = mutation.messages;
-            const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-            this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+            subscribers.forEach((subscriber) => {
+              subscriber.onMessagesChanged?.({
+                messages: this.messages,
+                state: this.state,
+                agent: this,
+                input,
+              });
+            });
           }
           if (mutation.state !== undefined) {
             this.state = mutation.state;
-            const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-            this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
+            subscribers.forEach((subscriber) => {
+              subscriber.onStateChanged?.({
+                state: this.state,
+                messages: this.messages,
+                agent: this,
+                input,
+              });
+            });
           }
         }
 
@@ -666,13 +476,25 @@ export abstract class AbstractAgent {
     ) {
       if (onRunFinalizedMutation.messages !== undefined) {
         this.messages = onRunFinalizedMutation.messages;
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-        this.notifySubscribers(subscribers, "onMessagesChanged", (s) => s.onMessagesChanged?.(params));
+        subscribers.forEach((subscriber) => {
+          subscriber.onMessagesChanged?.({
+            messages: this.messages,
+            state: this.state,
+            agent: this,
+            input,
+          });
+        });
       }
       if (onRunFinalizedMutation.state !== undefined) {
         this.state = onRunFinalizedMutation.state;
-        const params = { messages: this.messages, state: this.state, agent: this as AbstractAgent, input };
-        this.notifySubscribers(subscribers, "onStateChanged", (s) => s.onStateChanged?.(params));
+        subscribers.forEach((subscriber) => {
+          subscriber.onStateChanged?.({
+            state: this.state,
+            messages: this.messages,
+            agent: this,
+            input,
+          });
+        });
       }
     }
   }
@@ -687,10 +509,6 @@ export abstract class AbstractAgent {
     cloned.state = structuredClone_(this.state);
     cloned._debug = this._debug;
     cloned._debugLogger = this._debugLogger;
-    // cloned is untyped (Object.create), so the readonly TS constraint does not apply
-    cloned.notificationThrottle = this.notificationThrottle
-      ? { ...this.notificationThrottle }
-      : undefined;
     cloned.isRunning = this.isRunning;
     cloned.subscribers = [...this.subscribers];
     cloned.middlewares = [...this.middlewares];
@@ -699,161 +517,122 @@ export abstract class AbstractAgent {
   }
 
   public addMessage(message: Message) {
+    // Add message to the messages array
     this.messages.push(message);
-    const subscriberSnapshot = [...this.subscribers];
 
+    // Notify subscribers sequentially in the background
     (async () => {
-      for (const subscriber of subscriberSnapshot) {
-        try {
+      // Fire onNewMessage sequentially
+      for (const subscriber of this.subscribers) {
+        await subscriber.onNewMessage?.({
+          message,
+          messages: this.messages,
+          state: this.state,
+          agent: this,
+        });
+      }
+
+      // Fire onNewToolCall if the message is from assistant and contains tool calls
+      if (message.role === "assistant" && message.toolCalls) {
+        for (const toolCall of message.toolCalls) {
+          for (const subscriber of this.subscribers) {
+            await subscriber.onNewToolCall?.({
+              toolCall,
+              messages: this.messages,
+              state: this.state,
+              agent: this,
+            });
+          }
+        }
+      }
+
+      // Fire onMessagesChanged sequentially
+      for (const subscriber of this.subscribers) {
+        await subscriber.onMessagesChanged?.({
+          messages: this.messages,
+          state: this.state,
+          agent: this,
+        });
+      }
+    })();
+  }
+
+  public addMessages(messages: Message[]) {
+    // Add all messages to the messages array
+    this.messages.push(...messages);
+
+    // Notify subscribers sequentially in the background
+    (async () => {
+      // Fire onNewMessage and onNewToolCall for each message sequentially
+      for (const message of messages) {
+        // Fire onNewMessage sequentially
+        for (const subscriber of this.subscribers) {
           await subscriber.onNewMessage?.({
             message,
             messages: this.messages,
             state: this.state,
             agent: this,
           });
-        } catch (err) {
-          console.error("AG-UI: Subscriber onNewMessage threw:", err);
         }
-      }
 
-      if (message.role === "assistant" && message.toolCalls) {
-        for (const toolCall of message.toolCalls) {
-          for (const subscriber of subscriberSnapshot) {
-            try {
+        // Fire onNewToolCall if the message is from assistant and contains tool calls
+        if (message.role === "assistant" && message.toolCalls) {
+          for (const toolCall of message.toolCalls) {
+            for (const subscriber of this.subscribers) {
               await subscriber.onNewToolCall?.({
                 toolCall,
                 messages: this.messages,
                 state: this.state,
                 agent: this,
               });
-            } catch (err) {
-              console.error("AG-UI: Subscriber onNewToolCall threw:", err);
             }
           }
         }
       }
 
-      for (const subscriber of subscriberSnapshot) {
-        try {
-          await subscriber.onMessagesChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-          });
-        } catch (err) {
-          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
-        }
+      // Fire onMessagesChanged once at the end sequentially
+      for (const subscriber of this.subscribers) {
+        await subscriber.onMessagesChanged?.({
+          messages: this.messages,
+          state: this.state,
+          agent: this,
+        });
       }
-    })().catch((err) => {
-      console.error("AG-UI: Unhandled error in addMessage notification:", err);
-      this._debugLogger?.lifecycle("LIFECYCLE", "addMessage notification error:", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  }
-
-  public addMessages(messages: Message[]) {
-    this.messages.push(...messages);
-    const subscriberSnapshot = [...this.subscribers];
-
-    (async () => {
-      for (const message of messages) {
-        for (const subscriber of subscriberSnapshot) {
-          try {
-            await subscriber.onNewMessage?.({
-              message,
-              messages: this.messages,
-              state: this.state,
-              agent: this,
-            });
-          } catch (err) {
-            console.error("AG-UI: Subscriber onNewMessage threw:", err);
-          }
-        }
-
-        if (message.role === "assistant" && message.toolCalls) {
-          for (const toolCall of message.toolCalls) {
-            for (const subscriber of subscriberSnapshot) {
-              try {
-                await subscriber.onNewToolCall?.({
-                  toolCall,
-                  messages: this.messages,
-                  state: this.state,
-                  agent: this,
-                });
-              } catch (err) {
-                console.error("AG-UI: Subscriber onNewToolCall threw:", err);
-              }
-            }
-          }
-        }
-      }
-
-      for (const subscriber of subscriberSnapshot) {
-        try {
-          await subscriber.onMessagesChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-          });
-        } catch (err) {
-          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
-        }
-      }
-    })().catch((err) => {
-      console.error("AG-UI: Unhandled error in addMessages notification:", err);
-      this._debugLogger?.lifecycle("LIFECYCLE", "addMessages notification error:", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    })();
   }
 
   public setMessages(messages: Message[]) {
+    // Replace the entire messages array
     this.messages = structuredClone_(messages);
-    const subscriberSnapshot = [...this.subscribers];
 
+    // Notify subscribers sequentially in the background
     (async () => {
-      for (const subscriber of subscriberSnapshot) {
-        try {
-          await subscriber.onMessagesChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-          });
-        } catch (err) {
-          console.error("AG-UI: Subscriber onMessagesChanged threw:", err);
-        }
+      // Fire onMessagesChanged sequentially
+      for (const subscriber of this.subscribers) {
+        await subscriber.onMessagesChanged?.({
+          messages: this.messages,
+          state: this.state,
+          agent: this,
+        });
       }
-    })().catch((err) => {
-      console.error("AG-UI: Unhandled error in setMessages notification:", err);
-      this._debugLogger?.lifecycle("LIFECYCLE", "setMessages notification error:", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    })();
   }
 
   public setState(state: State) {
+    // Replace the entire state
     this.state = structuredClone_(state);
-    const subscriberSnapshot = [...this.subscribers];
 
+    // Notify subscribers sequentially in the background
     (async () => {
-      for (const subscriber of subscriberSnapshot) {
-        try {
-          await subscriber.onStateChanged?.({
-            messages: this.messages,
-            state: this.state,
-            agent: this,
-          });
-        } catch (err) {
-          console.error("AG-UI: Subscriber onStateChanged threw:", err);
-        }
+      // Fire onStateChanged sequentially
+      for (const subscriber of this.subscribers) {
+        await subscriber.onStateChanged?.({
+          messages: this.messages,
+          state: this.state,
+          agent: this,
+        });
       }
-    })().catch((err) => {
-      console.error("AG-UI: Unhandled error in setState notification:", err);
-      this._debugLogger?.lifecycle("LIFECYCLE", "setState notification error:", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    })();
   }
 
   public legacy_to_be_removed_runAgentBridged(
