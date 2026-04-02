@@ -11,6 +11,7 @@ import {
 
 import {
   AgentConfig,
+  AgentDebugConfig,
   RunAgentParameters,
   ResolvedAgentDebugConfig,
   resolveAgentDebugConfig,
@@ -50,7 +51,7 @@ export abstract class AbstractAgent {
   public threadId: string;
   public messages: Message[];
   public state: State;
-  public debug: ResolvedAgentDebugConfig;
+  private _debug: ResolvedAgentDebugConfig;
   private _debugLogger: DebugLogger | undefined;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
@@ -61,6 +62,15 @@ export abstract class AbstractAgent {
 
   get maxVersion() {
     return packageJson.version;
+  }
+
+  get debug(): ResolvedAgentDebugConfig {
+    return this._debug;
+  }
+
+  set debug(value: AgentDebugConfig | ResolvedAgentDebugConfig) {
+    this._debug = resolveAgentDebugConfig(value as AgentDebugConfig);
+    this._debugLogger = createDebugLogger(this._debug);
   }
 
   get debugLogger(): DebugLogger | undefined {
@@ -90,8 +100,8 @@ export abstract class AbstractAgent {
     this.threadId = threadId ?? uuidv4();
     this.messages = structuredClone_(initialMessages ?? []);
     this.state = structuredClone_(initialState ?? {});
-    this.debug = resolveAgentDebugConfig(debug);
-    this.debugLogger = createDebugLogger(this.debug);
+    this._debug = resolveAgentDebugConfig(debug);
+    this._debugLogger = createDebugLogger(this._debug);
 
     if (compareVersions(this.maxVersion, "0.0.39") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_39());
@@ -497,8 +507,8 @@ export abstract class AbstractAgent {
     cloned.threadId = this.threadId;
     cloned.messages = structuredClone_(this.messages);
     cloned.state = structuredClone_(this.state);
-    cloned.debug = this.debug;
-    cloned.debugLogger = this.debugLogger;
+    cloned._debug = this._debug;
+    cloned._debugLogger = this._debugLogger;
     cloned.isRunning = this.isRunning;
     cloned.subscribers = [...this.subscribers];
     cloned.middlewares = [...this.middlewares];
