@@ -37,10 +37,9 @@ export function resolveAgentDebugConfig(
  * stay current); only subscriber notifications (`onMessagesChanged`,
  * `onStateChanged`) are coalesced.
  *
- * The first event always fires immediately (leading edge). Subsequent
- * notifications fire when either threshold is met. A trailing timer
- * ensures pending notifications are flushed; the finalize flush supersedes
- * any pending trailing timer (the timer is cleared before final delivery).
+ * The first event of each run always fires immediately (leading edge).
+ * Subsequent notifications fire when either threshold is met. A trailing
+ * timer ensures pending notifications are flushed after each window.
  * On stream completion, any remaining pending notification is always delivered.
  */
 export interface NotificationThrottleConfig {
@@ -59,6 +58,9 @@ export interface NotificationThrottleConfig {
    * have been appended to the trailing assistant message (the last message
    * in the array, when it has role `"assistant"` and string content),
    * even if the time window has not yet elapsed.
+   * If the trailing assistant message has no string content (e.g.,
+   * tool-call-only messages where `content` is `undefined`), character
+   * tracking is inactive and only the time-based threshold applies.
    * Must be a non-negative finite number. Default: `0` (no minimum).
    */
   readonly minChunkSize?: number;
@@ -72,7 +74,8 @@ export interface ResolvedNotificationThrottleConfig {
 
 /**
  * Validates and normalizes a NotificationThrottleConfig.
- * Returns `undefined` when both thresholds are zero (no-op).
+ * Returns `undefined` when the input is `undefined` or when both
+ * thresholds are zero (no-op).
  */
 export function resolveNotificationThrottleConfig(
   config: NotificationThrottleConfig | undefined,

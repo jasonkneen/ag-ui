@@ -335,6 +335,8 @@ export abstract class AbstractAgent {
   /**
    * Safely notify all subscribers via the given callback, catching and
    * logging any errors so one failing subscriber never breaks the rest.
+   * Handles both synchronous throws and asynchronous rejections (subscriber
+   * callbacks are typed as `MaybePromise<void>`).
    */
   private notifySubscribers(
     subscribers: AgentSubscriber[],
@@ -343,7 +345,17 @@ export abstract class AbstractAgent {
   ): void {
     for (const subscriber of subscribers) {
       try {
-        callback(subscriber);
+        const result = callback(subscriber);
+        // Subscriber callbacks are MaybePromise<void> — catch async rejections
+        // that the synchronous try/catch cannot intercept.
+        if (result != null && typeof (result as any).catch === "function") {
+          (result as Promise<void>).catch((err) => {
+            console.error(`AG-UI: Subscriber ${callbackName} async error:`, err);
+            this._debugLogger?.lifecycle("LIFECYCLE", `Subscriber ${callbackName} async error:`, {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
       } catch (err) {
         console.error(`AG-UI: Subscriber ${callbackName} threw:`, err);
         this._debugLogger?.lifecycle("LIFECYCLE", `Subscriber ${callbackName} error:`, {
@@ -395,15 +407,21 @@ export abstract class AbstractAgent {
   /**
    * Throttled notification layer.
    *
-   * The first event always fires immediately (leading edge). Subsequent
-   * notifications fire when any condition is met:
+   * The first event of each run always fires immediately (leading edge);
+   * subsequent throttle windows do not have a leading-edge trigger.
+   * After the leading edge, notifications fire when any condition is met:
    *   - `intervalMs` has elapsed since the last notification, OR
-   *   - `minChunkSize` new characters have accumulated on the active assistant message
+   *   - `minChunkSize` new characters have accumulated on the trailing assistant message
    *
    * A trailing timer ensures pending notifications are flushed after each
-   * window. On normal stream completion, any remaining pending notification
-   * is delivered. On stream error, pending notifications are discarded to
-   * avoid delivering potentially inconsistent state.
+   * time window. When `intervalMs` is 0 with `minChunkSize > 0`, there is
+   * no time-based fallback — sub-threshold characters remain pending until
+   * the chunk threshold is met or the stream completes.
+   *
+   * Timer cleanup happens unconditionally in finalize (both error and
+   * completion paths); only the notification flush is conditional on
+   * normal completion. On stream error, pending notifications are discarded
+   * to avoid delivering potentially inconsistent state.
    */
   private processThrottledNotifications(
     mutated$: Observable<AgentStateMutation>,
@@ -432,8 +450,7 @@ export abstract class AbstractAgent {
         return;
       }
 
-      // Bookkeeping — if this fails it's a programming error; let it propagate
-      // rather than leaving pending flags in an inconsistent state.
+      // Reset throttle bookkeeping before delivering notifications.
       if (timerId !== null) {
         clearTimeout(timerId);
         timerId = null;
@@ -469,6 +486,7 @@ export abstract class AbstractAgent {
       const remaining = Math.max(0, throttleMs - elapsed);
       timerId = setTimeout(() => {
         timerId = null;
+        if (disposed) return;
         try {
           notify();
         } catch (err) {
@@ -533,16 +551,24 @@ export abstract class AbstractAgent {
         },
       }),
       finalize(() => {
-        if (timerId !== null) {
-          clearTimeout(timerId);
-          timerId = null;
+        try {
+          if (timerId !== null) {
+            clearTimeout(timerId);
+            timerId = null;
+          }
+          // Only flush on normal completion; skip on error to avoid
+          // delivering potentially inconsistent state to subscribers.
+          if (streamCompleted && (pendingMessages || pendingState)) {
+            notify();
+          }
+        } catch (err) {
+          console.error("AG-UI: Throttle finalize flush error:", err);
+          this._debugLogger?.lifecycle("LIFECYCLE", "Throttle finalize flush error:", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          disposed = true;
         }
-        // Only flush on normal completion; skip on error to avoid
-        // delivering potentially inconsistent state to subscribers.
-        if (streamCompleted && (pendingMessages || pendingState)) {
-          notify();
-        }
-        disposed = true;
       }),
     );
   }
@@ -720,6 +746,9 @@ export abstract class AbstractAgent {
       }
     })().catch((err) => {
       console.error("AG-UI: Unhandled error in addMessage notification:", err);
+      this._debugLogger?.lifecycle("LIFECYCLE", "addMessage notification error:", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -773,6 +802,9 @@ export abstract class AbstractAgent {
       }
     })().catch((err) => {
       console.error("AG-UI: Unhandled error in addMessages notification:", err);
+      this._debugLogger?.lifecycle("LIFECYCLE", "addMessages notification error:", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -794,6 +826,9 @@ export abstract class AbstractAgent {
       }
     })().catch((err) => {
       console.error("AG-UI: Unhandled error in setMessages notification:", err);
+      this._debugLogger?.lifecycle("LIFECYCLE", "setMessages notification error:", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -815,6 +850,9 @@ export abstract class AbstractAgent {
       }
     })().catch((err) => {
       console.error("AG-UI: Unhandled error in setState notification:", err);
+      this._debugLogger?.lifecycle("LIFECYCLE", "setState notification error:", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 

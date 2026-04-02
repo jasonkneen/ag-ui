@@ -431,9 +431,162 @@ describe("AbstractAgent notification throttle", () => {
     const calls: number[] = [];
     agent.subscribe({ onMessagesChanged: () => { calls.push(calls.length); } });
 
-    await runToCompletion(agent, () => emitCharChunks(agent, 10));
+    // Use MESSAGES_SNAPSHOT to inject an assistant message with undefined content
+    // (tool-call-only message). minChunkSize tracking should be inactive.
+    await runToCompletion(agent, () => {
+      agent.subject.next({
+        type: EventType.MESSAGES_SNAPSHOT,
+        messages: [{ id: "m1", role: "assistant", toolCalls: [{ id: "tc1", name: "foo", args: "{}" }] }],
+      } as BaseEvent);
+      // Emit more snapshots — since content is not a string, chunk tracking
+      // is inactive. Only leading edge and finalize flush should fire.
+      agent.subject.next({
+        type: EventType.MESSAGES_SNAPSHOT,
+        messages: [{ id: "m1", role: "assistant", toolCalls: [{ id: "tc1", name: "foo", args: "{}" }, { id: "tc2", name: "bar", args: "{}" }] }],
+      } as BaseEvent);
+    });
 
+    // Leading edge + finalize flush = 2, not 1 per event
     expect(calls.length).toBeGreaterThanOrEqual(1);
-    expect(firstAssistantContent(agent.messages)).toBe("ABCDEFGHIJ");
+    expect(calls.length).toBeLessThanOrEqual(3);
+  });
+
+  // ── Disposed flag suppresses post-finalize notifications ───────────
+
+  it("trailing timer that fires after finalize is suppressed by disposed flag", async () => {
+    vi.useFakeTimers();
+    try {
+      const agent = new TestAgent({ notificationThrottle: { intervalMs: 100 } });
+      const calls: string[] = [];
+      agent.subscribe({ onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); } });
+
+      const runPromise = agent.runAgent();
+      await vi.advanceTimersByTimeAsync(0);
+
+      agent.subject.next(runStarted());
+      // Leading edge fires immediately
+      agent.subject.next(textChunk("m1", "A"));
+      // Second chunk within the window — schedules a trailing timer
+      agent.subject.next(textChunk("m1", "B"));
+
+      // Complete the stream — finalize should flush and set disposed=true
+      agent.subject.next(runFinished());
+      agent.subject.complete();
+      await vi.advanceTimersByTimeAsync(0);
+      await runPromise;
+
+      const callsAfterComplete = calls.length;
+
+      // Now advance past the trailing timer — it should NOT fire
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(calls.length).toBe(callsAfterComplete);
+      // Final content should be complete
+      expect(calls[calls.length - 1]).toBe("AB");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── Trailing timer cleanup on stream error ────────────────────────
+
+  it("pending trailing timer does not fire after stream error", async () => {
+    vi.useFakeTimers();
+    try {
+      const agent = new TestAgent({ notificationThrottle: { intervalMs: 100 } });
+      const calls: string[] = [];
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      agent.subscribe({ onMessagesChanged: ({ messages }) => { calls.push(firstAssistantContent(messages)); } });
+
+      // Capture the promise BEFORE any events, so we can catch its rejection
+      const runPromise = agent.runAgent().catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+
+      agent.subject.next(runStarted());
+      // Leading edge
+      agent.subject.next(textChunk("m1", "A"));
+      // Within window — trailing timer scheduled
+      agent.subject.next(textChunk("m1", "B"));
+
+      const callsBeforeError = calls.length;
+
+      // Error the stream
+      agent.subject.error(new Error("stream error"));
+      await vi.advanceTimersByTimeAsync(0);
+      await runPromise;
+
+      const callsAfterError = calls.length;
+
+      // Advance past the trailing timer — should NOT fire
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(calls.length).toBe(callsAfterError);
+      // No additional notification was flushed
+      expect(calls.length).toBe(callsBeforeError);
+
+      consoleErrorSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── Async subscriber error handling ───────────────────────────────
+
+  it("async subscriber rejection is caught and does not crash the pipeline", async () => {
+    const agent = new TestAgent({ notificationThrottle: { intervalMs: 50 } });
+    const goodCalls: string[] = [];
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // First subscriber returns a rejected promise
+    agent.subscribe({
+      onMessagesChanged: () => Promise.reject(new Error("async boom")) as any,
+    });
+    // Second subscriber should still receive notifications
+    agent.subscribe({
+      onMessagesChanged: ({ messages }) => { goodCalls.push(firstAssistantContent(messages)); },
+    });
+
+    await runToCompletion(agent, () => {
+      agent.subject.next(textChunk("m1", "hello"));
+    });
+
+    // Allow microtasks to settle for the async rejection handler
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(goodCalls.length).toBeGreaterThanOrEqual(1);
+    expect(goodCalls[goodCalls.length - 1]).toBe("hello");
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("AG-UI: Subscriber onMessagesChanged async error"),
+      expect.any(Error),
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("async subscriber rejection in non-throttled path is caught", async () => {
+    const agent = new TestAgent(); // no throttle
+    const goodCalls: number[] = [];
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    agent.subscribe({
+      onMessagesChanged: () => Promise.reject(new Error("async boom")) as any,
+    });
+    agent.subscribe({
+      onMessagesChanged: ({ messages }) => { goodCalls.push(messages.length); },
+    });
+
+    await runToCompletion(agent, () => {
+      agent.subject.next(textChunk("m1", "hello"));
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(goodCalls.length).toBeGreaterThanOrEqual(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("AG-UI: Subscriber onMessagesChanged async error"),
+      expect.any(Error),
+    );
+
+    consoleErrorSpy.mockRestore();
   });
 });
