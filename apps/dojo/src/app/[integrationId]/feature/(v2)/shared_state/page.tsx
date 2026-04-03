@@ -14,7 +14,6 @@ import { useMobileView } from "@/utils/use-mobile-view";
 import { useMobileChat } from "@/utils/use-mobile-chat";
 import { useURLParams } from "@/contexts/url-params-context";
 import { CopilotKit } from "@copilotkit/react-core";
-import posthog from "posthog-js";
 
 interface SharedStateProps {
   params: Promise<{
@@ -606,13 +605,6 @@ function Recipe() {
           type="button"
           onClick={() => {
             if (!isLoading) {
-              posthog.capture("recipe_improve_ai_clicked", {
-                recipe_title: recipe.title,
-                ingredients_count: recipe.ingredients.length,
-                instructions_count: recipe.instructions.length,
-                skill_level: recipe.skill_level,
-                cooking_time: recipe.cooking_time,
-              });
               agent.addMessage({
                 id: crypto.randomUUID(),
                 role: "user",

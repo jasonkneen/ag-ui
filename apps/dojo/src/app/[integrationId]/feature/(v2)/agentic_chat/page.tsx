@@ -10,7 +10,6 @@ import {
 } from "@copilotkit/react-core/v2";
 import { z } from "zod";
 import { CopilotKit } from "@copilotkit/react-core";
-import posthog from "posthog-js";
 
 interface AgenticChatProps {
   params: Promise<{
@@ -48,9 +47,6 @@ const Chat = () => {
       background: z.string().describe("The background. Prefer gradients. Only use when asked."),
     }) ,
     handler: async ({ background }: { background: string }) => {
-      posthog.capture("background_changed", {
-        background,
-      });
       setBackground(background);
       return {
         status: "success",
