@@ -304,9 +304,9 @@ importers:
         specifier: ^3.25.75
         version: 3.25.76
     devDependencies:
-      '@copilotkit/llmock':
-        specifier: ^1.1.1
-        version: 1.3.1
+      '@copilotkit/aimock':
+        specifier: ^1.7.0
+        version: 1.7.0
       '@shadcn/ui':
         specifier: ^0.0.4
         version: 0.0.4
@@ -1963,8 +1963,9 @@ packages:
       react: ^18 || ^19 || ^19.0.0-rc
       react-dom: ^18 || ^19 || ^19.0.0-rc
 
-  '@copilotkit/llmock@1.3.1':
-    resolution: {integrity: sha512-9PL5AzGAqxAK0iJk0vBSfJF5azgrXvEC9yVCwysdahKXEeJds9VuZ4NSy+qfZgrgKTCXYXa8ap8S5LQHdor+WA==}
+  '@copilotkit/aimock@1.7.0':
+    resolution: {integrity: sha512-X6B2z0MgGTg8N/geRg6zRVVgEp3krP+gYapwXCt2w3JU7BSf2q0laa4iHC+BZqPXf29iVDVwDM7BxB5LqhjcAg==}
+    engines: {node: '>=20.15.0'}
     hasBin: true
 
   '@copilotkit/react-core@0.0.0-mme-ag-ui-0-0-46-20260227141603':
@@ -12213,7 +12214,7 @@ snapshots:
     transitivePeerDependencies:
       - signal-polyfill
 
-  '@copilotkit/llmock@1.3.1': {}
+  '@copilotkit/aimock@1.7.0': {}
 
   '@copilotkit/react-core@0.0.0-mme-ag-ui-0-0-46-20260227141603(a00f96f761bb394bf190b2e9f97d2193)':
     dependencies:
