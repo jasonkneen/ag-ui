@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/carousel";
 import { useURLParams } from "@/contexts/url-params-context";
 import { CopilotKit } from "@copilotkit/react-core";
+import posthog from "posthog-js";
 
 interface ToolBasedGenerativeUIProps {
   params: Promise<{
@@ -109,6 +110,11 @@ function HaikuDisplay() {
           image_name: image_name || null,
           gradient: gradient || "",
         };
+        posthog.capture("haiku_generated", {
+          english_first_line: english?.[0] || null,
+          has_image: !!image_name,
+          image_name: image_name || null,
+        });
         setHaikus((prev) => [
           newHaiku,
           ...prev.filter((h) => h.english[0] !== "A placeholder verse—"),
