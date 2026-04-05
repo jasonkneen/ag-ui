@@ -110,7 +110,7 @@ class LangGraphAgent:
         self.constant_schema_keys = ['messages', 'tools']
 
     def clone(self) -> "LangGraphAgent":
-        return LangGraphAgent(
+        return type(self)(
             name=self.name,
             graph=self.graph,
             description=self.description,
