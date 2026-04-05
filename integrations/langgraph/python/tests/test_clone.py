@@ -87,6 +87,12 @@ class TestClone(unittest.TestCase):
             agent.clone()
         self.assertIn("must override clone()", str(ctx.exception))
 
+    def test_clone_with_no_config(self):
+        """clone() with default (empty) config round-trips correctly."""
+        agent = LangGraphAgent(name="test", graph=self._make_graph())
+        cloned = agent.clone()
+        self.assertEqual(cloned.config, {})
+
     def test_clone_isolates_mutable_state(self):
         """clone() should produce a separate instance (not the same object)."""
         agent = LangGraphAgent(name="test", graph=self._make_graph())
