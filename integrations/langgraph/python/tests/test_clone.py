@@ -54,11 +54,38 @@ class TestClone(unittest.TestCase):
         self.assertEqual(cloned.description, "A test agent")
         self.assertEqual(cloned.config, config)
 
+    def test_clone_shallow_copies_config(self):
+        """clone() should shallow-copy config so mutations don't leak."""
+        config = {"recursion_limit": 50}
+        agent = LangGraphAgent(name="test", graph=self._make_graph(), config=config)
+        cloned = agent.clone()
+        self.assertEqual(cloned.config, config)
+        self.assertIsNot(cloned.config, agent.config)
+
     def test_clone_subclass_has_overridden_methods(self):
         """clone() of a subclass should have the subclass's methods."""
         agent = SubclassAgent(name="test", graph=self._make_graph())
         cloned = agent.clone()
         self.assertEqual(cloned.custom_method(), "subclass behavior")
+
+    def test_clone_does_not_preserve_subclass_extra_state(self):
+        """clone() only passes base-class params; subclass defaults apply."""
+        agent = SubclassAgent(name="test", graph=self._make_graph(), custom_flag=True)
+        cloned = agent.clone()
+        # Documented limitation: custom_flag reverts to its default
+        self.assertFalse(cloned.custom_flag)
+
+    def test_clone_subclass_with_required_extra_param_raises(self):
+        """Subclasses with extra required params must override clone()."""
+        class StrictAgent(LangGraphAgent):
+            def __init__(self, *, name, graph, api_key, description=None, config=None):
+                super().__init__(name=name, graph=graph, description=description, config=config)
+                self.api_key = api_key
+
+        agent = StrictAgent(name="test", graph=self._make_graph(), api_key="sk-123")
+        with self.assertRaises(TypeError) as ctx:
+            agent.clone()
+        self.assertIn("must override clone()", str(ctx.exception))
 
     def test_clone_isolates_mutable_state(self):
         """clone() should produce a separate instance (not the same object)."""
