@@ -274,8 +274,17 @@ export const defaultApplyEvents = (
               if (existing) {
                 targetMessage = existing;
               } else {
+                // Avoid duplicate IDs if a non-assistant message already has this ID.
+                const collision = messages.find((m) => m.id === parentMessageId);
+                const newId = collision ? toolCallId : parentMessageId;
+                if (collision) {
+                  console.warn(
+                    `TOOL_CALL_START: parentMessageId '${parentMessageId}' matches a '${collision.role}' message, ` +
+                      `not assistant — falling back to toolCallId`,
+                  );
+                }
                 targetMessage = {
-                  id: parentMessageId,
+                  id: newId,
                   role: "assistant",
                   toolCalls: [],
                 };

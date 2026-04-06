@@ -515,6 +515,88 @@ describe("defaultApplyEvents with tool calls", () => {
     expect(toolMsg?.id).toBe("result-1");
   });
 
+  it("should fall back to toolCallId when parentMessageId collides with a non-assistant message", async () => {
+    // When parentMessageId matches an existing message that is NOT an
+    // assistant message (e.g. a tool message), the code must not create a
+    // duplicate ID. Instead it falls back to toolCallId as the new message's ID.
+    const events$ = new Subject<BaseEvent>();
+    const collidingId = "shared-id";
+    const initialState: RunAgentInput = {
+      messages: [],
+      state: {},
+      threadId: "test-thread",
+      runId: "test-run",
+      tools: [],
+      context: [],
+    };
+
+    const agent = createAgent(initialState.messages);
+    const result$ = defaultApplyEvents(initialState, events$, agent, []);
+    const stateUpdatesPromise = firstValueFrom(result$.pipe(toArray()));
+
+    events$.next({ type: EventType.RUN_STARTED } as RunStartedEvent);
+
+    // First: create a tool result message that will occupy the collidingId
+    // We'll simulate this by using a full tool-call cycle with a result
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-setup",
+      toolCallName: "setup",
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-setup",
+      delta: '{}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-setup",
+    } as ToolCallEndEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: collidingId,
+      toolCallId: "tc-setup",
+      content: "done",
+    } as ToolCallResultEvent);
+
+    // Now: send a TOOL_CALL_START whose parentMessageId collides with the tool message
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-collide",
+      toolCallName: "collide",
+      parentMessageId: collidingId,
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-collide",
+      delta: '{"x":1}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-collide",
+    } as ToolCallEndEvent);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    events$.complete();
+
+    const stateUpdates = await stateUpdatesPromise;
+    const finalState = stateUpdates[stateUpdates.length - 1];
+
+    // The tool message should still have the collidingId
+    const toolMsg = finalState.messages?.find((m) => m.role === "tool");
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg?.id).toBe(collidingId);
+
+    // The new assistant message should have fallen back to toolCallId, not collidingId
+    const assistantMsgs = finalState.messages?.filter((m) => m.role === "assistant") as AssistantMessage[];
+    const collidingAssistant = assistantMsgs.find((m) =>
+      m.toolCalls?.some((tc) => tc.id === "tc-collide"),
+    );
+    expect(collidingAssistant).toBeDefined();
+    expect(collidingAssistant!.id).toBe("tc-collide");
+    expect(collidingAssistant!.id).not.toBe(collidingId);
+  });
+
   it("should create new assistant message when parentMessageId is not found anywhere", async () => {
     // When TOOL_CALL_START arrives with a parentMessageId that doesn't match
     // any existing message, a new assistant message should be created with
