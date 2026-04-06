@@ -261,10 +261,28 @@ export const defaultApplyEvents = (
               messages[messages.length - 1].id === parentMessageId
             ) {
               targetMessage = messages[messages.length - 1] as AssistantMessage;
+            } else if (parentMessageId) {
+              // The last message doesn't match (e.g. a tool result message was
+              // inserted between two tool calls in the same step). Search the
+              // full array so we attach to the existing parent instead of
+              // creating a duplicate.
+              const existing = messages.find((m) => m.id === parentMessageId) as
+                | AssistantMessage
+                | undefined;
+              if (existing) {
+                targetMessage = existing;
+              } else {
+                targetMessage = {
+                  id: parentMessageId,
+                  role: "assistant",
+                  toolCalls: [],
+                };
+                messages.push(targetMessage);
+              }
             } else {
-              // Create a new message otherwise
+              // No parentMessageId at all — create a new message keyed by toolCallId
               targetMessage = {
-                id: parentMessageId || toolCallId,
+                id: toolCallId,
                 role: "assistant",
                 toolCalls: [],
               };

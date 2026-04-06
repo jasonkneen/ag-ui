@@ -368,6 +368,67 @@ describe("event emission details (fake-only)", () => {
     expect(messageId1).not.toBe(messageId2);
   });
 
+  it("assigns new messageId after step-finish (multi-step tool flow)", async () => {
+    // Reproduces: text -> tool -> text -> tool across two LLM steps.
+    // Without the fix, all TEXT_MESSAGE_CHUNK events share the same
+    // messageId, causing the ag-ui client to merge them into one message.
+    const agent = makeLocalMastraAgent({
+      streamChunks: [
+        { type: "step-start", payload: {} },
+        { type: "text-delta", payload: { text: "I'll research..." } },
+        {
+          type: "tool-call",
+          payload: {
+            toolCallId: "tc-1",
+            toolName: "research_topic",
+            args: { topic: "quantum" },
+          },
+        },
+        {
+          type: "tool-result",
+          payload: { toolCallId: "tc-1", result: { findings: "data" } },
+        },
+        { type: "step-finish", payload: {} },
+        { type: "step-start", payload: {} },
+        { type: "text-delta", payload: { text: "Here are findings..." } },
+        {
+          type: "tool-call",
+          payload: {
+            toolCallId: "tc-2",
+            toolName: "show_findings",
+            args: { title: "Results" },
+          },
+        },
+        {
+          type: "tool-result",
+          payload: { toolCallId: "tc-2", result: "ok" },
+        },
+        { type: "step-finish", payload: {} },
+      ],
+    });
+
+    const events = await collectEvents(agent, makeInput());
+
+    const textChunks = events.filter(
+      (e) => e.type === EventType.TEXT_MESSAGE_CHUNK,
+    );
+    expect(textChunks).toHaveLength(2);
+
+    const messageId1 = (textChunks[0] as any).messageId;
+    const messageId2 = (textChunks[1] as any).messageId;
+
+    // Each step's text must have a distinct messageId
+    expect(messageId1).not.toBe(messageId2);
+
+    // Tool calls should reference their step's messageId
+    const toolStarts = events.filter(
+      (e) => e.type === EventType.TOOL_CALL_START,
+    );
+    expect(toolStarts).toHaveLength(2);
+    expect((toolStarts[0] as any).parentMessageId).toBe(messageId1);
+    expect((toolStarts[1] as any).parentMessageId).toBe(messageId2);
+  });
+
   it("tool call start references current messageId as parentMessageId", async () => {
     const agent = makeLocalMastraAgent({
       streamChunks: [

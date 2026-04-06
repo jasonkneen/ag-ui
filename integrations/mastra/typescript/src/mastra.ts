@@ -513,10 +513,14 @@ export class MastraAgent extends AbstractAgent {
           callbacks.onFinishMessagePart?.();
           break;
         }
+        case "step-finish": {
+          flush();
+          callbacks.onFinishMessagePart?.();
+          break;
+        }
         // Known Mastra lifecycle events with no AG-UI mapping — skip silently
         case "start":
         case "step-start":
-        case "step-finish":
           break;
         default: {
           console.warn(
