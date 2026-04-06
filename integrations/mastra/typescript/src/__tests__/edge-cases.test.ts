@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import type { TextMessageChunkEvent, ToolCallStartEvent } from "@ag-ui/client";
 import { EventType } from "@ag-ui/client";
 import { MastraAgent } from "../mastra";
 import {
@@ -362,8 +363,8 @@ describe("event emission details (fake-only)", () => {
     );
     expect(textChunks).toHaveLength(2);
 
-    const messageId1 = (textChunks[0] as any).messageId;
-    const messageId2 = (textChunks[1] as any).messageId;
+    const messageId1 = (textChunks[0] as TextMessageChunkEvent).messageId;
+    const messageId2 = (textChunks[1] as TextMessageChunkEvent).messageId;
 
     expect(messageId1).not.toBe(messageId2);
   });
@@ -414,8 +415,8 @@ describe("event emission details (fake-only)", () => {
     );
     expect(textChunks).toHaveLength(2);
 
-    const messageId1 = (textChunks[0] as any).messageId;
-    const messageId2 = (textChunks[1] as any).messageId;
+    const messageId1 = (textChunks[0] as TextMessageChunkEvent).messageId;
+    const messageId2 = (textChunks[1] as TextMessageChunkEvent).messageId;
 
     // Each step's text must have a distinct messageId
     expect(messageId1).not.toBe(messageId2);
@@ -425,8 +426,8 @@ describe("event emission details (fake-only)", () => {
       (e) => e.type === EventType.TOOL_CALL_START,
     );
     expect(toolStarts).toHaveLength(2);
-    expect((toolStarts[0] as any).parentMessageId).toBe(messageId1);
-    expect((toolStarts[1] as any).parentMessageId).toBe(messageId2);
+    expect((toolStarts[0] as ToolCallStartEvent).parentMessageId).toBe(messageId1);
+    expect((toolStarts[1] as ToolCallStartEvent).parentMessageId).toBe(messageId2);
   });
 
   it("tool call start references current messageId as parentMessageId", async () => {

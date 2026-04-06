@@ -10,6 +10,7 @@ import {
   RunStartedEvent,
   ToolCallArgsEvent,
   ToolCallEndEvent,
+  ToolCallResultEvent,
   ToolCallStartEvent,
 } from "@ag-ui/core";
 import { defaultApplyEvents } from "../default";
@@ -425,5 +426,144 @@ describe("defaultApplyEvents with tool calls", () => {
     expect((finalState.messages?.[1] as AssistantMessage).toolCalls?.[0]?.function?.name).toBe(
       "calculate",
     );
+  });
+
+  it("should find parent via full-array search when tool result sits between two tool calls", async () => {
+    // Regression test: when a TOOL_CALL_RESULT pushes a tool message (making
+    // it the last message), the next TOOL_CALL_START with the same
+    // parentMessageId must search the full array to find the existing parent
+    // instead of creating a duplicate assistant message.
+    const events$ = new Subject<BaseEvent>();
+    const parentMessageId = "parent-1";
+    const initialState: RunAgentInput = {
+      messages: [],
+      state: {},
+      threadId: "test-thread",
+      runId: "test-run",
+      tools: [],
+      context: [],
+    };
+
+    const agent = createAgent(initialState.messages);
+    const result$ = defaultApplyEvents(initialState, events$, agent, []);
+    const stateUpdatesPromise = firstValueFrom(result$.pipe(toArray()));
+
+    events$.next({ type: EventType.RUN_STARTED } as RunStartedEvent);
+
+    // First tool call with parentMessageId
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-1",
+      toolCallName: "search",
+      parentMessageId,
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-1",
+      delta: '{"q":"a"}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-1",
+    } as ToolCallEndEvent);
+
+    // Tool result — pushes a tool message, which becomes the last message
+    events$.next({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "result-1",
+      toolCallId: "tc-1",
+      content: "found it",
+    } as ToolCallResultEvent);
+
+    // Second tool call with the SAME parentMessageId — should attach to
+    // the existing assistant message, not create a duplicate
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-2",
+      toolCallName: "analyze",
+      parentMessageId,
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-2",
+      delta: '{"data":"x"}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-2",
+    } as ToolCallEndEvent);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    events$.complete();
+
+    const stateUpdates = await stateUpdatesPromise;
+    const finalState = stateUpdates[stateUpdates.length - 1];
+
+    // Should have exactly 2 messages: one assistant (with both tool calls) and one tool result
+    expect(finalState.messages?.length).toBe(2);
+
+    const assistantMsg = finalState.messages?.find((m) => m.role === "assistant") as AssistantMessage;
+    const toolMsg = finalState.messages?.find((m) => m.role === "tool");
+
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg.id).toBe(parentMessageId);
+    expect(assistantMsg.toolCalls?.length).toBe(2);
+    expect(assistantMsg.toolCalls?.[0]?.id).toBe("tc-1");
+    expect(assistantMsg.toolCalls?.[1]?.id).toBe("tc-2");
+
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg?.id).toBe("result-1");
+  });
+
+  it("should create new assistant message when parentMessageId is not found anywhere", async () => {
+    // When TOOL_CALL_START arrives with a parentMessageId that doesn't match
+    // any existing message, a new assistant message should be created with
+    // id === parentMessageId (not toolCallId).
+    const events$ = new Subject<BaseEvent>();
+    const initialState: RunAgentInput = {
+      messages: [],
+      state: {},
+      threadId: "test-thread",
+      runId: "test-run",
+      tools: [],
+      context: [],
+    };
+
+    const agent = createAgent(initialState.messages);
+    const result$ = defaultApplyEvents(initialState, events$, agent, []);
+    const stateUpdatesPromise = firstValueFrom(result$.pipe(toArray()));
+
+    events$.next({ type: EventType.RUN_STARTED } as RunStartedEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-1",
+      toolCallName: "lookup",
+      parentMessageId: "nonexistent-parent",
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-1",
+      delta: '{"key":"val"}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-1",
+    } as ToolCallEndEvent);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    events$.complete();
+
+    const stateUpdates = await stateUpdatesPromise;
+    const finalState = stateUpdates[stateUpdates.length - 1];
+
+    expect(finalState.messages?.length).toBe(1);
+
+    const msg = finalState.messages?.[0] as AssistantMessage;
+    // The message id should be the parentMessageId, not the toolCallId
+    expect(msg.id).toBe("nonexistent-parent");
+    expect(msg.role).toBe("assistant");
+    expect(msg.toolCalls?.length).toBe(1);
+    expect(msg.toolCalls?.[0]?.id).toBe("tc-1");
+    expect(msg.toolCalls?.[0]?.function?.name).toBe("lookup");
   });
 });

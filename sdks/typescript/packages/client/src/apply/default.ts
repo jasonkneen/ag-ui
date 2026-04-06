@@ -258,7 +258,8 @@ export const defaultApplyEvents = (
             if (
               parentMessageId &&
               messages.length > 0 &&
-              messages[messages.length - 1].id === parentMessageId
+              messages[messages.length - 1].id === parentMessageId &&
+              messages[messages.length - 1].role === "assistant"
             ) {
               targetMessage = messages[messages.length - 1] as AssistantMessage;
             } else if (parentMessageId) {
@@ -266,9 +267,10 @@ export const defaultApplyEvents = (
               // inserted between two tool calls in the same step). Search the
               // full array so we attach to the existing parent instead of
               // creating a duplicate.
-              const existing = messages.find((m) => m.id === parentMessageId) as
-                | AssistantMessage
-                | undefined;
+              const existing = messages.find(
+                (m): m is AssistantMessage =>
+                  m.id === parentMessageId && m.role === "assistant",
+              );
               if (existing) {
                 targetMessage = existing;
               } else {
