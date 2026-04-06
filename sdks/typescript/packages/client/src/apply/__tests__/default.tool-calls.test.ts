@@ -515,6 +515,93 @@ describe("defaultApplyEvents with tool calls", () => {
     expect(toolMsg?.id).toBe("result-1");
   });
 
+  it("should find parent via full-array search when multiple messages precede it", async () => {
+    // Exercises the common case where the parent assistant message is NOT the
+    // last message in the array and there are other messages before it.
+    const events$ = new Subject<BaseEvent>();
+    const parentMessageId = "assistant-1";
+    const initialState: RunAgentInput = {
+      messages: [],
+      state: {},
+      threadId: "test-thread",
+      runId: "test-run",
+      tools: [],
+      context: [],
+    };
+
+    const agent = createAgent(initialState.messages);
+    const result$ = defaultApplyEvents(initialState, events$, agent, []);
+    const stateUpdatesPromise = firstValueFrom(result$.pipe(toArray()));
+
+    events$.next({ type: EventType.RUN_STARTED } as RunStartedEvent);
+
+    // Build up: assistant message with first tool call, then a tool result
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-1",
+      toolCallName: "search",
+      parentMessageId,
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-1",
+      delta: '{"q":"a"}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-1",
+    } as ToolCallEndEvent);
+
+    // Tool result pushes a tool message — now the assistant is no longer last
+    events$.next({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "result-1",
+      toolCallId: "tc-1",
+      content: "found",
+    } as ToolCallResultEvent);
+
+    // Second tool result pushes another tool message
+    events$.next({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "result-2",
+      toolCallId: "tc-1",
+      content: "more",
+    } as ToolCallResultEvent);
+
+    // New tool call with the same parentMessageId — parent is now 2 positions back
+    events$.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tc-2",
+      toolCallName: "analyze",
+      parentMessageId,
+    } as ToolCallStartEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tc-2",
+      delta: '{"x":1}',
+    } as ToolCallArgsEvent);
+    events$.next({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: "tc-2",
+    } as ToolCallEndEvent);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    events$.complete();
+
+    const stateUpdates = await stateUpdatesPromise;
+    const finalState = stateUpdates[stateUpdates.length - 1];
+
+    // Should have 3 messages: 1 assistant (with both tool calls) + 2 tool results
+    expect(finalState.messages?.length).toBe(3);
+
+    const assistantMsg = finalState.messages?.find((m) => m.role === "assistant") as AssistantMessage;
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg.id).toBe(parentMessageId);
+    expect(assistantMsg.toolCalls?.length).toBe(2);
+    expect(assistantMsg.toolCalls?.[0]?.id).toBe("tc-1");
+    expect(assistantMsg.toolCalls?.[1]?.id).toBe("tc-2");
+  });
+
   it("should fall back to toolCallId when parentMessageId collides with a non-assistant message", async () => {
     // When parentMessageId matches an existing message that is NOT an
     // assistant message (e.g. a tool message), the code must not create a

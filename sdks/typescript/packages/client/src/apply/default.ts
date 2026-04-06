@@ -50,6 +50,54 @@ import untruncateJson from "untruncate-json";
 import { structuredClone_ } from "../utils";
 import { type DebugLoggerInput, resolveDebugLogger } from "@/debug-logger";
 
+/**
+ * Resolves (or creates) the assistant message that a tool call should attach to.
+ *
+ * Resolution order:
+ * 1. Fast path — `parentMessageId` matches the last message and it's an assistant message.
+ * 2. Full-array search — `parentMessageId` is set but the last message is not the matching
+ *    assistant message (e.g. a tool result was inserted, or the parent is simply earlier).
+ * 3. Collision — `parentMessageId` matches a non-assistant message; fall back to `toolCallId`.
+ * 4. Not found — create a new assistant message keyed by `parentMessageId`.
+ * 5. No `parentMessageId` — create a new assistant message keyed by `toolCallId`.
+ */
+const resolveOrCreateAssistantMessage = (
+  messages: Message[],
+  parentMessageId: string | undefined,
+  toolCallId: string,
+): AssistantMessage => {
+  if (parentMessageId) {
+    // Fast path: last message is the parent assistant message
+    const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
+    if (last?.id === parentMessageId && last.role === "assistant") {
+      return last as AssistantMessage;
+    }
+
+    // Full-array search — single pass for any message with this ID
+    const existing = messages.find((m) => m.id === parentMessageId);
+    if (existing?.role === "assistant") {
+      return existing as AssistantMessage;
+    }
+
+    // `existing` is set but not an assistant message → ID collision
+    const newId = existing ? toolCallId : parentMessageId;
+    if (existing) {
+      console.warn(
+        `TOOL_CALL_START: parentMessageId '${parentMessageId}' matches a '${existing.role}' message, ` +
+          `not assistant — falling back to toolCallId`,
+      );
+    }
+    const created: AssistantMessage = { id: newId, role: "assistant", toolCalls: [] };
+    messages.push(created);
+    return created;
+  }
+
+  // No parentMessageId — create a new message keyed by toolCallId
+  const created: AssistantMessage = { id: toolCallId, role: "assistant", toolCalls: [] };
+  messages.push(created);
+  return created;
+};
+
 export const defaultApplyEvents = (
   input: RunAgentInput,
   events$: Observable<BaseEvent>,
@@ -252,53 +300,11 @@ export const defaultApplyEvents = (
           if (mutation.stopPropagation !== true) {
             const { toolCallId, toolCallName, parentMessageId } = event as ToolCallStartEvent;
 
-            let targetMessage: AssistantMessage;
-
-            // Use last message if parentMessageId exists, we have messages, and the parentMessageId matches the last message's id
-            if (
-              parentMessageId &&
-              messages.length > 0 &&
-              messages[messages.length - 1].id === parentMessageId &&
-              messages[messages.length - 1].role === "assistant"
-            ) {
-              targetMessage = messages[messages.length - 1] as AssistantMessage;
-            } else if (parentMessageId) {
-              // The last message doesn't match (e.g. a tool result message was
-              // inserted between two tool calls in the same step). Search the
-              // full array so we attach to the existing parent instead of
-              // creating a duplicate.
-              const existing = messages.find(
-                (m): m is AssistantMessage =>
-                  m.id === parentMessageId && m.role === "assistant",
-              );
-              if (existing) {
-                targetMessage = existing;
-              } else {
-                // Avoid duplicate IDs if a non-assistant message already has this ID.
-                const collision = messages.find((m) => m.id === parentMessageId);
-                const newId = collision ? toolCallId : parentMessageId;
-                if (collision) {
-                  console.warn(
-                    `TOOL_CALL_START: parentMessageId '${parentMessageId}' matches a '${collision.role}' message, ` +
-                      `not assistant — falling back to toolCallId`,
-                  );
-                }
-                targetMessage = {
-                  id: newId,
-                  role: "assistant",
-                  toolCalls: [],
-                };
-                messages.push(targetMessage);
-              }
-            } else {
-              // No parentMessageId at all — create a new message keyed by toolCallId
-              targetMessage = {
-                id: toolCallId,
-                role: "assistant",
-                toolCalls: [],
-              };
-              messages.push(targetMessage);
-            }
+            const targetMessage = resolveOrCreateAssistantMessage(
+              messages,
+              parentMessageId,
+              toolCallId,
+            );
 
             targetMessage.toolCalls ??= [];
 

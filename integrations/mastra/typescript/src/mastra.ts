@@ -514,6 +514,10 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "step-finish": {
+          // Intentionally mirrors "finish": both boundaries flush buffered text
+          // and rotate the messageId so the next step's text gets a fresh ID.
+          // When a stream ends with step-finish followed by finish, onFinishMessagePart
+          // fires twice — the second rotation produces an unused messageId, which is harmless.
           flush();
           callbacks.onFinishMessagePart?.();
           break;
