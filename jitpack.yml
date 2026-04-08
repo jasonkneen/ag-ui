@@ -1,4 +1,2 @@
-before_install:
-  - cd sdks/community/java
 install:
-  - mvn install -DskipTests
+  - cd sdks/community/java && mvn install -DskipTests
