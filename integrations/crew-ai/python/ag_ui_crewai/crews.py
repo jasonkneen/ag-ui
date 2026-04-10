@@ -125,7 +125,7 @@ class ChatWithCrewFlow(Flow):
                 await copilotkit_exit()
                 self.state["messages"].append({
                     "role": "tool",
-                    "content": "Crew exited",
+                    "content": "Crew exited",  # E2E: aimock-setup.ts matches this exact string
                     "tool_call_id": message["tool_calls"][0]["id"]
                 })
 
