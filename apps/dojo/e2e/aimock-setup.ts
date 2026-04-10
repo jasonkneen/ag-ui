@@ -1237,7 +1237,14 @@ export async function setupLLMock(): Promise<void> {
     match: {
       predicate: (req) => {
         const last = req.messages[req.messages.length - 1];
-        return last?.role === "tool";
+        if (last?.role !== "tool") return false;
+        // Don't match CrewAI crew_exit follow-up — it has a dedicated fixture
+        const hasCrewExitTool = req.tools?.some(
+          (t) => t.function.name === "crew_exit",
+        );
+        if (hasCrewExitTool && textOf(last.content) === "Crew exited")
+          return false;
+        return true;
       },
     },
     response: { content: "Done! I've completed that for you." },

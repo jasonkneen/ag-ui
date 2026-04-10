@@ -35,22 +35,17 @@ test("[CrewAI] Crew Chat handles follow-up messages (dict state path)", async ({
   await chat.assertAgentReplyVisible(/equals 4/i);
 });
 
-// crew_exit: fixture predicates don't match — ChatWithCrewFlow rebuilds the
-// message array with crew_chat_build_system_message and the aimock tool-result
-// catch-all (prependFixture) fires instead. Needs local aimock journal
-// inspection to understand exact request structure reaching the mock.
-test.fixme(
-  "[CrewAI] Crew Chat handles crew_exit tool call (dict state path)",
-  async ({ page }) => {
-    await page.goto("/crewai/feature/crew_chat");
+test("[CrewAI] Crew Chat handles crew_exit tool call (dict state path)", async ({
+  page,
+}) => {
+  await page.goto("/crewai/feature/crew_chat");
 
-    const chat = new AgenticChatPage(page);
+  const chat = new AgenticChatPage(page);
 
-    await chat.openChat();
-    await expect(chat.agentGreeting).toBeVisible();
+  await chat.openChat();
+  await expect(chat.agentGreeting).toBeVisible();
 
-    await chat.sendMessage("goodbye crew");
-    await chat.assertUserMessageVisible("goodbye crew");
-    await chat.assertAgentReplyVisible(/crew has been shut down/i);
-  },
-);
+  await chat.sendMessage("goodbye crew");
+  await chat.assertUserMessageVisible("goodbye crew");
+  await chat.assertAgentReplyVisible(/crew has been shut down/i);
+});
