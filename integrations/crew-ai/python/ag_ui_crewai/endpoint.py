@@ -118,7 +118,10 @@ class FastAPICrewFlowEventListener(BaseEventListener):
         def _(source, event):
             queue = get_queue(source)
             if queue is not None:
-                messages = litellm_messages_to_ag_ui_messages(source.state.messages)
+                # source.state may be a Pydantic model (with .messages attr) or a plain dict
+                state = source.state
+                raw_messages = getattr(state, "messages", None) or (state.get("messages") if isinstance(state, dict) else None) or []
+                messages = litellm_messages_to_ag_ui_messages(raw_messages)
 
                 queue.put_nowait(
                     MessagesSnapshotEvent(
@@ -129,7 +132,7 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                 queue.put_nowait(
                     StateSnapshotEvent(
                         type=EventType.STATE_SNAPSHOT,
-                        snapshot=source.state
+                        snapshot=state if isinstance(state, dict) else state.model_dump() if hasattr(state, "model_dump") else {}
                     )
                 )
                 queue.put_nowait(
