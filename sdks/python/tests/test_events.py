@@ -641,6 +641,27 @@ class TestEvents(unittest.TestCase):
 
     def test_all_event_subclasses_in_event_union(self):
         """Ensure all BaseEvent subclasses are included in the Event union type"""
+        # Get all classes defined in the events module that are subclasses of BaseEvent
+        event_subclasses = set()
+        for name in dir(events_module):
+            obj = getattr(events_module, name)
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, BaseEvent)
+                and obj is not BaseEvent
+            ):
+                event_subclasses.add(obj)
+
+        # Get all types in the Event union
+        union_types = set(typing.get_args(typing.get_args(Event)[0]))
+
+        # Check that all event subclasses are in the union
+        missing_from_union = event_subclasses - union_types
+        self.assertEqual(
+            missing_from_union,
+            set(),
+            f"The following event types are missing from the Event union: {missing_from_union}"
+        )
 
     def test_reasoning_message_start_event_role_is_reasoning(self):
         """Test that ReasoningMessageStartEvent uses role='reasoning' to match TypeScript SDK.
@@ -687,28 +708,6 @@ class TestEvents(unittest.TestCase):
                 timestamp=1648214400000,
             )
 
-
-        # Get all classes defined in the events module that are subclasses of BaseEvent
-        event_subclasses = set()
-        for name in dir(events_module):
-            obj = getattr(events_module, name)
-            if (
-                isinstance(obj, type)
-                and issubclass(obj, BaseEvent)
-                and obj is not BaseEvent
-            ):
-                event_subclasses.add(obj)
-
-        # Get all types in the Event union
-        union_types = set(typing.get_args(typing.get_args(Event)[0]))
-
-        # Check that all event subclasses are in the union
-        missing_from_union = event_subclasses - union_types
-        self.assertEqual(
-            missing_from_union,
-            set(),
-            f"The following event types are missing from the Event union: {missing_from_union}"
-        )
 
         
 if __name__ == "__main__":
