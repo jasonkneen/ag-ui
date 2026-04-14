@@ -3,6 +3,7 @@
 """Main ADKAgent implementation for bridging AG-UI Protocol with Google ADK."""
 from ag_ui_adk.agui_toolset import AGUIToolset
 
+import copy
 from typing import Optional, Dict, Callable, Any, AsyncGenerator, List, Iterable, TYPE_CHECKING, Tuple, Union
 
 if TYPE_CHECKING:
@@ -111,6 +112,8 @@ class ADKAgent:
 
         # Session identity
         use_thread_id_as_session_id: bool = False,
+
+        capabilities: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the ADKAgent.
 
@@ -158,6 +161,12 @@ class ADKAgent:
                 as the ADK session_id instead of letting the backend generate one.
                 Eliminates the O(n) list_sessions scan for session recovery after
                 middleware restarts. Defaults to False for backward compatibility.
+            capabilities: Optional dictionary of agent capabilities conforming to
+                the AG-UI AgentCapabilities schema. When provided, the capabilities
+                are returned from the GET /capabilities endpoint, enabling frontend
+                clients to discover agent features before initiating a run. Use the
+                "custom" key for application-specific feature flags (e.g.,
+                {"custom": {"predictiveChips": True, "suggestedQuestions": True}}).
 
             Note:
             If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
@@ -169,7 +178,15 @@ class ADKAgent:
         
         if user_id and user_id_extractor:
             raise ValueError("Cannot specify both 'user_id' and 'user_id_extractor'")
-        
+
+        if capabilities is not None:
+            if not isinstance(capabilities, dict):
+                raise TypeError(f"capabilities must be a dict, got {type(capabilities).__name__}")
+            try:
+                json.dumps(capabilities)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"capabilities must be JSON-serializable: {e}") from e
+
         self._adk_agent = adk_agent
         self._static_app_name = app_name
         self._app_name_extractor = app_name_extractor
@@ -225,6 +242,7 @@ class ADKAgent:
         self._predict_state = predict_state
         # Message snapshot configuration
         self._emit_messages_snapshot = emit_messages_snapshot
+        self._capabilities = capabilities
 
         # Streaming function call arguments (Gemini 3+ via Vertex AI)
         if streaming_function_call_arguments and not self._adk_supports_streaming_fc_args():
@@ -338,6 +356,8 @@ class ADKAgent:
         streaming_function_call_arguments: bool = False,
         # Session identity
         use_thread_id_as_session_id: bool = False,
+        # Agent capabilities
+        capabilities: Optional[Dict[str, Any]] = None,
     ) -> "ADKAgent":
         """Create ADKAgent from an ADK App instance.
 
@@ -373,6 +393,8 @@ class ADKAgent:
                 call arguments from Gemini 3+ models. Requires google-adk >= 1.24.0.
             use_thread_id_as_session_id: When True, use the AG-UI thread_id directly
                 as the ADK session_id. See ADKAgent.__init__ for details.
+            capabilities: Optional dictionary of agent capabilities conforming to
+                the AG-UI AgentCapabilities schema. See ADKAgent.__init__ for details.
 
         Returns:
             ADKAgent instance configured to use the App
@@ -417,11 +439,22 @@ class ADKAgent:
             emit_messages_snapshot=emit_messages_snapshot,
             streaming_function_call_arguments=streaming_function_call_arguments,
             use_thread_id_as_session_id=use_thread_id_as_session_id,
+            capabilities=capabilities,
         )
         # Store App for per-request App creation with modified agents
         instance._app = app
         instance._plugin_close_timeout = plugin_close_timeout
         return instance
+
+    def get_capabilities(self) -> Optional[Dict[str, Any]]:
+        """Return a copy of the agent's declared capabilities, or None if not configured.
+
+        These capabilities conform to the AG-UI AgentCapabilities schema and are
+        served by the GET /capabilities endpoint when using add_adk_fastapi_endpoint().
+        """
+        if self._capabilities is None:
+            return None
+        return copy.deepcopy(self._capabilities)
 
     def _get_session_metadata(self, thread_id: str, user_id: str) -> Optional[Tuple[str, str, str]]:
         """Get session metadata for a (thread_id, user_id) pair efficiently.
