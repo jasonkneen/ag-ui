@@ -857,6 +857,26 @@ class ADKAgent:
         Yields:
             AG-UI protocol events
         """
+
+        # Multi-instance: hydrate in-memory session cache from DB on startup/switch.
+        # Ensures pending tool calls are detected across load-balanced instances
+        # so user messages are not dispatched before tool results (prevents LLM errors).
+        user_id = self._get_user_id(input)
+        cache_key = (input.thread_id, user_id)
+        if cache_key not in self._session_lookup_cache:
+            app_name = self._get_app_name(input)
+            session = await self._session_manager._find_session_by_thread_id(
+                app_name, user_id, input.thread_id
+            )
+            if session:
+                self._session_lookup_cache[cache_key] = (
+                    session.id, app_name, user_id
+                )
+                logger.info(
+                    "Hydrated session cache from DB for thread %s (session %s)",
+                    input.thread_id, session.id,
+                )
+            
         unseen_messages = await self._get_unseen_messages(input)
 
         if not unseen_messages:
