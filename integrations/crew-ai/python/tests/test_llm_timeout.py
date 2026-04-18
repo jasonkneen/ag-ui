@@ -60,9 +60,10 @@ def test_default_llm_timeout_is_set(monkeypatch):
     """
     monkeypatch.delenv("AGUI_CREWAI_LLM_TIMEOUT_SECONDS", raising=False)
     value = _llm_timeout_seconds()
-    # Must be a finite positive float.
+    # Must be a finite positive float. ``isinstance(value, float)`` already
+    # rules out ``None`` (R5 LOW #21: dropped the redundant separate
+    # ``is not None`` assertion — same guarantee from the type check).
     assert isinstance(value, float)
-    assert value is not None
     assert value > 0.0
     # Anchor against a fixed range rather than the module constant so a
     # rename-only regression is still caught.
@@ -91,6 +92,32 @@ def test_llm_timeout_bad_value_falls_back_to_default(monkeypatch):
     value = _llm_timeout_seconds()
     assert isinstance(value, float)
     assert value > 0.0
+
+
+def test_llm_timeout_nan_falls_back_to_default(monkeypatch):
+    """R5 HIGH #1: ``float('nan') > 0`` is False, which would silently
+    disable the LLM read timeout. A NaN env var must fall back to the
+    default, mirroring the NaN guard in ``endpoint._flow_timeout_seconds``.
+    """
+    monkeypatch.setenv("AGUI_CREWAI_LLM_TIMEOUT_SECONDS", "nan")
+    value = _llm_timeout_seconds()
+    assert value == _DEFAULT_LLM_TIMEOUT_SECONDS, (
+        f"NaN env var must fall back to default, not disable the LLM "
+        f"read timeout; got {value!r}"
+    )
+
+
+def test_llm_timeout_infinity_falls_back_to_default(monkeypatch):
+    """R5 HIGH #1 (defence in depth): ``float('inf')`` IS greater than 0
+    but would disable any practical ceiling. ``math.isfinite`` rejects it;
+    pin the behaviour so a regression to a naïve ``value > 0`` check is
+    caught.
+    """
+    monkeypatch.setenv("AGUI_CREWAI_LLM_TIMEOUT_SECONDS", "inf")
+    value = _llm_timeout_seconds()
+    assert value == _DEFAULT_LLM_TIMEOUT_SECONDS, (
+        f"Infinity env var must fall back to default; got {value!r}"
+    )
 
 
 async def test_acompletion_called_with_timeout_kwarg():

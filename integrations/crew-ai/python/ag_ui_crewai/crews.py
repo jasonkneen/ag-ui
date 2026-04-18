@@ -1,3 +1,4 @@
+import math
 import os
 import uuid
 import copy
@@ -33,13 +34,22 @@ _DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 
 
 def _llm_timeout_seconds() -> float | None:
-    """Return the configured LLM read timeout, or ``None`` to disable it."""
+    """Return the configured LLM read timeout, or ``None`` to disable it.
+
+    A non-positive value (``0`` / negative) disables the read timeout. NaN
+    and any other non-finite float is treated as unparseable and falls back
+    to the default — ``float('nan') > 0`` is False, which would otherwise
+    silently disable the guard. Mirrors the NaN handling in
+    ``endpoint._flow_timeout_seconds`` (R5 HIGH #1).
+    """
     raw = os.environ.get("AGUI_CREWAI_LLM_TIMEOUT_SECONDS")
     if raw is None:
         return _DEFAULT_LLM_TIMEOUT_SECONDS
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        return _DEFAULT_LLM_TIMEOUT_SECONDS
+    if not math.isfinite(value):
         return _DEFAULT_LLM_TIMEOUT_SECONDS
     return value if value > 0 else None
 
