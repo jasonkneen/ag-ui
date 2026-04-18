@@ -1,5 +1,3 @@
-import math
-import os
 import uuid
 import copy
 import json
@@ -41,17 +39,22 @@ def _llm_timeout_seconds() -> float | None:
     to the default — ``float('nan') > 0`` is False, which would otherwise
     silently disable the guard. Mirrors the NaN handling in
     ``endpoint._flow_timeout_seconds`` (R5 HIGH #1).
+
+    CR7 LOW: delegates to ``endpoint._parse_env_float`` so the three
+    env-parsed float helpers (flow ceiling / cancel-join ceiling / LLM
+    read timeout) share a single parse + policy path rather than
+    triplicating the scaffolding.
     """
-    raw = os.environ.get("AGUI_CREWAI_LLM_TIMEOUT_SECONDS")
-    if raw is None:
-        return _DEFAULT_LLM_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return _DEFAULT_LLM_TIMEOUT_SECONDS
-    if not math.isfinite(value):
-        return _DEFAULT_LLM_TIMEOUT_SECONDS
-    return value if value > 0 else None
+    # Local import to avoid a circular dependency at module load time —
+    # ``endpoint`` imports from ``crews`` (``ChatWithCrewFlow``), so we
+    # cannot import ``endpoint`` at the top of ``crews``.
+    from .endpoint import _parse_env_float
+
+    return _parse_env_float(
+        "AGUI_CREWAI_LLM_TIMEOUT_SECONDS",
+        _DEFAULT_LLM_TIMEOUT_SECONDS,
+        allow_disable=True,
+    )
 
 
 CREW_EXIT_TOOL = {
