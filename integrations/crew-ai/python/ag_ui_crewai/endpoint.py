@@ -80,6 +80,15 @@ __all__ = [
 # ``asyncio.wait`` returning and the ``finally`` clause cancelling it.
 _UNSET = object()
 
+# Process-wide global registry of in-flight flow queues, keyed by
+# ``id(flow)``. Writes are serialised via ``QUEUES_LOCK``; reads go
+# through ``get_queue`` which relies on GIL-atomic ``dict.get``
+# (see ``get_queue`` for the full contract). Between tests this dict
+# is cleared by the autouse ``_clear_endpoint_queues`` fixture in
+# ``tests/conftest.py``. ``id`` reuse is theoretically possible across
+# requests but bounded by flow lifetime — the endpoint holds a reference
+# to the flow copy for the full request, so within-request collisions
+# cannot happen (CR6-7 LOW #6).
 QUEUES = {}
 QUEUES_LOCK = asyncio.Lock()
 
@@ -462,9 +471,38 @@ async def create_queue(flow: object) -> asyncio.Queue:
 
 
 def get_queue(flow: object) -> asyncio.Queue | None:
-    """Get the queue for a flow."""
+    """Get the queue for a flow.
+
+    CR6-7 MEDIUM: ``QUEUES_LOCK`` is intentionally NOT taken here.
+
+    Contract:
+    * ``QUEUES`` is a plain ``dict`` keyed by ``id(flow)``. CPython's GIL
+      makes ``dict.get(k)`` atomic at the bytecode level — we cannot
+      observe a half-constructed mapping.
+    * This function is called from TWO contexts:
+      (a) Synchronous crewai event-listener callbacks. Those run from
+          arbitrary call stacks — potentially from a thread that is NOT
+          the event loop. Acquiring ``QUEUES_LOCK`` (an ``asyncio.Lock``)
+          from a sync context is not possible; we rely on GIL atomicity
+          instead.
+      (b) The async endpoint code paths, which always take
+          ``QUEUES_LOCK`` for writes (``create_queue``, ``delete_queue``)
+          but not reads.
+    * The one race that remains is SEMANTIC rather than data-structural:
+      a late listener callback that fires after ``delete_queue`` has
+      removed the entry will observe ``None`` and silently no-op. This
+      is the intended behaviour — an event for a torn-down flow has
+      nowhere to land. The ``_cancel_and_join`` teardown widens the
+      window during which late callbacks can arrive after delete, but
+      does not change the semantics: late events were already lost on
+      the happy-path, and continue to be lost here.
+    * ``id`` reuse is bounded by flow lifetime. A deleted flow's id can
+      be assigned to a new flow object only AFTER the old flow is
+      garbage-collected; the endpoint holds a reference for the entire
+      request lifetime, so within-request ``id`` collisions are not
+      possible.
+    """
     queue_id = id(flow)
-    # not using a lock here should be fine
     return QUEUES.get(queue_id)
 
 async def delete_queue(flow: object) -> None:
@@ -731,10 +769,18 @@ async def _run_flow_event_stream(
             # yields via ``sleep(0)`` and re-probes. We cap BOTH the total
             # pass count and the cumulative sleep budget so a pathological
             # listener that keeps enqueueing forever cannot pin the
-            # generator here. _DRAIN_MAX_PASSES is generous (5x the prior
-            # 2-pass cap) and _DRAIN_BUDGET_SECONDS bounds wall-clock
-            # even if ``sleep(0)`` returns immediately.
-            _DRAIN_MAX_PASSES = 5
+            # generator here.
+            #
+            # CR6-6 LOW #4: bumped from 5 → 10 based on R4/R5 history.
+            # Multiple late-arrival regressions were driven by listener
+            # chains needing 3+ scheduler ticks to materialise; 5 was
+            # uncomfortably close to that floor. ``_DRAIN_BUDGET_SECONDS``
+            # (50ms wall-clock) is the effective upper bound regardless
+            # of the pass count — on a loaded loop ``sleep(0)`` returns
+            # fast enough that 10 passes complete in <1ms, and on a
+            # quiet loop the pass cap is reached long before the wall
+            # clock matters.
+            _DRAIN_MAX_PASSES = 10
             _DRAIN_BUDGET_SECONDS = 0.050
 
             async def _drain_queue_until_sentinel_or_empty():
@@ -750,23 +796,33 @@ async def _run_flow_event_stream(
                 claimed ``Returns True`` which is syntactically impossible
                 for a generator.)
 
-                Algorithm (R5 HIGH #3):
-                * Pass 1 drains any currently-queued items. If the
-                  ``None`` sentinel appears we stop.
-                * If a pass drained ≥1 non-sentinel item, we assume more
-                  may be on the way (e.g. another listener callback
-                  already queued via ``call_soon``); yield once and loop.
-                * If a pass drained nothing, we yield once and probe
-                  once more so a ``call_soon``-scheduled listener has
-                  a chance to run before we conclude the queue is idle.
-                * Hard caps on pass count and cumulative yield budget
-                  prevent a pathological producer from pinning the
-                  drain.
+                Algorithm (CR6-6 LOW #1 — docstring rewritten to match
+                the actual implementation; pre-fix text still described
+                the legacy 2-pass "probe once more" shape):
+                * Each pass drains any currently-queued items via
+                  non-blocking ``get_nowait``. If the ``None`` sentinel
+                  appears we stop immediately.
+                * After each pass we yield one scheduler tick
+                  (``asyncio.sleep(0)``) — UNCONDITIONALLY, regardless of
+                  whether the pass drained anything — so any
+                  ``call_soon`` / ``call_later(0)`` chained by a
+                  listener has a chance to run before we probe again.
+                * We loop up to ``_DRAIN_MAX_PASSES`` (10) passes or
+                  until the cumulative ``_DRAIN_BUDGET_SECONDS`` wall
+                  clock is exhausted — whichever comes first. This
+                  covers listener chains that need multiple scheduler
+                  ticks to materialise their enqueue (e.g. a listener
+                  callback that itself schedules another ``call_soon``).
+                * Budget-exhaustion mid-pass is logged at DEBUG so
+                  operators can correlate dropped events; the hard pass
+                  cap is likewise logged so a pathological listener that
+                  keeps enqueueing forever is visible.
 
                 Pre-fix behaviour (R5 HIGH #3): a 2-pass early-return
                 dropped late-arriving items that needed more than a
-                single ``sleep(0)`` tick to land — e.g. a listener
-                callback that itself schedules another ``call_soon``.
+                single ``sleep(0)`` tick to land. R6 (CR6-6 LOW #4)
+                widened the cap from 5 to 10 to cover the listener-chain
+                scenarios observed in the R4/R5 history.
                 """
                 drain_deadline = time.monotonic() + _DRAIN_BUDGET_SECONDS
                 drained_anything_ever = False
@@ -965,19 +1021,28 @@ async def _run_flow_event_stream(
             # Log full context server-side; keep the client message tight
             # and correlated. Extras expose ``threadId`` / ``runId`` in
             # camelCase to match peer events' wire format (finding #3).
-            # ``timeout`` is always non-None here — the ``deadline``
-            # computation above only produces TimeoutError when ``timeout``
-            # was configured (the unreachable ``"configured"`` fallback
-            # branch has been removed, finding #11).
+            #
+            # ``timeout`` may be ``None`` here (CR6-4 LOW): when the
+            # flow-ceiling is disabled via non-positive env var, the
+            # ``deadline`` branch never produces a ``TimeoutError``, but a
+            # ``TimeoutError`` can still bubble out of ``kickoff_async``
+            # (e.g. a LiteLLM read timeout) and be caught here. Formatting
+            # ``None`` with ``%g`` / ``{timeout:g}`` crashes the handler
+            # BEFORE the ``RunErrorEvent`` is yielded, so the client sees
+            # an abruptly terminated stream instead of a correlated
+            # error event. Guard both sites with a single display string.
+            timeout_display = (
+                "disabled" if timeout is None else f"{timeout:g}s"
+            )
             _LOGGER.warning(
-                "CrewAI flow exceeded ceiling thread=%s run=%s ceiling=%gs",
+                "CrewAI flow exceeded ceiling thread=%s run=%s ceiling=%s",
                 input_data.thread_id,
                 input_data.run_id,
-                timeout,
+                timeout_display,
             )
             message = (
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
-                f"CrewAI flow exceeded {timeout:g}s ceiling"
+                f"CrewAI flow exceeded ceiling={timeout_display}"
             )
             yield encoder.encode(
                 RunErrorEvent(
