@@ -1,3 +1,4 @@
+import os
 import uuid
 import copy
 import json
@@ -18,6 +19,26 @@ from .sdk import (
 )
 
 _CREW_INPUTS_CACHE = {}
+
+# Default read timeout (seconds) for LiteLLM streaming requests. Without this,
+# a half-open TCP stream (server sends no bytes, client never receives FIN) can
+# leave the coroutine awaiting ``socket.recv()`` indefinitely. LiteLLM forwards
+# this to the underlying HTTP client. Override with the
+# ``AGUI_CREWAI_LLM_TIMEOUT_SECONDS`` environment variable; set to a
+# non-positive value to disable the cap.
+_DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
+
+
+def _llm_timeout_seconds() -> float | None:
+    """Return the configured LLM read timeout, or ``None`` to disable it."""
+    raw = os.environ.get("AGUI_CREWAI_LLM_TIMEOUT_SECONDS")
+    if raw is None:
+        return _DEFAULT_LLM_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LLM_TIMEOUT_SECONDS
+    return value if value > 0 else None
 
 
 CREW_EXIT_TOOL = {
@@ -93,7 +114,8 @@ class ChatWithCrewFlow(Flow):
                 messages=messages,
                 tools=tools,
                 parallel_tool_calls=False,
-                stream=True
+                stream=True,
+                timeout=_llm_timeout_seconds(),
             )
         )
 
@@ -143,7 +165,8 @@ class ChatWithCrewFlow(Flow):
                         tools=tools,
                         parallel_tool_calls=False,
                         stream=True,
-                        tool_choice="none"
+                        tool_choice="none",
+                        timeout=_llm_timeout_seconds(),
                     )
                 )
                 message = cast(Any, response).choices[0]["message"]
