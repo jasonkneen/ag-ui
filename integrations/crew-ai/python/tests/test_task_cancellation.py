@@ -26,6 +26,7 @@ endpoint factories (flow and crew):
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -706,10 +707,17 @@ class _LateEnqueueFlow:
     Used to pin R4 MEDIUM #3: the happy-path drain must not break on the
     first empty probe — it must yield once and probe again to catch a
     late-arriving listener enqueue (otherwise the event is silently dropped).
+
+    R5 MEDIUM #9: the deferred-put task is retained on the instance so
+    tests can cancel/await it during cleanup; a fire-and-forget
+    ``create_task`` would occasionally leave a pending task on the loop
+    at test teardown.
     """
 
-    def __init__(self, late_event) -> None:
+    def __init__(self, late_event, delay_ticks: int = 2) -> None:
         self._late_event = late_event
+        self._delay_ticks = delay_ticks
+        self._deferred_task: asyncio.Task | None = None
         self.done = asyncio.Event()
 
     def __deepcopy__(self, memo):  # noqa: D401 - trivial
@@ -723,17 +731,34 @@ class _LateEnqueueFlow:
         # returns but before the drain loop runs.
         q = _MODULE_QUEUE_REGISTRY.get(id(self))
         event = self._late_event
+        delay_ticks = self._delay_ticks
 
         async def _deferred_put():
-            # Yield twice so we are strictly after the main loop has
-            # observed ``kickoff_task.done()`` and entered the drain.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            # Yield ``delay_ticks`` times so we are strictly after the
+            # main loop has observed ``kickoff_task.done()`` and entered
+            # the drain. ``delay_ticks=2`` hits the fast-path; higher
+            # values exercise the drain's extended pass budget.
+            for _ in range(delay_ticks):
+                await asyncio.sleep(0)
             if q is not None:
                 q.put_nowait(event)
 
-        asyncio.create_task(_deferred_put())
+        # Retain a handle so tests can tear the task down deterministically
+        # (R5 MEDIUM #9: previously fire-and-forget).
+        self._deferred_task = asyncio.create_task(_deferred_put())
         self.done.set()
+
+    async def await_deferred(self) -> None:
+        """Await the deferred enqueue task, if it was scheduled."""
+        if self._deferred_task is not None and not self._deferred_task.done():
+            try:
+                await asyncio.wait_for(self._deferred_task, timeout=1.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                self._deferred_task.cancel()
+                try:
+                    await self._deferred_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
 
 async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
@@ -795,6 +820,76 @@ async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
         f"got types={types!r}"
     )
 
+    # R5 MEDIUM #9: await the deferred enqueue task so it does not leak
+    # into later tests as a pending task on the event loop.
+    await flow.await_deferred()
+
+
+@pytest.mark.parametrize("delay_ticks", [3, 4])
+async def test_happy_path_drain_captures_multi_tick_late_enqueue(
+    monkeypatch, delay_ticks
+):
+    """R5 HIGH #3 red-green: a listener enqueue that needs >1 scheduler
+    tick after ``kickoff_task.done()`` to materialise must still be
+    delivered. Pre-R5 the drain performed at most 2 passes (with a
+    single ``sleep(0)`` between) and early-returned on the first empty
+    pass — a listener whose ``call_soon`` chain fires 3+ ticks later
+    would be silently dropped.
+
+    Post-R5 the drain keeps looping while any pass drains something OR
+    while we have consecutive-empty budget (two empty passes) AND the
+    ``_DRAIN_MAX_PASSES`` / ``_DRAIN_BUDGET_SECONDS`` caps remain.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "30")
+
+    original_create_queue = ep.create_queue
+
+    async def _tracked_create_queue(flow_obj):
+        q = await original_create_queue(flow_obj)
+        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        return q
+
+    monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
+
+    late_event = RunStartedEvent(
+        type=EventType.RUN_STARTED,
+        thread_id="?",
+        run_id="?",
+    )
+    flow = _LateEnqueueFlow(late_event, delay_ticks=delay_ticks)
+    app = FastAPI()
+    ep.add_crewai_flow_fastapi_endpoint(app, flow, path="/run")
+
+    route = next(r for r in app.router.routes if getattr(r, "path", None) == "/run")
+    endpoint_fn = route.endpoint
+    response = await endpoint_fn(_make_input(), _make_request())
+    body_iter = response.body_iterator
+
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    await asyncio.wait_for(_drain(), timeout=5.0)
+    parts = [
+        p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
+        for p in drained
+    ]
+    joined = "".join(parts)
+    payloads = _parse_sse_payloads(joined)
+    types = [p.get("type") for p in payloads]
+
+    assert "RUN_STARTED" in types, (
+        f"multi-tick late enqueue (delay_ticks={delay_ticks}) was silently "
+        f"dropped by the happy-path drain; expected RUN_STARTED in payload "
+        f"types, got types={types!r}"
+    )
+
+    await flow.await_deferred()
+
 
 def test_flow_timeout_nan_falls_back_to_default(monkeypatch):
     """R4 LOW #17: ``float('nan') > 0`` is False, which would silently
@@ -837,6 +932,28 @@ async def test_get_flow_is_serialized_under_concurrent_first_requests(monkeypatc
     """R4 MEDIUM #6: two concurrent first-requests must not both
     construct ``ChatWithCrewFlow`` — that constructor issues a real LLM
     call and is expensive.
+
+    Scope note (R5 MEDIUM #5): ``ChatWithCrewFlow.__init__`` is
+    synchronous. The constructor IS slow (it issues a real LLM call), but
+    from the event loop's perspective it runs to completion on a single
+    tick — it cannot interleave with another coroutine via ``await``.
+    The serializing ``asyncio.Lock`` guarantees that even if two
+    coroutines race into ``_get_flow()``, only one crosses the
+    ``_cached_flow is None`` gate before releasing the lock. A TRUE
+    async-init race (where one coroutine awaits inside its __init__
+    while another races past) would require a module-level hook that
+    inserts an ``await`` between the counter increment and the lock
+    release; we don't have that surface here and reproducing it would
+    require patching both ``asyncio.Lock`` and adding an async
+    constructor shim.
+
+    This test is therefore a POSITIVE-CONTRACT PIN only: it asserts that
+    the "check then construct then cache" sequence under the lock
+    produces exactly one constructor call even when two coroutines enter
+    ``_get_flow()`` concurrently. A regression that removes the lock
+    entirely would still be caught because the two coroutines can
+    interleave their reads of ``_cached_flow`` if ``_get_flow`` awaits
+    any schedulable work between the check and the cache write.
     """
     from ag_ui_crewai import endpoint as ep
 
@@ -844,19 +961,14 @@ async def test_get_flow_is_serialized_under_concurrent_first_requests(monkeypatc
     monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "5")
 
     construct_calls = 0
-    construct_started = asyncio.Event()
-    release_construct = asyncio.Event()
 
     class _SlowCtorFlow:
         def __init__(self, *_a, **_kw):  # noqa: D401
             nonlocal construct_calls
             construct_calls += 1
-            # This simulates the LLM call inside the constructor; the
-            # serializing lock must hold the second caller here until
-            # the first completes. Since __init__ is synchronous we
-            # only increment the counter and let the first caller return
-            # immediately; the test asserts the counter stayed at 1.
-            construct_started.set()
+            # Synchronous constructor — the serializing behaviour the
+            # test exercises is the lock around the cache check/write,
+            # not a cross-await guard inside __init__ (see docstring).
             self.cancelled = asyncio.Event()
             self.started = asyncio.Event()
 
@@ -954,8 +1066,11 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
     # Outer cancel: triggers the CancelledError branch inside _cancel_and_join.
     driver.cancel()
 
-    loop = asyncio.get_running_loop()
-    start = loop.time()
+    # R5 LOW #17: use ``time.monotonic()`` for parity with
+    # ``_cancel_and_join``'s internal deadline math; ``loop.time()`` was
+    # an unnecessary divergence and on some platforms has different
+    # resolution characteristics than ``time.monotonic()``.
+    start = time.monotonic()
     try:
         # Bound = 1 × ceiling + generous slack. The pre-fix code produced
         # up to 2 × ceiling, so a regression would exceed this bound.
@@ -968,7 +1083,7 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
             "_cancel_and_join exceeded even the generous outer wait; the "
             "ceiling regression is severe."
         )
-    elapsed = loop.time() - start
+    elapsed = time.monotonic() - start
 
     # Strict invariant: single-ceiling window.
     assert elapsed <= ep._CANCEL_JOIN_TIMEOUT_SECONDS + 0.4, (
