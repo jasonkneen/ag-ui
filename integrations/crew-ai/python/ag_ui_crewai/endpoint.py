@@ -59,14 +59,18 @@ _LOGGER = logging.getLogger(__name__)
 # leading underscores and would be excluded from star-imports, but
 # pinning ``__all__`` makes the public contract documentation-grade
 # (R5 LOW #20) so downstream consumers can rely on it.
+#
+# ``create_queue`` / ``get_queue`` / ``delete_queue`` are intentionally
+# NOT exported (CR6-7 LOW #1): they are internal plumbing keyed by
+# ``id(flow)`` and exposing them makes it look like downstream code may
+# safely hook the queue lifecycle, which it cannot. Tests that need them
+# import via ``ag_ui_crewai.endpoint`` by attribute access, which still
+# works regardless of ``__all__``.
 __all__ = [
     "add_crewai_flow_fastapi_endpoint",
     "add_crewai_crew_fastapi_endpoint",
     "crewai_prepare_inputs",
     "FastAPICrewFlowEventListener",
-    "create_queue",
-    "get_queue",
-    "delete_queue",
 ]
 
 # Sentinel to distinguish "no item delivered" from a legitimate ``None``
@@ -652,6 +656,20 @@ def _run_error_extras(input_data: RunAgentInput) -> dict:
     The alias names are derived from ``RunStartedEvent.model_fields``
     (finding #30) so a rename of the alias policy in ag-ui.core does not
     silently regress this module.
+
+    LOAD-BEARING ASSUMPTION (CR6-7 LOW #2): ``RunStartedEvent`` and
+    ``RunErrorEvent`` share the same alias-generator policy (both derive
+    from ``ConfiguredBaseModel`` in ag-ui.core). We derive the alias
+    names from ``RunStartedEvent.model_fields`` and apply them to
+    ``RunErrorEvent`` extras on the premise that the wire name for
+    ``thread_id`` / ``run_id`` is IDENTICAL across the two models. If
+    ag-ui.core ever splits the alias policy per-model (e.g. a future
+    event keeps ``thread_id`` snake_case), this derivation silently
+    diverges: extras on ``RunErrorEvent`` would be camelCased while the
+    declared fields on the same event would not. The failure mode is
+    subtle (wire format mismatch, not a crash) so verifying the shared
+    policy at test time is the right escalation point rather than
+    asserting it dynamically here.
     """
     thread_alias = _field_alias(RunStartedEvent, "thread_id", "threadId")
     run_alias = _field_alias(RunStartedEvent, "run_id", "runId")
