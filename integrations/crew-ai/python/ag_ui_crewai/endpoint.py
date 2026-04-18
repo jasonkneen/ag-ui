@@ -190,7 +190,47 @@ def _sanitize_exception_code(name: str) -> str:
     composed code stays greppable and regex-matchable by downstream
     alerting. CR8 MEDIUM.
     """
-    return _CODE_SANITIZE_RE.sub("_", name.upper())
+    sanitized = _CODE_SANITIZE_RE.sub("_", name.upper())
+    # CR9 LOW: collapse runs of underscores into a single underscore
+    # (a class name like ``weird exception`` would otherwise produce
+    # ``WEIRD_EXCEPTION`` which is fine, but a unicode name like
+    # ``ErrorXé`` sanitizes to ``ERRORX_`` and a name like ``Error__X``
+    # would produce ``ERROR__X`` — collapse both consistently). Strip
+    # leading/trailing underscores so the result respects the peer
+    # convention. If the sanitized-and-stripped result is empty or does
+    # NOT start with ``[A-Z]`` (e.g. the class name was digits-only or
+    # all-unicode) prefix ``E_`` so the composed code still matches
+    # ``^[A-Z][A-Z0-9_]+$``.
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    if not sanitized or not sanitized[0].isascii() or not sanitized[0].isalpha():
+        sanitized = f"E_{sanitized}" if sanitized else "E"
+    return sanitized
+
+
+def _stamp_correlation_ids(event: object, *, thread_id: str, run_id: str) -> None:
+    """Stamp ``thread_id`` / ``run_id`` on ``event`` if the fields exist.
+
+    CR9 MEDIUM: the main-loop previously only rewrote these ids on
+    ``RUN_STARTED`` / ``RUN_FINISHED`` — any future ag-ui.core event
+    that also carries thread/run correlation (e.g. RUN_ERROR on the
+    error path) would ship the listener's ``"?"`` placeholders unless
+    stamped here. Rather than enumerate event types, probe attributes
+    with ``hasattr`` so new correlated events are covered automatically.
+    Events without these fields (StepStartedEvent, MessagesSnapshotEvent,
+    etc.) are left untouched — they do not carry correlation on the
+    wire today. Model ``__setattr__`` on Pydantic events is allowed by
+    ``model_config`` (no frozen).
+    """
+    if hasattr(event, "thread_id"):
+        try:
+            event.thread_id = thread_id
+        except (AttributeError, ValueError):  # pragma: no cover - defensive
+            pass
+    if hasattr(event, "run_id"):
+        try:
+            event.run_id = run_id
+        except (AttributeError, ValueError):  # pragma: no cover - defensive
+            pass
 
 
 def _flow_timeout_seconds() -> float | None:
@@ -237,8 +277,14 @@ def _cancel_join_timeout_seconds() -> float:
     # CR8 LOW: ``assert`` is stripped under ``python -O``; use an
     # explicit defensive guard that collapses to the default on the
     # (impossible) None path rather than silently returning None to
-    # the caller under -O.
-    if result is None:
+    # the caller under -O. CR9 LOW: kept (not removed) — this is an
+    # assertion-in-code-form. ``allow_disable=False`` guarantees
+    # non-None today, but a future refactor that widens the contract
+    # (or that introduces a fallback branch that returns None) would
+    # fall through to this guard rather than propagate ``None`` to
+    # every call site. Cheaper to keep than to audit every caller
+    # again.
+    if result is None:  # pragma: no cover - defensive; allow_disable=False guarantees non-None today
         return _CANCEL_JOIN_TIMEOUT_SECONDS
     return result
 
@@ -387,6 +433,17 @@ async def _cancel_and_join(
                                 timeout=_remaining(),
                             )
                         )
+                        # CR9 MEDIUM: if the recovery wait below times
+                        # out and we re-raise ``grace_outer_cancel``,
+                        # the stored ``TimeoutError`` on ``grace_teardown``
+                        # is never retrieved by anyone and the GC logs
+                        # ``Task exception was never retrieved``. Attach
+                        # a done-callback that drains the stored
+                        # exception so the future is left clean regardless
+                        # of the code path we exit through.
+                        grace_teardown.add_done_callback(
+                            lambda f: f.exception() if not f.cancelled() else None
+                        )
                         try:
                             await asyncio.shield(grace_teardown)
                         except (asyncio.TimeoutError, TimeoutError):
@@ -448,6 +505,15 @@ async def _cancel_and_join(
                 asyncio.gather(task, return_exceptions=True),
                 timeout=_remaining(),
             )
+        )
+        # CR9 MEDIUM: if the recovery wait below times out and we
+        # re-raise ``outer_cancel``, the stored ``TimeoutError`` on
+        # ``teardown`` is never retrieved by anyone and the GC logs
+        # ``Task exception was never retrieved``. Attach a done-callback
+        # that drains the stored exception so the future is left clean
+        # regardless of the code path we exit through.
+        teardown.add_done_callback(
+            lambda f: f.exception() if not f.cancelled() else None
         )
         try:
             await asyncio.shield(teardown)
@@ -555,15 +621,26 @@ async def create_queue(flow: object) -> asyncio.Queue:
     through another side channel.
     """
     queue_key = uuid.uuid4().hex
+    # CR9 LOW: register the queue in the module-level mapping BEFORE
+    # stamping the key on the flow. The pre-fix order (stamp first,
+    # then lock+insert) left a window — however small — where
+    # ``get_queue(flow)`` could observe the attribute and then miss
+    # the (not-yet-inserted) key in ``QUEUES``, returning ``None``
+    # and silently dropping an event. Reversing the order closes the
+    # window: the flow is not visible as "has a queue key" until
+    # there is a queue to look up.
     # ``setattr`` rather than direct ``flow._agui_queue_key = ...`` so
     # pylint / type-checkers don't flag the private-attribute write on
     # an arbitrary ``object``; crewai ``Flow`` instances accept
     # arbitrary attribute writes but the static-typing path must stay
     # clean.
-    setattr(flow, _QUEUE_KEY_ATTR, queue_key)
     async with QUEUES_LOCK:
         queue = asyncio.Queue()
         QUEUES[queue_key] = queue
+        # Stamp only AFTER the queue is registered under its key so
+        # a concurrent ``get_queue(flow)`` never observes the attr
+        # pointing at a not-yet-present entry.
+        setattr(flow, _QUEUE_KEY_ATTR, queue_key)
         return queue
 
 
@@ -910,6 +987,19 @@ async def _run_flow_event_stream(
         # does not raise in normal paths, but we defend against a future
         # refactor / wrapper that could. On failure the queue entry is
         # now orphaned — drop it before propagating so we do not leak.
+        #
+        # CR9 HIGH: if the BaseException we caught is a CancelledError
+        # on Python 3.11+, a bare ``await delete_queue(flow_copy)`` will
+        # re-raise CancelledError on entry because ``Task.cancelling()``
+        # is still non-zero — the cleanup never runs and the queue leaks.
+        # Mirror the ``_cancel_and_join`` pattern (lines 364-367,
+        # 459-462): call ``asyncio.current_task().uncancel()`` via
+        # ``getattr`` (3.10-compat) before the cleanup await so the
+        # teardown completes before we re-raise the original exception.
+        current = asyncio.current_task()
+        uncancel = getattr(current, "uncancel", None)
+        if callable(uncancel):
+            uncancel()
         await delete_queue(flow_copy)
         raise
     # Hold a reference to the kickoff task so we can cancel it on
@@ -992,12 +1082,22 @@ async def _run_flow_event_stream(
                         if item_local is None:
                             # Sentinel consumed — happy-path terminator.
                             return
-                        if item_local.type in (
-                            EventType.RUN_STARTED,
-                            EventType.RUN_FINISHED,
-                        ):
-                            item_local.thread_id = input_data.thread_id
-                            item_local.run_id = input_data.run_id
+                        # CR9 MEDIUM: stamp thread/run correlation on
+                        # ANY event whose schema carries those fields,
+                        # not just RUN_STARTED / RUN_FINISHED. The
+                        # listener enqueues ``"?"`` placeholders for
+                        # events it constructs (RunStarted/Finished),
+                        # but a future ag-ui.core event that also
+                        # carries correlation would otherwise ship the
+                        # stale ``"?"``s unchanged. ``_stamp_correlation_ids``
+                        # is a no-op for today's extras events
+                        # (StepStarted, MessagesSnapshot, ...) since
+                        # they don't declare the fields.
+                        _stamp_correlation_ids(
+                            item_local,
+                            thread_id=input_data.thread_id,
+                            run_id=input_data.run_id,
+                        )
                         yield encoder.encode(item_local)
 
                     # Budget exhausted: exit regardless of what the
@@ -1128,7 +1228,23 @@ async def _run_flow_event_stream(
                         await kickoff_task
 
                     if get_task in done:
-                        item = get_task.result()
+                        # CR9 LOW: narrow guard against CancelledError
+                        # on ``get_task.result()``. The happy-path ``done``
+                        # membership check normally implies the task
+                        # completed normally, but a concurrent outer-cancel
+                        # that propagated into ``get_task`` after
+                        # ``asyncio.wait`` returned can leave it
+                        # ``done()`` AND ``cancelled()`` — reading
+                        # ``.result()`` then raises CancelledError, which
+                        # would bypass the ``except _CeilingExceeded`` /
+                        # ``except Exception`` handlers below. Fall back
+                        # to the ``_UNSET`` sentinel so the next loop
+                        # iteration hits the ``kickoff_task.done()``
+                        # fast path.
+                        try:
+                            item = get_task.result()
+                        except asyncio.CancelledError:
+                            item = _UNSET
                     else:
                         # kickoff finished without error but no item was
                         # enqueued yet; the top-of-loop guard on the next
@@ -1178,9 +1294,15 @@ async def _run_flow_event_stream(
                     allow_grace = True
                     break
 
-                if item.type in (EventType.RUN_STARTED, EventType.RUN_FINISHED):
-                    item.thread_id = input_data.thread_id
-                    item.run_id = input_data.run_id
+                # CR9 MEDIUM: stamp correlation on any event whose
+                # schema declares the fields (see _stamp_correlation_ids).
+                # RUN_STARTED / RUN_FINISHED always do; future
+                # correlated events are covered automatically.
+                _stamp_correlation_ids(
+                    item,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
 
                 yield encoder.encode(item)
 
@@ -1197,7 +1319,13 @@ async def _run_flow_event_stream(
             )
             message = (
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
-                f"CrewAI flow was cancelled"
+                # CR9 LOW: align wording with the internal sentinel
+                # message ("CrewAI kickoff task was cancelled") so the
+                # code (``AGUI_CREWAI_KICKOFF_CANCELLED``), the
+                # server-side log ("kickoff cancelled externally"),
+                # and the client-facing message all agree on
+                # "kickoff" rather than mixing "flow" and "kickoff".
+                f"CrewAI kickoff was cancelled"
             )
             yield encoder.encode(
                 RunErrorEvent(
