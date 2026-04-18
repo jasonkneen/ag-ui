@@ -4,7 +4,9 @@ AG-UI FastAPI server for CrewAI.
 import copy
 import asyncio
 import logging
+import re
 import time
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -81,6 +83,22 @@ __all__ = [
 _UNSET = object()
 
 
+class _KickoffCancelled(Exception):
+    """Sentinel raised when the kickoff task is observed in the cancelled
+    state via an external path (e.g. a cooperating task cancelled the
+    ``kickoff_task`` out from under the generator).
+
+    CR8 HIGH #2: pre-fix, when ``kickoff_task.done() and
+    kickoff_task.cancelled()`` in the main-loop fast path, the code
+    silently fell through (drained the queue and broke out), closing
+    the stream with no ``RUN_ERROR`` event. Clients could not
+    distinguish "flow finished successfully" from "flow was cancelled
+    out from under us". Raising this sentinel from the fast path lets
+    the error-handling block emit ``AGUI_CREWAI_KICKOFF_CANCELLED`` so
+    the client gets a correlated, categorised error.
+    """
+
+
 class _CeilingExceeded(Exception):
     """Sentinel raised when our configured flow-ceiling deadline fires.
 
@@ -97,17 +115,28 @@ class _CeilingExceeded(Exception):
     so conflating upstream failures under that code makes alerting lie.
     """
 
-# Process-wide global registry of in-flight flow queues, keyed by
-# ``id(flow)``. Writes are serialised via ``QUEUES_LOCK``; reads go
-# through ``get_queue`` which relies on GIL-atomic ``dict.get``
-# (see ``get_queue`` for the full contract). Between tests this dict
-# is cleared by the autouse ``_clear_endpoint_queues`` fixture in
-# ``tests/conftest.py``. ``id`` reuse is theoretically possible across
-# requests but bounded by flow lifetime — the endpoint holds a reference
-# to the flow copy for the full request, so within-request collisions
-# cannot happen (CR6-7 LOW #6).
+# Process-wide global registry of in-flight flow queues, keyed by a
+# per-flow ``uuid.uuid4().hex`` stored on the flow as the
+# ``_agui_queue_key`` attribute (CR8 MEDIUM). Writes are serialised via
+# ``QUEUES_LOCK``; reads go through ``get_queue`` which relies on
+# GIL-atomic ``dict.get`` (see ``get_queue`` for the full contract).
+# Between tests this dict is cleared by the autouse
+# ``_clear_endpoint_queues`` fixture in ``tests/conftest.py``.
+#
+# CR8 MEDIUM rationale: prior versions keyed by ``id(flow)``. CPython
+# reuses ``id`` values aggressively once an object is garbage-collected,
+# which left a theoretical (though hard to exploit) window where a
+# late-arriving listener callback for a torn-down flow could route its
+# event onto a NEW flow's queue whose ``id`` happened to match. UUID
+# keys eliminate the collision concern entirely — each flow gets a
+# fresh hex key that is never reused across the process lifetime.
 QUEUES = {}
 QUEUES_LOCK = asyncio.Lock()
+
+# Attribute name we set on flow objects to carry their per-request queue
+# key. Module-level so tests and the listener callbacks share one
+# source of truth.
+_QUEUE_KEY_ATTR = "_agui_queue_key"
 
 # Hard wall-clock ceiling on a single flow run. A runaway flow (e.g. a hung
 # LiteLLM stream or an infinite loop in a user task) must not be able to pin
@@ -130,6 +159,38 @@ _CANCEL_GRACE_SECONDS = 1.0
 # swallow. Default override-able via ``AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS``
 # so operators can tune it under disconnect-heavy load (finding #8).
 _CANCEL_JOIN_TIMEOUT_SECONDS = 10.0
+
+# Caps on the happy-path drain (R5 HIGH #3). Unconditional
+# ``_DRAIN_MAX_PASSES`` loop with an ``asyncio.sleep(0)`` between passes
+# and a wall-clock ``_DRAIN_BUDGET_SECONDS`` ceiling that short-circuits
+# the loop when the budget is exhausted mid-pass.
+#
+# CR8 LOW: hoisted from function scope to module scope alongside the
+# other tuning constants so operators grepping for tunables find them
+# all in one place.
+_DRAIN_MAX_PASSES = 10
+_DRAIN_BUDGET_SECONDS = 0.050
+
+# Regex to sanitize exception class names before embedding them in a
+# ``code`` field. Peer events' codes match ``^[A-Z][A-Z0-9_]+$``; a
+# custom exception with dynamically-generated or unicode name (e.g.
+# ``class WeirdError42(Exception): pass``) must be forced into that
+# shape before going on the wire. CR8 MEDIUM.
+_CODE_SANITIZE_RE = re.compile(r"[^A-Z0-9_]")
+
+
+def _sanitize_exception_code(name: str) -> str:
+    """Sanitize an exception class name for the ``code`` field.
+
+    Peer events on this wire use ``^[A-Z][A-Z0-9_]+$`` codes. Exception
+    class names may contain lowercase letters, digits, or even unicode
+    (custom exceptions with dynamically-generated names are legal in
+    Python). Upper-case the name and replace any character that is not
+    an ASCII uppercase letter, digit, or underscore with ``_`` so the
+    composed code stays greppable and regex-matchable by downstream
+    alerting. CR8 MEDIUM.
+    """
+    return _CODE_SANITIZE_RE.sub("_", name.upper())
 
 
 def _flow_timeout_seconds() -> float | None:
@@ -173,7 +234,12 @@ def _cancel_join_timeout_seconds() -> float:
     # ``allow_disable=False`` guarantees a non-None return, but the
     # signature of ``_parse_env_float`` is ``float | None`` — narrow
     # here so callers can use the float without a type assertion.
-    assert result is not None  # invariant: allow_disable=False
+    # CR8 LOW: ``assert`` is stripped under ``python -O``; use an
+    # explicit defensive guard that collapses to the default on the
+    # (impossible) None path rather than silently returning None to
+    # the caller under -O.
+    if result is None:
+        return _CANCEL_JOIN_TIMEOUT_SECONDS
     return result
 
 
@@ -219,7 +285,20 @@ async def _cancel_and_join(
       implementation remains compatible with 3.10 (where the method does
       not exist).
     """
-    if task is None or task.done():
+    if task is None:
+        return
+    if task.done():
+        # CR8 LOW: if the task is already done with a stored exception
+        # (e.g. kickoff raised before the generator reached this
+        # teardown path), defensively call ``.exception()`` so the
+        # exception is marked retrieved and does NOT surface as a
+        # "Task exception was never retrieved" GC warning. ``.exception()``
+        # is only safe on a non-cancelled done task.
+        if not task.cancelled():
+            try:
+                task.exception()
+            except Exception:  # noqa: BLE001 - defensive
+                pass
         return
 
     # Shared monotonic deadline covering the ENTIRE teardown — grace
@@ -256,7 +335,20 @@ async def _cancel_and_join(
                 except (asyncio.TimeoutError, TimeoutError):
                     # Happy path did not complete in time; fall through to
                     # force-cancel below.
-                    pass
+                    #
+                    # CR8 MEDIUM: emit a debug log before silently
+                    # falling through so operators diagnosing stuck
+                    # teardown see a signal at the grace-expired
+                    # boundary (other branches in this function log;
+                    # this one was the only silent fall-through).
+                    _LOGGER.debug(
+                        "CrewAI kickoff grace window expired "
+                        "thread=%s run=%s grace=%gs; "
+                        "proceeding to force-cancel",
+                        thread_id,
+                        run_id,
+                        grace_budget,
+                    )
                 except asyncio.CancelledError as grace_outer_cancel:
                     # Outer-cancel during the grace wait. Mirror the
                     # post-grace recovery pattern (finding #5): ensure
@@ -305,44 +397,21 @@ async def _cancel_and_join(
                                 ceiling=ceiling,
                             )
                         except asyncio.CancelledError:
-                            # Recovery wait itself cancelled; attach a
-                            # drain callback (R5 HIGH #11 — mirror the
-                            # post-grace pattern) so a late-completing
-                            # teardown's exception is retrieved rather
-                            # than surfaced as "Task exception was never
-                            # retrieved" during GC. Then propagate.
-                            if grace_teardown is not None:
-                                def _drain_grace(fut):
-                                    if fut.cancelled():
-                                        return
-                                    exc = fut.exception()
-                                    if exc is not None:
-                                        _LOGGER.debug(
-                                            "CrewAI kickoff teardown completed "
-                                            "post-grace-cancel with %s "
-                                            "(thread=%s run=%s)",
-                                            type(exc).__name__,
-                                            thread_id,
-                                            run_id,
-                                        )
-
-                                if grace_teardown.done():
-                                    _drain_grace(grace_teardown)
-                                else:
-                                    grace_teardown.add_done_callback(_drain_grace)
+                            # Recovery wait itself cancelled. The inner
+                            # ``asyncio.gather(task, return_exceptions=True)``
+                            # already swallows any task exception into
+                            # its result list, so there is nothing to
+                            # "drain" from ``grace_teardown.exception()``
+                            # (CR8 MEDIUM — the prior drain log never
+                            # fired with a useful value; removed). Just
+                            # propagate the outer cancel.
                             raise
-                        # Normal completion of the shielded teardown;
-                        # drain any stored exception so GC does not warn.
-                        if grace_teardown.done() and not grace_teardown.cancelled():
-                            drained_exc = grace_teardown.exception()
-                            if drained_exc is not None:
-                                _LOGGER.debug(
-                                    "CrewAI kickoff grace teardown completed "
-                                    "with %s (thread=%s run=%s)",
-                                    type(drained_exc).__name__,
-                                    thread_id,
-                                    run_id,
-                                )
+                        # CR8 MEDIUM: no exception-drain log on normal
+                        # completion either — ``gather(return_exceptions=True)``
+                        # has already retrieved any task exception into
+                        # its result list, so ``grace_teardown.exception()``
+                        # here is always ``None`` / a bare TimeoutError
+                        # from ``wait_for`` (already handled above).
                     # Re-raise the ORIGINAL outer cancel instance so args
                     # and traceback propagate intact (R5 HIGH #2).
                     raise grace_outer_cancel
@@ -414,29 +483,12 @@ async def _cancel_and_join(
                     thread_id,
                     run_id,
                 )
-            # Retrieve any exception on ``teardown`` so it does not surface
-            # as ``Task exception was never retrieved`` during GC. If the
-            # task is still pending (recovery wait_for timed out), detach
-            # a callback that drains its eventual result — we've already
-            # spent our full ceiling budget and must not block further.
-            def _drain(fut):
-                if fut.cancelled():
-                    return
-                # ``.exception()`` marks the exception retrieved.
-                exc = fut.exception()
-                if exc is not None:
-                    _LOGGER.debug(
-                        "CrewAI kickoff teardown completed post-cancel "
-                        "with %s (thread=%s run=%s)",
-                        type(exc).__name__,
-                        thread_id,
-                        run_id,
-                    )
-
-            if teardown.done():
-                _drain(teardown)
-            else:
-                teardown.add_done_callback(_drain)
+            # CR8 MEDIUM: the prior ``_drain`` callback on ``teardown``
+            # was effectively dead code. ``asyncio.gather(task,
+            # return_exceptions=True)`` already swallows ``task``'s
+            # exception into its result list, so ``teardown.exception()``
+            # here only surfaces a ``TimeoutError`` from ``wait_for``
+            # (already handled above) or ``None``. Nothing to drain.
             # Re-raise the original CancelledError so traceback and
             # ``.args`` context propagate intact to the outer scope
             # (finding #14). A bare ``raise`` would reference ``outer_cancel``
@@ -493,11 +545,25 @@ def _log_stuck_cancel(
 
 
 async def create_queue(flow: object) -> asyncio.Queue:
-    """Create a queue for a flow."""
-    queue_id = id(flow)
+    """Create a queue for a flow and stamp the flow with its UUID key.
+
+    CR8 MEDIUM: keys are ``uuid.uuid4().hex`` rather than ``id(flow)``
+    so the registry cannot suffer from id-reuse collisions after a flow
+    is garbage-collected. The key is stored on the flow as
+    ``_agui_queue_key`` so listener callbacks that receive a flow via
+    the event bus can look up the queue without threading the key
+    through another side channel.
+    """
+    queue_key = uuid.uuid4().hex
+    # ``setattr`` rather than direct ``flow._agui_queue_key = ...`` so
+    # pylint / type-checkers don't flag the private-attribute write on
+    # an arbitrary ``object``; crewai ``Flow`` instances accept
+    # arbitrary attribute writes but the static-typing path must stay
+    # clean.
+    setattr(flow, _QUEUE_KEY_ATTR, queue_key)
     async with QUEUES_LOCK:
         queue = asyncio.Queue()
-        QUEUES[queue_id] = queue
+        QUEUES[queue_key] = queue
         return queue
 
 
@@ -507,10 +573,11 @@ def get_queue(flow: object) -> asyncio.Queue | None:
     CR6-7 MEDIUM: ``QUEUES_LOCK`` is intentionally NOT taken here.
 
     Contract:
-    * ``QUEUES`` is a plain ``dict`` keyed by ``id(flow)``. CPython's GIL
-      makes ``dict.get(k)`` atomic at the bytecode level — we cannot
-      observe a half-constructed mapping. CR7 LOW: this assumes a
-      CPython-with-GIL interpreter. Free-threaded CPython 3.13+ (PEP
+    * ``QUEUES`` is a plain ``dict`` keyed by the per-flow UUID hex
+      stored on the flow as ``_agui_queue_key`` (CR8 MEDIUM). CPython's
+      GIL makes ``dict.get(k)`` atomic at the bytecode level — we
+      cannot observe a half-constructed mapping. CR7 LOW: this assumes
+      a CPython-with-GIL interpreter. Free-threaded CPython 3.13+ (PEP
       703, opt-in ``--disable-gil``) removes the bytecode-atomicity
       guarantee and would require wrapping the read in a
       ``threading.Lock`` (or migrating ``QUEUES`` to a thread-safe
@@ -547,26 +614,42 @@ def get_queue(flow: object) -> asyncio.Queue | None:
       window during which late callbacks can arrive after delete, but
       does not change the semantics: late events were already lost on
       the happy-path, and continue to be lost here.
-    * ``id`` reuse is bounded by flow lifetime. A deleted flow's id can
-      be assigned to a new flow object only AFTER the old flow is
-      garbage-collected; the endpoint holds a reference for the entire
-      request lifetime, so within-request ``id`` collisions are not
-      possible.
+    * A flow that was never registered with ``create_queue`` (e.g. a
+      listener callback routed to an unrelated Flow) will not carry
+      the ``_agui_queue_key`` attribute; we default to ``None`` and
+      the ``get`` returns ``None`` as intended.
     """
-    queue_id = id(flow)
-    return QUEUES.get(queue_id)
+    queue_key = getattr(flow, _QUEUE_KEY_ATTR, None)
+    if queue_key is None:
+        return None
+    return QUEUES.get(queue_key)
 
 async def delete_queue(flow: object) -> None:
     """Delete the queue for a flow."""
-    queue_id = id(flow)
+    queue_key = getattr(flow, _QUEUE_KEY_ATTR, None)
+    if queue_key is None:
+        return
     async with QUEUES_LOCK:
-        if queue_id in QUEUES:
-            del QUEUES[queue_id]
+        QUEUES.pop(queue_key, None)
 
 GLOBAL_EVENT_LISTENER = None
 
 class FastAPICrewFlowEventListener(BaseEventListener):
-    """FastAPI CrewFlow event listener"""
+    """FastAPI CrewFlow event listener.
+
+    WARNING (CR8 MEDIUM): do NOT construct this class directly in
+    application code. ``add_crewai_flow_fastapi_endpoint`` and
+    ``add_crewai_crew_fastapi_endpoint`` auto-instantiate a process-wide
+    singleton the first time either is called; constructing a second
+    instance manually (and then calling a factory) registers DUPLICATE
+    listeners on the crewai global event bus, which then enqueues every
+    event TWICE onto the per-flow queues and doubles the wire output.
+
+    The class remains in ``__all__`` for introspection / type-hinting
+    in downstream code (some callers legitimately want to reference
+    the listener instance via ``ag_ui_crewai.endpoint.GLOBAL_EVENT_LISTENER``),
+    but direct construction is not a supported usage pattern.
+    """
 
     def setup_listeners(self, crewai_event_bus):
         """Setup listeners for the FastAPI CrewFlow event listener"""
@@ -727,7 +810,14 @@ def _field_alias(model_cls, field_name: str, default: str) -> str:
     # ``serialization_alias``; prefer the latter if set.
     serialization_alias = getattr(field, "serialization_alias", None)
     basic_alias = getattr(field, "alias", None)
-    alias = serialization_alias or basic_alias
+    # CR8 LOW: use an explicit None check rather than ``or`` so an empty
+    # string (legal, if unusual) on ``serialization_alias`` does not
+    # silently fall through to ``basic_alias``.
+    alias = (
+        serialization_alias
+        if serialization_alias is not None
+        else basic_alias
+    )
     if alias is None:
         model_name = getattr(model_cls, "__name__", str(model_cls))
         dedup_key = (model_name, field_name)
@@ -844,29 +934,9 @@ async def _run_flow_event_stream(
                 else None
             )
 
-            # Caps on the happy-path drain (R5 HIGH #3). Unconditional
-            # ``_DRAIN_MAX_PASSES`` loop with an ``asyncio.sleep(0)``
-            # between passes and a wall-clock ``_DRAIN_BUDGET_SECONDS``
-            # ceiling that short-circuits the loop when the budget is
-            # exhausted mid-pass. See the inner-generator docstring for
-            # the full algorithm. CR7 LOW: prior comment described a
-            # legacy "keep draining while pass drained ≥1 item; single
-            # empty pass yields and re-probes" shape that no longer
-            # matches the implementation (now: always loop up to the
-            # cap regardless of a given pass's productivity).
-            #
-            # CR6-6 LOW #4: bumped from 5 → 10 based on R4/R5 history.
-            # Multiple late-arrival regressions were driven by listener
-            # chains needing 3+ scheduler ticks to materialise; 5 was
-            # uncomfortably close to that floor. ``_DRAIN_BUDGET_SECONDS``
-            # (50ms wall-clock) is the effective upper bound regardless
-            # of the pass count — on a loaded loop ``sleep(0)`` returns
-            # fast enough that 10 passes complete in <1ms, and on a
-            # quiet loop the pass cap is reached long before the wall
-            # clock matters.
-            _DRAIN_MAX_PASSES = 10
-            _DRAIN_BUDGET_SECONDS = 0.050
-
+            # ``_DRAIN_MAX_PASSES`` / ``_DRAIN_BUDGET_SECONDS`` are
+            # module-level constants (CR8 LOW) so the tuning surface
+            # is grouped with the other env-var-backed ceilings above.
             async def _drain_queue_until_sentinel_or_empty():
                 """Async-generator: drain queued items until sentinel or quiet.
 
@@ -979,16 +1049,23 @@ async def _run_flow_event_stream(
                 # traceback chain whose innermost frame is this ``raise``
                 # line, hiding the real origin.
                 if kickoff_task.done():
+                    # CR8 HIGH #2: if the task was cancelled externally,
+                    # surface it as a categorised RUN_ERROR so the
+                    # client can distinguish "completed successfully"
+                    # from "cancelled out from under us". Pre-fix this
+                    # fell through to the happy-path drain+break,
+                    # closing the stream with no error event at all.
+                    if kickoff_task.cancelled():
+                        raise _KickoffCancelled(
+                            "CrewAI kickoff task was cancelled"
+                        )
                     # Guard against ``.exception()`` raising
                     # CancelledError if the task was cancelled externally
                     # (finding #2): only read ``.exception()`` on a
                     # non-cancelled task. R5 LOW #12: dropped the
                     # unused ``kickoff_exc`` local — its only role was
                     # the None check, which is inlined here.
-                    if (
-                        not kickoff_task.cancelled()
-                        and kickoff_task.exception() is not None
-                    ):
+                    if kickoff_task.exception() is not None:
                         # ``await`` re-raises the stored exception
                         # WITH its original traceback intact.
                         await kickoff_task
@@ -1107,6 +1184,28 @@ async def _run_flow_event_stream(
 
                 yield encoder.encode(item)
 
+        except _KickoffCancelled:
+            # CR8 HIGH #2: kickoff task was cancelled externally (not by
+            # our teardown path, which propagates CancelledError through
+            # to the outer scope). Emit a categorised RUN_ERROR so the
+            # client can distinguish an external cancel from a clean
+            # finish.
+            _LOGGER.warning(
+                "CrewAI kickoff cancelled externally thread=%s run=%s",
+                input_data.thread_id,
+                input_data.run_id,
+            )
+            message = (
+                f"thread={input_data.thread_id} run={input_data.run_id}: "
+                f"CrewAI flow was cancelled"
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=message,
+                    code="AGUI_CREWAI_KICKOFF_CANCELLED",
+                    **_run_error_extras(input_data),
+                )
+            )
         except _CeilingExceeded as ceiling_exc:
             # Ceiling-fired path (CR7 CRITICAL): our configured flow
             # deadline tripped. Message / code must advertise the ceiling
@@ -1192,10 +1291,16 @@ async def _run_flow_event_stream(
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
                 f"CrewAI flow failed; see server logs"
             )
+            # CR8 MEDIUM: sanitize the exception class name before
+            # embedding it in the ``code`` field. Python exception
+            # classes can have dynamically-generated or unicode names,
+            # which would violate the ``^[A-Z][A-Z0-9_]+$`` convention
+            # peer events follow and break downstream regex-matchers.
+            sanitized_name = _sanitize_exception_code(type(e).__name__)
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,
-                    code=f"AGUI_CREWAI_FLOW_ERROR_{type(e).__name__}",
+                    code=f"AGUI_CREWAI_FLOW_ERROR_{sanitized_name}",
                     **_run_error_extras(input_data),
                 )
             )

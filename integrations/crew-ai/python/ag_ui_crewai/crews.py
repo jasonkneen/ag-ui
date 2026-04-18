@@ -44,10 +44,10 @@ def _llm_timeout_seconds() -> float | None:
     CR7 LOW: delegates to ``_env._parse_env_float`` so the three
     env-parsed float helpers (flow ceiling / cancel-join ceiling / LLM
     read timeout) share a single parse + policy path rather than
-    triplicating the scaffolding. Extracted to the ``_env`` leaf module
-    (CR8 MEDIUM) so ``crews`` can import it at module load without a
-    circular dependency on ``endpoint`` (which imports ``ChatWithCrewFlow``
-    from this module).
+    triplicating the scaffolding. CR8 MEDIUM: the helper lives on a
+    neutral ``_env`` module (rather than ``endpoint``) so we can
+    import it at module load time without a circular dependency
+    (``endpoint`` imports ``ChatWithCrewFlow`` from ``crews``).
     """
     return _parse_env_float(
         "AGUI_CREWAI_LLM_TIMEOUT_SECONDS",
