@@ -51,16 +51,27 @@ def _patch_instance_state(flow, state):
 
 
 def test_default_llm_timeout_is_set(monkeypatch):
-    """With no env var, the default is the module constant — a finite,
-    positive, non-None number of seconds. Using ``==`` locks the value in
-    so a regression that disables the default (e.g. silently returning
-    ``None``) is caught loudly.
+    """With no env var, the default is a finite positive number in a
+    sane range. Pinning against a literal (not the same constant we
+    import) so a silent regression that swaps ``_DEFAULT_LLM_TIMEOUT_SECONDS``
+    to ``None`` or a bogus value is caught (finding #24 — the previous
+    ``value == _DEFAULT_LLM_TIMEOUT_SECONDS`` compared the import to
+    itself, a tautology).
     """
     monkeypatch.delenv("AGUI_CREWAI_LLM_TIMEOUT_SECONDS", raising=False)
     value = _llm_timeout_seconds()
-    assert value == _DEFAULT_LLM_TIMEOUT_SECONDS
-    # A sane ceiling — not minutes away, not hours.
-    assert 0.0 < _DEFAULT_LLM_TIMEOUT_SECONDS < 3600.0
+    # Must be a finite positive float.
+    assert isinstance(value, float)
+    assert value is not None
+    assert value > 0.0
+    # Anchor against a fixed range rather than the module constant so a
+    # rename-only regression is still caught.
+    assert 30.0 <= value <= 600.0, (
+        f"default LLM timeout out of sane range; got {value}"
+    )
+    # And confirm the constant itself is in the same range (so a future
+    # change must update BOTH sides — the test ceases to be tautological).
+    assert 30.0 <= _DEFAULT_LLM_TIMEOUT_SECONDS <= 600.0
 
 
 def test_llm_timeout_env_override(monkeypatch):
