@@ -239,7 +239,7 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
                         type=EventType.RUN_ERROR,
                         thread_id=input_data.thread_id,
                         run_id=input_data.run_id,
-                        error=str(e),
+                        message=str(e),
                     )
                 )
             finally:
@@ -306,7 +306,7 @@ def add_crewai_crew_fastapi_endpoint(app: FastAPI, crew: Crew, path: str = "/"):
                         type=EventType.RUN_ERROR,
                         thread_id=input_data.thread_id,
                         run_id=input_data.run_id,
-                        error=str(e),
+                        message=str(e),
                     )
                 )
             finally:
