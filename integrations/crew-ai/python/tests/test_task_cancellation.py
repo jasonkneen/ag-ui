@@ -1068,11 +1068,15 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
     not exceed a single ``_CANCEL_JOIN_TIMEOUT_SECONDS`` window (plus a
     small slack for scheduling jitter).
     """
-    from ag_ui_crewai import endpoint as ep
-
     # Shrink the teardown ceiling so the test is fast and the regression
     # signature (2x → 1x) is clearly distinguishable from scheduling jitter.
-    monkeypatch.setattr(ep, "_CANCEL_JOIN_TIMEOUT_SECONDS", 0.5)
+    # CR7 MEDIUM: drive this via the public env var rather than stabbing
+    # the module constant — that exercises the full parse pipeline in
+    # ``_cancel_join_timeout_seconds`` (float(), isfinite, >0 guard)
+    # rather than short-circuiting it at the constant-read site.
+    monkeypatch.setenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", "0.5")
+
+    from ag_ui_crewai import endpoint as ep
 
     stop_absorbing = asyncio.Event()
 
@@ -1111,11 +1115,16 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
     # ``_cancel_and_join``'s internal deadline math; ``loop.time()`` was
     # an unnecessary divergence and on some platforms has different
     # resolution characteristics than ``time.monotonic()``.
+    # Resolve the ceiling through the helper that reads the env var, so
+    # the bound matches what ``_cancel_and_join`` actually uses under
+    # the monkeypatched env (CR7 MEDIUM).
+    ceiling = ep._cancel_join_timeout_seconds()
+
     start = time.monotonic()
     try:
         # Bound = 1 × ceiling + generous slack. The pre-fix code produced
         # up to 2 × ceiling, so a regression would exceed this bound.
-        bound = ep._CANCEL_JOIN_TIMEOUT_SECONDS + 0.4
+        bound = ceiling + 0.4
         await asyncio.wait_for(driver, timeout=bound + 0.5)
     except asyncio.CancelledError:
         pass  # expected propagation
@@ -1127,10 +1136,10 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
     elapsed = time.monotonic() - start
 
     # Strict invariant: single-ceiling window.
-    assert elapsed <= ep._CANCEL_JOIN_TIMEOUT_SECONDS + 0.4, (
+    assert elapsed <= ceiling + 0.4, (
         f"_cancel_and_join outer-cancel teardown exceeded single-ceiling "
         f"window; elapsed={elapsed:.3f}s, "
-        f"ceiling={ep._CANCEL_JOIN_TIMEOUT_SECONDS}s "
+        f"ceiling={ceiling}s "
         f"(finding #7 regression)"
     )
 
@@ -1171,22 +1180,26 @@ class _UpstreamTimeoutFlow:
 
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
-async def test_flow_timeout_handler_when_ceiling_disabled(monkeypatch, factory):
-    """CR6-4 LOW: timeout handler must not crash when flow-ceiling is
-    disabled and a ``TimeoutError`` bubbles up from inside ``kickoff_async``.
+async def test_upstream_timeout_distinct_from_ceiling_timeout_when_ceiling_disabled(
+    monkeypatch, factory
+):
+    """CR7 CRITICAL: upstream ``TimeoutError`` bubbling out of
+    ``kickoff_async`` must NOT be classified as a flow-ceiling timeout
+    when the ceiling is disabled.
 
-    When ``AGUI_CREWAI_FLOW_TIMEOUT_SECONDS`` is non-positive the ceiling
-    is disabled and ``timeout`` is ``None`` in the event-stream generator.
-    If upstream code (e.g. a LiteLLM read) raises ``TimeoutError`` in that
-    configuration, the handler enters with ``timeout=None``. The log
-    ``%g`` format and the ``{timeout:g}`` f-string both crash on ``None``
-    (``TypeError``), short-circuiting the handler BEFORE the
-    ``RunErrorEvent`` is yielded — the client sees an abruptly terminated
-    stream instead of a coherent error event.
+    Prior to the fix, ``except (asyncio.TimeoutError, TimeoutError)``
+    emitted ``code=AGUI_CREWAI_FLOW_TIMEOUT`` with "exceeded ceiling=…"
+    prose regardless of whether the ceiling fired or upstream raised.
+    When the ceiling is disabled (``AGUI_CREWAI_FLOW_TIMEOUT_SECONDS=0``
+    → ``timeout=None``), the message "exceeded ceiling=disabled" is
+    self-contradictory, and downstream log consumers treating
+    ``AGUI_CREWAI_FLOW_TIMEOUT`` as "we hit our configured ceiling" end
+    up with a lying signal.
 
-    Fix: guard both formats with a ``timeout_display`` value that reads
-    ``"disabled"`` when ``timeout is None`` and ``f"{timeout:g}s"``
-    otherwise.
+    Fix: ceiling-fired sites raise a sentinel ``_CeilingExceeded``;
+    upstream timeouts are caught by a separate handler that emits
+    ``AGUI_CREWAI_UPSTREAM_TIMEOUT`` with a message that explicitly
+    notes the ceiling did not fire.
     """
     # Disable the flow ceiling — timeout is None in the generator.
     monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "0")
@@ -1234,14 +1247,6 @@ async def test_flow_timeout_handler_when_ceiling_disabled(monkeypatch, factory):
     err = run_errors[0]
     error_msg = err.get("message", "")
 
-    # The message must contain a coherent ceiling descriptor rather than
-    # a stack trace leaked into the wire format. ``disabled`` is the
-    # load-bearing token that distinguishes the null-ceiling path from
-    # the finite-ceiling path.
-    assert "disabled" in error_msg, (
-        f"RunErrorEvent message should indicate ceiling is disabled; "
-        f"got: {error_msg!r}"
-    )
     # Correlation must still appear.
     assert "t-1" in error_msg and "r-1" in error_msg, (
         f"RunErrorEvent must carry thread/run correlation; got: {error_msg!r}"
@@ -1256,9 +1261,141 @@ async def test_flow_timeout_handler_when_ceiling_disabled(monkeypatch, factory):
         f"RunErrorEvent must not surface a NoneType-formatting error; "
         f"got: {error_msg!r}"
     )
-    # Timeout code must be set (this is a timeout path, not the generic
-    # flow-error path).
+    # CR7 CRITICAL: the code must distinguish upstream timeouts from
+    # ceiling-fired timeouts. This is the load-bearing assertion —
+    # pre-fix emitted AGUI_CREWAI_FLOW_TIMEOUT here, which is what
+    # downstream alerting treats as "our configured ceiling tripped".
+    assert err.get("code") == "AGUI_CREWAI_UPSTREAM_TIMEOUT", (
+        f"upstream TimeoutError must surface as "
+        f"AGUI_CREWAI_UPSTREAM_TIMEOUT (not AGUI_CREWAI_FLOW_TIMEOUT — "
+        f"conflating them lies to downstream alerting); "
+        f"got: {err.get('code')!r}"
+    )
+    # The prose must be compatible with both "ceiling disabled" and
+    # "ceiling set but didn't fire" — the shared token is "did not
+    # fire" so operators can grep uniformly.
+    assert "did not fire" in error_msg, (
+        f"upstream-timeout message must indicate the ceiling did not "
+        f"fire (as opposed to the ceiling-fired message which uses "
+        f"'exceeded ceiling='); got: {error_msg!r}"
+    )
+    # The ceiling descriptor still appears so operators can see the
+    # configured ceiling at failure time.
+    assert "disabled" in error_msg, (
+        f"when ceiling is disabled, message should mention 'disabled' "
+        f"as the ceiling descriptor; got: {error_msg!r}"
+    )
+    # Must NOT advertise ceiling-exceeded prose (that's the
+    # ceiling-fired path).
+    assert "exceeded ceiling=" not in error_msg, (
+        f"upstream-timeout message must NOT use the ceiling-fired "
+        f"'exceeded ceiling=' prose; got: {error_msg!r}"
+    )
+
+
+class _HangingLongerThanCeilingFlow:
+    """A flow whose ``kickoff_async`` hangs longer than our ceiling.
+
+    Used to pin the ceiling-fired path (CR7 CRITICAL): our monotonic
+    deadline / ``asyncio.wait`` timeout must raise ``_CeilingExceeded``
+    (not a bare ``TimeoutError``) so the dedicated handler emits
+    ``AGUI_CREWAI_FLOW_TIMEOUT`` with "exceeded ceiling=<value>s".
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+@pytest.mark.parametrize("factory", ["flow", "crew"])
+async def test_ceiling_fired_emits_flow_timeout_code_distinct_from_upstream(
+    monkeypatch, factory
+):
+    """CR7 CRITICAL: the ceiling-fired path must keep emitting
+    ``AGUI_CREWAI_FLOW_TIMEOUT`` with "exceeded ceiling=<value>s".
+
+    Complement to ``test_upstream_timeout_distinct_from_ceiling_timeout``
+    — together the two tests pin that:
+    * ``_CeilingExceeded`` → ``AGUI_CREWAI_FLOW_TIMEOUT`` + "exceeded
+      ceiling=<value>s" (this test).
+    * bare ``TimeoutError`` from upstream → ``AGUI_CREWAI_UPSTREAM_TIMEOUT``
+      + "did not fire" (sibling test).
+
+    A regression that reconflates the two handlers would break exactly
+    one of the two assertions — the aggregate red-green ensures the
+    split is preserved.
+    """
+    # Short finite ceiling — ours fires, not upstream.
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "0.2")
+
+    from ag_ui_crewai import endpoint as ep
+
+    flow = _HangingLongerThanCeilingFlow()
+    app = FastAPI()
+    _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
+
+    route = next(
+        r for r in app.router.routes if getattr(r, "path", None) == "/run"
+    )
+    endpoint_fn = route.endpoint
+    fake_request = _make_request()
+
+    response = await endpoint_fn(_make_input(), fake_request)
+    body_iter = response.body_iterator
+
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    await asyncio.wait_for(_drain(), timeout=15.0)
+
+    parts = [
+        p.decode("utf-8", errors="replace")
+        if isinstance(p, (bytes, bytearray))
+        else p
+        for p in drained
+    ]
+    joined = "".join(parts)
+    payloads = _parse_sse_payloads(joined)
+    run_errors = [p for p in payloads if p.get("type") == "RUN_ERROR"]
+
+    assert run_errors, (
+        "expected a RUN_ERROR event on the ceiling-fired path; "
+        f"got payloads={payloads!r}"
+    )
+    err = run_errors[0]
+    error_msg = err.get("message", "")
+
+    # Code must be FLOW_TIMEOUT (NOT the upstream variant).
     assert err.get("code") == "AGUI_CREWAI_FLOW_TIMEOUT", (
-        f"RunErrorEvent should set code=AGUI_CREWAI_FLOW_TIMEOUT on the "
-        f"timeout handler path; got: {err.get('code')!r}"
+        f"ceiling-fired path should emit AGUI_CREWAI_FLOW_TIMEOUT; "
+        f"got: {err.get('code')!r}"
+    )
+    # Prose must be the ceiling-exceeded variant.
+    assert "exceeded ceiling=" in error_msg, (
+        f"ceiling-fired path should emit 'exceeded ceiling=...' prose; "
+        f"got: {error_msg!r}"
+    )
+    # And MUST NOT borrow the upstream-variant prose.
+    assert "did not fire" not in error_msg, (
+        f"ceiling-fired path must NOT use the upstream 'did not fire' "
+        f"prose; got: {error_msg!r}"
+    )
+    # The configured ceiling value must appear.
+    assert "0.2" in error_msg, (
+        f"ceiling-fired path should include the configured ceiling "
+        f"value (0.2); got: {error_msg!r}"
     )
