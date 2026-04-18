@@ -51,29 +51,66 @@ def _clear_endpoint_queues():
     workaround — crewai does not expose a public teardown API.
     """
 
-    def _reset_bus_handlers():
+    # CR9 MEDIUM: ``handlers.clear()`` on the process-wide event bus
+    # wipes ALL handlers — including any registered by another
+    # library importing crewai in the same process. Snapshot the
+    # handlers dict (key -> list of callables) at setup and restore
+    # it on teardown so we only drop what tests registered, not
+    # pre-existing subscribers. We deep-copy the lists (``list(v)``)
+    # because crewai mutates them in-place via ``append`` during
+    # listener registration — a shallow ``dict(...)`` snapshot would
+    # still observe our appends post-setup.
+    def _snapshot_handlers():
         if _crewai_event_bus is None:
+            return None
+        handlers = getattr(_crewai_event_bus, "_handlers", None)
+        if handlers is None:
+            return None
+        try:
+            return {k: list(v) for k, v in handlers.items()}
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _restore_handlers(snapshot):
+        if _crewai_event_bus is None or snapshot is None:
             return
         handlers = getattr(_crewai_event_bus, "_handlers", None)
         if handlers is None:
             return
         try:
             handlers.clear()
+            for k, v in snapshot.items():
+                handlers[k] = list(v)
         except Exception:  # pragma: no cover - defensive
             # Unexpected handler-store shape; skip rather than crash.
             pass
 
+    handlers_snapshot = _snapshot_handlers()
+
     ep.QUEUES.clear()
+    # CR9 MEDIUM: clear our module-level ``_ALIAS_WARN_SEEN`` dedup set
+    # alongside ``QUEUES`` so a prior test that observed an alias
+    # divergence does not suppress the warning (and its log assertion)
+    # in a later test.
+    try:
+        ep._ALIAS_WARN_SEEN.clear()
+    except AttributeError:  # pragma: no cover - symbol removed in refactor
+        pass
     # Reset singleton; the next test that calls ``add_crewai_*`` will
-    # create a fresh FastAPICrewFlowEventListener. Also clear
-    # accumulated handlers on the crewai event bus so stale listeners
+    # create a fresh FastAPICrewFlowEventListener. Also restore the
+    # event-bus handlers from the pre-test snapshot so stale listeners
     # from prior tests don't keep firing and skewing queue counts
-    # (R5 MEDIUM #10).
+    # (R5 MEDIUM #10) — while leaving any pre-existing subscribers
+    # from other libraries untouched (CR9 MEDIUM).
     ep.GLOBAL_EVENT_LISTENER = None
-    _reset_bus_handlers()
+    _restore_handlers(handlers_snapshot)
     try:
         yield
     finally:
         ep.QUEUES.clear()
+        try:
+            ep._ALIAS_WARN_SEEN.clear()
+        except AttributeError:  # pragma: no cover
+            pass
         ep.GLOBAL_EVENT_LISTENER = None
-        _reset_bus_handlers()
+        _restore_handlers(handlers_snapshot)
