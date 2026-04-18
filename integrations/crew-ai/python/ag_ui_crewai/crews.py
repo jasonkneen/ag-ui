@@ -20,12 +20,15 @@ from .sdk import (
 
 _CREW_INPUTS_CACHE = {}
 
-# Default read timeout (seconds) for LiteLLM streaming requests. Without this,
-# a half-open TCP stream (server sends no bytes, client never receives FIN) can
-# leave the coroutine awaiting ``socket.recv()`` indefinitely. LiteLLM forwards
-# this to the underlying HTTP client. Override with the
+# Per-read idle guard (seconds) for LiteLLM streaming requests. LiteLLM
+# forwards this to the underlying HTTP client, where it acts as a
+# *per-read* / socket-recv timeout — NOT a session-level ceiling. That means
+# a trickle-feeding server can still keep the coroutine alive indefinitely
+# by sending a single byte before each timeout expires; the session-level
+# cap for that scenario is enforced by ``AGUI_CREWAI_FLOW_TIMEOUT_SECONDS``
+# in ``endpoint.py``. Override this per-read guard with the
 # ``AGUI_CREWAI_LLM_TIMEOUT_SECONDS`` environment variable; set to a
-# non-positive value to disable the cap.
+# non-positive value to disable it (the outer flow ceiling still applies).
 _DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 
 
