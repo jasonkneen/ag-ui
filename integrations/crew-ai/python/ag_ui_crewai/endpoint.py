@@ -121,6 +121,16 @@ async def _cancel_and_join(
       ``KeyboardInterrupt`` / ``CancelledError`` must propagate; we only
       swallow ``TimeoutError`` (explicitly) and recoverable ``Exception``
       subclasses from the task itself.
+    - On Python 3.11+, catching ``CancelledError`` does NOT decrement
+      ``Task.cancelling()``: any subsequent ``await`` re-raises immediately
+      unless we call ``asyncio.current_task().uncancel()``. Without that,
+      the bounded second wait in the CancelledError branch is defeated
+      (re-raises on entry). We invoke ``uncancel`` via ``getattr`` so the
+      implementation remains compatible with 3.10 (where the method does
+      not exist). The total teardown window is capped at a SHARED
+      ``_CANCEL_JOIN_TIMEOUT_SECONDS`` monotonic deadline — the inner wait
+      and the outer-cancel wait draw from the same budget — so the
+      effective ceiling is one window, not two (finding #7).
     """
     if task is None or task.done():
         return
@@ -142,12 +152,25 @@ async def _cancel_and_join(
                 # Happy path did not complete in time; fall through to
                 # force-cancel below.
                 pass
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception as grace_exc:  # pylint: disable=broad-exception-caught
                 # The task itself raised during the grace wait. It has
-                # finished — nothing left to clean up.
+                # finished — nothing left to clean up. Log the exception
+                # rather than silently swallowing it so that operators can
+                # diagnose teardown surprises (finding #6).
                 if task.done():
                     return
-                # Fall through: shouldn't normally happen.
+                # This branch is reachable only in unusual orderings
+                # (e.g. a TimeoutError raised from inside the task that
+                # isn't caught by the dual-class tuple above). Log loudly
+                # and fall through to force-cancel.
+                _LOGGER.warning(
+                    "CrewAI grace-period wait raised a non-Timeout error "
+                    "while task is not done; proceeding to force-cancel "
+                    "thread=%s run=%s cause=%s",
+                    thread_id,
+                    run_id,
+                    type(grace_exc).__name__,
+                )
 
         if task.done():
             return
@@ -156,6 +179,15 @@ async def _cancel_and_join(
         # task.cancel() runs exactly once even if we are cancelled mid-flight.
         task.cancel()
         cancellation_scheduled = True
+
+        # Shared monotonic deadline: the combined budget for the inner
+        # wait and any CancelledError-branch recovery wait is ONE ceiling
+        # window, not two (finding #7). ``max(0, deadline - now)`` is used
+        # at each await-site so the remaining budget shrinks monotonically.
+        deadline = time.monotonic() + _CANCEL_JOIN_TIMEOUT_SECONDS
+
+        def _remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
 
         # Build a teardown coroutine and shield it so outer cancellation
         # cannot abandon the task mid-teardown. We want resources (httpx
@@ -169,18 +201,51 @@ async def _cancel_and_join(
         try:
             await asyncio.shield(teardown)
         except asyncio.CancelledError:
-            # Outer scope was cancelled. We still want the teardown to finish;
-            # do so in a bounded detached wait so we don't leak, then re-raise.
+            # Outer scope was cancelled. On Python 3.11+, we must uncancel
+            # the current task before issuing another ``await`` — otherwise
+            # the next ``await`` re-raises CancelledError immediately and
+            # the bounded recovery wait is a no-op (finding #2).
+            current = asyncio.current_task()
+            uncancel = getattr(current, "uncancel", None)
+            if callable(uncancel):
+                uncancel()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(teardown),
-                    timeout=_CANCEL_JOIN_TIMEOUT_SECONDS,
+                    timeout=_remaining(),
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 _log_stuck_cancel(thread_id, run_id, after_outer_cancel=True)
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
-            raise
+            # Retrieve any exception on ``teardown`` so it does not surface
+            # as ``Task exception was never retrieved`` during GC. If the
+            # task is still pending (recovery wait_for timed out), detach
+            # a callback that drains its eventual result — we've already
+            # spent our full ceiling budget and must not block further.
+            def _drain(fut):
+                if fut.cancelled():
+                    return
+                # ``.exception()`` marks the exception retrieved.
+                exc = fut.exception()
+                if exc is not None:
+                    _LOGGER.debug(
+                        "CrewAI kickoff teardown completed post-cancel "
+                        "with %s (thread=%s run=%s)",
+                        type(exc).__name__,
+                        thread_id,
+                        run_id,
+                    )
+
+            if teardown.done():
+                _drain(teardown)
+            else:
+                teardown.add_done_callback(_drain)
+            # Re-raise CancelledError so the outer scope still observes the
+            # cancellation (finding #2: we uncancel only to permit the
+            # bounded recovery wait; cancellation semantics for the caller
+            # must still propagate).
+            raise asyncio.CancelledError()
         except (asyncio.TimeoutError, TimeoutError):
             _log_stuck_cancel(thread_id, run_id, after_outer_cancel=False)
     finally:
@@ -347,6 +412,37 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                 )
 
 
+def _format_timeout_message(timeout: float | None) -> str:
+    """Build the ``TimeoutError`` message for the flow-ceiling path.
+
+    Extracted (finding #13) so the two TimeoutError construction sites and
+    the client-facing error message derive from a single source of truth.
+
+    ``timeout`` is always a finite positive value here — the flow-ceiling
+    code paths that raise ``TimeoutError`` are guarded by ``timeout is not
+    None``. Using ``%g`` (up to 6 significant digits, no trailing zeros)
+    avoids the truncation of sub-decisecond values that ``%.1f`` produces
+    (finding #14). For ``0.2``, ``%g`` renders ``0.2``; for ``0.25``,
+    ``0.25``; for ``600``, ``600``.
+    """
+    return f"CrewAI flow exceeded {timeout:g}s ceiling"
+
+
+def _run_error_extras(input_data: RunAgentInput) -> dict:
+    """Return the extras kwargs for a RunErrorEvent, camelCased to match
+    peer events' wire format.
+
+    ``ConfiguredBaseModel`` uses ``extra="allow"`` — extras bypass the
+    alias generator, so pre-camelCased keys are required to line up with
+    declared-field peers (``RunStartedEvent.thread_id`` / ``run_id`` emit
+    as ``threadId`` / ``runId`` via the alias generator). Finding #3.
+    """
+    return {
+        "threadId": input_data.thread_id,
+        "runId": input_data.run_id,
+    }
+
+
 async def _run_flow_event_stream(
     *,
     flow_copy: object,
@@ -364,7 +460,9 @@ async def _run_flow_event_stream(
       down on client disconnect);
     * reads from the per-flow queue with a wall-clock deadline;
     * surfaces timeouts and other exceptions as a ``RunErrorEvent`` whose
-      ``message`` carries thread/run correlation;
+      ``message`` carries thread/run correlation AND whose event-level
+      extras (``threadId`` / ``runId``) mirror the peer events' wire
+      format (finding #3);
     * on exit, cancels the kickoff task, drops the queue, and resets the
       context var — unconditionally, even if the outer scope is cancelled.
     """
@@ -398,11 +496,43 @@ async def _run_flow_event_stream(
                 # assertion) would leave the main loop blocked on
                 # ``queue.get()`` until the flow-timeout ceiling, and users
                 # would see ``AGUI_CREWAI_FLOW_TIMEOUT`` instead of the real
-                # traceback.
+                # traceback. We use ``await kickoff_task`` (rather than
+                # ``raise kickoff_task.exception()``) so the original
+                # traceback is preserved — finding #4: re-raising the
+                # stored exception via ``raise exc`` starts a new
+                # traceback chain whose innermost frame is this ``raise``
+                # line, hiding the real origin.
                 if kickoff_task.done():
-                    exc = kickoff_task.exception()
-                    if exc is not None:
-                        raise exc
+                    if kickoff_task.exception() is not None:
+                        # ``await`` re-raises the stored exception WITH its
+                        # original traceback intact.
+                        await kickoff_task
+                    # Happy path: task finished without error. Drain any
+                    # remaining queue items (for example the ``None``
+                    # sentinel enqueued by the FlowFinishedEvent listener),
+                    # then break. Critically we do NOT fall through to
+                    # ``asyncio.wait({get_task, kickoff_task}, ...)``
+                    # below, because that wait would return immediately
+                    # (kickoff_task is already done) and cause a CPU spin
+                    # (finding #1).
+                    drained_sentinel = False
+                    while True:
+                        try:
+                            item = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if item is None:
+                            drained_sentinel = True
+                            break
+                        if item.type in (EventType.RUN_STARTED, EventType.RUN_FINISHED):
+                            item.thread_id = input_data.thread_id
+                            item.run_id = input_data.run_id
+                        yield encoder.encode(item)
+                    if drained_sentinel:
+                        # Sentinel observed inline; still grant the tiny
+                        # grace window for any in-flight teardown.
+                        allow_grace = True
+                    break
 
                 get_task = asyncio.ensure_future(queue.get())
                 try:
@@ -410,9 +540,7 @@ async def _run_flow_event_stream(
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             get_task.cancel()
-                            raise TimeoutError(
-                                f"CrewAI flow exceeded {timeout:.1f}s ceiling"
-                            )
+                            raise TimeoutError(_format_timeout_message(timeout))
                         done, _pending = await asyncio.wait(
                             {get_task, kickoff_task},
                             return_when=asyncio.FIRST_COMPLETED,
@@ -426,23 +554,24 @@ async def _run_flow_event_stream(
 
                     if not done:
                         get_task.cancel()
-                        raise TimeoutError(
-                            f"CrewAI flow exceeded {timeout:.1f}s ceiling"
-                        )
+                        raise TimeoutError(_format_timeout_message(timeout))
 
                     # Prefer propagating the kickoff exception (if any) over
                     # consuming a queued event — the exception is the real
-                    # story the operator needs.
+                    # story the operator needs. ``await`` preserves the
+                    # original traceback (finding #4).
                     if kickoff_task in done and kickoff_task.exception() is not None:
                         get_task.cancel()
-                        raise kickoff_task.exception()  # type: ignore[misc]
+                        await kickoff_task
 
                     if get_task in done:
                         item = get_task.result()
                     else:
                         # kickoff finished without error but no item was
-                        # enqueued yet; loop to drain remaining queue items
-                        # or detect the ``None`` sentinel on the next pass.
+                        # enqueued yet; the top-of-loop guard on the next
+                        # iteration will observe ``kickoff_task.done()``
+                        # and drain via the fast path above (no spin —
+                        # finding #1).
                         continue
                 finally:
                     if not get_task.done():
@@ -462,29 +591,28 @@ async def _run_flow_event_stream(
                 yield encoder.encode(item)
 
         except (asyncio.TimeoutError, TimeoutError):
-            # Log full context server-side; keep the client message tight and
-            # correlated. Also expose thread_id / run_id as event extras
-            # (``ConfiguredBaseModel`` uses ``extra="allow"``) so downstream
-            # consumers can filter without string-parsing.
-            ceiling_str = (
-                f"{timeout:.1f}s" if timeout is not None else "configured"
-            )
+            # Log full context server-side; keep the client message tight
+            # and correlated. Extras expose ``threadId`` / ``runId`` in
+            # camelCase to match peer events' wire format (finding #3).
+            # ``timeout`` is always non-None here — the ``deadline``
+            # computation above only produces TimeoutError when ``timeout``
+            # was configured (the unreachable ``"configured"`` fallback
+            # branch has been removed, finding #11).
             _LOGGER.warning(
-                "CrewAI flow exceeded ceiling thread=%s run=%s ceiling=%s",
+                "CrewAI flow exceeded ceiling thread=%s run=%s ceiling=%gs",
                 input_data.thread_id,
                 input_data.run_id,
-                ceiling_str,
+                timeout,
             )
             message = (
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
-                f"CrewAI flow exceeded {ceiling_str} ceiling"
+                f"CrewAI flow exceeded {timeout:g}s ceiling"
             )
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,
                     code="AGUI_CREWAI_FLOW_TIMEOUT",
-                    thread_id=input_data.thread_id,
-                    run_id=input_data.run_id,
+                    **_run_error_extras(input_data),
                 )
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -496,17 +624,18 @@ async def _run_flow_event_stream(
                 input_data.run_id,
                 type(e).__name__,
             )
+            # Tight message (finding #5): the exception class name already
+            # lives in ``code`` (AGUI_CREWAI_FLOW_ERROR:<Class>); the
+            # run_id already appears once as a prefix — do not duplicate.
             message = (
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
-                f"CrewAI flow failed ({type(e).__name__}); see server logs"
-                f" for run={input_data.run_id}"
+                f"CrewAI flow failed; see server logs"
             )
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,
                     code=f"AGUI_CREWAI_FLOW_ERROR:{type(e).__name__}",
-                    thread_id=input_data.thread_id,
-                    run_id=input_data.run_id,
+                    **_run_error_extras(input_data),
                 )
             )
     finally:
