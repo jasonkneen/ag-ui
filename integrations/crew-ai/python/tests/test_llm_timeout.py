@@ -20,33 +20,34 @@ from ag_ui_crewai.crews import _DEFAULT_LLM_TIMEOUT_SECONDS, _llm_timeout_second
 
 @contextmanager
 def _patch_instance_state(flow, state):
-    """Install ``state`` on a single flow instance without touching the class.
+    """Install ``state`` on a single flow instance via a throwaway subclass.
 
-    Flow.state is a class-level descriptor, so a simple attribute assignment
-    goes through the descriptor's ``__set__``. We bypass that by writing
-    directly to the instance ``__dict__`` — but since a data descriptor on
-    the class wins over the instance ``__dict__``, we also temporarily
-    replace the descriptor with a thin property that reads from
-    ``flow._state`` and restore it on exit. Scoping the class-level swap to
-    a ``with`` block keeps parallel tests that share the class isolated to
-    the extent Python permits.
+    Flow.state is a class-level descriptor, so a naive attribute assignment
+    goes through the descriptor's ``__set__``. Rather than mutate the shared
+    class (which is unsafe under ``pytest-xdist`` and other parallel test
+    runners — finding #9), we rebind the instance's ``__class__`` to a
+    freshly-minted subclass that declares ``state`` as a plain property
+    reading from ``flow._state``. The subclass is per-instance, so two
+    parallel tests patching two different ``flow`` instances cannot race on
+    the same descriptor.
+
+    On exit the original class is restored. If the caller has already
+    replaced ``__class__`` themselves we leave well enough alone.
     """
 
     flow._state = state  # pylint: disable=protected-access
-    cls = type(flow)
-    sentinel = object()
-    original = cls.__dict__.get("state", sentinel)
-    cls.state = property(lambda self: self._state)
+    original_cls = type(flow)
+    subclass = type(
+        f"{original_cls.__name__}_StatePatched",
+        (original_cls,),
+        {"state": property(lambda self: self._state)},
+    )
+    flow.__class__ = subclass
     try:
         yield
     finally:
-        if original is sentinel:
-            try:
-                delattr(cls, "state")
-            except AttributeError:
-                pass
-        else:
-            setattr(cls, "state", original)
+        if flow.__class__ is subclass:
+            flow.__class__ = original_cls
 
 
 def test_default_llm_timeout_is_set(monkeypatch):
