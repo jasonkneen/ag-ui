@@ -10,21 +10,56 @@ down the timeout-forwarding behaviour for BOTH acompletion call sites in
 ``ChatWithCrewFlow.chat``.
 """
 
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
 
-from ag_ui_crewai.crews import _llm_timeout_seconds
+from ag_ui_crewai.crews import _DEFAULT_LLM_TIMEOUT_SECONDS, _llm_timeout_seconds
+
+
+@contextmanager
+def _patch_instance_state(flow, state):
+    """Install ``state`` on a single flow instance without touching the class.
+
+    Flow.state is a class-level descriptor, so a simple attribute assignment
+    goes through the descriptor's ``__set__``. We bypass that by writing
+    directly to the instance ``__dict__`` — but since a data descriptor on
+    the class wins over the instance ``__dict__``, we also temporarily
+    replace the descriptor with a thin property that reads from
+    ``flow._state`` and restore it on exit. Scoping the class-level swap to
+    a ``with`` block keeps parallel tests that share the class isolated to
+    the extent Python permits.
+    """
+
+    flow._state = state  # pylint: disable=protected-access
+    cls = type(flow)
+    sentinel = object()
+    original = cls.__dict__.get("state", sentinel)
+    cls.state = property(lambda self: self._state)
+    try:
+        yield
+    finally:
+        if original is sentinel:
+            try:
+                delattr(cls, "state")
+            except AttributeError:
+                pass
+        else:
+            setattr(cls, "state", original)
 
 
 def test_default_llm_timeout_is_set(monkeypatch):
-    """With no env var, the default is a finite, positive number of seconds."""
+    """With no env var, the default is the module constant — a finite,
+    positive, non-None number of seconds. Using ``==`` locks the value in
+    so a regression that disables the default (e.g. silently returning
+    ``None``) is caught loudly.
+    """
     monkeypatch.delenv("AGUI_CREWAI_LLM_TIMEOUT_SECONDS", raising=False)
     value = _llm_timeout_seconds()
-    assert isinstance(value, float)
-    assert value > 0.0
+    assert value == _DEFAULT_LLM_TIMEOUT_SECONDS
     # A sane ceiling — not minutes away, not hours.
-    assert value < 3600.0
+    assert 0.0 < _DEFAULT_LLM_TIMEOUT_SECONDS < 3600.0
 
 
 def test_llm_timeout_env_override(monkeypatch):
@@ -61,13 +96,10 @@ async def test_acompletion_called_with_timeout_kwarg():
 
     async def _fake_stream(resp):
         # Return a minimal object the chat() body can poke at; it accesses
-        # response.choices[0]["message"].
-        class _Msg(dict):
-            def get(self, k, default=None):
-                return dict.get(self, k, default)
-
+        # response.choices[0]["message"]. A plain ``dict`` already supplies
+        # the ``.get`` the code uses — no custom subclass needed.
         class _Resp:
-            choices = [{"message": _Msg(role="assistant", content="done")}]
+            choices = [{"message": dict(role="assistant", content="done")}]
 
         return _Resp()
 
@@ -81,15 +113,13 @@ async def test_acompletion_called_with_timeout_kwarg():
         "function": {"name": "dummy_tool", "description": "", "parameters": {"type": "object"}},
     }
     flow.system_message = "sys"
-    # chat() pulls from self.state — stash a minimal shape.
-    flow._state = {  # pylint: disable=protected-access
+    state = {
         "messages": [],
         "inputs": {},
         "copilotkit": {"actions": []},
     }
 
-    # Flow exposes state via descriptor; patch it to return our dict directly.
-    with patch.object(type(flow), "state", new=property(lambda self: flow._state)):
+    with _patch_instance_state(flow, state):
         with patch.object(crews_mod, "acompletion", _fake_acompletion):
             with patch.object(crews_mod, "copilotkit_stream", _fake_stream):
                 await flow.chat()
@@ -97,7 +127,10 @@ async def test_acompletion_called_with_timeout_kwarg():
     assert _fake_acompletion.calls, "acompletion was never invoked"
     kwargs = _fake_acompletion.calls[0]
     assert "timeout" in kwargs, f"acompletion call missing timeout kwarg: {kwargs}"
-    assert kwargs["timeout"] is None or kwargs["timeout"] > 0
+    # With the default env, the timeout is the module default — lock the
+    # value in so a regression that silently disables the default (None) is
+    # caught loudly. This is finding #4: reject the "None or >0" tautology.
+    assert kwargs["timeout"] == _DEFAULT_LLM_TIMEOUT_SECONDS
 
 
 async def test_acompletion_crew_exit_path_also_forwards_timeout():
@@ -125,12 +158,8 @@ async def test_acompletion_crew_exit_path_also_forwards_timeout():
         async def _fake_stream(resp):  # pylint: disable=unused-argument
             call_index["n"] += 1
 
-            class _Msg(dict):
-                def get(self, k, default=None):
-                    return dict.get(self, k, default)
-
             if call_index["n"] == 1:
-                msg = _Msg(
+                msg = dict(
                     role="assistant",
                     tool_calls=[
                         {
@@ -143,7 +172,7 @@ async def test_acompletion_crew_exit_path_also_forwards_timeout():
                     ],
                 )
             else:
-                msg = _Msg(role="assistant", content="bye")
+                msg = dict(role="assistant", content="bye")
 
             class _Resp:
                 choices = [{"message": msg}]
@@ -163,13 +192,13 @@ async def test_acompletion_crew_exit_path_also_forwards_timeout():
         "function": {"name": "dummy_tool", "description": "", "parameters": {"type": "object"}},
     }
     flow.system_message = "sys"
-    flow._state = {  # pylint: disable=protected-access
+    state = {
         "messages": [],
         "inputs": {},
         "copilotkit": {"actions": []},
     }
 
-    with patch.object(type(flow), "state", new=property(lambda self: flow._state)):
+    with _patch_instance_state(flow, state):
         with patch.object(crews_mod, "acompletion", _fake_acompletion):
             with patch.object(crews_mod, "copilotkit_stream", _stream_factory()):
                 with patch.object(crews_mod, "copilotkit_exit", _fake_exit):
@@ -182,4 +211,9 @@ async def test_acompletion_crew_exit_path_also_forwards_timeout():
         assert "timeout" in kwargs, (
             f"acompletion call #{idx} missing timeout kwarg: {kwargs}"
         )
-        assert kwargs["timeout"] is None or kwargs["timeout"] > 0
+        # Default env → default timeout; locked in to prevent silent regression
+        # to ``None`` (disabled).
+        assert kwargs["timeout"] == _DEFAULT_LLM_TIMEOUT_SECONDS, (
+            f"acompletion call #{idx} timeout should be the default "
+            f"({_DEFAULT_LLM_TIMEOUT_SECONDS}); got {kwargs['timeout']!r}"
+        )
