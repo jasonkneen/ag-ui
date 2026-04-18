@@ -12,6 +12,7 @@ from crewai.cli.crew_chat import (
   create_tool_function as crew_chat_create_tool_function
 )
 from litellm import acompletion
+from ._env import _parse_env_float
 from .sdk import (
   copilotkit_stream,
   copilotkit_exit,
@@ -40,16 +41,14 @@ def _llm_timeout_seconds() -> float | None:
     silently disable the guard. Mirrors the NaN handling in
     ``endpoint._flow_timeout_seconds`` (R5 HIGH #1).
 
-    CR7 LOW: delegates to ``endpoint._parse_env_float`` so the three
+    CR7 LOW: delegates to ``_env._parse_env_float`` so the three
     env-parsed float helpers (flow ceiling / cancel-join ceiling / LLM
     read timeout) share a single parse + policy path rather than
-    triplicating the scaffolding.
+    triplicating the scaffolding. Extracted to the ``_env`` leaf module
+    (CR8 MEDIUM) so ``crews`` can import it at module load without a
+    circular dependency on ``endpoint`` (which imports ``ChatWithCrewFlow``
+    from this module).
     """
-    # Local import to avoid a circular dependency at module load time —
-    # ``endpoint`` imports from ``crews`` (``ChatWithCrewFlow``), so we
-    # cannot import ``endpoint`` at the top of ``crews``.
-    from .endpoint import _parse_env_float
-
     return _parse_env_float(
         "AGUI_CREWAI_LLM_TIMEOUT_SECONDS",
         _DEFAULT_LLM_TIMEOUT_SECONDS,

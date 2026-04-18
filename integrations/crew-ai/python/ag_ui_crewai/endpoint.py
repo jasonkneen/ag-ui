@@ -4,11 +4,11 @@ AG-UI FastAPI server for CrewAI.
 import copy
 import asyncio
 import logging
-import math
-import os
 import time
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+
+from ._env import _parse_env_float
 
 from crewai.utilities.events import (
     FlowStartedEvent,
@@ -130,44 +130,6 @@ _CANCEL_GRACE_SECONDS = 1.0
 # swallow. Default override-able via ``AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS``
 # so operators can tune it under disconnect-heavy load (finding #8).
 _CANCEL_JOIN_TIMEOUT_SECONDS = 10.0
-
-
-def _parse_env_float(
-    name: str,
-    default: float,
-    *,
-    allow_disable: bool,
-) -> float | None:
-    """Parse a float env var with shared "non-finite / non-positive" policy.
-
-    CR7 LOW: consolidates the triplicated parse scaffolding previously
-    spread across ``_flow_timeout_seconds`` /
-    ``_cancel_join_timeout_seconds`` / ``crews._llm_timeout_seconds``.
-
-    Semantics:
-    * Unset env var → return ``default``.
-    * Unparseable value (``TypeError`` / ``ValueError``) or non-finite
-      (NaN / ±inf) → return ``default``. ``float('nan') > 0`` is False,
-      which without the isfinite guard would silently flip to "disable"
-      when ``allow_disable=True`` — finding #17.
-    * ``allow_disable=True`` + non-positive value → return ``None``
-      (caller interprets as "disable the guard").
-    * ``allow_disable=False`` + non-positive value → return ``default``
-      (caller requires a bounded positive; see
-      ``_cancel_join_timeout_seconds`` for rationale).
-    """
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(value):
-        return default
-    if value <= 0:
-        return None if allow_disable else default
-    return value
 
 
 def _flow_timeout_seconds() -> float | None:
