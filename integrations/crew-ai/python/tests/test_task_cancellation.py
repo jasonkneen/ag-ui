@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 
-from ag_ui.core import RunAgentInput
+from ag_ui.core import EventType, RunAgentInput, RunStartedEvent
 
 
 # -- helpers ----------------------------------------------------------------
@@ -87,8 +87,25 @@ class _ExplodingFlow:
 
 
 class _FakeCrew:
-    """Placeholder Crew for the crew endpoint. Internals are unused because
-    ``ChatWithCrewFlow`` is monkeypatched in the crew tests."""
+    """Inert Crew stand-in for the crew-endpoint factory.
+
+    The crew-endpoint tests monkeypatch ``ChatWithCrewFlow`` itself, so the
+    endpoint never routes calls back to this object — its only purpose is
+    to be accepted by ``add_crewai_crew_fastapi_endpoint`` as the ``crew``
+    argument. To catch accidental surface-additions (a future refactor
+    that starts calling ``crew.<method>`` at request time would silently
+    "succeed" under a plain stub), we raise on any attribute access.
+    Finding #12 — spy pattern.
+    """
+
+    def __getattr__(self, name):  # noqa: D401
+        raise AssertionError(
+            f"_FakeCrew accessed unexpected attribute {name!r}; the "
+            "crew endpoint should not touch the crew object directly "
+            "when ChatWithCrewFlow is monkeypatched. If the endpoint "
+            "now does, add the attribute to an allow-list here and in "
+            "the factory contract."
+        )
 
 
 def _register_with_factory(factory_name: str, app: FastAPI, flow, path: str,
@@ -157,13 +174,23 @@ def _parse_sse_payloads(raw: str) -> list[dict]:
 
     payloads: list[dict] = []
     for frame in raw.split("\n\n"):
+        frame_lines = frame.splitlines()
         data_lines = [
             line[len("data:"):].lstrip()
-            for line in frame.splitlines()
+            for line in frame_lines
             if line.startswith("data:")
         ]
         if not data_lines:
             continue
+        # Defensive invariant (finding #13): each SSE frame produced by
+        # EventEncoder carries exactly one ``data:`` line per payload.
+        # A regression that pretty-prints JSON (inserting embedded blank
+        # lines) would split the frame across the ``\n\n`` separator and
+        # silently corrupt this parse; pin the invariant here.
+        assert len(data_lines) == 1, (
+            f"unexpected multi-line data frame (likely indented JSON "
+            f"breaking \\n\\n frame separator): {frame!r}"
+        )
         # SSE allows a data payload to span multiple lines; rejoin with "\n".
         payload_text = "\n".join(data_lines).strip()
         if not payload_text:
@@ -176,21 +203,6 @@ def _parse_sse_payloads(raw: str) -> list[dict]:
                 f"{payload_text!r} ({exc})"
             )
     return payloads
-
-
-def _extract_sse_event_names(raw: str) -> list[str]:
-    """Return the ``event:`` names appearing in the SSE stream, in order.
-
-    Used by the RUN_ERROR-is-terminal assertion: we want to confirm the
-    stream contains no RUN_FINISHED frame alongside RUN_ERROR on the
-    timeout path, regardless of payload parsing order.
-    """
-
-    names: list[str] = []
-    for line in raw.splitlines():
-        if line.startswith("event:"):
-            names.append(line[len("event:"):].strip())
-    return names
 
 
 class _CompletingFlow:
@@ -213,33 +225,6 @@ class _CompletingFlow:
         # bypassed in a future refactor).
         self.done.set()
         return None
-
-
-class _DoubleCancelFlow:
-    """Flow that cooperates with the inner CancelledError path under a
-    simulated double-cancel (Python 3.11+ ``Task.cancelling`` > 1).
-
-    The outer test cancels the generator twice: once to trigger the grace
-    path, and once more to exercise the ``_cancel_and_join`` outer-cancel
-    branch. Without an ``uncancel()`` call in the CancelledError handler,
-    the bounded second ``await wait_for`` re-raises on entry, making the
-    bounded wait a no-op.
-    """
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.cancelled = asyncio.Event()
-
-    def __deepcopy__(self, memo):  # noqa: D401 - trivial
-        return self
-
-    async def kickoff_async(self, inputs=None):  # noqa: D401
-        self.started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self.cancelled.set()
-            raise
 
 
 # -- tests ------------------------------------------------------------------
@@ -391,16 +376,12 @@ async def test_flow_timeout_env_var_bounds_execution(monkeypatch, factory):
         f"RUN_ERROR must be the terminal event on the timeout path; "
         f"got trailing type={payloads[-1].get('type')!r} all={all_types!r}"
     )
-
-    # Also verify at the SSE-frame layer that we don't even emit the
-    # ``event: RUN_FINISHED`` header. This catches a regression where a
-    # listener enqueues RunFinishedEvent *after* the timeout logic has
-    # already yielded RunErrorEvent but before the generator's ``finally``
-    # tears down the queue.
-    frame_names = _extract_sse_event_names(joined)
-    assert "RUN_FINISHED" not in frame_names, (
-        f"RUN_FINISHED SSE frame must NOT appear on timeout; got={frame_names!r}"
-    )
+    # Finding #4: the previous assertion scanned for ``event:`` header
+    # lines, but EventEncoder's SSE format emits only ``data:`` frames —
+    # the scan is vacuously empty, so the assertion was silently passing
+    # regardless of whether RUN_FINISHED was present at the wire layer.
+    # The payload-type assertion above already pins the contract; the
+    # redundant frame-name scan has been removed.
 
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
@@ -435,8 +416,9 @@ async def test_kickoff_exception_is_surfaced_promptly(monkeypatch, factory):
         async for chunk in body_iter:
             drained.append(chunk)
 
-    # 5s is dramatically shorter than the 30s env-var ceiling; if the
-    # kickoff race is missing or broken, this wait_for raises.
+    # 15s is dramatically shorter than the 30s env-var ceiling; if the
+    # kickoff race is missing or broken, this wait_for raises (finding
+    # #20: earlier comment said 5s but was already bumped to 15s).
     await asyncio.wait_for(_drain(), timeout=15.0)
 
     parts = [p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
@@ -541,15 +523,25 @@ async def test_happy_path_no_spin_when_kickoff_completes_without_sentinel(
 
     assert flow.done.is_set(), "kickoff must have completed"
 
-    # No RUN_ERROR should fire; happy-path exits cleanly.
+    # Positive pin (finding #11): the happy-path-no-sentinel flow
+    # should produce an empty payload list (the flow emits nothing, no
+    # listeners fire, no ``None`` sentinel is delivered). Asserting
+    # ``payloads == []`` pins that we neither drop nor fabricate events
+    # on this path. Also double-check no error-type events leaked even
+    # if a future change starts yielding benign events here.
     parts = [p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
              for p in drained]
     joined = "".join(parts)
     payloads = _parse_sse_payloads(joined)
     types = [p.get("type") for p in payloads]
-    assert "RUN_ERROR" not in types, (
-        f"happy-path completion without sentinel should NOT emit RUN_ERROR; "
-        f"got types={types!r}"
+    error_types = {t for t in types if isinstance(t, str) and "ERROR" in t}
+    assert not error_types, (
+        f"happy-path completion without sentinel should NOT emit any "
+        f"error-typed events; got types={types!r}"
+    )
+    assert payloads == [], (
+        f"happy-path completion without sentinel should yield an empty "
+        f"event stream; got payloads={payloads!r}"
     )
 
 
@@ -595,6 +587,324 @@ async def test_run_error_wire_format_camelcase_extras(monkeypatch, factory):
     # snake_case must be absent — wire format alignment.
     assert "thread_id" not in err, err
     assert "run_id" not in err, err
+
+
+class _RaceFlow:
+    """Flow that completes quickly after enqueueing a single event.
+
+    Used to pin the cancel-race invariant (R4 HIGH #1): the main loop
+    must not silently drop an item delivered to ``get_task`` between
+    ``asyncio.wait`` returning and the ``finally`` cancelling it.
+    """
+
+    def __init__(self, queue_event) -> None:
+        self._queue_event = queue_event
+        self.done = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        # Enqueue one event *and* complete the task in the same tick so
+        # ``asyncio.wait({get_task, kickoff_task}, FIRST_COMPLETED)`` may
+        # observe ``kickoff_task in done`` while ``get_task`` was also
+        # delivered an item that the old code cancelled and dropped.
+        q = _MODULE_QUEUE_REGISTRY.get(id(self))
+        if q is not None:
+            q.put_nowait(self._queue_event)
+        self.done.set()
+
+
+# Module-level side-channel so ``_RaceFlow.kickoff_async`` can find the
+# queue the endpoint created for its instance. Populated by a thin wrapper
+# around ``create_queue``.
+_MODULE_QUEUE_REGISTRY: dict = {}
+
+
+@pytest.mark.parametrize("factory", ["flow", "crew"])
+async def test_cancel_race_does_not_drop_delivered_queue_item(
+    monkeypatch, factory
+):
+    """R4 HIGH #1: if ``get_task`` is cancelled but had already been
+    delivered a queue item, the item must be yielded (or the cancel must
+    not happen). The cancel-race guard in the ``finally`` clause harvests
+    ``get_task.result()`` before discarding.
+
+    This test wires a flow whose ``kickoff_async`` enqueues a recognisable
+    RunStartedEvent ``item`` and returns immediately. The race is that
+    both the queue delivery and the kickoff completion may land in the
+    same scheduler tick; we simulate the timing by running many rounds
+    and asserting that the event is delivered every time.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    # Give the flow a long ceiling so the outer wait_for does not mask a
+    # regression by firing the timeout path.
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "30")
+
+    # Wrap create_queue so _RaceFlow.kickoff_async can reach the queue.
+    original_create_queue = ep.create_queue
+
+    async def _tracked_create_queue(flow_obj):
+        q = await original_create_queue(flow_obj)
+        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        return q
+
+    monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
+
+    # Run 10 independent requests; every single one must deliver the
+    # enqueued custom event. A regression drops the event on SOME of the
+    # runs (the race is timing-dependent) — so loop to amplify the
+    # signal.
+    for _round in range(10):
+        _MODULE_QUEUE_REGISTRY.clear()
+        event = RunStartedEvent(
+            type=EventType.RUN_STARTED,
+            thread_id="?",
+            run_id="?",
+        )
+        flow = _RaceFlow(event)
+        app = FastAPI()
+        _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
+
+        route = next(
+            r for r in app.router.routes if getattr(r, "path", None) == "/run"
+        )
+        endpoint_fn = route.endpoint
+        fake_request = _make_request()
+        response = await endpoint_fn(_make_input(), fake_request)
+        body_iter = response.body_iterator
+
+        drained: list[bytes] = []
+
+        async def _drain():
+            async for chunk in body_iter:
+                drained.append(chunk)
+
+        await asyncio.wait_for(_drain(), timeout=5.0)
+
+        parts = [
+            p.decode("utf-8", errors="replace")
+            if isinstance(p, (bytes, bytearray))
+            else p
+            for p in drained
+        ]
+        joined = "".join(parts)
+        payloads = _parse_sse_payloads(joined)
+        types = [p.get("type") for p in payloads]
+        assert "RUN_STARTED" in types, (
+            f"round {_round}: enqueued RUN_STARTED was dropped by cancel-race; "
+            f"got types={types!r}"
+        )
+
+
+class _LateEnqueueFlow:
+    """Flow that schedules a queue ``put_nowait`` via ``call_soon`` just
+    before returning from ``kickoff_async``. The enqueue fires the scheduler
+    tick AFTER ``kickoff_task.done()`` becomes true.
+
+    Used to pin R4 MEDIUM #3: the happy-path drain must not break on the
+    first empty probe — it must yield once and probe again to catch a
+    late-arriving listener enqueue (otherwise the event is silently dropped).
+    """
+
+    def __init__(self, late_event) -> None:
+        self._late_event = late_event
+        self.done = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        # Spawn a background task that will enqueue AFTER this coroutine
+        # returns. Using ``create_task`` + ``sleep(0)`` guarantees the
+        # enqueue lands on a subsequent scheduler tick — simulating a
+        # listener callback that fires right after ``kickoff_async``
+        # returns but before the drain loop runs.
+        q = _MODULE_QUEUE_REGISTRY.get(id(self))
+        event = self._late_event
+
+        async def _deferred_put():
+            # Yield twice so we are strictly after the main loop has
+            # observed ``kickoff_task.done()`` and entered the drain.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if q is not None:
+                q.put_nowait(event)
+
+        asyncio.create_task(_deferred_put())
+        self.done.set()
+
+
+async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
+    """R4 MEDIUM #3: after ``kickoff_task.done()``, the drain loop must
+    yield to the event loop and re-probe the queue — otherwise a
+    listener that enqueues in the tick immediately after kickoff's
+    return is silently dropped.
+
+    Pre-fix drain was ``while get_nowait() ... break on QueueEmpty`` —
+    one-shot. Post-fix drain does two passes with an ``asyncio.sleep(0)``
+    between them so a ``call_soon``-scheduled listener callback has a
+    chance to run and enqueue before the drain concludes.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "30")
+
+    original_create_queue = ep.create_queue
+
+    async def _tracked_create_queue(flow_obj):
+        q = await original_create_queue(flow_obj)
+        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        return q
+
+    monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
+
+    late_event = RunStartedEvent(
+        type=EventType.RUN_STARTED,
+        thread_id="?",
+        run_id="?",
+    )
+    flow = _LateEnqueueFlow(late_event)
+    app = FastAPI()
+    ep.add_crewai_flow_fastapi_endpoint(app, flow, path="/run")
+
+    route = next(r for r in app.router.routes if getattr(r, "path", None) == "/run")
+    endpoint_fn = route.endpoint
+    response = await endpoint_fn(_make_input(), _make_request())
+    body_iter = response.body_iterator
+
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    await asyncio.wait_for(_drain(), timeout=5.0)
+    parts = [
+        p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
+        for p in drained
+    ]
+    joined = "".join(parts)
+    payloads = _parse_sse_payloads(joined)
+    types = [p.get("type") for p in payloads]
+
+    assert "RUN_STARTED" in types, (
+        f"late-arriving listener enqueue was silently dropped by the "
+        f"happy-path drain; expected RUN_STARTED in payload types, "
+        f"got types={types!r}"
+    )
+
+
+def test_flow_timeout_nan_falls_back_to_default(monkeypatch):
+    """R4 LOW #17: ``float('nan') > 0`` is False, which would silently
+    disable the ceiling. A NaN env var must fall back to the default.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "nan")
+    result = ep._flow_timeout_seconds()
+    assert result == ep._DEFAULT_FLOW_TIMEOUT_SECONDS, (
+        f"NaN env var must fall back to default, not disable the ceiling; "
+        f"got {result!r}"
+    )
+
+
+def test_cancel_join_timeout_env_override(monkeypatch):
+    """R4 MEDIUM #8: operators must be able to tune the teardown ceiling
+    via AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS to reduce tail latency
+    under disconnect-heavy load.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    monkeypatch.delenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", raising=False)
+    assert ep._cancel_join_timeout_seconds() == ep._CANCEL_JOIN_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", "3.5")
+    assert ep._cancel_join_timeout_seconds() == pytest.approx(3.5)
+
+    monkeypatch.setenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", "not-a-number")
+    assert ep._cancel_join_timeout_seconds() == ep._CANCEL_JOIN_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", "0")
+    assert ep._cancel_join_timeout_seconds() == ep._CANCEL_JOIN_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS", "nan")
+    assert ep._cancel_join_timeout_seconds() == ep._CANCEL_JOIN_TIMEOUT_SECONDS
+
+
+async def test_get_flow_is_serialized_under_concurrent_first_requests(monkeypatch):
+    """R4 MEDIUM #6: two concurrent first-requests must not both
+    construct ``ChatWithCrewFlow`` — that constructor issues a real LLM
+    call and is expensive.
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    # Fast ceiling so test finishes even if a regression holds one caller.
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "5")
+
+    construct_calls = 0
+    construct_started = asyncio.Event()
+    release_construct = asyncio.Event()
+
+    class _SlowCtorFlow:
+        def __init__(self, *_a, **_kw):  # noqa: D401
+            nonlocal construct_calls
+            construct_calls += 1
+            # This simulates the LLM call inside the constructor; the
+            # serializing lock must hold the second caller here until
+            # the first completes. Since __init__ is synchronous we
+            # only increment the counter and let the first caller return
+            # immediately; the test asserts the counter stayed at 1.
+            construct_started.set()
+            self.cancelled = asyncio.Event()
+            self.started = asyncio.Event()
+
+        def __deepcopy__(self, memo):
+            return self
+
+        async def kickoff_async(self, inputs=None):
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    monkeypatch.setattr(ep, "ChatWithCrewFlow", _SlowCtorFlow)
+
+    app = FastAPI()
+    ep.add_crewai_crew_fastapi_endpoint(app, _FakeCrew(), path="/run")
+    route = next(
+        r for r in app.router.routes if getattr(r, "path", None) == "/run"
+    )
+    endpoint_fn = route.endpoint
+
+    # Fire two concurrent first-requests. Both must see the SAME
+    # cached flow; we assert the constructor ran exactly once.
+    async def _one_request():
+        response = await endpoint_fn(_make_input(), _make_request())
+        return response
+
+    # Kick off both responses in parallel; don't fully drain — we only
+    # care that the endpoint returned a StreamingResponse each. Cancel
+    # the bodies after to free resources.
+    responses = await asyncio.gather(
+        _one_request(), _one_request(), return_exceptions=True
+    )
+
+    assert construct_calls == 1, (
+        f"ChatWithCrewFlow constructor should be called exactly once "
+        f"under concurrent first-requests; got {construct_calls} calls"
+    )
+
+    # Drain/close both responses so teardown is clean.
+    for r in responses:
+        if hasattr(r, "body_iterator"):
+            try:
+                await r.body_iterator.aclose()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkeypatch):
@@ -644,7 +954,7 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
     # Outer cancel: triggers the CancelledError branch inside _cancel_and_join.
     driver.cancel()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     start = loop.time()
     try:
         # Bound = 1 × ceiling + generous slack. The pre-fix code produced
