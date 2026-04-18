@@ -596,10 +596,19 @@ class _RaceFlow:
     Used to pin the cancel-race invariant (R4 HIGH #1): the main loop
     must not silently drop an item delivered to ``get_task`` between
     ``asyncio.wait`` returning and the ``finally`` cancelling it.
+
+    CR6-7 LOW #3 / CR6-6 LOW #2: the registry is supplied by the test
+    rather than held in a module-level global. A module-level global
+    ``dict`` is xdist-unsafe (process-parallel workers share import-time
+    state via ``pickle``-ish boundaries, but mutating module state
+    across parametrized cases serialised on one worker is still a
+    cross-test coupling surface). Scoping the registry to the test
+    fixture eliminates the coupling regardless of execution model.
     """
 
-    def __init__(self, queue_event) -> None:
+    def __init__(self, queue_event, registry: dict) -> None:
         self._queue_event = queue_event
+        self._registry = registry
         self.done = asyncio.Event()
 
     def __deepcopy__(self, memo):  # noqa: D401 - trivial
@@ -610,21 +619,27 @@ class _RaceFlow:
         # ``asyncio.wait({get_task, kickoff_task}, FIRST_COMPLETED)`` may
         # observe ``kickoff_task in done`` while ``get_task`` was also
         # delivered an item that the old code cancelled and dropped.
-        q = _MODULE_QUEUE_REGISTRY.get(id(self))
+        q = self._registry.get(id(self))
         if q is not None:
             q.put_nowait(self._queue_event)
         self.done.set()
 
 
-# Module-level side-channel so ``_RaceFlow.kickoff_async`` can find the
-# queue the endpoint created for its instance. Populated by a thin wrapper
-# around ``create_queue``.
-_MODULE_QUEUE_REGISTRY: dict = {}
+@pytest.fixture
+def _race_queue_registry() -> dict:
+    """Per-test queue registry for ``_RaceFlow`` (CR6-7 LOW #3).
+
+    Replaces the prior module-level ``_MODULE_QUEUE_REGISTRY`` global.
+    Scoping to the test fixture keeps the side-channel local to the
+    test case — no cross-test mutation, no xdist-serialisation concern,
+    and no surprise when a future regression deletes the clear() call.
+    """
+    return {}
 
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
 async def test_cancel_race_does_not_drop_delivered_queue_item(
-    monkeypatch, factory
+    monkeypatch, factory, _race_queue_registry
 ):
     """R4 HIGH #1: if ``get_task`` is cancelled but had already been
     delivered a queue item, the item must be yielded (or the cancel must
@@ -636,6 +651,15 @@ async def test_cancel_race_does_not_drop_delivered_queue_item(
     both the queue delivery and the kickoff completion may land in the
     same scheduler tick; we simulate the timing by running many rounds
     and asserting that the event is delivered every time.
+
+    Amplification-style probe (CR6-6 LOW #3): this test runs 10
+    independent rounds to amplify the timing-dependent race signal.
+    The regression it pins does not reproduce deterministically in
+    userspace — the scheduler may or may not surface the race on any
+    single round. If this test ever flakes in CI, INCREASE the round
+    count rather than remove; a single flaky run means a regression
+    just barely slipped through the probe's catch net, not that the
+    test is unreliable.
     """
     from ag_ui_crewai import endpoint as ep
 
@@ -648,7 +672,7 @@ async def test_cancel_race_does_not_drop_delivered_queue_item(
 
     async def _tracked_create_queue(flow_obj):
         q = await original_create_queue(flow_obj)
-        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        _race_queue_registry[id(flow_obj)] = q
         return q
 
     monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
@@ -658,13 +682,13 @@ async def test_cancel_race_does_not_drop_delivered_queue_item(
     # runs (the race is timing-dependent) — so loop to amplify the
     # signal.
     for _round in range(10):
-        _MODULE_QUEUE_REGISTRY.clear()
+        _race_queue_registry.clear()
         event = RunStartedEvent(
             type=EventType.RUN_STARTED,
             thread_id="?",
             run_id="?",
         )
-        flow = _RaceFlow(event)
+        flow = _RaceFlow(event, _race_queue_registry)
         app = FastAPI()
         _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
 
@@ -714,8 +738,9 @@ class _LateEnqueueFlow:
     at test teardown.
     """
 
-    def __init__(self, late_event, delay_ticks: int = 2) -> None:
+    def __init__(self, late_event, registry: dict, delay_ticks: int = 2) -> None:
         self._late_event = late_event
+        self._registry = registry
         self._delay_ticks = delay_ticks
         self._deferred_task: asyncio.Task | None = None
         self.done = asyncio.Event()
@@ -729,7 +754,7 @@ class _LateEnqueueFlow:
         # enqueue lands on a subsequent scheduler tick — simulating a
         # listener callback that fires right after ``kickoff_async``
         # returns but before the drain loop runs.
-        q = _MODULE_QUEUE_REGISTRY.get(id(self))
+        q = self._registry.get(id(self))
         event = self._late_event
         delay_ticks = self._delay_ticks
 
@@ -761,7 +786,9 @@ class _LateEnqueueFlow:
                     pass
 
 
-async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
+async def test_happy_path_drain_captures_late_listener_enqueue(
+    monkeypatch, _race_queue_registry
+):
     """R4 MEDIUM #3: after ``kickoff_task.done()``, the drain loop must
     yield to the event loop and re-probe the queue — otherwise a
     listener that enqueues in the tick immediately after kickoff's
@@ -780,7 +807,7 @@ async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
 
     async def _tracked_create_queue(flow_obj):
         q = await original_create_queue(flow_obj)
-        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        _race_queue_registry[id(flow_obj)] = q
         return q
 
     monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
@@ -790,7 +817,7 @@ async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
         thread_id="?",
         run_id="?",
     )
-    flow = _LateEnqueueFlow(late_event)
+    flow = _LateEnqueueFlow(late_event, _race_queue_registry)
     app = FastAPI()
     ep.add_crewai_flow_fastapi_endpoint(app, flow, path="/run")
 
@@ -827,7 +854,7 @@ async def test_happy_path_drain_captures_late_listener_enqueue(monkeypatch):
 
 @pytest.mark.parametrize("delay_ticks", [3, 4])
 async def test_happy_path_drain_captures_multi_tick_late_enqueue(
-    monkeypatch, delay_ticks
+    monkeypatch, delay_ticks, _race_queue_registry
 ):
     """R5 HIGH #3 red-green: a listener enqueue that needs >1 scheduler
     tick after ``kickoff_task.done()`` to materialise must still be
@@ -848,7 +875,7 @@ async def test_happy_path_drain_captures_multi_tick_late_enqueue(
 
     async def _tracked_create_queue(flow_obj):
         q = await original_create_queue(flow_obj)
-        _MODULE_QUEUE_REGISTRY[id(flow_obj)] = q
+        _race_queue_registry[id(flow_obj)] = q
         return q
 
     monkeypatch.setattr(ep, "create_queue", _tracked_create_queue)
@@ -858,7 +885,7 @@ async def test_happy_path_drain_captures_multi_tick_late_enqueue(
         thread_id="?",
         run_id="?",
     )
-    flow = _LateEnqueueFlow(late_event, delay_ticks=delay_ticks)
+    flow = _LateEnqueueFlow(late_event, _race_queue_registry, delay_ticks=delay_ticks)
     app = FastAPI()
     ep.add_crewai_flow_fastapi_endpoint(app, flow, path="/run")
 
@@ -954,6 +981,20 @@ async def test_get_flow_is_serialized_under_concurrent_first_requests(monkeypatc
     entirely would still be caught because the two coroutines can
     interleave their reads of ``_cached_flow`` if ``_get_flow`` awaits
     any schedulable work between the check and the cache write.
+
+    CR6-7 LOW #5: reviewer suggested strengthening by monkeypatching
+    ``__init__`` to include ``await asyncio.sleep(0)``. That is
+    syntactically impossible — Python's sync ``__init__`` cannot host
+    an ``await`` — and the ``_get_flow`` double-check inside the
+    ``async with`` critical section means a no-op lock substitute still
+    produces a single ctor call (the second caller, after any yield,
+    observes ``_cached_flow is not None`` and returns the cache). The
+    only regression shape this pin does NOT catch is one where both
+    the lock AND the double-check are removed; that pattern is
+    structurally distant from the current implementation and would be
+    obvious on review. Kept as a positive pin rather than deleted
+    (option b) because the exact-one-ctor-call property is itself a
+    load-bearing contract worth keeping green through refactors.
     """
     from ag_ui_crewai import endpoint as ep
 
@@ -1101,3 +1142,123 @@ async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkey
             await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
         except (asyncio.CancelledError, asyncio.TimeoutError, TimeoutError):
             pass
+
+
+class _UpstreamTimeoutFlow:
+    """A flow whose ``kickoff_async`` raises a bare ``TimeoutError``.
+
+    Models the scenario where LiteLLM (or any other underlying library)
+    surfaces a read-timeout as a plain ``TimeoutError`` that bubbles out
+    of ``kickoff_async``. The endpoint's timeout handler must be robust
+    to this exception even when the flow-ceiling is disabled
+    (``timeout=None``) — otherwise the ``timeout:g`` formatting crashes
+    with ``TypeError: unsupported format string passed to
+    NoneType.__format__`` and the client sees an abruptly terminated
+    stream instead of a correlated RunErrorEvent. CR6-4 LOW.
+    """
+
+    def __init__(self) -> None:
+        self.done = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        self.done.set()
+        # Bare TimeoutError — caught by the endpoint's
+        # ``except (asyncio.TimeoutError, TimeoutError)`` handler.
+        raise TimeoutError("simulated upstream read timeout")
+
+
+@pytest.mark.parametrize("factory", ["flow", "crew"])
+async def test_flow_timeout_handler_when_ceiling_disabled(monkeypatch, factory):
+    """CR6-4 LOW: timeout handler must not crash when flow-ceiling is
+    disabled and a ``TimeoutError`` bubbles up from inside ``kickoff_async``.
+
+    When ``AGUI_CREWAI_FLOW_TIMEOUT_SECONDS`` is non-positive the ceiling
+    is disabled and ``timeout`` is ``None`` in the event-stream generator.
+    If upstream code (e.g. a LiteLLM read) raises ``TimeoutError`` in that
+    configuration, the handler enters with ``timeout=None``. The log
+    ``%g`` format and the ``{timeout:g}`` f-string both crash on ``None``
+    (``TypeError``), short-circuiting the handler BEFORE the
+    ``RunErrorEvent`` is yielded — the client sees an abruptly terminated
+    stream instead of a coherent error event.
+
+    Fix: guard both formats with a ``timeout_display`` value that reads
+    ``"disabled"`` when ``timeout is None`` and ``f"{timeout:g}s"``
+    otherwise.
+    """
+    # Disable the flow ceiling — timeout is None in the generator.
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "0")
+
+    from ag_ui_crewai import endpoint as ep
+
+    flow = _UpstreamTimeoutFlow()
+    app = FastAPI()
+    _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
+
+    route = next(
+        r for r in app.router.routes if getattr(r, "path", None) == "/run"
+    )
+    endpoint_fn = route.endpoint
+    fake_request = _make_request()
+
+    response = await endpoint_fn(_make_input(), fake_request)
+    body_iter = response.body_iterator
+
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    # The stream must complete cleanly — a crash inside the handler would
+    # either abort the generator mid-flight (our drain would surface the
+    # TypeError here) or leave the stream hanging.
+    await asyncio.wait_for(_drain(), timeout=10.0)
+
+    parts = [
+        p.decode("utf-8", errors="replace")
+        if isinstance(p, (bytes, bytearray))
+        else p
+        for p in drained
+    ]
+    joined = "".join(parts)
+    payloads = _parse_sse_payloads(joined)
+    run_errors = [p for p in payloads if p.get("type") == "RUN_ERROR"]
+
+    assert run_errors, (
+        "expected a RUN_ERROR event when upstream TimeoutError bubbles out "
+        f"with ceiling disabled; got payloads={payloads!r}"
+    )
+    err = run_errors[0]
+    error_msg = err.get("message", "")
+
+    # The message must contain a coherent ceiling descriptor rather than
+    # a stack trace leaked into the wire format. ``disabled`` is the
+    # load-bearing token that distinguishes the null-ceiling path from
+    # the finite-ceiling path.
+    assert "disabled" in error_msg, (
+        f"RunErrorEvent message should indicate ceiling is disabled; "
+        f"got: {error_msg!r}"
+    )
+    # Correlation must still appear.
+    assert "t-1" in error_msg and "r-1" in error_msg, (
+        f"RunErrorEvent must carry thread/run correlation; got: {error_msg!r}"
+    )
+    assert err.get("threadId") == "t-1", err
+    assert err.get("runId") == "r-1", err
+    # Stack trace repr must not leak.
+    assert "Traceback" not in error_msg, (
+        f"RunErrorEvent must not leak a Python traceback; got: {error_msg!r}"
+    )
+    assert "NoneType" not in error_msg, (
+        f"RunErrorEvent must not surface a NoneType-formatting error; "
+        f"got: {error_msg!r}"
+    )
+    # Timeout code must be set (this is a timeout path, not the generic
+    # flow-error path).
+    assert err.get("code") == "AGUI_CREWAI_FLOW_TIMEOUT", (
+        f"RunErrorEvent should set code=AGUI_CREWAI_FLOW_TIMEOUT on the "
+        f"timeout handler path; got: {err.get('code')!r}"
+    )
