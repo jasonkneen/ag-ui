@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ag-ui-crewai"
-version = "0.1.5"
+version = "0.2.0"
 description = "Implementation of the AG-UI protocol for CrewAI"
 authors = ["Markus Ecker <markus.ecker@gmail.com>"]
 readme = "README.md"
