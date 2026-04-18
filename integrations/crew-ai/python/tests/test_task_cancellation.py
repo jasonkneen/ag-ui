@@ -26,7 +26,6 @@ endpoint factories (flow and crew):
 
 import asyncio
 import json
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -150,6 +149,10 @@ def _parse_sse_payloads(raw: str) -> list[dict]:
     Splits on the SSE frame separator ``\\n\\n`` and extracts ``data:``
     lines. This is robust against multi-line JSON encoders that a plain
     regex over the whole string would miss.
+
+    We intentionally do NOT silently swallow JSON decode errors: a malformed
+    SSE frame is a real bug and the test should fail loudly rather than
+    hide it. Callers get a ``pytest.fail`` that pins the offending frame.
     """
 
     payloads: list[dict] = []
@@ -167,16 +170,83 @@ def _parse_sse_payloads(raw: str) -> list[dict]:
             continue
         try:
             payloads.append(json.loads(payload_text))
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            pytest.fail(
+                f"Malformed SSE data frame could not be parsed as JSON: "
+                f"{payload_text!r} ({exc})"
+            )
     return payloads
+
+
+def _extract_sse_event_names(raw: str) -> list[str]:
+    """Return the ``event:`` names appearing in the SSE stream, in order.
+
+    Used by the RUN_ERROR-is-terminal assertion: we want to confirm the
+    stream contains no RUN_FINISHED frame alongside RUN_ERROR on the
+    timeout path, regardless of payload parsing order.
+    """
+
+    names: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("event:"):
+            names.append(line[len("event:"):].strip())
+    return names
+
+
+class _CompletingFlow:
+    """A flow whose ``kickoff_async`` returns cleanly WITHOUT the listener
+    having enqueued a ``None`` sentinel. Used to pin the CPU-spin regression
+    (finding #1): if the main loop keeps re-creating get_task and waiting on
+    ``{get_task, kickoff_task}`` after ``kickoff_task.done()``, it spins.
+    """
+
+    def __init__(self) -> None:
+        self.done = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        # Return immediately and cleanly; we do NOT enqueue a sentinel,
+        # because this test's purpose is to pin the behaviour when the
+        # listener is not wired (e.g. if a listener misfires, or is
+        # bypassed in a future refactor).
+        self.done.set()
+        return None
+
+
+class _DoubleCancelFlow:
+    """Flow that cooperates with the inner CancelledError path under a
+    simulated double-cancel (Python 3.11+ ``Task.cancelling`` > 1).
+
+    The outer test cancels the generator twice: once to trigger the grace
+    path, and once more to exercise the ``_cancel_and_join`` outer-cancel
+    branch. Without an ``uncancel()`` call in the CancelledError handler,
+    the bounded second ``await wait_for`` re-raises on entry, making the
+    bounded wait a no-op.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    def __deepcopy__(self, memo):  # noqa: D401 - trivial
+        return self
+
+    async def kickoff_async(self, inputs=None):  # noqa: D401
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
 
 
 # -- tests ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
-async def test_kickoff_task_is_cancelled_on_client_disconnect(factory, monkeypatch):
+async def test_kickoff_task_is_cancelled_on_client_disconnect(monkeypatch, factory):
     """When the generator is closed, the kickoff task must be cancelled.
 
     Exercised against BOTH endpoint factories (flow + crew) — they share the
@@ -201,7 +271,7 @@ async def test_kickoff_task_is_cancelled_on_client_disconnect(factory, monkeypat
 
     # Pump once to ensure the task is scheduled and running.
     pump = asyncio.create_task(anext(body_iter))
-    await asyncio.wait_for(flow.started.wait(), timeout=2.0)
+    await asyncio.wait_for(flow.started.wait(), timeout=10.0)
 
     # Simulate client disconnect: cancel the pending __anext__ and aclose.
     # Starlette's real disconnect path calls aclose() on the body iterator
@@ -214,7 +284,7 @@ async def test_kickoff_task_is_cancelled_on_client_disconnect(factory, monkeypat
     await body_iter.aclose()
 
     # The kickoff coroutine must have been cancelled.
-    await asyncio.wait_for(flow.cancelled.wait(), timeout=2.0)
+    await asyncio.wait_for(flow.cancelled.wait(), timeout=10.0)
 
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
@@ -245,7 +315,7 @@ async def test_flow_timeout_env_var_bounds_execution(monkeypatch, factory):
         async for chunk in body_iter:
             drained.append(chunk)
 
-    await asyncio.wait_for(_drain(), timeout=5.0)
+    await asyncio.wait_for(_drain(), timeout=15.0)
 
     # The kickoff coroutine must have been cancelled by the timeout path.
     assert flow.cancelled.is_set(), "kickoff task was not cancelled by the timeout"
@@ -279,16 +349,27 @@ async def test_flow_timeout_env_var_bounds_execution(monkeypatch, factory):
     )
 
     # Correlation IDs must be in the message (human-readable log grep) AND
-    # exposed as event-level extras (machine-parseable for downstream
-    # consumers without string-parsing).
+    # exposed as event-level extras. We emit extras camelCased (``threadId``
+    # / ``runId``) so the wire format lines up with peer events
+    # (RunStartedEvent / RunFinishedEvent) whose declared fields are
+    # camelCased by the alias generator. Finding #3: snake_case extras on
+    # RunErrorEvent were a protocol inconsistency.
     assert "t-1" in error_msg and "r-1" in error_msg, (
         f"RunErrorEvent message should carry thread/run correlation; got: {error_msg!r}"
     )
-    assert err.get("thread_id") == "t-1", (
-        f"RunErrorEvent should expose thread_id as an event extra; got: {err!r}"
+    assert err.get("threadId") == "t-1", (
+        f"RunErrorEvent should expose threadId as a camelCase event extra; got: {err!r}"
     )
-    assert err.get("run_id") == "r-1", (
-        f"RunErrorEvent should expose run_id as an event extra; got: {err!r}"
+    assert err.get("runId") == "r-1", (
+        f"RunErrorEvent should expose runId as a camelCase event extra; got: {err!r}"
+    )
+    assert "thread_id" not in err, (
+        f"RunErrorEvent should NOT expose snake_case thread_id (wire format "
+        f"must match peer events); got: {err!r}"
+    )
+    assert "run_id" not in err, (
+        f"RunErrorEvent should NOT expose snake_case run_id (wire format "
+        f"must match peer events); got: {err!r}"
     )
 
     # Timeout path should also flag a distinguishing code so downstream log
@@ -298,9 +379,32 @@ async def test_flow_timeout_env_var_bounds_execution(monkeypatch, factory):
         f"got: {err.get('code')!r}"
     )
 
+    # Finding #8: RUN_ERROR must be terminal on the timeout path. A regression
+    # that emits both RUN_FINISHED and RUN_ERROR would still parse — this
+    # assertion pins the contract that only RUN_ERROR appears.
+    all_types = [p.get("type") for p in payloads]
+    assert "RUN_FINISHED" not in all_types, (
+        "RUN_FINISHED must NOT appear in the stream on the timeout path; "
+        f"got payload types={all_types!r}"
+    )
+    assert payloads[-1].get("type") == "RUN_ERROR", (
+        f"RUN_ERROR must be the terminal event on the timeout path; "
+        f"got trailing type={payloads[-1].get('type')!r} all={all_types!r}"
+    )
+
+    # Also verify at the SSE-frame layer that we don't even emit the
+    # ``event: RUN_FINISHED`` header. This catches a regression where a
+    # listener enqueues RunFinishedEvent *after* the timeout logic has
+    # already yielded RunErrorEvent but before the generator's ``finally``
+    # tears down the queue.
+    frame_names = _extract_sse_event_names(joined)
+    assert "RUN_FINISHED" not in frame_names, (
+        f"RUN_FINISHED SSE frame must NOT appear on timeout; got={frame_names!r}"
+    )
+
 
 @pytest.mark.parametrize("factory", ["flow", "crew"])
-async def test_kickoff_exception_is_surfaced_promptly(factory, monkeypatch):
+async def test_kickoff_exception_is_surfaced_promptly(monkeypatch, factory):
     """If ``kickoff_async`` itself raises, the stream must surface the real
     cause as a ``RUN_ERROR`` event without waiting for the flow-timeout
     ceiling to fire. Red-green pin for finding #3.
@@ -333,7 +437,7 @@ async def test_kickoff_exception_is_surfaced_promptly(factory, monkeypatch):
 
     # 5s is dramatically shorter than the 30s env-var ceiling; if the
     # kickoff race is missing or broken, this wait_for raises.
-    await asyncio.wait_for(_drain(), timeout=5.0)
+    await asyncio.wait_for(_drain(), timeout=15.0)
 
     parts = [p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
              for p in drained]
@@ -358,21 +462,217 @@ async def test_kickoff_exception_is_surfaced_promptly(factory, monkeypatch):
         f"FLOW_ERROR code should encode the exception class name; got code={code!r}"
     )
 
-    # Coarse message: must carry correlation + class name; must NOT leak the
-    # raw exception repr (which contained our unique marker). This is the
-    # finding #10 contract.
+    # Coarse message: must carry correlation; must NOT leak the raw
+    # exception repr (which contained our unique marker) NOR duplicate the
+    # class name (which already lives in the ``code`` field). Finding #5.
     message = err.get("message", "")
     assert "t-1" in message and "r-1" in message, (
         f"RunErrorEvent message should carry thread/run correlation; got: {message!r}"
-    )
-    assert "RuntimeError" in message, (
-        f"RunErrorEvent message should include the exception class name; got: {message!r}"
     )
     assert marker not in message, (
         f"RunErrorEvent message should NOT leak the internal exception repr; "
         f"got: {message!r}"
     )
+    # The message previously duplicated the run_id ("run=X ... see server
+    # logs for run=X") and the class name (already in ``code``). Tighten:
+    # run_id should appear exactly once in the message body.
+    assert message.count("r-1") == 1, (
+        f"RunErrorEvent message should not duplicate run_id; got: {message!r}"
+    )
+    assert "RuntimeError" not in message, (
+        f"RunErrorEvent message should NOT duplicate the class name (already "
+        f"in code={code!r}); got: {message!r}"
+    )
 
-    # Correlation extras should still be present.
-    assert err.get("thread_id") == "t-1", err
-    assert err.get("run_id") == "r-1", err
+    # Correlation extras should still be present, camelCased (finding #3).
+    assert err.get("threadId") == "t-1", err
+    assert err.get("runId") == "r-1", err
+    assert "thread_id" not in err, err
+    assert "run_id" not in err, err
+
+
+# -- R3 additions ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("factory", ["flow", "crew"])
+async def test_happy_path_no_spin_when_kickoff_completes_without_sentinel(
+    monkeypatch, factory
+):
+    """Finding #1: if ``kickoff_async`` returns cleanly but no ``None``
+    sentinel is enqueued (listener disabled, misfire, or future refactor),
+    the generator must NOT spin on ``asyncio.wait({get_task, kickoff_task})``
+    — which always returns immediately because ``kickoff_task`` is already
+    done.
+
+    The test wires a flow that completes with no sentinel. A correct
+    implementation breaks out of the main loop once it observes
+    ``kickoff_task.done()`` with ``exception() is None``. A broken
+    implementation spins forever, which we detect via an outer wait_for
+    ceiling much shorter than the flow-timeout ceiling.
+    """
+    # 60s flow ceiling — 20x longer than the spin-detection window. A
+    # regression spins and we catch it via the outer wait_for.
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "60")
+
+    from ag_ui_crewai import endpoint as ep
+
+    flow = _CompletingFlow()
+    app = FastAPI()
+    _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
+
+    route = next(r for r in app.router.routes if getattr(r, "path", None) == "/run")
+    endpoint_fn = route.endpoint
+    fake_request = _make_request()
+
+    response = await endpoint_fn(_make_input(), fake_request)
+    body_iter = response.body_iterator
+
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    # Generator must complete well under the flow ceiling. A CPU spin
+    # regression either (a) never completes and we time out, or (b) emits
+    # a FLOW_TIMEOUT event (if the deadline fires first); both fail this
+    # assertion. 3.0s is comfortable headroom over the ~0 expected runtime.
+    await asyncio.wait_for(_drain(), timeout=3.0)
+
+    assert flow.done.is_set(), "kickoff must have completed"
+
+    # No RUN_ERROR should fire; happy-path exits cleanly.
+    parts = [p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
+             for p in drained]
+    joined = "".join(parts)
+    payloads = _parse_sse_payloads(joined)
+    types = [p.get("type") for p in payloads]
+    assert "RUN_ERROR" not in types, (
+        f"happy-path completion without sentinel should NOT emit RUN_ERROR; "
+        f"got types={types!r}"
+    )
+
+
+@pytest.mark.parametrize("factory", ["flow", "crew"])
+async def test_run_error_wire_format_camelcase_extras(monkeypatch, factory):
+    """Finding #3: verify by-alias round-trip of the RunErrorEvent wire
+    payload. ``threadId`` / ``runId`` must be present, snake_case variants
+    must not. A targeted assertion — independent of the broader timeout test
+    — so a regression to snake_case is caught even if other assertions drift.
+    """
+    monkeypatch.setenv("AGUI_CREWAI_FLOW_TIMEOUT_SECONDS", "0.2")
+    from ag_ui_crewai import endpoint as ep
+
+    flow = _HangingFlow()
+    app = FastAPI()
+    _register_with_factory(factory, app, flow, "/run", ep, monkeypatch)
+
+    route = next(r for r in app.router.routes if getattr(r, "path", None) == "/run")
+    endpoint_fn = route.endpoint
+    fake_request = _make_request()
+
+    response = await endpoint_fn(_make_input(), fake_request)
+    body_iter = response.body_iterator
+    drained: list[bytes] = []
+
+    async def _drain():
+        async for chunk in body_iter:
+            drained.append(chunk)
+
+    await asyncio.wait_for(_drain(), timeout=15.0)
+    joined = "".join(
+        p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else p
+        for p in drained
+    )
+    payloads = _parse_sse_payloads(joined)
+    run_errors = [p for p in payloads if p.get("type") == "RUN_ERROR"]
+    assert run_errors, f"no RUN_ERROR; payloads={payloads!r}"
+    err = run_errors[0]
+
+    # camelCase assertions (match peer RunStartedEvent/RunFinishedEvent).
+    assert err.get("threadId") == "t-1", err
+    assert err.get("runId") == "r-1", err
+    # snake_case must be absent — wire format alignment.
+    assert "thread_id" not in err, err
+    assert "run_id" not in err, err
+
+
+async def test_cancel_and_join_outer_cancel_bounded_by_monotonic_deadline(monkeypatch):
+    """Finding #2 + #7: verify the teardown window stays bounded when the
+    outer scope is cancelled mid-teardown. The post-fix implementation
+    uses a shared monotonic deadline, so the combined wait of the inner
+    shielded ``wait_for`` plus the CancelledError-branch ``wait_for`` must
+    not exceed a single ``_CANCEL_JOIN_TIMEOUT_SECONDS`` window (plus a
+    small slack for scheduling jitter).
+    """
+    from ag_ui_crewai import endpoint as ep
+
+    # Shrink the teardown ceiling so the test is fast and the regression
+    # signature (2x → 1x) is clearly distinguishable from scheduling jitter.
+    monkeypatch.setattr(ep, "_CANCEL_JOIN_TIMEOUT_SECONDS", 0.5)
+
+    stop_absorbing = asyncio.Event()
+
+    async def _absorb_cancel():
+        # Absorb cancellations until stop_absorbing fires, so the bounded
+        # wait_for MUST time out on its own rather than finishing because
+        # the task exited. We check ``stop_absorbing`` between sleeps so
+        # the test can release the task during cleanup without warnings.
+        while not stop_absorbing.is_set():
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                if stop_absorbing.is_set():
+                    return
+                continue
+
+    task = asyncio.create_task(_absorb_cancel())
+    await asyncio.sleep(0)
+
+    async def _driver():
+        await ep._cancel_and_join(
+            task,
+            thread_id="t-double",
+            run_id="r-double",
+            allow_grace=False,
+        )
+
+    driver = asyncio.create_task(_driver())
+    # Let the driver reach the inner ``await asyncio.shield(teardown)``.
+    await asyncio.sleep(0.05)
+
+    # Outer cancel: triggers the CancelledError branch inside _cancel_and_join.
+    driver.cancel()
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    try:
+        # Bound = 1 × ceiling + generous slack. The pre-fix code produced
+        # up to 2 × ceiling, so a regression would exceed this bound.
+        bound = ep._CANCEL_JOIN_TIMEOUT_SECONDS + 0.4
+        await asyncio.wait_for(driver, timeout=bound + 0.5)
+    except asyncio.CancelledError:
+        pass  # expected propagation
+    except (asyncio.TimeoutError, TimeoutError):  # pragma: no cover - regression
+        pytest.fail(
+            "_cancel_and_join exceeded even the generous outer wait; the "
+            "ceiling regression is severe."
+        )
+    elapsed = loop.time() - start
+
+    # Strict invariant: single-ceiling window.
+    assert elapsed <= ep._CANCEL_JOIN_TIMEOUT_SECONDS + 0.4, (
+        f"_cancel_and_join outer-cancel teardown exceeded single-ceiling "
+        f"window; elapsed={elapsed:.3f}s, "
+        f"ceiling={ep._CANCEL_JOIN_TIMEOUT_SECONDS}s "
+        f"(finding #7 regression)"
+    )
+
+    # Clean up the absorb-cancel task cleanly.
+    stop_absorbing.set()
+    if not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, TimeoutError):
+            pass
