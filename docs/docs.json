@@ -75,6 +75,12 @@
               "development/roadmap",
               "development/contributing"
             ]
+          },
+          {
+            "group": "Get in Touch",
+            "pages": [
+              "talk-to-us"
+            ]
           }
         ]
       },
