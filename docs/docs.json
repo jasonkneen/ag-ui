@@ -32,7 +32,8 @@
                   },
                   "quickstart/clients"
                 ]
-              }
+              },
+              "talk-to-us"
             ]
           },
           {
@@ -74,12 +75,6 @@
               "development/updates",
               "development/roadmap",
               "development/contributing"
-            ]
-          },
-          {
-            "group": "Get in Touch",
-            "pages": [
-              "talk-to-us"
             ]
           }
         ]
