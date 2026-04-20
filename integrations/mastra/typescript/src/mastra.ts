@@ -2,6 +2,7 @@ import type {
   AgentConfig,
   BaseEvent,
   CustomEvent,
+  MessagesSnapshotEvent,
   ReasoningStartEvent,
   ReasoningMessageStartEvent,
   ReasoningMessageContentEvent,
@@ -26,6 +27,7 @@ import { Observable } from "rxjs";
 import type { MastraClient } from "@mastra/client-js";
 import {
   convertAGUIMessagesToMastra,
+  convertMastraMessagesToAGUI,
   GetLocalAgentsOptions,
   getLocalAgents,
   getRemoteAgents,
@@ -92,6 +94,22 @@ export class MastraAgent extends AbstractAgent {
   run(input: RunAgentInput): Observable<BaseEvent> {
     let messageId = randomUUID();
 
+    // True once any tool call is streamed this run. We then suppress the
+    // end-of-run MESSAGES_SNAPSHOT, because the bridge streams tool calls under
+    // the model/provider id (e.g. OpenAI `call_…`) while Mastra persists them
+    // under a different stored id. The snapshot is sourced from memory.recall()
+    // and is authoritative — replacing the client's message list — so its
+    // mismatched ids orphan whatever the frontend rendered against the streamed
+    // id (a HITL plan, a backend-tool card), wiping the UI. Until streamed ids
+    // match stored ids, only pure-text turns can safely emit the snapshot.
+    // Mirrors LangGraph's snapshot suppression "while a message is in progress".
+    // NOTE: this still cannot protect a *prior* turn's tool render from a later
+    // text turn's snapshot — full safety needs streamed==stored id alignment.
+    let toolCallStreamedThisRun = false;
+    const markToolCallStreamed = () => {
+      toolCallStreamedThisRun = true;
+    };
+
     return new Observable<BaseEvent>((subscriber) => {
       const run = async () => {
         const runStartedEvent: RunStartedEvent = {
@@ -114,6 +132,7 @@ export class MastraAgent extends AbstractAgent {
           forwardedCommand?.interruptEvent
         ) {
           await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
+          await this.emitMessagesSnapshot(subscriber, input.threadId);
           subscriber.next({
             type: EventType.RUN_FINISHED,
             threadId: input.threadId,
@@ -205,6 +224,7 @@ export class MastraAgent extends AbstractAgent {
                 messageId = id;
               },
               input.runId,
+              markToolCallStreamed,
             );
             const hadError = await this.processFullStream(response.fullStream, {
               ...callbacks,
@@ -215,6 +235,9 @@ export class MastraAgent extends AbstractAgent {
 
             if (!hadError) {
               await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
+              if (!toolCallStreamedThisRun) {
+                await this.emitMessagesSnapshot(subscriber, input.threadId);
+              }
               subscriber.next({
                 type: EventType.RUN_FINISHED,
                 threadId: input.threadId,
@@ -311,6 +334,7 @@ export class MastraAgent extends AbstractAgent {
               messageId = id;
             },
             input.runId,
+            markToolCallStreamed,
           );
 
           await this.streamMastraAgent(input, {
@@ -320,6 +344,9 @@ export class MastraAgent extends AbstractAgent {
             },
             onRunFinished: async () => {
               await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
+              if (!toolCallStreamedThisRun) {
+                await this.emitMessagesSnapshot(subscriber, input.threadId);
+              }
               subscriber.next({
                 type: EventType.RUN_FINISHED,
                 threadId: input.threadId,
@@ -406,6 +433,54 @@ export class MastraAgent extends AbstractAgent {
   }
 
   /**
+   * Fetches conversation history from a local agent's memory and emits a
+   * MESSAGES_SNAPSHOT event so frontends (e.g. CopilotKit) can synchronize
+   * thread state without re-sending all messages.
+   *
+   * Best-effort: logs a warning and returns gracefully on failure so callers
+   * can proceed with RUN_FINISHED even when the snapshot could not be delivered.
+   */
+  private async emitMessagesSnapshot(
+    subscriber: { next: (event: BaseEvent) => void },
+    threadId: string,
+  ): Promise<boolean> {
+    if (!this.isLocalMastraAgent(this.agent)) return true;
+    try {
+      const memory = await this.agent.getMemory({
+        requestContext: this.requestContext,
+      });
+      if (memory) {
+        const { messages } = await memory.recall({
+          threadId,
+          resourceId: this.resourceId ?? threadId,
+          perPage: false,
+        });
+
+        if (messages && messages.length > 0) {
+          const aguiMessages = convertMastraMessagesToAGUI(messages);
+          // Guard against emitting an empty snapshot when all recalled
+          // messages were filtered out (e.g. system-only history).
+          // MESSAGES_SNAPSHOT is authoritative on the client, so an empty
+          // array would clear visible conversation state.
+          if (aguiMessages.length > 0) {
+            subscriber.next({
+              type: EventType.MESSAGES_SNAPSHOT,
+              messages: aguiMessages,
+            } as MessagesSnapshotEvent);
+          }
+        }
+      }
+      return true;
+    } catch (error) {
+      console.warn(
+        `[MastraAgent] Failed to emit messages snapshot for thread ${threadId}:`,
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Creates the callback set used by processFullStream to emit AG-UI events.
    * messageId is accessed/mutated via getter/setter closures so that when
    * onFinishMessagePart replaces the ID with a new UUID, subsequent callbacks
@@ -416,6 +491,7 @@ export class MastraAgent extends AbstractAgent {
     getMessageId: () => string,
     setMessageId: (id: string) => void,
     runId: string,
+    onToolCallStreamed: () => void,
   ): Omit<MastraAgentStreamOptions, "onError" | "onRunFinished"> {
     let reasoningMessageId: string | null = null;
     let isReasoning = false;
@@ -477,6 +553,10 @@ export class MastraAgent extends AbstractAgent {
       },
       onToolCallPart: (streamPart) => {
         closeReasoning();
+        // Any tool call this run gates the end-of-run MESSAGES_SNAPSHOT (see
+        // run()): the snapshot's stored ids won't match this streamed id, so
+        // emitting it would orphan the frontend's tool render.
+        onToolCallStreamed();
         subscriber.next({
           type: EventType.TOOL_CALL_START,
           parentMessageId: getMessageId(),
@@ -709,6 +789,11 @@ export class MastraAgent extends AbstractAgent {
     const convertedMessages = convertAGUIMessagesToMastra(messages);
     this.requestContext?.set("ag-ui", { context: inputContext });
     const requestContext = this.requestContext;
+
+    // Message IDs are preserved by convertAGUIMessagesToMastra, so Mastra's
+    // MessageHistory processor dedupes input against stored messages by ID
+    // and storage.saveMessages upserts by ID. We forward everything
+    // CopilotKit sends and let Mastra handle deduplication.
 
     if (this.isLocalMastraAgent(this.agent)) {
       try {
