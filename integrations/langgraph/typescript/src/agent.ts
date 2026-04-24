@@ -1230,14 +1230,19 @@ export class LangGraphAgent extends AbstractAgent {
         if (isMessageContentEvent && shouldEmitMessages) {
           // No existing message yet, also init the message
           if (!currentStream) {
+            // Reuse the stable ID from earlier in this run so that text
+            // resuming after a tool call stays in the same message bubble.
+            const messageId =
+              this.activeRun!.currentTextMessageId ?? event.data.chunk.id;
+            this.activeRun!.currentTextMessageId = messageId;
             this.dispatchEvent({
               type: EventType.TEXT_MESSAGE_START,
               role: "assistant",
-              messageId: event.data.chunk.id,
+              messageId,
               rawEvent: event,
             });
             this.setMessageInProgress(this.activeRun!.id, {
-              id: event.data.chunk.id,
+              id: messageId,
               toolCallId: null,
               toolCallName: null,
             });
@@ -1540,13 +1545,17 @@ export class LangGraphAgent extends AbstractAgent {
     // Handle text content streaming
     if (content) {
       if (!currentStream) {
+        // Reuse the stable ID from earlier in this run so that text
+        // resuming after a tool call stays in the same message bubble.
+        const messageId = this.activeRun!.currentTextMessageId ?? chunk.id;
+        this.activeRun!.currentTextMessageId = messageId;
         this.dispatchEvent({
           type: EventType.TEXT_MESSAGE_START,
           role: "assistant",
-          messageId: chunk.id,
+          messageId,
         });
         this.setMessageInProgress(this.activeRun!.id, {
-          id: chunk.id,
+          id: messageId,
           toolCallId: null,
           toolCallName: null,
         });
