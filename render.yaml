@@ -436,7 +436,7 @@ projects:
       - key: AGENT_FRAMEWORK_DOTNET_URL
         value: https://ag-ui-dojo-maf-dotnet.onrender.com
       - key: A2A_MIDDLEWARE_BUILDINGS_MANAGEMENT_URL
-        value: https://ag-ui-dojo-a2a-middleware-businesses-management.onrender.com
+        value: https://ag-ui-dojo-a2a-middleware-businesses.onrender.com
       - key: A2A_MIDDLEWARE_FINANCE_URL
         value: https://ag-ui-dojo-a2a-middleware-finance.onrender.com
       - key: A2A_MIDDLEWARE_IT_URL
