@@ -490,6 +490,62 @@ describe("messages-tuple stream mode", () => {
       expect(contentAfterTool[0].messageId).toBe(firstId);
     });
 
+    it("mints a fresh messageId when the graph transitions to a different node (events mode)", () => {
+      // Multi-node scenario covering the events-mode read site
+      // (on_chat_model_stream routed through handleSingleEvent's switch case,
+      // not through handleMessagesTupleEvent). Pairs with the messages-tuple
+      // multi-node test below.
+      const { agent, events } = createAgent();
+      (agent as any).activeRun.nodeName = "supervisor";
+
+      // 1. Supervisor emits its routing message.
+      agent.handleSingleEvent({
+        event: "on_chat_model_stream",
+        metadata: { "emit-messages": true, "emit-tool-calls": true },
+        data: {
+          chunk: {
+            id: "msg-sup",
+            content: "Routing to billing",
+            tool_call_chunks: [],
+            response_metadata: {},
+          },
+        },
+      });
+
+      // 2. Supervisor's LLM call ends, clearing messagesInProcess.
+      agent.handleSingleEvent({
+        event: "on_chat_model_end",
+        metadata: { "emit-messages": true, "emit-tool-calls": true },
+        data: {},
+      });
+
+      // 3. Graph transitions to billing. handleNodeChange clears the pinned
+      //    text message id, so the next text chunk mints fresh.
+      agent.handleNodeChange("billing");
+
+      // 4. Billing emits its response from a new LLM invocation.
+      agent.handleSingleEvent({
+        event: "on_chat_model_stream",
+        metadata: { "emit-messages": true, "emit-tool-calls": true },
+        data: {
+          chunk: {
+            id: "msg-bil",
+            content: "Here's your invoice",
+            tool_call_chunks: [],
+            response_metadata: {},
+          },
+        },
+      });
+
+      const textStarts = events.filter(
+        (e) => e.type === EventType.TEXT_MESSAGE_START,
+      );
+      expect(textStarts).toHaveLength(2);
+      expect(textStarts[0].messageId).toBe("msg-sup");
+      expect(textStarts[1].messageId).toBe("msg-bil");
+      expect(textStarts[0].messageId).not.toBe(textStarts[1].messageId);
+    });
+
     it("reuses the same messageId across multiple text/tool cycles in one run", () => {
       // Three text segments separated by two tool calls all share one
       // messageId. Pins the invariant against any future "reset on tool end".

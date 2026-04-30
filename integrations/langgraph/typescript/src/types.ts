@@ -86,17 +86,12 @@ export interface RunMetadata {
   // reused for every subsequent TEXT_MESSAGE_START emitted from the same
   // node, so text resuming after a tool call (or after a fresh model
   // invocation within the same node) stays in the same UI bubble. Cleared
-  // implicitly on a node transition: the next text chunk from a different
-  // node mints a fresh id, so multi-node graphs (e.g. supervisor routing to
-  // specialist agents) preserve separate bubbles per node. Reset implicitly
-  // on the next run when activeRun is replaced. Not used by
-  // ManuallyEmitMessage events: those carry their own messageId and bypass
-  // this field entirely.
+  // by handleNodeChange on every node transition, so multi-node graphs
+  // (e.g. supervisor routing to specialist agents) preserve separate
+  // bubbles per node. Reset implicitly on the next run when activeRun is
+  // replaced. Not used by ManuallyEmitMessage events: those carry their
+  // own messageId and bypass this field entirely.
   currentTextMessageId?: string;
-  // The nodeName that was active when currentTextMessageId was minted. The
-  // reuse predicate matches against this; on node change, both fields are
-  // overwritten on the next text chunk.
-  currentTextMessageNode?: string;
 }
 
 export type MessagesInProgressRecord = Record<string, MessageInProgress | null>;

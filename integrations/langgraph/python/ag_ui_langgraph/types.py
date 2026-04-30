@@ -79,17 +79,12 @@ RunMetadata = TypedDict("RunMetadata", {
     # reused for every subsequent TEXT_MESSAGE_START emitted from the same
     # node, so text resuming after a tool call (or after a fresh model
     # invocation within the same node) stays in the same UI bubble. Cleared
-    # implicitly on a node transition: the next text chunk from a different
-    # node mints a fresh id, so multi-node graphs (e.g. supervisor routing to
-    # specialist agents) preserve separate bubbles per node. Reset implicitly
-    # on the next run when active_run is replaced. Not used by
-    # ManuallyEmitMessage events: those carry their own message_id and bypass
-    # this field entirely.
-    "current_text_message_id": NotRequired[str],
-    # The node_name that was active when current_text_message_id was minted.
-    # The reuse predicate matches against this; on node change, both fields
-    # are overwritten on the next text chunk.
-    "current_text_message_node": NotRequired[Optional[str]],
+    # by handle_node_change on every node transition, so multi-node graphs
+    # (e.g. supervisor routing to specialist agents) preserve separate
+    # bubbles per node. Reset implicitly on the next run when active_run is
+    # replaced. Not used by ManuallyEmitMessage events: those carry their
+    # own message_id and bypass this field entirely.
+    "current_text_message_id": NotRequired[Optional[str]],
 })
 
 MessagesInProgressRecord = Dict[str, Optional[MessageInProgress]]
