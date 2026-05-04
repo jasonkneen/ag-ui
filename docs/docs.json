@@ -149,8 +149,8 @@
     }
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "/logo/ag-ui-light.svg",
+    "dark": "/logo/ag-ui-dark.svg"
   },
   "navbar": {
     "links": [
