@@ -679,13 +679,21 @@ class StrandsAgent:
             # For continuation runs (has_pending_tool_result), derive a meaningful
             # message from the frontend tool that was just executed so the agent
             # understands the context and can generate a proper conclusion.
-            user_message = "Hello"
+            user_message = ""
             if pending_tool_result_ids and input_data.messages:
                 for msg in reversed(input_data.messages):
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
                         if tool_name and tool_name in frontend_tool_names:
                             user_message = f"{tool_name} executed successfully with no return value."
+                        else:
+                            logger.warning(
+                                f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
+                                f"(lookup has {len(_tool_call_id_to_name)} entries, "
+                                f"frontend_tool_names={frontend_tool_names}). "
+                                f"The assistant message with tool_calls may be missing from "
+                                f"input_data.messages (delta-only payload)."
+                            )
                         break
             elif input_data.messages:
                 for msg in reversed(input_data.messages):
@@ -699,7 +707,7 @@ class StrandsAgent:
                                 user_message = convert_agui_content_to_strands(msg.content)
                                 if not user_message:
                                     # All content blocks failed conversion — fall back to text
-                                    user_message = flatten_content_to_text(msg.content) or "Hello"
+                                    user_message = flatten_content_to_text(msg.content) or ""
                                     logger.warning("All media content blocks failed conversion, falling back to text")
                             else:
                                 user_message = flatten_content_to_text(msg.content)
