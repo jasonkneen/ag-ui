@@ -692,13 +692,14 @@ class StrandsAgent:
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
                         if tool_name and tool_name in frontend_tool_names:
                             user_message = f"{tool_name} executed successfully with no return value."
-                        else:
+                        elif frontend_tool_names:
+                            fallback_name = next(iter(frontend_tool_names))
+                            user_message = f"{fallback_name} executed successfully with no return value."
                             logger.warning(
                                 f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
-                                f"(lookup has {len(_tool_call_id_to_name)} entries, "
-                                f"frontend_tool_names={frontend_tool_names}). "
-                                f"The assistant message with tool_calls may be missing from "
-                                f"input_data.messages (delta-only payload)."
+                                f"from input messages (assistant message with tool_calls may be "
+                                f"missing — delta-only payload). Falling back to frontend tool "
+                                f"name '{fallback_name}' from input_data.tools."
                             )
                         break
             elif input_data.messages:
