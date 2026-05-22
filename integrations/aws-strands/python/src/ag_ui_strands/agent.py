@@ -632,11 +632,17 @@ class StrandsAgent:
 
                 # Handle tool messages (must follow assistant message with tool_calls)
                 elif msg.role == "tool":
-                    # Skip tool messages that don't have a preceding assistant message with tool_calls
+                    # Skip tool messages that don't have a preceding assistant message
+                    # with tool_calls — UNLESS this is a pending frontend tool result
+                    # (delta-only payloads only contain the tool result, so the
+                    # assistant message is absent but the result is still valid).
+                    is_pending_frontend_result = (
+                        msg.tool_call_id in pending_tool_result_ids
+                    )
                     if (
                         not last_msg_had_tool_calls
                         or msg.tool_call_id not in expected_tool_call_ids
-                    ):
+                    ) and not is_pending_frontend_result:
                         logger.debug(
                             f"Skipping orphaned tool message: tool_call_id={msg.tool_call_id}, last_msg_had_tool_calls={last_msg_had_tool_calls}, valid_ids={expected_tool_call_ids}, thread_id={input_data.thread_id}"
                         )
@@ -649,7 +655,7 @@ class StrandsAgent:
                     else:
                         strands_msg["content"] = msg.content
 
-                    expected_tool_call_ids.remove(msg.tool_call_id)
+                    expected_tool_call_ids.discard(msg.tool_call_id)
                     if not expected_tool_call_ids:
                         last_msg_had_tool_calls = False
                     strands_messages.append(strands_msg)
