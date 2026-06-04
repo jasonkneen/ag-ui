@@ -16,7 +16,7 @@ Scenario from the issue:
      still never gets a MESSAGES_SNAPSHOT -> every later turn crashes the
      same way -> the thread is permanently broken.
 
-These tests pin the *current* behavior on main:
+These tests pin the post-fix behavior:
 
   * ``test_sse_drop_does_not_enter_regenerate_or_raise`` -- the recovery: the
     fresh-UUID count mismatch must NOT enter the regenerate path and must
@@ -115,6 +115,38 @@ class TestOSS28SSEDropRecovery(unittest.IsolatedAsyncioTestCase):
             getattr(m, "id", None) for m in result["state"].get("messages", [])
         }
         self.assertIn("fresh-uuid-never-persisted", streamed_ids)
+
+    async def test_count_mismatch_all_incoming_in_checkpoint_is_continuation(self):
+        """The motivating non-regeneration case: the client is behind (never
+        received ai1) and resends only [h1] while the checkpoint holds
+        [h1, ai1]. The count mismatches (2 > 1), but every incoming id is
+        already in the checkpoint, so is_continuation short-circuits before the
+        last-user-id check. A regression flipping issubset or dropping the
+        truthiness precondition would wrongly regenerate here."""
+        agent = make_agent()
+        agent.active_run = {"id": "run-1", "mode": "start"}
+
+        checkpoint_messages = [
+            HumanMessage(id="h1", content="first question"),
+            AIMessage(id="ai1", content="first answer"),
+        ]
+        state = _make_state(checkpoint_messages)
+
+        frontend_messages = [
+            UserMessage(id="h1", role="user", content="first question"),
+        ]
+        inp = _make_input(frontend_messages, forwarded_props={})
+
+        agent.prepare_regenerate_stream = AsyncMock(
+            side_effect=AssertionError("a continuation must not enter regenerate")
+        )
+        agent.graph.astream_events.return_value = _empty_stream()
+        config = {"configurable": {"thread_id": "t1"}}
+
+        result = await agent.prepare_stream(inp, state, config)
+
+        agent.prepare_regenerate_stream.assert_not_awaited()
+        self.assertIsNotNone(result.get("stream"))
 
     async def test_underlying_landmine_still_raises_for_unknown_id(self):
         """The crash site is unchanged: regenerating against an id absent from

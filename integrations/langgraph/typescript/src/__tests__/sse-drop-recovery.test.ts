@@ -4,15 +4,15 @@
  *
  * The Python integration was fixed by an ID guard in `prepare_stream`
  * (regenerate only when the last user message id is present in the
- * checkpoint). The TypeScript `prepareStream` has NO such guard: it routes
- * into `prepareRegenerateStream` on any non-system count mismatch
+ * checkpoint). The TypeScript `prepareStream` previously had no such guard:
+ * it routed into `prepareRegenerateStream` on any non-system count mismatch
  * (`stateNonSystemCount > inputNonSystemCount`, agent.ts), then
- * `getCheckpointByMessage` throws `Error("Message not found")` because the
+ * `getCheckpointByMessage` threw `Error("Message not found")` because the
  * client's freshly generated UUID was never persisted.
  *
- * The guard has now been ported to agent.ts: regenerate is only taken when
- * the incoming IDs are not already a subset of the checkpoint AND the last
- * user message's ID exists in the checkpoint. These tests assert recovery.
+ * The guard is now ported to agent.ts: regenerate is only taken when the
+ * incoming IDs are not already a subset of the checkpoint AND the last user
+ * message's ID exists in the checkpoint. These tests assert recovery.
  */
 import { describe, it, expect, vi } from "vitest";
 import { LangGraphAgent } from "../agent";
@@ -140,6 +140,40 @@ describe("OSS-28 / #1278 SSE-drop recovery (TypeScript)", () => {
     ).toBe(true);
   });
 
+  it("count mismatch with all incoming IDs in checkpoint is a continuation (isContinuation branch)", async () => {
+    // The motivating non-regeneration case: the client is behind (it never
+    // received ai1), so it resends only [h1] while the checkpoint holds
+    // [h1, ai1]. Count mismatches (2 > 1), but every incoming ID is already in
+    // the checkpoint, so isContinuation short-circuits BEFORE the last-user-id
+    // check -- a distinct guard from test 1 (which falls through via the
+    // last-user-id check). A regression flipping `every` -> `some` or dropping
+    // the length precondition would wrongly regenerate here.
+    const checkpointMessages = [
+      { type: "human", id: "h1", content: "first question" },
+      { type: "ai", id: "ai1", content: "first answer" },
+    ];
+    const { agent, streamCalls } = buildAgent(checkpointMessages, []);
+    (agent as any).prepareRegenerateStream = vi.fn(() => {
+      throw new Error("a continuation must not enter regenerate");
+    });
+
+    const input = {
+      runId: "run-1",
+      threadId: "thread-1",
+      messages: [{ id: "h1", role: "user", content: "first question" }],
+      tools: [],
+      context: [],
+      forwardedProps: {},
+    };
+
+    const prepared = await agent.prepareStream(input as any, STREAM_MODE as any);
+
+    expect(prepared).toBeTruthy();
+    expect((agent as any).prepareRegenerateStream).not.toHaveBeenCalled();
+    expect((agent as any).client.threads.getHistory).not.toHaveBeenCalled();
+    expect(streamCalls).toHaveLength(1);
+  });
+
   it("underlying landmine still throws for an unknown id (guard is load-bearing)", async () => {
     // The crash site is unchanged: regenerating against an id absent from
     // history still throws "Message not found". This is why the prepareStream
@@ -174,10 +208,10 @@ describe("OSS-28 / #1278 SSE-drop recovery (TypeScript)", () => {
       { type: "ai", id: "ai2", content: "second answer" },
     ];
     const { agent } = buildAgent(checkpointMessages, []);
-    // Spy out the regenerate machinery; we only assert routing here.
-    const regenSpy = vi
-      .fn()
-      .mockResolvedValue({ streamResponse: {}, state: {}, streamMode: STREAM_MODE });
+    // Spy out the regenerate machinery; we assert routing and that its result
+    // is returned unchanged (parity with the Python test's assertIs).
+    const regenResult = { streamResponse: {}, state: {}, streamMode: STREAM_MODE };
+    const regenSpy = vi.fn().mockResolvedValue(regenResult);
     (agent as any).prepareRegenerateStream = regenSpy;
 
     // An incoming id (h-edited) is NOT in the checkpoint -> not a plain
@@ -195,9 +229,10 @@ describe("OSS-28 / #1278 SSE-drop recovery (TypeScript)", () => {
       forwardedProps: {},
     };
 
-    await agent.prepareStream(input as any, STREAM_MODE as any);
+    const result = await agent.prepareStream(input as any, STREAM_MODE as any);
 
     expect(regenSpy).toHaveBeenCalledTimes(1);
+    expect(result).toBe(regenResult);
   });
 
   it("a genuine continuation (no count mismatch) does NOT throw", async () => {
