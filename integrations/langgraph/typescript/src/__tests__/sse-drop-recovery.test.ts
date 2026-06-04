@@ -102,7 +102,12 @@ describe("OSS-28 / #1278 SSE-drop recovery (TypeScript)", () => {
         next: [],
       },
     ];
-    const { agent } = buildAgent(checkpointMessages, history);
+    const { agent, streamCalls } = buildAgent(checkpointMessages, history);
+    // Loud guard: any accidental routing into regenerate fails the test
+    // immediately (mirrors the Python test's AssertionError side-effect).
+    (agent as any).prepareRegenerateStream = vi.fn(() => {
+      throw new Error("SSE-drop recovery must not enter regenerate");
+    });
 
     // SSE dropped before MESSAGES_SNAPSHOT, so the client resends only the new
     // user message with a freshly generated UUID (1 non-system message).
@@ -122,8 +127,42 @@ describe("OSS-28 / #1278 SSE-drop recovery (TypeScript)", () => {
     const prepared = await agent.prepareStream(input as any, STREAM_MODE as any);
 
     expect(prepared).toBeTruthy();
-    // Regenerate path not taken: the history lookup never happened.
+    // Regenerate path not taken, and the history lookup never happened.
+    expect((agent as any).prepareRegenerateStream).not.toHaveBeenCalled();
     expect((agent as any).client.threads.getHistory).not.toHaveBeenCalled();
+    expect((agent as any).subscriber.error).not.toHaveBeenCalled();
+    // The new turn must actually reach the stream (not be silently dropped):
+    // exactly one stream started, carrying the fresh-UUID message.
+    expect(streamCalls).toHaveLength(1);
+    const streamedMessages = (streamCalls[0] as any).input?.messages ?? [];
+    expect(
+      streamedMessages.some((m: any) => m.id === "fresh-uuid-never-persisted"),
+    ).toBe(true);
+  });
+
+  it("underlying landmine still throws for an unknown id (guard is load-bearing)", async () => {
+    // The crash site is unchanged: regenerating against an id absent from
+    // history still throws "Message not found". This is why the prepareStream
+    // guard exercised above is load-bearing -- if a refactor made this return
+    // silently instead of throwing, the guard could be dropped and the
+    // thread-corruption bug would return undetected. Mirrors the Python
+    // test_underlying_landmine_still_raises_for_unknown_id.
+    const checkpointMessages = [
+      { type: "human", id: "h1", content: "real" },
+    ];
+    const history = [
+      {
+        values: { messages: checkpointMessages },
+        checkpoint: { checkpoint_id: "ck-1", checkpoint_ns: "" },
+        parent_checkpoint: null,
+        next: [],
+      },
+    ];
+    const { agent } = buildAgent(checkpointMessages, history);
+
+    await expect(
+      (agent as any).getCheckpointByMessage("fresh-uuid-never-persisted", "thread-1"),
+    ).rejects.toThrow("Message not found");
   });
 
   it("a genuine edit still routes into regenerate", async () => {

@@ -464,7 +464,7 @@ export class LangGraphAgent extends AbstractAgent {
       // A higher checkpoint count than the frontend sent does NOT always mean a
       // regeneration. If an SSE stream dropped before MESSAGES_SNAPSHOT, the
       // client never learned the persisted message IDs and resends the new user
-      // turn with a freshly generated UUID — making the checkpoint legitimately
+      // turn with a freshly generated UUID, making the checkpoint legitimately
       // longer than the input even though this is a continuation. Routing that
       // into regeneration calls getCheckpointByMessage with an ID that was never
       // persisted, which throws "Message not found" and breaks the thread on
@@ -474,7 +474,10 @@ export class LangGraphAgent extends AbstractAgent {
       // NOT already a subset of the checkpoint (a genuine edit) AND the last user
       // message's ID actually exists in the checkpoint. Otherwise fall through to
       // a normal continuation stream so the end-of-run MESSAGES_SNAPSHOT re-syncs
-      // the client. Mirrors the Python guard in prepare_stream.
+      // the client. This continuation/regeneration decision mirrors the Python
+      // guard in prepare_stream; the outer count pre-filter differs harmlessly
+      // (this side excludes system messages from both counts, Python only from
+      // the incoming side) and is not load-bearing for the recovery.
       const checkpointIds = new Set(
         (agentStateMessages as LangGraphPlatformMessage[])
           .map((m) => m.id)
@@ -556,7 +559,10 @@ export class LangGraphAgent extends AbstractAgent {
       });
     }
     // @ts-ignore
-    const { command, ...restProps } = forwardedProps;
+    // forwardedProps is optional on the input; the SSE-drop recovery now reaches
+    // this continuation path (instead of returning early via regenerate), so guard
+    // against an undefined value here rather than throwing on destructure.
+    const { command, ...restProps } = forwardedProps ?? {};
     if (command?.resume && typeof command.resume === "string") {
       try {
         command.resume = JSON.parse(command.resume);

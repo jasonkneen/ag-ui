@@ -109,6 +109,12 @@ class TestOSS28SSEDropRecovery(unittest.IsolatedAsyncioTestCase):
 
         agent.prepare_regenerate_stream.assert_not_awaited()
         self.assertIsNotNone(result.get("stream"))
+        # The new turn must actually reach the stream, not be silently dropped:
+        # the merged state carries the fresh-UUID message.
+        streamed_ids = {
+            getattr(m, "id", None) for m in result["state"].get("messages", [])
+        }
+        self.assertIn("fresh-uuid-never-persisted", streamed_ids)
 
     async def test_underlying_landmine_still_raises_for_unknown_id(self):
         """The crash site is unchanged: regenerating against an id absent from
