@@ -475,9 +475,10 @@ export class LangGraphAgent extends AbstractAgent {
       // message's ID actually exists in the checkpoint. Otherwise fall through to
       // a normal continuation stream so the end-of-run MESSAGES_SNAPSHOT re-syncs
       // the client. This continuation/regeneration decision mirrors the Python
-      // guard in prepare_stream; the outer count pre-filter differs harmlessly
-      // (this side excludes system messages from both counts, Python only from
-      // the incoming side) and is not load-bearing for the recovery.
+      // guard in prepare_stream. The outer count pre-filter differs only in which
+      // inputs enter this block (this side excludes system messages from both
+      // counts, Python only from the incoming side); both reach the same
+      // continuation-vs-regenerate decision for the recovery case.
       const checkpointIds = new Set(
         (agentStateMessages as LangGraphPlatformMessage[])
           .map((m) => m.id)
@@ -558,7 +559,6 @@ export class LangGraphAgent extends AbstractAgent {
         schemaKeys: this.activeRun!.schemaKeys,
       });
     }
-    // @ts-ignore
     // forwardedProps is optional on the input; the SSE-drop recovery now reaches
     // this continuation path (instead of returning early via regenerate), so guard
     // against an undefined value here rather than throwing on destructure.
