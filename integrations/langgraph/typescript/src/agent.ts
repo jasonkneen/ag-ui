@@ -461,25 +461,59 @@ export class LangGraphAgent extends AbstractAgent {
     // first interrupt while the frontend's input.messages hasn't, which would
     // otherwise trigger the regeneration path and ignore the resume.
     if (!forwardedProps?.command?.resume && stateNonSystemCount > inputNonSystemCount) {
-      let lastUserMessage: LangGraphMessage | null = null;
-      // Find the first user message by working backwards from the last message
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === "user") {
-          lastUserMessage = aguiMessagesToLangChain([messages[i]])[0];
-          break;
+      // A higher checkpoint count than the frontend sent does NOT always mean a
+      // regeneration. If an SSE stream dropped before MESSAGES_SNAPSHOT, the
+      // client never learned the persisted message IDs and resends the new user
+      // turn with a freshly generated UUID — making the checkpoint legitimately
+      // longer than the input even though this is a continuation. Routing that
+      // into regeneration calls getCheckpointByMessage with an ID that was never
+      // persisted, which throws "Message not found" and breaks the thread on
+      // every subsequent turn (#1278).
+      //
+      // Only treat the count mismatch as a regeneration when the incoming IDs are
+      // NOT already a subset of the checkpoint (a genuine edit) AND the last user
+      // message's ID actually exists in the checkpoint. Otherwise fall through to
+      // a normal continuation stream so the end-of-run MESSAGES_SNAPSHOT re-syncs
+      // the client. Mirrors the Python guard in prepare_stream.
+      const checkpointIds = new Set(
+        (agentStateMessages as LangGraphPlatformMessage[])
+          .map((m) => m.id)
+          .filter((id): id is string => Boolean(id)),
+      );
+      // Tool results are excluded from the comparison: connectors (e.g.
+      // CopilotKit) reassign tool-message IDs that won't match the checkpoint's
+      // placeholders. Human/AI IDs are stable and sufficient to distinguish a
+      // continuation from a genuine regeneration.
+      const incomingNonToolIds = messages
+        .filter((m) => m.role !== "tool" && Boolean(m.id))
+        .map((m) => m.id as string);
+      const isContinuation =
+        incomingNonToolIds.length > 0 &&
+        incomingNonToolIds.every((id) => checkpointIds.has(id));
+
+      if (!isContinuation) {
+        let lastUserMessage: LangGraphMessage | null = null;
+        let lastUserMessageId: string | undefined;
+        // Find the last user message by working backwards from the end.
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user") {
+            lastUserMessageId = messages[i].id;
+            lastUserMessage = aguiMessagesToLangChain([messages[i]])[0];
+            break;
+          }
+        }
+
+        if (
+          lastUserMessage &&
+          lastUserMessageId &&
+          checkpointIds.has(lastUserMessageId)
+        ) {
+          return this.prepareRegenerateStream(
+            { ...input, messageCheckpoint: lastUserMessage },
+            streamMode,
+          );
         }
       }
-
-      if (!lastUserMessage) {
-        return this.subscriber.error(
-          "No user message found in messages to regenerate",
-        );
-      }
-
-      return this.prepareRegenerateStream(
-        { ...input, messageCheckpoint: lastUserMessage },
-        streamMode,
-      );
     }
     this.activeRun!.graphInfo = await this.client.assistants.getGraph(
       this.assistant.assistant_id,
