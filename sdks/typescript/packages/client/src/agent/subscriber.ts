@@ -230,25 +230,39 @@ function deepFreeze<T>(obj: T): T {
 // in-place mutation during development — it is NOT required for correctness.
 // Paying a full recursive structuredClone + deepFreeze of the entire messages
 // array AND state object on every streamed event is what exhausts the renderer
-// heap when tool-call arguments stream large payloads (the structuredClone OOM).
+// heap when tool-call arguments stream large payloads (V8 fatal:
+// "JavaScript heap out of memory" from structuredClone).
 const DEV_FREEZE_CHAR_LIMIT = 512 * 1024;
 
 // Cheap, bounded size probe: returns true as soon as the combined string length
-// of messages+state exceeds `limit` (so large payloads short-circuit early and
-// small ones are fully — but cheaply — scanned). Allocates nothing.
+// of messages+state (counting both string values AND object key names, since
+// keys also contribute to clone cost) exceeds `limit`. Does NOT recursively
+// structuredClone or materialize copies — only a bounded iterative traversal
+// stack plus a visited-set guard, so it is safe for arbitrarily nested or
+// cyclic structures. (`State` is typed `any`, so cycles are possible.)
 function payloadExceeds(messages: unknown, state: unknown, limit: number): boolean {
   let chars = 0;
   const stack: unknown[] = [messages, state];
+  const seen = new WeakSet<object>();
   while (stack.length > 0) {
     const value = stack.pop();
     if (typeof value === "string") {
       chars += value.length;
       if (chars > limit) return true;
     } else if (value !== null && typeof value === "object") {
+      if (seen.has(value as object)) continue;
+      seen.add(value as object);
       if (Array.isArray(value)) {
         for (let i = 0; i < value.length; i++) stack.push(value[i]);
       } else {
-        for (const key in value as Record<string, unknown>) {
+        // Own enumerable keys only — avoids walking the prototype chain and
+        // triggering inherited getters (matches deepFreeze's Object.values).
+        const keys = Object.keys(value as Record<string, unknown>);
+        for (let i = 0; i < keys.length; i++) {
+          const key = keys[i];
+          // Key names contribute to clone cost too; count them as we go.
+          chars += key.length;
+          if (chars > limit) return true;
           stack.push((value as Record<string, unknown>)[key]);
         }
       }
@@ -280,8 +294,8 @@ export async function runSubscribersWithMutation(
   // mutation) is the dominant per-event allocation. Skip it in production, and
   // in dev when the payload is large — otherwise streaming large tool-call
   // arguments deep-clones the whole messages+state on every event and exhausts
-  // the heap (DataCloneError: structuredClone … out of memory).
-  const freezeInputs = isDev && !payloadExceeds(initialMessages, initialState, DEV_FREEZE_CHAR_LIMIT);
+  // the heap (V8 fatal: "JavaScript heap out of memory" from structuredClone).
+  let freezeInputs = isDev && !payloadExceeds(initialMessages, initialState, DEV_FREEZE_CHAR_LIMIT);
 
   // Only the freeze path needs an isolated baseline copy. Otherwise pass the
   // inputs through and lazily clone only when a subscriber actually returns a
@@ -312,14 +326,27 @@ export async function runSubscribersWithMutation(
 
       // Replace with a defensive copy of the subscriber's mutation,
       // but skip if the subscriber returned the same reference (no-op).
+      let payloadChanged = false;
       if (mutation.messages !== undefined && mutation.messages !== messages) {
         messages = structuredClone_(mutation.messages);
         messagesMutated = true;
+        payloadChanged = true;
       }
 
       if (mutation.state !== undefined && mutation.state !== state) {
         state = structuredClone_(mutation.state);
         stateMutated = true;
+        payloadChanged = true;
+      }
+
+      // If a subscriber's mutation has grown the payload past the limit, drop
+      // the freeze guard for the remaining iterations. Otherwise we'd pay a
+      // full deepFreeze + final unfreeze-clone of the now-huge structure on
+      // every later subscriber — exactly the cost this PR removes.
+      if (freezeInputs && payloadChanged) {
+        if (payloadExceeds(messages, state, DEV_FREEZE_CHAR_LIMIT)) {
+          freezeInputs = false;
+        }
       }
 
       stopPropagation = mutation.stopPropagation;
