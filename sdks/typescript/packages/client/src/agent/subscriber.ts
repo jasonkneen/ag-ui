@@ -225,6 +225,38 @@ function deepFreeze<T>(obj: T): T {
   return obj;
 }
 
+// Above this many string characters across messages+state, the dev-only
+// clone+deepFreeze guard is skipped. That guard exists to surface accidental
+// in-place mutation during development — it is NOT required for correctness.
+// Paying a full recursive structuredClone + deepFreeze of the entire messages
+// array AND state object on every streamed event is what exhausts the renderer
+// heap when tool-call arguments stream large payloads (the structuredClone OOM).
+const DEV_FREEZE_CHAR_LIMIT = 512 * 1024;
+
+// Cheap, bounded size probe: returns true as soon as the combined string length
+// of messages+state exceeds `limit` (so large payloads short-circuit early and
+// small ones are fully — but cheaply — scanned). Allocates nothing.
+function payloadExceeds(messages: unknown, state: unknown, limit: number): boolean {
+  let chars = 0;
+  const stack: unknown[] = [messages, state];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value === "string") {
+      chars += value.length;
+      if (chars > limit) return true;
+    } else if (value !== null && typeof value === "object") {
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) stack.push(value[i]);
+      } else {
+        for (const key in value as Record<string, unknown>) {
+          stack.push((value as Record<string, unknown>)[key]);
+        }
+      }
+    }
+  }
+  return false;
+}
+
 export async function runSubscribersWithMutation(
   subscribers: AgentSubscriber[],
   initialMessages: Message[],
@@ -243,10 +275,21 @@ export async function runSubscribersWithMutation(
     (process.env.NODE_ENV === "development" ||
       process.env.NODE_ENV === "test" ||
       Boolean(process.env.VITEST_WORKER_ID));
-  const baselineMessages = structuredClone_(initialMessages);
-  const baselineState = structuredClone_(initialState);
-  let messages: Message[] = baselineMessages;
-  let state: State = baselineState;
+
+  // The dev-only clone+deepFreeze guard (which surfaces accidental in-place
+  // mutation) is the dominant per-event allocation. Skip it in production, and
+  // in dev when the payload is large — otherwise streaming large tool-call
+  // arguments deep-clones the whole messages+state on every event and exhausts
+  // the heap (DataCloneError: structuredClone … out of memory).
+  const freezeInputs = isDev && !payloadExceeds(initialMessages, initialState, DEV_FREEZE_CHAR_LIMIT);
+
+  // Only the freeze path needs an isolated baseline copy. Otherwise pass the
+  // inputs through and lazily clone only when a subscriber actually returns a
+  // mutation — so the common "no mutation" event costs zero clones.
+  let messages: Message[] = freezeInputs ? structuredClone_(initialMessages) : initialMessages;
+  let state: State = freezeInputs ? structuredClone_(initialState) : initialState;
+  let messagesMutated = false;
+  let stateMutated = false;
 
   let stopPropagation: boolean | undefined = undefined;
 
@@ -254,9 +297,9 @@ export async function runSubscribersWithMutation(
     try {
       // Subscribers receive shared references and must not mutate them in-place.
       // Mutations should only be communicated via the return value.
-      // In dev/test mode only: deep-freeze inputs so accidental in-place mutations surface
-      // as TypeErrors immediately. In production, enforcement is type-level only.
-      if (isDev) {
+      // In dev/test mode (small payloads): deep-freeze inputs so accidental
+      // in-place mutations surface as TypeErrors immediately.
+      if (freezeInputs) {
         deepFreeze(messages);
         deepFreeze(state);
       }
@@ -271,10 +314,12 @@ export async function runSubscribersWithMutation(
       // but skip if the subscriber returned the same reference (no-op).
       if (mutation.messages !== undefined && mutation.messages !== messages) {
         messages = structuredClone_(mutation.messages);
+        messagesMutated = true;
       }
 
       if (mutation.state !== undefined && mutation.state !== state) {
         state = structuredClone_(mutation.state);
+        stateMutated = true;
       }
 
       stopPropagation = mutation.stopPropagation;
@@ -304,15 +349,14 @@ export async function runSubscribersWithMutation(
     }
   }
 
-  // In dev/test mode, the canonical messages/state references may have been
-  // frozen in-place (for subscriber mutation detection). Clone them before
-  // returning so callers receive a mutable copy, not a frozen one.
+  // A mutated copy may have been frozen in-place on a later subscriber pass;
+  // clone it before returning so callers receive a mutable copy.
   return {
-    ...(messages !== baselineMessages
-      ? { messages: isDev && Object.isFrozen(messages) ? structuredClone_(messages) : messages }
+    ...(messagesMutated
+      ? { messages: Object.isFrozen(messages) ? structuredClone_(messages) : messages }
       : {}),
-    ...(state !== baselineState
-      ? { state: isDev && Object.isFrozen(state) ? structuredClone_(state) : state }
+    ...(stateMutated
+      ? { state: Object.isFrozen(state) ? structuredClone_(state) : state }
       : {}),
     ...(stopPropagation !== undefined ? { stopPropagation } : {}),
   };
