@@ -16,7 +16,6 @@ test-results/
 
 node_modules
 .vscode
-.integration-tests/
 
 **/mastra.db*
 
