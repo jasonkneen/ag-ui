@@ -216,8 +216,13 @@ export const menuIntegrations = [
     features: [
       "agentic_chat",
       "v1_agentic_chat",
+      "agentic_chat_reasoning",
+      "agentic_chat_multimodal",
+      "agentic_generative_ui",
       "backend_tool_rendering",
       "human_in_the_loop",
+      "predictive_state_updates",
+      "shared_state",
       "tool_based_generative_ui",
     ],
   },
