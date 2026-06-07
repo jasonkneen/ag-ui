@@ -328,5 +328,52 @@ void main() {
       expect(modified.description, 'original');
       expect(modified.value, 'value2');
     });
+
+    test(
+        'RunAgentInput.copyWith — sentinel-clear semantics for state and '
+        'forwardedProps (regression for #1018 review)', () {
+      // Before the sentinel sweep these fields used `?? this.field`, so a
+      // caller could not clear them explicitly via `copyWith(state: null)`.
+      // Now the sentinel allows omitted-vs-explicit-null to be distinguished.
+      final original = RunAgentInput(
+        threadId: 'thread_001',
+        runId: 'run_001',
+        state: const {'k': 'v'},
+        messages: const [],
+        tools: const [],
+        context: const [],
+        forwardedProps: const {'fp': 1},
+      );
+
+      // Omitted argument preserves the existing value.
+      final keep = original.copyWith();
+      expect(keep.state, equals(const {'k': 'v'}));
+      expect(keep.forwardedProps, equals(const {'fp': 1}));
+
+      // Explicit null clears each field independently.
+      final clearedState = original.copyWith(state: null);
+      expect(clearedState.state, isNull);
+      expect(clearedState.forwardedProps, equals(const {'fp': 1}));
+
+      final clearedFP = original.copyWith(forwardedProps: null);
+      expect(clearedFP.forwardedProps, isNull);
+      expect(clearedFP.state, equals(const {'k': 'v'}));
+    });
+
+    test(
+        'Run.copyWith(result: null) clears result; omitted preserves it '
+        '(regression for #1018 review)', () {
+      final original = Run(
+        threadId: 't',
+        runId: 'r',
+        result: const {'ok': true},
+      );
+
+      final keep = original.copyWith();
+      expect(keep.result, equals(const {'ok': true}));
+
+      final cleared = original.copyWith(result: null);
+      expect(cleared.result, isNull);
+    });
   });
 }
