@@ -8,7 +8,6 @@ overrides:
   langium: 3.2.0
   '@copilotkit/runtime>@langchain/core': 0.3.80
   '@langchain/openai>@langchain/core': 0.3.80
-  '@ag-ui/a2ui-middleware': link:./middlewares/a2ui-middleware
   zod: 3.25.76
   '@strands-agents/sdk>zod': ^4.4.3
   '@ag-ui/aws-strands>zod': ^4.4.3
@@ -97,7 +96,7 @@ importers:
         specifier: workspace:*
         version: link:../../middlewares/a2a-middleware
       '@ag-ui/a2ui-middleware':
-        specifier: link:../../middlewares/a2ui-middleware
+        specifier: workspace:*
         version: link:../../middlewares/a2ui-middleware
       '@ag-ui/adk':
         specifier: workspace:*
@@ -1582,6 +1581,12 @@ packages:
 
   '@a2ui/web_core@0.9.0':
     resolution: {integrity: sha512-TsMWuEeuVDsScGIGPy/fWIZu+EOBRfhx6KwjKh3VwY1AwysRenQM8zDr8VrSk14Wck/aBgVxk2zWVrMCK2/s6A==}
+
+  '@ag-ui/a2ui-middleware@0.0.6':
+    resolution: {integrity: sha512-LAv6Prh399WgGIbjnkd9Qw0/9SuyjVh6Hatkbs5IjO7zVeipY6fMyVunBN52j4AnJANRnk4qbSqpG/HOcGMaGw==}
+    peerDependencies:
+      '@ag-ui/client': '>=0.0.40'
+      rxjs: 7.8.1
 
   '@ag-ui/a2ui-toolkit@0.0.1-alpha.3':
     resolution: {integrity: sha512-9U4DtwJ6rHO4vn4ixYVnRJGrO7u07phT/AjgsHymLf4cvPw57PNZACc4y6eTtayG0IcySNqRGW/wE+qjlXzgzw==}
@@ -12557,6 +12562,12 @@ snapshots:
       zod: 3.25.76
       zod-to-json-schema: 3.25.2(zod@3.25.76)
 
+  '@ag-ui/a2ui-middleware@0.0.6(@ag-ui/client@0.0.53)(rxjs@7.8.1)':
+    dependencies:
+      '@ag-ui/client': 0.0.53
+      clarinet: 0.12.6
+      rxjs: 7.8.1
+
   '@ag-ui/a2ui-toolkit@0.0.1-alpha.3': {}
 
   '@ag-ui/client@0.0.46':
@@ -14942,7 +14953,7 @@ snapshots:
 
   '@copilotkit/runtime@1.59.5(2ea9b4f56e43567ad28ff71961bd4e0e)':
     dependencies:
-      '@ag-ui/a2ui-middleware': link:middlewares/a2ui-middleware
+      '@ag-ui/a2ui-middleware': 0.0.6(@ag-ui/client@0.0.53)(rxjs@7.8.1)
       '@ag-ui/client': 0.0.53
       '@ag-ui/core': 0.0.53
       '@ag-ui/encoder': 0.0.53
