@@ -5,7 +5,10 @@ import {
   DEFAULT_DESIGN_GUIDELINES,
   DEFAULT_GENERATION_GUIDELINES,
   DEFAULT_SURFACE_ID,
+  GENERATE_A2UI_TOOL_DESCRIPTION,
+  GENERATE_A2UI_TOOL_NAME,
   RENDER_A2UI_TOOL_DEF,
+  resolveA2UIToolParams,
   assembleOps,
   buildA2UIEnvelope,
   buildContextPrompt,
@@ -637,5 +640,33 @@ describe("buildA2UIEnvelope", () => {
     const ops = env[A2UI_OPERATIONS_KEY];
     expect(ops.some((o: any) => o.createSurface)).toBe(false);
     expect(ops[0].updateComponents.surfaceId).toBe("s1");
+  });
+});
+
+describe("resolveA2UIToolParams", () => {
+  it("fills the canonical defaults", () => {
+    const r = resolveA2UIToolParams({ model: "M" });
+    expect(r.model).toBe("M");
+    expect(r.defaultSurfaceId).toBe(DEFAULT_SURFACE_ID);
+    expect(r.defaultCatalogId).toBe(BASIC_CATALOG_ID);
+    expect(r.toolName).toBe(GENERATE_A2UI_TOOL_NAME);
+    expect(r.toolDescription).toBe(GENERATE_A2UI_TOOL_DESCRIPTION);
+    expect(r.guidelines).toBeUndefined();
+  });
+
+  it("falls back to defaults on empty-string overrides", () => {
+    const r = resolveA2UIToolParams({ model: "M", toolName: "", defaultCatalogId: "" });
+    expect(r.toolName).toBe(GENERATE_A2UI_TOOL_NAME);
+    expect(r.defaultCatalogId).toBe(BASIC_CATALOG_ID);
+  });
+
+  it("passes overrides through", () => {
+    const r = resolveA2UIToolParams({
+      model: "M",
+      toolName: "custom_tool",
+      guidelines: { compositionGuide: "g" },
+    });
+    expect(r.toolName).toBe("custom_tool");
+    expect(r.guidelines).toEqual({ compositionGuide: "g" });
   });
 });

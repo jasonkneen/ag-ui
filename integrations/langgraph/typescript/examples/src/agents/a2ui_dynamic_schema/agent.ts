@@ -55,7 +55,8 @@ Example:
 - Generate 3-4 realistic items with diverse data
 `;
 
-const a2uiTool = getA2UITools(new ChatOpenAI({ model: "gpt-4o" }), {
+const a2uiTool = getA2UITools({
+  model: new ChatOpenAI({ model: "gpt-4o" }),
   defaultCatalogId: CUSTOM_CATALOG_ID,
   guidelines: { compositionGuide: COMPOSITION_GUIDE },
 });

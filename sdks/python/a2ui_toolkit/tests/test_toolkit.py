@@ -15,6 +15,8 @@ from ag_ui_a2ui_toolkit import (
     DEFAULT_DESIGN_GUIDELINES,
     DEFAULT_GENERATION_GUIDELINES,
     DEFAULT_SURFACE_ID,
+    GENERATE_A2UI_TOOL_DESCRIPTION,
+    GENERATE_A2UI_TOOL_NAME,
     RENDER_A2UI_TOOL_DEF,
     assemble_ops,
     build_a2ui_envelope,
@@ -23,6 +25,7 @@ from ag_ui_a2ui_toolkit import (
     create_surface,
     find_prior_surface,
     prepare_a2ui_request,
+    resolve_a2ui_tool_params,
     update_components,
     update_data_model,
     wrap_as_operations_envelope,
@@ -721,6 +724,35 @@ class TestBuildA2UIEnvelope(unittest.TestCase):
         ops = env[A2UI_OPERATIONS_KEY]
         self.assertFalse(any("createSurface" in o for o in ops))
         self.assertEqual(ops[0]["updateComponents"]["surfaceId"], "s1")
+
+
+class TestResolveA2UIToolParams(unittest.TestCase):
+    def test_fills_canonical_defaults(self):
+        r = resolve_a2ui_tool_params({"model": "M"})
+        self.assertEqual(r["model"], "M")
+        self.assertEqual(r["default_surface_id"], DEFAULT_SURFACE_ID)
+        self.assertEqual(r["default_catalog_id"], BASIC_CATALOG_ID)
+        self.assertEqual(r["tool_name"], GENERATE_A2UI_TOOL_NAME)
+        self.assertEqual(r["tool_description"], GENERATE_A2UI_TOOL_DESCRIPTION)
+        self.assertIsNone(r["guidelines"])
+
+    def test_empty_string_override_falls_back_to_default(self):
+        r = resolve_a2ui_tool_params(
+            {"model": "M", "tool_name": "", "default_catalog_id": ""}
+        )
+        self.assertEqual(r["tool_name"], GENERATE_A2UI_TOOL_NAME)
+        self.assertEqual(r["default_catalog_id"], BASIC_CATALOG_ID)
+
+    def test_overrides_pass_through(self):
+        r = resolve_a2ui_tool_params(
+            {
+                "model": "M",
+                "tool_name": "custom_tool",
+                "guidelines": {"composition_guide": "g"},
+            }
+        )
+        self.assertEqual(r["tool_name"], "custom_tool")
+        self.assertEqual(r["guidelines"], {"composition_guide": "g"})
 
 
 if __name__ == "__main__":

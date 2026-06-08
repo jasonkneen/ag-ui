@@ -31,6 +31,9 @@ __all__ = [
     "A2UIGuidelines",
     "DEFAULT_GENERATION_GUIDELINES",
     "DEFAULT_DESIGN_GUIDELINES",
+    "A2UIToolParams",
+    "ResolvedA2UIToolParams",
+    "resolve_a2ui_tool_params",
     "assemble_ops",
     "wrap_as_operations_envelope",
     "wrap_error_envelope",
@@ -644,6 +647,74 @@ GENERATE_A2UI_ARG_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 """Planner-facing descriptions for the outer tool's three arguments."""
+
+
+# ---------------------------------------------------------------------------
+# Shared A2UI tool-factory params (OSS-248)
+#
+# One params shape, owned by the toolkit, consumed identically by every
+# framework adapter. A framework's factory is always
+# ``get_a2ui_tools(params: A2UIToolParams)`` — only the body (tool decorator,
+# runtime/state accessor, model bind+invoke) differs per framework.
+#
+# ``model`` is the single framework-specific field (typed ``Any`` here so the
+# toolkit stays framework-agnostic). Adding a new knob = add a field here (+ its
+# default in ``resolve_a2ui_tool_params``) — NO adapter signature ever changes,
+# and a brand-new framework adapter gets the knob for free on day one.
+# ---------------------------------------------------------------------------
+
+
+class A2UIToolParams(TypedDict, total=False):
+    """Shared input shape for every framework's ``get_a2ui_tools`` factory."""
+
+    model: Any  # required in practice; framework-specific chat model
+    guidelines: Optional[A2UIGuidelines]
+    default_surface_id: Optional[str]
+    default_catalog_id: Optional[str]
+    tool_name: Optional[str]
+    tool_description: Optional[str]
+    catalog: Optional[dict]
+    recovery: Optional[dict]
+    on_a2ui_attempt: Optional[Any]
+
+
+class ResolvedA2UIToolParams(TypedDict):
+    """``A2UIToolParams`` with every optional knob resolved to its effective
+    value — returned by ``resolve_a2ui_tool_params`` so adapters never
+    re-implement defaults."""
+
+    model: Any
+    guidelines: Optional[A2UIGuidelines]
+    default_surface_id: str
+    default_catalog_id: str
+    tool_name: str
+    tool_description: str
+    catalog: Optional[dict]
+    recovery: Optional[dict]
+    on_a2ui_attempt: Optional[Any]
+
+
+def resolve_a2ui_tool_params(params: A2UIToolParams) -> ResolvedA2UIToolParams:
+    """Normalize ``A2UIToolParams`` into ``ResolvedA2UIToolParams``, filling the
+    canonical defaults so each framework adapter stops re-implementing
+    ``tool_name or DEFAULT`` / ``catalog_id or BASIC`` lines.
+
+    Uses ``or`` (not ``is None``) so an accidental empty-string override falls
+    back to the canonical default rather than advertising a nameless tool or
+    emitting a blank surface/catalog id.
+    """
+    return {
+        "model": params.get("model"),
+        "guidelines": params.get("guidelines"),
+        "default_surface_id": params.get("default_surface_id") or DEFAULT_SURFACE_ID,
+        "default_catalog_id": params.get("default_catalog_id") or BASIC_CATALOG_ID,
+        "tool_name": params.get("tool_name") or GENERATE_A2UI_TOOL_NAME,
+        "tool_description": params.get("tool_description")
+        or GENERATE_A2UI_TOOL_DESCRIPTION,
+        "catalog": params.get("catalog"),
+        "recovery": params.get("recovery"),
+        "on_a2ui_attempt": params.get("on_a2ui_attempt"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,28 @@ Built-in defaults apply automatically, so existing callers that pass nothing now
 design guidance injected into the subagent prompt. This is the intended re-enable. The
 middleware's `RENDER_A2UI_TOOL_GUIDELINES` (direct-tool path) is orthogonal and untouched.
 
+## Follow-up: shared tool-factory params (scales to N frameworks)
+
+The guidelines bag makes *new prompt knobs* free, but the first cut still
+re-declared each knob in every adapter signature — so introducing a knob, or
+onboarding a new framework, was still O(adapters). Closed that gap:
+
+- Toolkit owns a single generic params type `A2UIToolParams<TModel>` (TS) /
+  `A2UIToolParams` TypedDict (Py) — `model` is the one framework-specific field,
+  hence the generic. Plus a shared `resolveA2UIToolParams` /
+  `resolve_a2ui_tool_params` that fills canonical defaults (`toolName`,
+  `defaultCatalogId`, …) once.
+- Every framework factory is now identical: `getA2UITools(params: A2UIToolParams<TModel>)`
+  / `get_a2ui_tools(params: A2UIToolParams)`. Only the body (tool decorator,
+  runtime/state accessor, model bind+invoke) is framework-specific.
+- Net effect: a new knob = add a field to `A2UIToolParams` + apply its default in
+  the resolver — **no adapter signature changes, ever**, and a brand-new
+  framework adapter inherits every knob on day one.
+
+Breaking: factories take a single params object now (`getA2UITools(model, opts)`
+→ `getA2UITools({ model, ...opts })`); `A2UISubagentToolOptions` is replaced by
+`A2UIToolParams`. All in-repo examples updated.
+
 ## Testing
 
 - **Toolkit (TS + Py):** `build_subagent_prompt` — defaults applied when absent; per-field

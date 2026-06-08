@@ -7,6 +7,9 @@
  * binding/invoke). Nothing in this package depends on any agent framework.
  */
 
+import type { A2UIRecoveryConfig, A2UIAttemptRecord } from "./recovery";
+import type { A2UIValidationCatalog } from "./validate";
+
 /** Container key the A2UI middleware looks for in tool results. */
 export const A2UI_OPERATIONS_KEY = "a2ui_operations";
 
@@ -554,6 +557,83 @@ export const GENERATE_A2UI_ARG_DESCRIPTIONS = {
   target_surface_id: "Required when intent='update'. The surface id of the prior render to modify.",
   changes: "Optional natural-language description of the changes to apply when intent='update'.",
 } as const;
+
+// ---------------------------------------------------------------------------
+// Shared A2UI tool-factory params (OSS-248)
+//
+// One params shape, owned by the toolkit, consumed identically by every
+// framework adapter. A framework's factory is always
+// `getA2UITools(params: A2UIToolParams<TModel>)` — only the body (tool
+// decorator, runtime/state accessor, model bind+invoke) differs per framework.
+//
+// `model` is the single framework-specific field, so the type is generic over
+// it. Adding a new knob = add a field here (+ apply its default in
+// `resolveA2UIToolParams`) — NO adapter signature ever changes, and a brand-new
+// framework adapter gets the knob for free on day one.
+// ---------------------------------------------------------------------------
+
+export interface A2UIToolParams<TModel = unknown> {
+  /** Chat model the subagent invokes for structured A2UI output. The one
+   *  framework-specific field — typed per framework via the generic. */
+  model: TModel;
+  /** Generation/design/composition prompt knobs (per-field defaults applied). */
+  guidelines?: A2UIGuidelines;
+  /** Surface id used when the subagent omits `surfaceId`. */
+  defaultSurfaceId?: string;
+  /** Catalog id assigned to every new surface this factory creates — the
+   *  subagent never picks the catalog. Falls back to the basic v0.9 catalog. */
+  defaultCatalogId?: string;
+  /** Name advertised to the main agent's planner. */
+  toolName?: string;
+  /** Description shown to the main agent's planner. */
+  toolDescription?: string;
+  /** Inline catalog enabling catalog-aware recovery. Pass the SAME catalog the
+   *  host gives the middleware so retry decision + paint gate agree. */
+  catalog?: A2UIValidationCatalog;
+  /** Recovery loop config: attempt cap, retry-UI threshold, debug exposure. */
+  recovery?: A2UIRecoveryConfig;
+  /** Per-attempt hook for recovery status / dev logs (non-disruptive). */
+  onA2UIAttempt?: (record: A2UIAttemptRecord) => void;
+}
+
+/** `A2UIToolParams` with every optional field resolved to its effective value.
+ *  Returned by `resolveA2UIToolParams` so adapters never re-implement defaults. */
+export interface ResolvedA2UIToolParams<TModel = unknown> {
+  model: TModel;
+  guidelines?: A2UIGuidelines;
+  defaultSurfaceId: string;
+  defaultCatalogId: string;
+  toolName: string;
+  toolDescription: string;
+  catalog?: A2UIValidationCatalog;
+  recovery?: A2UIRecoveryConfig;
+  onA2UIAttempt?: (record: A2UIAttemptRecord) => void;
+}
+
+/**
+ * Normalize an `A2UIToolParams` into a `ResolvedA2UIToolParams`, filling the
+ * canonical defaults so each framework adapter stops re-implementing
+ * `toolName || DEFAULT` / `catalogId || BASIC` lines.
+ *
+ * Uses `||` (not `??`) so an accidental empty-string override from a caller
+ * falls back to the canonical default rather than advertising a nameless /
+ * empty-description tool or emitting a blank surface/catalog id.
+ */
+export function resolveA2UIToolParams<TModel>(
+  params: A2UIToolParams<TModel>,
+): ResolvedA2UIToolParams<TModel> {
+  return {
+    model: params.model,
+    guidelines: params.guidelines,
+    defaultSurfaceId: params.defaultSurfaceId || DEFAULT_SURFACE_ID,
+    defaultCatalogId: params.defaultCatalogId || BASIC_CATALOG_ID,
+    toolName: params.toolName || GENERATE_A2UI_TOOL_NAME,
+    toolDescription: params.toolDescription || GENERATE_A2UI_TOOL_DESCRIPTION,
+    catalog: params.catalog,
+    recovery: params.recovery,
+    onA2UIAttempt: params.onA2UIAttempt,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // High-level orchestration

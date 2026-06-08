@@ -11,7 +11,7 @@ Example usage in a chat node::
 
     from ag_ui_langgraph import get_a2ui_tools
 
-    a2ui = get_a2ui_tools(model=ChatOpenAI(model="gpt-4o"))
+    a2ui = get_a2ui_tools({"model": ChatOpenAI(model="gpt-4o")})
 
     model_with_tools = chat_model.bind_tools(
         [*state["tools"], a2ui],
@@ -24,19 +24,16 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from langchain.tools import tool, ToolRuntime
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 
 from ag_ui_a2ui_toolkit import (
     A2UI_OPERATIONS_KEY,
-    A2UIGuidelines,
+    A2UIToolParams,
     BASIC_CATALOG_ID,
-    DEFAULT_SURFACE_ID,
-    GENERATE_A2UI_TOOL_NAME,
-    GENERATE_A2UI_TOOL_DESCRIPTION,
     RENDER_A2UI_TOOL_DEF,
     build_a2ui_envelope,
     prepare_a2ui_request,
+    resolve_a2ui_tool_params,
     wrap_error_envelope,
     run_a2ui_generation_with_recovery,
 )
@@ -47,48 +44,41 @@ from ag_ui_a2ui_toolkit import (
 __all__ = [
     "get_a2ui_tools",
     "A2UI_OPERATIONS_KEY",
+    "A2UIToolParams",
     "BASIC_CATALOG_ID",
 ]
 
 
-def get_a2ui_tools(
-    model: BaseChatModel,
-    *,
-    guidelines: Optional[A2UIGuidelines] = None,
-    default_surface_id: str = DEFAULT_SURFACE_ID,
-    default_catalog_id: str = BASIC_CATALOG_ID,
-    tool_name: str = GENERATE_A2UI_TOOL_NAME,
-    tool_description: Optional[str] = None,
-    catalog: Optional[dict] = None,
-    recovery: Optional[dict] = None,
-    on_a2ui_attempt: Optional[Any] = None,
-):
+def get_a2ui_tools(params: A2UIToolParams):
     """Build a LangGraph tool that delegates A2UI surface generation to a subagent.
 
     The returned tool is decorated with ``@langchain.tools.tool`` and is
     ready to bind into a chat model alongside any other tools.
 
     Args:
-        model: Chat model the subagent will invoke for structured A2UI output.
-            Using the same provider/model as the main agent is fine.
-        guidelines: Optional prompt knobs (``generation_guidelines``,
-            ``design_guidelines``, ``composition_guide``) forwarded verbatim to
-            the toolkit. Generation/design fall back per-field to the toolkit's
-            built-in defaults when unset; an empty string suppresses a block.
-        default_surface_id: Surface id used when the subagent omits ``surfaceId``.
-        default_catalog_id: Catalog id assigned to every new surface this
-            factory creates — the subagent never picks the catalog. Falls back
-            to the basic v0.9 catalog.
-        tool_name: Name advertised to the main agent's planner.
-        tool_description: Description shown to the main agent's planner.
+        params: Shared ``A2UIToolParams`` (``model`` + behavior knobs). The
+            toolkit owns the shape and fills defaults via
+            ``resolve_a2ui_tool_params``. Every framework adapter takes this
+            exact params type — only the body below is LangGraph-specific, so a
+            new knob added to ``A2UIToolParams`` reaches this adapter with no
+            signature change.
 
     Returns:
         A LangGraph tool callable suitable for ``bind_tools(...)``.
     """
+    # Shared: normalize knobs + fill canonical defaults so this adapter never
+    # re-implements default logic. A new params field + its default lives
+    # entirely in the toolkit.
+    cfg = resolve_a2ui_tool_params(params)
+    model = cfg["model"]
+    guidelines = cfg["guidelines"]
+    default_surface_id = cfg["default_surface_id"]
+    default_catalog_id = cfg["default_catalog_id"]
+    catalog = cfg["catalog"]
+    recovery = cfg["recovery"]
+    on_a2ui_attempt = cfg["on_a2ui_attempt"]
 
-    description = tool_description or GENERATE_A2UI_TOOL_DESCRIPTION
-
-    @tool(tool_name, description=description)
+    @tool(cfg["tool_name"], description=cfg["tool_description"])
     def generate_a2ui(
         runtime: ToolRuntime[Any],
         intent: str = "create",
