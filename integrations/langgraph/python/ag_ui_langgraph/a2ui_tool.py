@@ -29,6 +29,7 @@ from langchain_core.messages import SystemMessage
 
 from ag_ui_a2ui_toolkit import (
     A2UI_OPERATIONS_KEY,
+    A2UIGuidelines,
     BASIC_CATALOG_ID,
     DEFAULT_SURFACE_ID,
     GENERATE_A2UI_TOOL_NAME,
@@ -53,7 +54,7 @@ __all__ = [
 def get_a2ui_tools(
     model: BaseChatModel,
     *,
-    composition_guide: Optional[str] = None,
+    guidelines: Optional[A2UIGuidelines] = None,
     default_surface_id: str = DEFAULT_SURFACE_ID,
     default_catalog_id: str = BASIC_CATALOG_ID,
     tool_name: str = GENERATE_A2UI_TOOL_NAME,
@@ -70,8 +71,10 @@ def get_a2ui_tools(
     Args:
         model: Chat model the subagent will invoke for structured A2UI output.
             Using the same provider/model as the main agent is fine.
-        composition_guide: Optional extra rules appended to the subagent's
-            system prompt (e.g. project-specific component usage rules).
+        guidelines: Optional prompt knobs (``generation_guidelines``,
+            ``design_guidelines``, ``composition_guide``) forwarded verbatim to
+            the toolkit. Generation/design fall back per-field to the toolkit's
+            built-in defaults when unset; an empty string suppresses a block.
         default_surface_id: Surface id used when the subagent omits ``surfaceId``.
         default_catalog_id: Catalog id assigned to every new surface this
             factory creates — the subagent never picks the catalog. Falls back
@@ -114,7 +117,7 @@ def get_a2ui_tools(
             changes=changes,
             messages=messages,
             state=runtime.state,
-            composition_guide=composition_guide,
+            guidelines=guidelines,
         )
         if prep.get("error"):
             return wrap_error_envelope(prep["error"])

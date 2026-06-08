@@ -33,6 +33,7 @@ import {
   prepareA2UIRequest,
   wrapErrorEnvelope,
   runA2UIGenerationWithRecovery,
+  type A2UIGuidelines,
   type A2UIRecoveryConfig,
   type A2UIValidationCatalog,
   type A2UIAttemptRecord,
@@ -53,8 +54,13 @@ export type A2UISubagentModel = any;
 export { A2UI_OPERATIONS_KEY, BASIC_CATALOG_ID };
 
 export interface A2UISubagentToolOptions {
-  /** Optional extra rules appended to the subagent's system prompt. */
-  compositionGuide?: string;
+  /**
+   * Optional prompt knobs (`generationGuidelines`, `designGuidelines`,
+   * `compositionGuide`) forwarded verbatim to the toolkit. Generation/design
+   * fall back per-field to the toolkit's built-in defaults when unset; an empty
+   * string suppresses a block.
+   */
+  guidelines?: A2UIGuidelines;
   /** Surface id used when the subagent omits `surfaceId`. */
   defaultSurfaceId?: string;
   /** Catalog id assigned to every new surface this factory creates — the
@@ -112,7 +118,7 @@ export function getA2UITools(
   // `or` for the same parity). Otherwise an accidental `""` from a caller
   // would advertise a nameless / empty-description tool to the planner.
   const {
-    compositionGuide,
+    guidelines,
     defaultSurfaceId: defaultSurfaceIdOpt,
     defaultCatalogId: defaultCatalogIdOpt,
     toolName: toolNameOpt,
@@ -146,7 +152,7 @@ export function getA2UITools(
         changes: input.changes,
         messages,
         state,
-        compositionGuide,
+        guidelines,
       });
       if (prep.error) return wrapErrorEnvelope(prep.error);
 

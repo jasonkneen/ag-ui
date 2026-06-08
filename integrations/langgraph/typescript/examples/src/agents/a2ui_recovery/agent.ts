@@ -50,14 +50,17 @@ Card components bound to per-item data (relative paths inside the template).
 
 const a2uiTool = getA2UITools(new ChatOpenAI({ model: "gpt-4o" }), {
   defaultCatalogId: CUSTOM_CATALOG_ID,
-  compositionGuide: COMPOSITION_GUIDE,
+  guidelines: { compositionGuide: COMPOSITION_GUIDE },
   // Recovery loop runs by default; set explicitly for the showcase. No catalog
   // → structural validation (which is all this demo's error needs).
   recovery: { maxAttempts: 3 },
   onA2UIAttempt: (rec) => {
     // Dev observability: each attempt (incl. rejected ones) is logged.
     // eslint-disable-next-line no-console
-    console.log(`[a2ui recovery] attempt ${rec.attempt}: ${rec.ok ? "valid" : "invalid"}`, rec.errors);
+    console.log(
+      `[a2ui recovery] attempt ${rec.attempt}: ${rec.ok ? "valid" : "invalid"}`,
+      rec.errors,
+    );
   },
 });
 

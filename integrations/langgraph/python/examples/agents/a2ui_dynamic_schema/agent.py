@@ -66,7 +66,7 @@ TOOLS = [
     get_a2ui_tools(
         model=base_model,
         default_catalog_id=CUSTOM_CATALOG_ID,
-        composition_guide=COMPOSITION_GUIDE,
+        guidelines={"composition_guide": COMPOSITION_GUIDE},
     )
 ]
 
