@@ -28,6 +28,7 @@ from langchain_core.messages import SystemMessage
 
 from ag_ui_a2ui_toolkit import (
     A2UI_OPERATIONS_KEY,
+    A2UIGuidelines,
     A2UIToolParams,
     BASIC_CATALOG_ID,
     RENDER_A2UI_TOOL_DEF,
@@ -39,12 +40,15 @@ from ag_ui_a2ui_toolkit import (
 )
 
 
-# Re-export the toolkit constants for callers that previously imported them
-# from this package — keeps the public surface stable.
+# Re-export the toolkit constants/types for callers that previously imported
+# them from this package — keeps the public surface stable and lets consumers
+# type the shared params object + its guidelines without depending on the
+# toolkit package directly.
 __all__ = [
     "get_a2ui_tools",
     "A2UI_OPERATIONS_KEY",
     "A2UIToolParams",
+    "A2UIGuidelines",
     "BASIC_CATALOG_ID",
 ]
 
