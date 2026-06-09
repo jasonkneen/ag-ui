@@ -47,11 +47,12 @@ from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.apps import App, ResumabilityConfig
 from google.genai import types
 
+from tests.constants import LIVE_TEST_MODEL
 
-# 2.0-flash is retired on the public endpoint; allow override, default to a
-# currently-available fast model. The sibling HITL tests still hardcode
-# gemini-2.0-flash and need a separate model bump.
-DEFAULT_MODEL = os.getenv("GOOGLE_TEST_MODEL", "gemini-2.5-flash")
+
+# Shared, env-overridable live model id (see tests/constants.py) so model
+# cutovers stay a one-line change across the whole suite.
+DEFAULT_MODEL = LIVE_TEST_MODEL
 MAX_TOOL_CALL_RETRIES = 3
 RC_TOOL_NAME = "adk_request_confirmation"
 
