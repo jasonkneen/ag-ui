@@ -115,6 +115,10 @@ class SessionManager:
     def stop_session_read_cache(self, token) -> None:
         _SESSION_READ_CACHE.reset(token)
 
+    def disable_session_read_cache(self) -> None:
+        """Disable session caching for the remainder of the current context."""
+        _SESSION_READ_CACHE.set(None)
+
     def _cache_key(
         self,
         session_id: str,

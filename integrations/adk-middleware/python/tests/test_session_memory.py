@@ -534,6 +534,31 @@ class TestSessionStateManagement:
         assert mock_session_service.get_session.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_session_read_cache_can_be_disabled(
+        self, manager, mock_session_service, mock_session
+    ):
+        """Test disabling the cache makes post-run reads hit the live service."""
+        mock_session_service.get_session.return_value = mock_session
+
+        token = manager.start_session_read_cache()
+        try:
+            await manager.get_session_state(
+                session_id="test_session",
+                app_name="test_app",
+                user_id="test_user",
+            )
+            manager.disable_session_read_cache()
+            await manager.get_session_state(
+                session_id="test_session",
+                app_name="test_app",
+                user_id="test_user",
+            )
+        finally:
+            manager.stop_session_read_cache(token)
+
+        assert mock_session_service.get_session.call_count == 2
+
+    @pytest.mark.asyncio
     async def test_get_state_value_session_not_found(self, manager, mock_session_service):
         """Test get state value when session doesn't exist."""
         mock_session_service.get_session.return_value = None
