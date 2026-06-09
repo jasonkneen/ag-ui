@@ -135,7 +135,7 @@ def _build_agent(counter: _ExecCounter, *, composite_root: bool) -> ADKAgent:
     )
 
 
-class TestIssue1839LlmAgentHITLConfirmation:
+class TestLlmAgentHITLConfirmation:
     """HITL confirmation must re-execute the original backend tool on resume."""
 
     @pytest.fixture(autouse=True)
