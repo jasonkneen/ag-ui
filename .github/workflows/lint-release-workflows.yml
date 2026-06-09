@@ -15,6 +15,7 @@ on:
     paths:
       - ".github/workflows/prepare-release.yml"
       - ".github/workflows/publish-release.yml"
+      - ".github/workflows/canary.yml"
       - ".github/workflows/lint-release-workflows.yml"
       - "scripts/release/**"
       - "nx.json"
@@ -22,6 +23,7 @@ on:
     paths:
       - ".github/workflows/prepare-release.yml"
       - ".github/workflows/publish-release.yml"
+      - ".github/workflows/canary.yml"
       - ".github/workflows/lint-release-workflows.yml"
       - "scripts/release/**"
       - "nx.json"
@@ -45,6 +47,7 @@ jobs:
           actionlint_flags: >-
             .github/workflows/prepare-release.yml
             .github/workflows/publish-release.yml
+            .github/workflows/canary.yml
             .github/workflows/lint-release-workflows.yml
 
   shellcheck:

@@ -1,0 +1,205 @@
+name: canary / publish
+
+# Discoverable, one-click canary publisher. Surfaces in the Actions tab so any
+# maintainer can publish a prerelease of the branch they're working on without
+# learning the manual `canary/*` branch + dispatch dance.
+#
+# IMPORTANT: this workflow does NOT publish to npm itself. It ORCHESTRATES
+# publish-release.yml, which holds the SINGLE npm OIDC trusted-publisher binding
+# (see that file's header). Adding a second npm-publishing entry point would
+# break OIDC for every @ag-ui/* package.
+#
+# Why a separate orchestrator instead of a flag inside publish-release.yml:
+#   The `npm` GitHub Environment's deployment-branch policy is evaluated against
+#   the ref a run is TRIGGERED on — NOT against branches created mid-run. So
+#   publish-release.yml can only publish a canary when its run's ref already
+#   matches the policy (`canary/*`). Creating a branch inside a run triggered on
+#   `feature/*` does not change that run's ref, so it would still be rejected.
+#   This workflow therefore runs on any non-main branch, mirrors it to a
+#   short-lived `canary/<slug>` ref, dispatches publish-release.yml ON that ref
+#   (clearing the env gate), waits for it, then deletes the ref.
+#
+# Token: the branch create/delete and the cross-workflow dispatch use the
+# devops-bot GitHub App token, NOT the default GITHUB_TOKEN. Events authenticated
+# with GITHUB_TOKEN do not start new workflow runs (recursion prevention), so the
+# delegated publish-release run would silently never fire.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Package scope to publish a canary for. Regenerated from scripts/release/release.config.json — do NOT hand-edit (the release-scope-dropdown-sync CI guard enforces parity)."
+        required: true
+        type: choice
+        options:
+          - integration-a2a
+          - integration-adk-py
+          - integration-adk-ts
+          - integration-ag2
+          - integration-agent-spec
+          - integration-agno
+          - integration-aws-strands-py
+          - integration-aws-strands-ts
+          - integration-claude-agent-sdk-py
+          - integration-claude-agent-sdk-ts
+          - integration-cloudflare-agents
+          - integration-crewai-py
+          - integration-crewai-ts
+          - integration-langchain
+          - integration-langgraph-py
+          - integration-langgraph-ts
+          - integration-langroid
+          - integration-llama-index
+          - integration-mastra
+          - integration-pydantic-ai
+          - integration-spring-ai
+          - integration-watsonx-py
+          - integration-watsonx-ts
+          - middleware-a2a
+          - middleware-a2ui
+          - middleware-mcp
+          - middleware-mcp-apps
+          - sdk-py
+          - sdk-py-a2ui-toolkit
+          - sdk-ts
+          - sdk-ts-a2ui-toolkit
+      suffix:
+        description: "Prerelease suffix (e.g. 'fix-user-issue'); blank = unix timestamp. Allowed: [a-zA-Z0-9._-]+. Reuse a suffix only if the base version moved, else the publish collides."
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: build + detect but do NOT publish to npm. Useful for previewing what would ship."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # One canary orchestration per source branch at a time so two dispatches don't
+  # race the same canary/<slug> ref.
+  group: canary-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  # The job's own GITHUB_TOKEN does nothing privileged — every write goes through
+  # the App token minted below.
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Guard against main
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "::error::Canary publishes are for non-main branches. To release from main, use the 'release / publish' workflow with mode=stable."
+          exit 1
+
+      - name: Mint devops-bot token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: "3877599"
+          private-key: ${{ secrets.DEVOPS_BOT_PRIVATE_KEY }}
+
+      - name: Compute canary branch name
+        id: slug
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Collapse the source ref to a single path segment under canary/ so it
+          # matches the `canary/*` deployment-branch policy and is a valid ref.
+          SLUG=$(printf '%s' "$REF_NAME" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-' | tr -s '-')
+          SLUG="${SLUG#-}"
+          SLUG="${SLUG%-}"
+          if [ -z "$SLUG" ]; then
+            echo "::error::Could not derive a canary slug from ref '$REF_NAME'"
+            exit 1
+          fi
+          echo "branch=canary/${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "Canary branch: canary/${SLUG}"
+
+      - name: Create or update canary ref
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.slug.outputs.branch }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Point canary/<slug> at the dispatched ref's HEAD. Create, or force it
+          # forward if a stale ref survived an aborted prior run.
+          if gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" -f sha="$SHA"; then
+            echo "Created ${BRANCH} at ${SHA}"
+          else
+            echo "Ref exists; force-updating ${BRANCH} to ${SHA}"
+            gh api --silent -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="$SHA" -F force=true
+          fi
+
+      - name: Dispatch publish-release.yml on the canary ref and wait
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.slug.outputs.branch }}
+          SCOPE: ${{ inputs.scope }}
+          SUFFIX: ${{ inputs.suffix }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # Watermark to disambiguate our run from any earlier run on this ref.
+          BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run publish-release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$BRANCH" \
+            -f mode=prerelease \
+            -f scope="$SCOPE" \
+            -f suffix="$SUFFIX" \
+            -f dry_run="$DRY_RUN"
+
+          # gh workflow run does not return the run id; poll for the new run on
+          # our ref created at/after the watermark (registry indexing can lag).
+          RUN_ID=""
+          for _ in $(seq 1 20); do
+            sleep 6
+            RUN_ID=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow=publish-release.yml \
+              --branch "$BRANCH" \
+              --event workflow_dispatch \
+              --json databaseId,createdAt \
+              --jq "map(select(.createdAt >= \"$BEFORE\")) | sort_by(.createdAt) | last | .databaseId // empty") || RUN_ID=""
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Could not locate the dispatched publish-release run on ${BRANCH}"
+            exit 1
+          fi
+
+          RUN_URL=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          echo "Delegated publish run: ${RUN_URL}"
+          {
+            echo "## Canary publish"
+            echo ""
+            echo "- **Scope:** \`${SCOPE}\`"
+            echo "- **Source branch:** \`${GITHUB_REF_NAME}\`"
+            echo "- **Delegated run:** ${RUN_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # --exit-status propagates the publish run's failure to this job.
+          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+
+      - name: Delete canary ref
+        # Always clean up once the ref exists, even if the publish failed — but
+        # skip when slug never computed (e.g. the main guard tripped).
+        if: always() && steps.slug.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.slug.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh api --silent -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+            && echo "Deleted ${BRANCH}" \
+            || echo "Branch ${BRANCH} already gone"
