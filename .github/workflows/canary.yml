@@ -74,8 +74,9 @@ on:
         type: boolean
 
 concurrency:
-  # One canary orchestration per source branch at a time so two dispatches don't
-  # race the same canary/<slug> ref.
+  # Serialize repeated dispatches on the same source branch. Cross-branch ref
+  # races are independently prevented by making the canary ref unique per run
+  # (slug + github.run_id, see the slug step below).
   group: canary-publish-${{ github.ref }}
   cancel-in-progress: false
 
@@ -110,15 +111,21 @@ jobs:
           set -euo pipefail
           # Collapse the source ref to a single path segment under canary/ so it
           # matches the `canary/*` deployment-branch policy and is a valid ref.
-          SLUG=$(printf '%s' "$REF_NAME" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-' | tr -s '-')
-          SLUG="${SLUG#-}"
-          SLUG="${SLUG%-}"
+          # Also collapse dot runs and strip leading/trailing separators so the
+          # result can never form an invalid ref (e.g. `..`, trailing `.`).
+          SLUG=$(printf '%s' "$REF_NAME" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-' | tr -s '.-')
+          SLUG="${SLUG#[-.]}"
+          SLUG="${SLUG%[-.]}"
           if [ -z "$SLUG" ]; then
             echo "::error::Could not derive a canary slug from ref '$REF_NAME'"
             exit 1
           fi
-          echo "branch=canary/${SLUG}" >> "$GITHUB_OUTPUT"
-          echo "Canary branch: canary/${SLUG}"
+          # Append the orchestration run id so every dispatch owns a UNIQUE canary
+          # ref. This is what prevents two dispatches whose source branches slugify
+          # to the same value from racing one shared ref, and it makes the run
+          # discovery below unambiguous (exactly one publish run per ref).
+          echo "branch=canary/${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "Canary branch: canary/${SLUG}-${GITHUB_RUN_ID}"
 
       - name: Create or update canary ref
         env:
@@ -127,18 +134,26 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Point canary/<slug> at the dispatched ref's HEAD. Create, or force it
-          # forward if a stale ref survived an aborted prior run.
+          # Point canary/<slug> at the dispatched ref's HEAD. The ref is unique
+          # per run, so it should not pre-exist; only force-update on the specific
+          # "already exists" case (e.g. a re-run reusing the run id). Any OTHER
+          # failure (auth, rate limit, 5xx) must surface, not be silently retried.
+          ERR=$(mktemp)
           if gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/heads/${BRANCH}" -f sha="$SHA"; then
+              -f ref="refs/heads/${BRANCH}" -f sha="$SHA" 2>"$ERR"; then
             echo "Created ${BRANCH} at ${SHA}"
-          else
-            echo "Ref exists; force-updating ${BRANCH} to ${SHA}"
+          elif grep -qi "already exists" "$ERR"; then
+            echo "Ref ${BRANCH} already exists; force-updating to ${SHA}"
             gh api --silent -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
               -f sha="$SHA" -F force=true
+          else
+            echo "::error::Failed to create canary ref ${BRANCH}:"
+            cat "$ERR" >&2
+            exit 1
           fi
 
       - name: Dispatch publish-release.yml on the canary ref and wait
+        id: dispatch
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ steps.slug.outputs.branch }}
@@ -147,8 +162,15 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          # Watermark to disambiguate our run from any earlier run on this ref.
-          BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Validate the suffix at the orchestrator boundary so a bad value fails
+          # here with a clear message rather than deep inside the delegated run.
+          # Mirrors publish-release.yml's own check; blank is allowed (it falls
+          # back to a unix timestamp downstream).
+          if [ -n "$SUFFIX" ] && ! printf '%s' "$SUFFIX" | grep -Eq '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid suffix '$SUFFIX'. Allowed: [a-zA-Z0-9._-]+ (blank = unix timestamp)."
+            exit 1
+          fi
+
           gh workflow run publish-release.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$BRANCH" \
@@ -157,26 +179,33 @@ jobs:
             -f suffix="$SUFFIX" \
             -f dry_run="$DRY_RUN"
 
-          # gh workflow run does not return the run id; poll for the new run on
-          # our ref created at/after the watermark (registry indexing can lag).
+          # The canary ref is unique to this run, so there is exactly ONE
+          # publish-release dispatch on it — no timestamp watermark needed (which
+          # also sidesteps runner/server clock-skew). Poll until it indexes
+          # (30 x 6s = 3 min tolerance for Actions indexing lag).
           RUN_ID=""
-          for _ in $(seq 1 20); do
+          for _ in $(seq 1 30); do
             sleep 6
             RUN_ID=$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow=publish-release.yml \
               --branch "$BRANCH" \
               --event workflow_dispatch \
-              --json databaseId,createdAt \
-              --jq "map(select(.createdAt >= \"$BEFORE\")) | sort_by(.createdAt) | last | .databaseId // empty") || RUN_ID=""
+              --json databaseId \
+              --jq 'sort_by(.databaseId) | last | .databaseId // empty') || RUN_ID=""
             if [ -n "$RUN_ID" ]; then
               break
             fi
           done
           if [ -z "$RUN_ID" ]; then
-            echo "::error::Could not locate the dispatched publish-release run on ${BRANCH}"
+            echo "::error::Dispatched publish-release run never appeared on ${BRANCH}. Leaving the ref in place for debugging; delete it manually once resolved."
             exit 1
           fi
+
+          # Mark located BEFORE the watch so cleanup runs even if the publish
+          # fails — but is skipped entirely if we never tracked a run (so we
+          # never delete a ref a still-pending run may need).
+          echo "located=true" >> "$GITHUB_OUTPUT"
 
           RUN_URL=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
           echo "Delegated publish run: ${RUN_URL}"
@@ -192,14 +221,24 @@ jobs:
           gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
 
       - name: Delete canary ref
-        # Always clean up once the ref exists, even if the publish failed — but
-        # skip when slug never computed (e.g. the main guard tripped).
-        if: always() && steps.slug.outputs.branch != ''
+        # Clean up only when we actually tracked a dispatched run (located=true),
+        # even if that run then failed. If the run was never located, the ref is
+        # deliberately left in place — deleting it could yank the ref out from
+        # under a publish run that is still about to start.
+        if: always() && steps.dispatch.outputs.located == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ steps.slug.outputs.branch }}
         run: |
-          set -euo pipefail
-          gh api --silent -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
-            && echo "Deleted ${BRANCH}" \
-            || echo "Branch ${BRANCH} already gone"
+          # Best-effort cleanup: never fail the job on a delete hiccup, but do
+          # surface a real error instead of masking every failure as "gone".
+          set -uo pipefail
+          ERR=$(mktemp)
+          if gh api --silent -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" 2>"$ERR"; then
+            echo "Deleted ${BRANCH}"
+          elif grep -qiE "not found|does not exist" "$ERR"; then
+            echo "Branch ${BRANCH} already gone"
+          else
+            echo "::warning::Failed to delete canary ref ${BRANCH} (manual cleanup may be needed):"
+            cat "$ERR" >&2
+          fi
