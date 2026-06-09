@@ -1,8 +1,8 @@
 name: Lint Release Workflows
 
-# Runs actionlint + shellcheck against the release / create-pr and
-# release / publish pipelines and the scripts they call. Keeps these
-# critical, retry-sensitive files from silently regressing on shell or
+# Runs actionlint + shellcheck against the release / create-pr, release /
+# publish, and canary / publish pipelines and the scripts they call. Keeps
+# these critical, retry-sensitive files from silently regressing on shell or
 # action-syntax bugs.
 #
 # Scope is intentionally narrow: only the release workflows and

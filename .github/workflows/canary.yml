@@ -109,13 +109,13 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Collapse the source ref to a single path segment under canary/ so it
-          # matches the `canary/*` deployment-branch policy and is a valid ref.
-          # Also collapse dot runs and strip leading/trailing separators so the
-          # result can never form an invalid ref (e.g. `..`, trailing `.`).
+          # Byte-deterministic (LC_ALL=C) transform collapsing the source ref to a
+          # single path segment under canary/ so it matches the `canary/*`
+          # deployment-branch policy. tr -s collapses same-char runs (so no `..`),
+          # and the sed fully strips any leading/trailing `.`/`-` runs.
+          export LC_ALL=C
           SLUG=$(printf '%s' "$REF_NAME" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-' | tr -s '.-')
-          SLUG="${SLUG#[-.]}"
-          SLUG="${SLUG%[-.]}"
+          SLUG=$(printf '%s' "$SLUG" | sed -E 's/^[.-]+//; s/[.-]+$//')
           if [ -z "$SLUG" ]; then
             echo "::error::Could not derive a canary slug from ref '$REF_NAME'"
             exit 1
@@ -166,7 +166,9 @@ jobs:
           # here with a clear message rather than deep inside the delegated run.
           # Mirrors publish-release.yml's own check; blank is allowed (it falls
           # back to a unix timestamp downstream).
-          if [ -n "$SUFFIX" ] && ! printf '%s' "$SUFFIX" | grep -Eq '^[a-zA-Z0-9._-]+$'; then
+          # Bash regex matches the WHOLE string (unlike grep, which matches per
+          # line and would accept a multi-line value whose first line is valid).
+          if [ -n "$SUFFIX" ] && ! [[ "$SUFFIX" =~ ^[a-zA-Z0-9._-]+$ ]]; then
             echo "::error::Invalid suffix '$SUFFIX'. Allowed: [a-zA-Z0-9._-]+ (blank = unix timestamp)."
             exit 1
           fi
