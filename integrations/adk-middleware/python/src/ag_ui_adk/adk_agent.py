@@ -2540,8 +2540,12 @@ class ADKAgent:
 
             # Share the translator's emitted IDs set with proxy toolsets so
             # ClientProxyTool can skip emission when the translator already handled it.
+            # Also share the translator's name→[partial IDs] ledger so the proxy can
+            # suppress the cross-path twin when SSE streaming gives the partial event
+            # and the proxy invocation different IDs (#1168) — matched by tool name.
             for toolset in client_proxy_toolsets:
                 toolset._translator_emitted_tool_call_ids = event_translator.emitted_tool_call_ids
+                toolset._translator_lro_emitted_ids_by_name = event_translator.lro_emitted_ids_by_name
 
             try:
                 # Session was already obtained from _ensure_session_exists above

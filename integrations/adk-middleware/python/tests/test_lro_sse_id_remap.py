@@ -1634,6 +1634,105 @@ class TestLroIdRemapStaleSessionRegression:
             )
 
 
+class TestLroNoDuplicateToolCallEndToEnd:
+    """End-to-end regression: a long-running client tool streamed by ADK as a
+    partial then final event (with different IDs, #1168) must surface exactly
+    ONE TOOL_CALL_START to the client — not two. The duplicate is cross-path:
+    the EventTranslator emits from the partial event while ADK separately
+    invokes the ClientProxyTool for the final, each with a different ID, so the
+    ID-based dedupe on both sides misses. Drives the real ADK runner + real
+    ClientProxyTool + real EventTranslator (no real LLM, no DB).
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_session_manager(self):
+        SessionManager.reset_instance()
+        yield
+        SessionManager.reset_instance()
+
+    def _scripted_lro_llm(self, tool_name: str):
+        from google.adk.models.base_llm import BaseLlm
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types as gt
+
+        class _ScriptedLro(BaseLlm):
+            name_: str = tool_name
+
+            async def generate_content_async(
+                self, llm_request, stream: bool = False
+            ) -> AsyncGenerator:
+                def mk(partial):
+                    return LlmResponse(
+                        content=gt.Content(
+                            role="model",
+                            parts=[gt.Part(function_call=gt.FunctionCall(
+                                name=self.name_, args={"action": "archive"}))],
+                        ),
+                        partial=partial,
+                        turn_complete=not partial,
+                    )
+                # partial: ADK assigns id_A; middleware emits via the translator.
+                yield mk(partial=True)
+                # final: ADK assigns a *different* id_B and invokes the proxy.
+                yield mk(partial=False)
+
+        return _ScriptedLro(model="scripted-lro")
+
+    @pytest.mark.asyncio
+    async def test_partial_plus_proxy_emits_single_tool_call(self):
+        from ag_ui_adk.agui_toolset import AGUIToolset
+        from google.adk.agents import LlmAgent
+        from google.adk.apps import App, ResumabilityConfig
+
+        frontend_tool = AGUITool(
+            name="approve_action",
+            description="Ask the user to approve an action.",
+            parameters={
+                "type": "object",
+                "properties": {"action": {"type": "string"}},
+                "required": ["action"],
+            },
+        )
+        agent = LlmAgent(
+            name="hitl_dupe_agent",
+            model=self._scripted_lro_llm("approve_action"),
+            instruction="Call the tool when asked.",
+            tools=[AGUIToolset()],
+        )
+        adk_app = App(
+            name=f"app_{uuid.uuid4().hex[:8]}",
+            root_agent=agent,
+            resumability_config=ResumabilityConfig(is_resumable=True),
+        )
+        adk_agent = ADKAgent.from_app(
+            adk_app, user_id="u1", use_in_memory_services=True,
+        )
+
+        starts = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            async for event in adk_agent.run(
+                RunAgentInput(
+                    thread_id=f"t_{uuid.uuid4().hex[:8]}",
+                    run_id=str(uuid.uuid4()),
+                    state={},
+                    messages=[UserMessage(id=str(uuid.uuid4()), content="archive please")],
+                    tools=[frontend_tool],
+                    context=[],
+                    forwarded_props={},
+                )
+            ):
+                if event.type == EventType.TOOL_CALL_START:
+                    starts.append((event.tool_call_id, getattr(event, "tool_call_name", None)))
+
+        approve_starts = [s for s in starts if s[1] == "approve_action"]
+        assert len(approve_starts) == 1, (
+            f"Expected exactly one TOOL_CALL_START for approve_action, got "
+            f"{len(approve_starts)}: {approve_starts}. The partial→proxy "
+            f"cross-path duplicate (#1168) has regressed."
+        )
+
+
 # =============================================================================
 # Direct Execution
 # =============================================================================
