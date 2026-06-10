@@ -1887,6 +1887,10 @@ class ADKAgent:
             )
         finally:
             try:
+                # The ADK runner can mutate session state without going
+                # through SessionManager, so the parent context's pre-run read
+                # cache is stale by the time this cleanup guard runs.
+                self._session_manager.disable_session_read_cache()
                 # Clean up execution if complete and no pending tool calls (HITL scenarios)
                 async with self._execution_lock:
                     if exec_key in self._active_executions:
