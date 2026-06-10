@@ -453,18 +453,24 @@ export function resolveReasoningContent(eventData: any): LangGraphReasoning | nu
 
     // OpenAI Responses API v1 format: { type: "reasoning", summary: [{ text: "..." }] }
     //
-    // The `response.reasoning_summary_part.added` chunk carries the reasoning
-    // item's canonical id (OpenAI `rs_…`) with an empty text, while the
-    // `…summary_text.delta` chunks carry text but no id. Surface the
-    // empty-text chunk too (instead of dropping it) so the reasoning message
-    // can open under the canonical id — the id the snapshot converter emits
-    // for the same block. Only the first summary part (index 0) takes the id:
-    // later parts belong to the same item, and reusing its id would mint two
-    // messages with one id. An item chunk with an empty summary LIST
-    // (store=true reasoning: id only, never any text) stays dropped.
-    if (block.type === 'reasoning' && Array.isArray(block.summary) && typeof block.summary[0] === 'object' && block.summary[0] !== null) {
+    // The reasoning item's canonical id (OpenAI `rs_…`) only travels on
+    // text-less chunks: the `response.output_item.added` chunk ({ id,
+    // summary: [] }) and — depending on the langchain-openai version — the
+    // `…summary_part.added` chunk ({ id, summary: [{ text: "" }] }). The
+    // `…summary_text.delta` chunks carry text but no id. Surface the id
+    // carriers (instead of dropping them for having no text) so the streamed
+    // reasoning message can adopt the canonical id — the id the snapshot
+    // converter emits for the same block; handleReasoningEvent stashes the id
+    // without opening a message, so summary-less (store=true) items still
+    // render nothing. Only the first summary part takes the id: later parts
+    // belong to the same item, and reusing its id would mint two messages
+    // with one id.
+    if (block.type === 'reasoning' && Array.isArray(block.summary)) {
+      if (block.summary.length === 0 && block.id) {
+        return { type: 'text', text: '', index: block.index ?? 0, id: String(block.id) };
+      }
       const part = block.summary[0];
-      if (part.text || block.id) {
+      if (part && typeof part === 'object' && (part.text || block.id)) {
         const result: LangGraphReasoning = {
           type: 'text',
           text: part.text ?? '',

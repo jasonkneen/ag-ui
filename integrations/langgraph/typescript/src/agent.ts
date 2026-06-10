@@ -158,6 +158,10 @@ export class LangGraphAgent extends AbstractAgent {
   messagesInProcess: MessagesInProgressRecord;
   emittedToolCallStartIds: Set<string> = new Set();
   reasoningProcess: null | ReasoningInProgress;
+  // Canonical reasoning id (e.g. OpenAI `rs_…`) stashed from a text-less id
+  // carrier chunk, consumed when the first text delta opens the reasoning
+  // message. See handleReasoningEvent.
+  private pendingReasoningId?: string;
   activeRun?: RunMetadata;
   // Subgraph node names discovered dynamically from langgraph_checkpoint_ns
   private subgraphs: Set<string> = new Set();
@@ -295,6 +299,7 @@ export class LangGraphAgent extends AbstractAgent {
       hasFunctionStreaming: false,
       modelMadeToolCall: false,
     };
+    this.pendingReasoningId = undefined;
     // Reset per-run flags
     this.cancelRequested = false;
     this.cancelSent = false;
@@ -1575,11 +1580,19 @@ export class LangGraphAgent extends AbstractAgent {
   }
 
   handleReasoningEvent(reasoningData: LangGraphReasoning) {
-    // An empty-text chunk is still meaningful when it carries the provider's
-    // canonical reasoning id (`response.reasoning_summary_part.added`): it
-    // opens the reasoning message under that id. Text-less AND id-less
-    // chunks remain dropped.
-    if (!reasoningData || !reasoningData.type || (!reasoningData.text && !reasoningData.id)) {
+    if (!reasoningData || !reasoningData.type) {
+      return;
+    }
+
+    // A text-less chunk is still meaningful when it carries the provider's
+    // canonical reasoning id (the `response.output_item.added` /
+    // `…summary_part.added` chunks): stash the id so the first text delta
+    // opens the reasoning message under it, WITHOUT opening a message here —
+    // a summary-less (store=true) reasoning item must keep rendering nothing.
+    if (!reasoningData.text) {
+      if (reasoningData.id) {
+        this.pendingReasoningId = reasoningData.id;
+      }
       return;
     }
 
@@ -1604,11 +1617,12 @@ export class LangGraphAgent extends AbstractAgent {
 
     if (!this.reasoningProcess) {
       // No thinking step yet. Start a new one. Prefer the provider's
-      // canonical reasoning id (e.g. OpenAI `rs_…`) when the stream carries
+      // canonical reasoning id (e.g. OpenAI `rs_…`) when the stream carried
       // one: the snapshot converter re-emits this same reasoning under that
       // id, and only a matching id lets the client reconcile the streamed
       // copy with the snapshot copy instead of rendering both.
-      const messageId = reasoningData.id ?? randomUUID();
+      const messageId = reasoningData.id ?? this.pendingReasoningId ?? randomUUID();
+      this.pendingReasoningId = undefined;
       this.dispatchEvent({
         type: EventType.REASONING_START,
         messageId,
@@ -1633,9 +1647,7 @@ export class LangGraphAgent extends AbstractAgent {
       this.reasoningProcess.signature = reasoningData.signature;
     }
 
-    // Skip empty deltas: the id-bearing `reasoning_summary_part.added`
-    // chunk carries no text — it exists only to open the message above.
-    if (this.reasoningProcess.type && reasoningData.text) {
+    if (this.reasoningProcess.type) {
       this.dispatchEvent({
         type: EventType.REASONING_MESSAGE_CONTENT,
         messageId: this.reasoningProcess.messageId,

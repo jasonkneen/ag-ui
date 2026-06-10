@@ -470,19 +470,29 @@ def resolve_reasoning_content(chunk: Any) -> LangGraphReasoning | None:
 
         # OpenAI Responses API v1 format: { type: "reasoning", summary: [{ text: "..." }] }
         #
-        # The `response.reasoning_summary_part.added` chunk carries the
-        # reasoning item's canonical id (OpenAI ``rs_…``) with an empty text,
-        # while the `…summary_text.delta` chunks carry text but no id. Surface
-        # the empty-text chunk too (instead of dropping it) so the reasoning
-        # message can open under the canonical id — the id the snapshot
-        # converter (_reasoning_block_to_agui_message) emits for the same
-        # block. Only the first summary part (index 0) takes the id: later
-        # parts belong to the same item, and reusing its id would mint two
-        # messages with one id. An item chunk with an empty summary LIST
-        # (store=true reasoning: id only, never any text) stays dropped.
-        if block_type == "reasoning" and block.get("summary"):
+        # The reasoning item's canonical id (OpenAI ``rs_…``) only travels on
+        # text-less chunks: the `response.output_item.added` chunk
+        # ({ id, summary: [] }) and — depending on the langchain-openai
+        # version — the `…summary_part.added` chunk ({ id, summary:
+        # [{ text: "" }] }). The `…summary_text.delta` chunks carry text but
+        # no id. Surface the id carriers (instead of dropping them for having
+        # no text) so the streamed reasoning message can adopt the canonical
+        # id — the id the snapshot converter
+        # (_reasoning_block_to_agui_message) emits for the same block;
+        # handle_reasoning_event stashes the id without opening a message, so
+        # summary-less (store=true) items still render nothing. Only the
+        # first summary part takes the id: later parts belong to the same
+        # item, and reusing its id would mint two messages with one id.
+        if block_type == "reasoning" and isinstance(block.get("summary"), list):
             summaries = block["summary"]
-            if summaries and isinstance(summaries, list) and isinstance(summaries[0], dict):
+            if not summaries and block.get("id"):
+                return LangGraphReasoning(
+                    type="text",
+                    text="",
+                    index=block.get("index", 0),
+                    id=str(block["id"]),
+                )
+            if summaries and isinstance(summaries[0], dict):
                 data = summaries[0]
                 if data.get("text") or block.get("id"):
                     result = LangGraphReasoning(

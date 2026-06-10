@@ -7,17 +7,21 @@ emits checkpointed reasoning under the provider's canonical block id (OpenAI
 can never reconcile the streamed copy with the snapshot copy and renders the
 same reasoning twice (the langgraph-python dojo e2e strict-mode failure).
 
-With ``use_responses_api=True``, langchain-openai surfaces the canonical id on
-the ``response.reasoning_summary_part.added`` chunk (empty text, ``id`` set);
-the subsequent ``response.reasoning_summary_text.delta`` chunks carry text but
-no id. These tests pin that:
+With ``use_responses_api=True``, the canonical id only travels on text-less
+chunks — the ``response.output_item.added`` chunk (``{id, summary: []}``,
+observed on the LangGraph Platform wire) and, depending on the
+langchain-openai version, the ``…summary_part.added`` chunk (``{id, summary:
+[{text: ""}]}``). The ``…summary_text.delta`` chunks carry text but no id.
+These tests pin that:
 
-  * ``resolve_reasoning_content`` surfaces the part-added chunk (instead of
-    dropping it for having empty text) and extracts the block id,
-  * ``handle_reasoning_event`` opens the reasoning message under that id and
-    does not emit an empty content delta for the id-bearing chunk,
-  * everything else (store=true empty-summary items, id-less providers,
-    non-first summary parts) behaves exactly as before.
+  * ``resolve_reasoning_content`` surfaces the id-carrier chunks (instead of
+    dropping them for having no text) and extracts the block id,
+  * ``handle_reasoning_event`` stashes the id from a text-less chunk WITHOUT
+    emitting anything (summary-less store=true items must keep rendering
+    nothing) and opens the reasoning message under the stashed id when the
+    first text delta arrives,
+  * id-less providers keep the uuid fallback, and non-first summary parts
+    never reuse the item id.
 """
 
 import unittest
@@ -76,14 +80,32 @@ class TestResolveReasoningContentCanonicalId(unittest.TestCase):
         self.assertEqual(result["text"], "Hi")
         self.assertEqual(result["id"], "rs-canonical")
 
-    def test_store_true_empty_summary_item_still_dropped(self):
-        """`response.output_item.added` for a store=true reasoning item has an
-        id but an empty summary list — must stay dropped (no ghost reasoning
-        bubble for summary-less reasoning)."""
+    def test_item_added_empty_summary_carries_id(self):
+        """`response.output_item.added` shape ({id, summary: []}) — the only
+        id carrier on the LangGraph Platform wire. Surfaced as a text-less
+        carrier; handle_reasoning_event stashes it without emitting."""
         chunk = FakeChunk(content=[{
             "type": "reasoning",
             "id": "rs-canonical",
             "summary": [],
+            "index": 0,
+        }])
+        result = resolve_reasoning_content(chunk)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["id"], "rs-canonical")
+
+    def test_empty_summary_without_id_still_dropped(self):
+        chunk = FakeChunk(content=[{"type": "reasoning", "summary": [], "index": 0}])
+        self.assertIsNone(resolve_reasoning_content(chunk))
+
+    def test_part_added_with_null_id_dropped(self):
+        """Observed platform wire shape: part.added with `id: null` and empty
+        text — nothing to surface."""
+        chunk = FakeChunk(content=[{
+            "type": "reasoning",
+            "id": None,
+            "summary": [{"index": 0, "type": "summary_text", "text": ""}],
             "index": 0,
         }])
         self.assertIsNone(resolve_reasoning_content(chunk))
@@ -112,22 +134,25 @@ class TestHandleReasoningEventCanonicalId(unittest.TestCase):
     def _events(self, reasoning_data):
         return list(self.agent.handle_reasoning_event(reasoning_data))
 
-    def test_reasoning_start_uses_canonical_id(self):
+    def test_id_carrier_chunk_emits_nothing(self):
+        """The text-less id carrier must not open a message — a store=true
+        item (id only, no summary ever) must keep rendering nothing."""
         self._events({"type": "text", "text": "", "index": 0, "id": "rs-canonical"})
+        self.assertEqual(self.agent.dispatched, [])
+        self.assertEqual(
+            self.agent.active_run.get("pending_reasoning_id"), "rs-canonical"
+        )
+
+    def test_first_delta_opens_under_stashed_canonical_id(self):
+        self._events({"type": "text", "text": "", "index": 0, "id": "rs-canonical"})
+        self._events({"type": "text", "text": "Because X", "index": 0})
         start_events = [
             e for e in self.agent.dispatched if e.type == EventType.REASONING_START
         ]
         self.assertEqual(len(start_events), 1)
         self.assertEqual(start_events[0].message_id, "rs-canonical")
-
-    def test_empty_text_chunk_emits_no_content_delta(self):
-        self._events({"type": "text", "text": "", "index": 0, "id": "rs-canonical"})
-        content_events = [
-            e
-            for e in self.agent.dispatched
-            if e.type == EventType.REASONING_MESSAGE_CONTENT
-        ]
-        self.assertEqual(content_events, [])
+        # consumed: a later id-less reasoning item must not inherit it
+        self.assertIsNone(self.agent.active_run.get("pending_reasoning_id"))
 
     def test_subsequent_deltas_join_the_canonical_message(self):
         self._events({"type": "text", "text": "", "index": 0, "id": "rs-canonical"})
