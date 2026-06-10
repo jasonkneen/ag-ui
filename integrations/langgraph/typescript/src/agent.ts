@@ -1575,7 +1575,11 @@ export class LangGraphAgent extends AbstractAgent {
   }
 
   handleReasoningEvent(reasoningData: LangGraphReasoning) {
-    if (!reasoningData || !reasoningData.type || !reasoningData.text) {
+    // An empty-text chunk is still meaningful when it carries the provider's
+    // canonical reasoning id (`response.reasoning_summary_part.added`): it
+    // opens the reasoning message under that id. Text-less AND id-less
+    // chunks remain dropped.
+    if (!reasoningData || !reasoningData.type || (!reasoningData.text && !reasoningData.id)) {
       return;
     }
 
@@ -1599,8 +1603,12 @@ export class LangGraphAgent extends AbstractAgent {
     }
 
     if (!this.reasoningProcess) {
-      // No thinking step yet. Start a new one
-      const messageId = randomUUID();
+      // No thinking step yet. Start a new one. Prefer the provider's
+      // canonical reasoning id (e.g. OpenAI `rs_…`) when the stream carries
+      // one: the snapshot converter re-emits this same reasoning under that
+      // id, and only a matching id lets the client reconcile the streamed
+      // copy with the snapshot copy instead of rendering both.
+      const messageId = reasoningData.id ?? randomUUID();
       this.dispatchEvent({
         type: EventType.REASONING_START,
         messageId,
@@ -1625,7 +1633,9 @@ export class LangGraphAgent extends AbstractAgent {
       this.reasoningProcess.signature = reasoningData.signature;
     }
 
-    if (this.reasoningProcess.type) {
+    // Skip empty deltas: the id-bearing `reasoning_summary_part.added`
+    // chunk carries no text — it exists only to open the message above.
+    if (this.reasoningProcess.type && reasoningData.text) {
       this.dispatchEvent({
         type: EventType.REASONING_MESSAGE_CONTENT,
         messageId: this.reasoningProcess.messageId,

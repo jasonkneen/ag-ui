@@ -1522,7 +1522,13 @@ class LangGraphAgent:
             self.active_run["reasoning_process"] = None
 
         if not self.active_run.get("reasoning_process"):
-            message_id = str(uuid.uuid4())
+            # Prefer the provider's canonical reasoning id (e.g. OpenAI
+            # ``rs_…``) when the stream carries one: the snapshot converter
+            # (_reasoning_block_to_agui_message) re-emits this same reasoning
+            # under that id, and only a matching id lets the client reconcile
+            # the streamed copy with the snapshot copy instead of rendering
+            # both.
+            message_id = reasoning_data.get("id") or str(uuid.uuid4())
             yield self._dispatch_event(
                 ReasoningStartEvent(
                     type=EventType.REASONING_START,
@@ -1548,7 +1554,9 @@ class LangGraphAgent:
         if reasoning_data.get("signature"):
             self.active_run["reasoning_process"]["signature"] = reasoning_data["signature"]
 
-        if self.active_run["reasoning_process"].get("type"):
+        # Skip empty deltas: the id-bearing `reasoning_summary_part.added`
+        # chunk carries no text — it exists only to open the message above.
+        if self.active_run["reasoning_process"].get("type") and reasoning_data["text"]:
             yield self._dispatch_event(
                 ReasoningMessageContentEvent(
                     type=EventType.REASONING_MESSAGE_CONTENT,

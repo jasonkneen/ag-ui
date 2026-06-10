@@ -452,11 +452,28 @@ export function resolveReasoningContent(eventData: any): LangGraphReasoning | nu
     }
 
     // OpenAI Responses API v1 format: { type: "reasoning", summary: [{ text: "..." }] }
-    if (block.type === 'reasoning' && block.summary?.[0]?.text) {
-      return {
-        type: 'text',
-        text: block.summary[0].text,
-        index: block.summary[0].index ?? 0,
+    //
+    // The `response.reasoning_summary_part.added` chunk carries the reasoning
+    // item's canonical id (OpenAI `rs_…`) with an empty text, while the
+    // `…summary_text.delta` chunks carry text but no id. Surface the
+    // empty-text chunk too (instead of dropping it) so the reasoning message
+    // can open under the canonical id — the id the snapshot converter emits
+    // for the same block. Only the first summary part (index 0) takes the id:
+    // later parts belong to the same item, and reusing its id would mint two
+    // messages with one id. An item chunk with an empty summary LIST
+    // (store=true reasoning: id only, never any text) stays dropped.
+    if (block.type === 'reasoning' && Array.isArray(block.summary) && typeof block.summary[0] === 'object' && block.summary[0] !== null) {
+      const part = block.summary[0];
+      if (part.text || block.id) {
+        const result: LangGraphReasoning = {
+          type: 'text',
+          text: part.text ?? '',
+          index: part.index ?? 0,
+        };
+        if (block.id && (part.index ?? 0) === 0) {
+          result.id = String(block.id);
+        }
+        return result;
       }
     }
 

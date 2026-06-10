@@ -469,16 +469,30 @@ def resolve_reasoning_content(chunk: Any) -> LangGraphReasoning | None:
                 return result
 
         # OpenAI Responses API v1 format: { type: "reasoning", summary: [{ text: "..." }] }
+        #
+        # The `response.reasoning_summary_part.added` chunk carries the
+        # reasoning item's canonical id (OpenAI ``rs_…``) with an empty text,
+        # while the `…summary_text.delta` chunks carry text but no id. Surface
+        # the empty-text chunk too (instead of dropping it) so the reasoning
+        # message can open under the canonical id — the id the snapshot
+        # converter (_reasoning_block_to_agui_message) emits for the same
+        # block. Only the first summary part (index 0) takes the id: later
+        # parts belong to the same item, and reusing its id would mint two
+        # messages with one id. An item chunk with an empty summary LIST
+        # (store=true reasoning: id only, never any text) stays dropped.
         if block_type == "reasoning" and block.get("summary"):
             summaries = block["summary"]
-            if summaries and isinstance(summaries, list) and summaries[0]:
+            if summaries and isinstance(summaries, list) and isinstance(summaries[0], dict):
                 data = summaries[0]
-                if data.get("text"):
-                    return LangGraphReasoning(
+                if data.get("text") or block.get("id"):
+                    result = LangGraphReasoning(
                         type="text",
-                        text=data["text"],
+                        text=data.get("text") or "",
                         index=data.get("index", 0)
                     )
+                    if block.get("id") and data.get("index", 0) == 0:
+                        result["id"] = str(block["id"])
+                    return result
 
         # Bedrock Converse API format: { type: "reasoning_content", reasoning_content: { type: "text", text: "..." } }
         if block_type == "reasoning_content" and isinstance(block.get("reasoning_content"), dict):
