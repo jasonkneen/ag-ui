@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FIX**: Duplicate HITL tool-call emission under SSE streaming (long-running client tools)
+  - With SSE streaming (the default), ADK streams a long-running client tool call as a `partial=True` event then a `partial=False` (final) event, and `populate_client_function_call_id` assigns a **different** ID to each (#1168). `translate_lro_function_calls` deduped only by tool-call ID, so it treated the final event as a brand-new call and emitted a **second** `TOOL_CALL_START/ARGS/END` trio — the dojo then rendered the Human-in-the-Loop card **twice** (two cards with two different `adk-…` IDs visible in the event stream).
+  - The translator now suppresses the final (non-partial) twin of an already-emitted partial by matching it to the partial **by tool name, positionally (FIFO)** — the same pairing `_extract_lro_id_remap` uses for ID remapping — so genuinely parallel same-name calls still each emit once, and the non-streaming (final-only) path is unaffected.
+  - Reproduced deterministically at the translator level (partial id-A then final id-B for one logical call → previously two `TOOL_CALL_START`, now one). New regression tests in `tests/test_lro_sse_id_remap.py` cover the partial→final twin, parallel same-name calls (no over-suppression), final-only emission, and reset.
+
 - **FIX**: `adk_events_to_messages` now preserves `file_data` parts on user
   events (#1771). Previously only the text part was extracted, so image,
   audio, video, and document attachments were silently dropped from

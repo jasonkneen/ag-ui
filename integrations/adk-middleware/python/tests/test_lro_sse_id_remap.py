@@ -281,6 +281,89 @@ class TestEventTranslatorLroTracking:
         translator.reset()
         assert translator.lro_emitted_ids_by_name == {}
 
+
+class TestLroDuplicateEmissionSuppression:
+    """Regression: a single logical LRO call streamed by ADK as a partial event
+    then a final event (with *different* IDs, per #1168) must emit exactly ONE
+    TOOL_CALL trio — not two. Otherwise the dojo renders the HITL card twice.
+    """
+
+    @pytest.fixture
+    def translator(self):
+        return EventTranslator()
+
+    def _event(self, fcs, *, partial):
+        """Build an ADK-style event. ``fcs`` is a list of (name, id) tuples."""
+        parts = []
+        for name, fid in fcs:
+            fc = MagicMock()
+            fc.id = fid
+            fc.name = name
+            fc.args = {"steps": [{"description": "x", "status": "enabled"}]}
+            part = MagicMock()
+            part.function_call = fc
+            part.text = None
+            parts.append(part)
+        evt = MagicMock()
+        evt.content = MagicMock()
+        evt.content.parts = parts
+        evt.long_running_tool_ids = [fid for _, fid in fcs]
+        evt.partial = partial
+        return evt
+
+    async def _starts(self, translator, evt):
+        ids = []
+        async for e in translator.translate_lro_function_calls(evt):
+            if e.type == EventType.TOOL_CALL_START:
+                ids.append(e.tool_call_id)
+        return ids
+
+    @pytest.mark.asyncio
+    async def test_partial_then_final_emits_once(self, translator):
+        """The non-partial twin (different id) is suppressed — one emission total."""
+        partial_ids = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-AAA")], partial=True)
+        )
+        final_ids = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-BBB")], partial=False)
+        )
+        assert partial_ids == ["adk-AAA"]
+        assert final_ids == [], "final twin must be suppressed (no duplicate render)"
+
+    @pytest.mark.asyncio
+    async def test_parallel_same_name_calls_not_oversuppressed(self, translator):
+        """Two genuinely parallel calls each emit once (partials), finals suppressed."""
+        partial_ids = await self._starts(
+            translator,
+            self._event(
+                [("generate_task_steps", "adk-A1"), ("generate_task_steps", "adk-A2")],
+                partial=True,
+            ),
+        )
+        final_ids = await self._starts(
+            translator,
+            self._event(
+                [("generate_task_steps", "adk-B1"), ("generate_task_steps", "adk-B2")],
+                partial=False,
+            ),
+        )
+        assert partial_ids == ["adk-A1", "adk-A2"]
+        assert final_ids == []  # both finals are twins of the two partials
+
+    @pytest.mark.asyncio
+    async def test_final_only_still_emits(self, translator):
+        """Non-streaming case (no partial twin): the final must still emit once."""
+        final_ids = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-ONLY")], partial=False)
+        )
+        assert final_ids == ["adk-ONLY"]
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_finalized_counter(self, translator):
+        translator._lro_finalized_by_name["t"] = 3
+        translator.reset()
+        assert translator._lro_finalized_by_name == {}
+
     @pytest.mark.asyncio
     async def test_lro_adk_request_credential_oauth2(self, translator):
         """Regression (#1331): adk_request_credential with OAuth2 AuthConfig must serialize.
