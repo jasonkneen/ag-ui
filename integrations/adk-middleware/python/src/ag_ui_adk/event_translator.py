@@ -250,15 +250,13 @@ class EventTranslator:
         # A list is used because the same tool can be called multiple times
         # in parallel (e.g. 5 concurrent create_item calls).
         self.lro_emitted_ids_by_name: Dict[str, List[str]] = {}
-        # Count of non-partial (final) LRO calls already matched to a partial
-        # emission, per tool name. Under SSE streaming ADK emits the same logical
-        # call twice (partial then final) with *different* IDs (#1168), so the
-        # id-based dedupe in translate_lro_function_calls can't recognize the
-        # final as a duplicate. We suppress the final twin by matching it to an
-        # already-emitted partial positionally (same FIFO pairing as
-        # _extract_lro_id_remap), which avoids the duplicate TOOL_CALL render
-        # while still allowing genuinely parallel same-name calls.
-        self._lro_finalized_by_name: Dict[str, int] = {}
+        # This ledger doubles as the high-water mark for replay suppression in
+        # translate_lro_function_calls: ADK can replay the same logical LRO call
+        # across several events (streaming chunk, aggregated partial, persisted
+        # final) with a different ID each time (#1168); any same-name call whose
+        # position within its event does not exceed len(ledger[name]) is a
+        # replay and is suppressed. ClientProxyTool consults the same ledger to
+        # suppress its own cross-path twin (see client_proxy_tool.py).
 
         # Track reasoning message streaming state (for thought parts)
         self._is_reasoning: bool = False  # Whether we're currently in a reasoning block
@@ -841,26 +839,33 @@ class EventTranslator:
 
         if adk_event.content and adk_event.content.parts:
             lro_ids = set(adk_event.long_running_tool_ids or [])
-            is_partial = getattr(adk_event, 'partial', False)
+            # High-water-mark dedupe across REPLAYED events. Under SSE streaming
+            # ADK can deliver the same logical LRO call several times — a
+            # streaming chunk (partial=True), an aggregated partial, and the
+            # persisted final (partial=False) — and assigns a *different* ID to
+            # each replay (#1168), so the ID-based guard below cannot recognize
+            # them as the same call and a duplicate TOOL_CALL trio renders the
+            # HITL card twice in the dojo. Instead, count same-name LRO calls
+            # positionally WITHIN this event: the Nth same-name call in an event
+            # is a replay if we already emitted >= N calls for that name in this
+            # run (the FIFO pairing _extract_lro_id_remap also uses). Genuinely
+            # parallel same-name calls arrive as multiple parts of ONE event, so
+            # they exceed the high-water mark and still emit individually. A
+            # second model turn calling the same tool again cannot occur within
+            # this runner stream — LRO pauses the invocation — so a same-name
+            # reappearance in a LATER event is always a replay.
+            seen_in_event: Dict[str, int] = {}
             for i, part in enumerate(adk_event.content.parts):
                 if part.function_call:
                     fc = part.function_call
-                    # Suppress the final (non-partial) twin of an LRO call that
-                    # was already emitted from a partial event. ADK assigns a
-                    # different ID to the partial vs final under SSE streaming
-                    # (#1168), so the ID-based guard below treats the final as a
-                    # brand-new call and emits a duplicate TOOL_CALL trio — the
-                    # dojo then renders the HITL card twice. Match the final to an
-                    # already-emitted partial by name, positionally (FIFO), the
-                    # same pairing _extract_lro_id_remap uses; genuinely parallel
-                    # same-name calls still each get their own partial+final pair.
-                    if (not is_partial
-                            and getattr(fc, 'id', None) in lro_ids
-                            and fc.id not in self.emitted_tool_call_ids):
-                        emitted_partials = len(self.lro_emitted_ids_by_name.get(fc.name, []))
-                        finalized = self._lro_finalized_by_name.get(fc.name, 0)
-                        if finalized < emitted_partials:
-                            self._lro_finalized_by_name[fc.name] = finalized + 1
+                    if getattr(fc, 'id', None) in lro_ids \
+                      and fc.id not in self.emitted_tool_call_ids:
+                        position = seen_in_event.get(fc.name, 0) + 1
+                        seen_in_event[fc.name] = position
+                        already_emitted = len(self.lro_emitted_ids_by_name.get(fc.name, []))
+                        if position <= already_emitted:
+                            # Replay of the position-th call — already emitted
+                            # (under a different ID); suppress the duplicate.
                             continue
                     # Emit whenever the FC is LRO and hasn't already been emitted
                     # — by ClientProxyTool (1.18+ when ADK invokes the proxy) or
@@ -1284,7 +1289,6 @@ class EventTranslator:
         self._last_streamed_run_id = None
         self.long_running_tool_ids.clear()
         self.lro_emitted_ids_by_name.clear()
-        self._lro_finalized_by_name.clear()
         self._emitted_predict_state_for_tools.clear()
         self._emitted_confirm_for_tools.clear()
         self._predictive_state_tool_call_ids.clear()

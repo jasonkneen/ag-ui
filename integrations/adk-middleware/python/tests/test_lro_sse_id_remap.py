@@ -359,10 +359,33 @@ class TestLroDuplicateEmissionSuppression:
         assert final_ids == ["adk-ONLY"]
 
     @pytest.mark.asyncio
-    async def test_reset_clears_finalized_counter(self, translator):
-        translator._lro_finalized_by_name["t"] = 3
+    async def test_second_partial_replay_suppressed(self, translator):
+        """ADK can replay the call in a SECOND partial chunk (e.g. streaming
+        chunk + aggregated partial) with yet another ID — also a twin."""
+        first = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-P1")], partial=True)
+        )
+        second = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-P2")], partial=True)
+        )
+        final = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-F1")], partial=False)
+        )
+        assert first == ["adk-P1"]
+        assert second == [], "second partial replay must be suppressed"
+        assert final == [], "final replay must be suppressed"
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_replay_ledger(self, translator):
+        """After reset(), a same-name call in a new run emits again."""
+        await self._starts(
+            translator, self._event([("generate_task_steps", "adk-RUN1")], partial=True)
+        )
         translator.reset()
-        assert translator._lro_finalized_by_name == {}
+        ids = await self._starts(
+            translator, self._event([("generate_task_steps", "adk-RUN2")], partial=True)
+        )
+        assert ids == ["adk-RUN2"]
 
     @pytest.mark.asyncio
     async def test_lro_adk_request_credential_oauth2(self, translator):
@@ -1650,18 +1673,19 @@ class TestLroNoDuplicateToolCallEndToEnd:
         yield
         SessionManager.reset_instance()
 
-    def _scripted_lro_llm(self, tool_name: str):
+    def _scripted_lro_llm(self, tool_name: str, shape: str = "partial-final"):
         from google.adk.models.base_llm import BaseLlm
         from google.adk.models.llm_response import LlmResponse
         from google.genai import types as gt
 
         class _ScriptedLro(BaseLlm):
             name_: str = tool_name
+            shape_: str = shape
 
             async def generate_content_async(
                 self, llm_request, stream: bool = False
             ) -> AsyncGenerator:
-                def mk(partial):
+                def mk(partial, turn_complete=None):
                     return LlmResponse(
                         content=gt.Content(
                             role="model",
@@ -1669,17 +1693,30 @@ class TestLroNoDuplicateToolCallEndToEnd:
                                 name=self.name_, args={"action": "archive"}))],
                         ),
                         partial=partial,
-                        turn_complete=not partial,
+                        turn_complete=(not partial) if turn_complete is None else turn_complete,
                     )
-                # partial: ADK assigns id_A; middleware emits via the translator.
-                yield mk(partial=True)
-                # final: ADK assigns a *different* id_B and invokes the proxy.
-                yield mk(partial=False)
+                # Each yield gets a FRESH ID from ADK's
+                # populate_client_function_call_id — guaranteed divergence.
+                if self.shape_ == "two-partials":
+                    # streaming chunk + aggregated partial + persisted final
+                    yield mk(partial=True)
+                    yield mk(partial=True)
+                    yield mk(partial=False)
+                elif self.shape_ == "two-partials-no-final":
+                    # the "last event is partial, which is not expected" shape
+                    yield mk(partial=True)
+                    yield mk(partial=True, turn_complete=True)
+                else:  # partial-final
+                    yield mk(partial=True)
+                    yield mk(partial=False)
 
-        return _ScriptedLro(model="scripted-lro")
+        return _ScriptedLro(model=f"scripted-lro-{shape}")
 
     @pytest.mark.asyncio
-    async def test_partial_plus_proxy_emits_single_tool_call(self):
+    @pytest.mark.parametrize(
+        "shape", ["partial-final", "two-partials", "two-partials-no-final"]
+    )
+    async def test_partial_plus_proxy_emits_single_tool_call(self, shape):
         from ag_ui_adk.agui_toolset import AGUIToolset
         from google.adk.agents import LlmAgent
         from google.adk.apps import App, ResumabilityConfig
@@ -1695,7 +1732,7 @@ class TestLroNoDuplicateToolCallEndToEnd:
         )
         agent = LlmAgent(
             name="hitl_dupe_agent",
-            model=self._scripted_lro_llm("approve_action"),
+            model=self._scripted_lro_llm("approve_action", shape),
             instruction="Call the tool when asked.",
             tools=[AGUIToolset()],
         )
