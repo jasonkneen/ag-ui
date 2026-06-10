@@ -90,11 +90,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Guard against main
-        if: github.ref == 'refs/heads/main'
+      - name: Guard ref
+        # Canary publishes are for non-main BRANCHES only. Block main (use the
+        # stable release flow) and block non-branch refs such as tags (a tag
+        # dispatch would otherwise canary-publish from the tagged commit).
+        if: github.ref == 'refs/heads/main' || !startsWith(github.ref, 'refs/heads/')
         run: |
-          echo "::error::Canary publishes are for non-main branches. To release from main, use the 'release / publish' workflow with mode=stable."
+          echo "::error::Canary publishes are for non-main branches only (got '${{ github.ref }}'). To release from main, use the 'release / publish' workflow with mode=stable."
           exit 1
+
+      - name: Validate suffix
+        if: inputs.suffix != ''
+        env:
+          SUFFIX: ${{ inputs.suffix }}
+        run: |
+          set -euo pipefail
+          # Validate BEFORE any side effect (token mint, ref creation) so a bad
+          # suffix can't leave an orphaned canary ref behind. Bash regex matches
+          # the WHOLE string (grep matches per line and would accept a multi-line
+          # value whose first line is valid).
+          if ! [[ "$SUFFIX" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::Invalid suffix '$SUFFIX'. Allowed: [a-zA-Z0-9._-]+ (blank = unix timestamp)."
+            exit 1
+          fi
 
       - name: Mint devops-bot token
         id: app-token
@@ -120,12 +138,14 @@ jobs:
             echo "::error::Could not derive a canary slug from ref '$REF_NAME'"
             exit 1
           fi
-          # Append the orchestration run id so every dispatch owns a UNIQUE canary
-          # ref. This is what prevents two dispatches whose source branches slugify
-          # to the same value from racing one shared ref, and it makes the run
+          # Append run id AND attempt so every dispatch — including a re-run of
+          # this same orchestration — owns a UNIQUE canary ref. This prevents two
+          # dispatches whose source branches slugify to the same value (or a
+          # re-run reusing the run id) from racing one shared ref, and keeps run
           # discovery below unambiguous (exactly one publish run per ref).
-          echo "branch=canary/${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "Canary branch: canary/${SLUG}-${GITHUB_RUN_ID}"
+          REF_SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "branch=canary/${SLUG}-${REF_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "Canary branch: canary/${SLUG}-${REF_SUFFIX}"
 
       - name: Create or update canary ref
         env:
@@ -162,17 +182,8 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          # Validate the suffix at the orchestrator boundary so a bad value fails
-          # here with a clear message rather than deep inside the delegated run.
-          # Mirrors publish-release.yml's own check; blank is allowed (it falls
-          # back to a unix timestamp downstream).
-          # Bash regex matches the WHOLE string (unlike grep, which matches per
-          # line and would accept a multi-line value whose first line is valid).
-          if [ -n "$SUFFIX" ] && ! [[ "$SUFFIX" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "::error::Invalid suffix '$SUFFIX'. Allowed: [a-zA-Z0-9._-]+ (blank = unix timestamp)."
-            exit 1
-          fi
-
+          # (suffix already validated in the "Validate suffix" step above, before
+          # the canary ref was created)
           gh workflow run publish-release.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$BRANCH" \
@@ -181,10 +192,12 @@ jobs:
             -f suffix="$SUFFIX" \
             -f dry_run="$DRY_RUN"
 
-          # The canary ref is unique to this run, so there is exactly ONE
+          # The canary ref is unique to this run+attempt, so there is exactly ONE
           # publish-release dispatch on it — no timestamp watermark needed (which
           # also sidesteps runner/server clock-skew). Poll until it indexes
-          # (30 x 6s = 3 min tolerance for Actions indexing lag).
+          # (30 x 6s = 3 min tolerance for Actions indexing lag). --limit is
+          # defensive headroom; the branch/workflow/event filters are applied
+          # server-side so the matching run is never crowded out.
           RUN_ID=""
           for _ in $(seq 1 30); do
             sleep 6
@@ -193,6 +206,7 @@ jobs:
               --workflow=publish-release.yml \
               --branch "$BRANCH" \
               --event workflow_dispatch \
+              --limit 100 \
               --json databaseId \
               --jq 'sort_by(.databaseId) | last | .databaseId // empty') || RUN_ID=""
             if [ -n "$RUN_ID" ]; then
