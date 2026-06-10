@@ -1619,9 +1619,54 @@ class ADKAgent:
                     await self._remove_pending_tool_call(thread_id, tool_call_id, user_id)
                     processed_tool_ids.append(tool_call_id)
 
-            # Since all tools are long-running, all tool results are standalone
-            # and should start new executions with the tool results
+            # "All-results" gate for a turn with multiple long-running calls.
+            # The client returns each long-running result independently (an
+            # instant frontend tool resolves before a HITL one, etc.). Resuming
+            # the model on a partial set would replay a turn whose
+            # function-call parts outnumber its function-response parts, which
+            # the provider rejects (Gemini: "number of function response parts
+            # [must] equal the number of function call parts of the function
+            # call turn"). So if any long-running call from this turn is still
+            # unanswered, persist what we just received and stop here without
+            # resuming; the buffered responses are merged with the remaining
+            # ones (ADK's _rearrange_events_for_latest_function_response) once
+            # the final result arrives. A trailing user message is an explicit
+            # new turn, so never gate that.
+            remaining_pending = await self._get_pending_tool_call_ids(thread_id, user_id)
+            if remaining_pending and not trailing_messages:
+                logger.info(
+                    "Buffering %d tool result(s) for thread %s; %d long-running "
+                    "call(s) from the same turn still pending %s — deferring "
+                    "model resume until the turn is complete.",
+                    len(tool_results),
+                    thread_id,
+                    len(remaining_pending),
+                    remaining_pending,
+                )
+                await self._buffer_tool_results(input, tool_results)
+                # Mark these results processed so they aren't re-extracted when
+                # the next result arrives and we finally resume.
+                buffered_message_ids = self._collect_message_ids(
+                    [tr["message"] for tr in tool_results]
+                )
+                if buffered_message_ids:
+                    self._session_manager.mark_messages_processed(
+                        app_name, thread_id, buffered_message_ids
+                    )
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=thread_id,
+                    run_id=input.run_id,
+                )
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=thread_id,
+                    run_id=input.run_id,
+                )
+                return
 
+            # All of this turn's long-running calls are answered (or a trailing
+            # user message forces a new turn): resume the model with the results.
             # Use trailing_messages if provided, otherwise fall back to candidate_messages
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
 
@@ -1640,6 +1685,99 @@ class ADKAgent:
                 code="TOOL_RESULT_PROCESSING_ERROR"
             )
     
+    async def _buffer_tool_results(
+        self,
+        input: RunAgentInput,
+        tool_results: List[Dict],
+    ) -> None:
+        """Persist FunctionResponse(s) for resolved long-running calls WITHOUT
+        resuming the model.
+
+        Used by the "all-results" gate in ``_handle_tool_result_submission``
+        when a model turn emitted multiple long-running tool calls and only some
+        have results so far. The responses are appended to the ADK session —
+        tagged with the originating FunctionCall's invocation_id, exactly like
+        the resume path — so they persist and are merged with the remaining
+        responses when the turn completes, instead of running the model on a
+        partially-answered turn.
+        """
+        user_id = self._get_user_id(input)
+        app_name = self._get_app_name(input)
+        backend_session_id = self._get_backend_session_id(input.thread_id, user_id)
+        session = (
+            await self._session_manager.get_session(
+                backend_session_id, app_name, user_id
+            )
+            if backend_session_id
+            else None
+        )
+        if session is None:
+            logger.warning(
+                "Cannot buffer tool results for thread %s: no backend session.",
+                input.thread_id,
+            )
+            return
+
+        # Same client->ADK id remap the resume path uses: with SSE streaming the
+        # partial and final events can carry different function-call ids.
+        lro_id_remap = await self._get_lro_id_remap(
+            backend_session_id, app_name, user_id
+        )
+
+        function_response_parts: List[types.Part] = []
+        for tool_result in tool_results:
+            tool_call_id = tool_result["message"].tool_call_id
+            tool_call_id = lro_id_remap.get(tool_call_id, tool_call_id)
+            content = tool_result["message"].content
+            # Mirror the resume path's parsing: JSON when possible, else wrap the
+            # raw string; empty content becomes an empty success.
+            try:
+                if content and content.strip():
+                    try:
+                        result = json.loads(content)
+                    except json.JSONDecodeError:
+                        result = {"success": True, "result": content, "status": "completed"}
+                else:
+                    result = {"success": True, "result": None, "status": "completed"}
+            except Exception as e:
+                result = {"success": True, "result": str(content) if content else None, "status": "completed"}
+                logger.warning(f"Error buffering tool result for {tool_call_id}: {e}")
+            function_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=tool_call_id,
+                        name=tool_result["tool_name"],
+                        response=result,
+                    )
+                )
+            )
+
+        # Tag with the originating FunctionCall event's invocation_id so ADK
+        # pairs this response with its call (and DatabaseSessionService receives
+        # a non-null invocation_id — see #957).
+        invocation_id = (
+            self._find_function_call_invocation_id(
+                session, function_response_parts[0].function_response.id
+            )
+            or input.run_id
+        )
+        await self._session_manager._session_service.append_event(
+            session,
+            Event(
+                timestamp=time.time(),
+                author="user",
+                content=types.Content(parts=function_response_parts, role="user"),
+                invocation_id=invocation_id,
+            ),
+        )
+        logger.debug(
+            "Buffered %d FunctionResponse(s) for thread %s (invocation_id=%s) "
+            "without resuming the model.",
+            len(function_response_parts),
+            input.thread_id,
+            invocation_id,
+        )
+
     async def _extract_tool_results(
         self,
         input: RunAgentInput,

@@ -1,0 +1,304 @@
+#!/usr/bin/env python
+"""Regression tests for resuming a turn with MULTIPLE long-running tool calls.
+
+When a single model turn emits more than one long-running (client / HITL) tool
+call, the client returns the results independently — an instant frontend
+``render`` tool resolves before a human-in-the-loop ``ask_user_choice`` tool, so
+they arrive in separate submissions. Before the "all-results" gate, ag-ui-adk
+treated each tool result as a standalone resume (``_handle_tool_result_submission``:
+*"all tool results are standalone and should start new executions"*), so the
+first result resumed the model while the other call was still unanswered. The
+replayed turn then carried N function-call parts but fewer than N
+function-response parts, which Gemini rejects with::
+
+    400 INVALID_ARGUMENT: Please ensure that the number of function response
+    parts is equal to the number of function call parts of the function call
+    turn.
+
+The fix gates the resume: while any long-running call from the turn is still
+pending, the arriving results are persisted (so they survive and ADK merges
+them later) but the model is NOT resumed. It resumes once — when the last
+result lands and ``pending_tool_calls`` is empty.
+
+These tests use a scripted LLM (no network) so the mismatch is caught
+deterministically: the LLM records the function-call/function-response balance
+of every request it receives, and we assert it is never handed a turn whose
+responses don't match its calls. A single-call control test guards that the
+gate does NOT defer the ordinary one-tool HITL case.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import AsyncGenerator, Dict, List, Tuple
+
+import pytest
+import pytest_asyncio
+from pydantic import Field
+
+from ag_ui.core import (
+    AssistantMessage,
+    FunctionCall,
+    RunAgentInput,
+    Tool as AGUITool,
+    ToolCall,
+    ToolMessage,
+    UserMessage,
+)
+
+from ag_ui_adk import ADKAgent
+from ag_ui_adk.agui_toolset import AGUIToolset
+from ag_ui_adk.session_manager import SessionManager
+
+from google.adk.agents import LlmAgent
+from google.adk.apps import App, ResumabilityConfig
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_response import LlmResponse
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+
+TOOL_A = "render_card"  # instant client tool (resolves immediately)
+TOOL_B = "ask_choice"  # HITL client tool (waits for the user)
+
+
+def _count_calls_and_responses(llm_request) -> Tuple[int, int]:
+    """Count function_call vs function_response parts in an ADK LlmRequest."""
+    fc = fr = 0
+    for content in getattr(llm_request, "contents", None) or []:
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "function_call", None) is not None:
+                fc += 1
+            if getattr(part, "function_response", None) is not None:
+                fr += 1
+    return fc, fr
+
+
+class _LroThenTextLlm(BaseLlm):
+    """Turn 1: emit one function call per name in ``tool_names`` (all wired as
+    long-running client tools). Every later turn: emit final text.
+
+    Records the ``(function_calls, function_responses)`` balance of each request
+    so a test can assert the model is never handed a turn whose function
+    responses don't match its function calls (the exact thing Gemini 400s on).
+    """
+
+    tool_names: List[str] = Field(default_factory=lambda: [TOOL_A, TOOL_B])
+    turn_count: int = 0
+    request_balances: List[Tuple[int, int]] = Field(default_factory=list)
+
+    async def generate_content_async(
+        self, llm_request, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        self.turn_count += 1
+        self.request_balances.append(_count_calls_and_responses(llm_request))
+        if self.turn_count == 1:
+            yield LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            function_call=types.FunctionCall(name=name, args={})
+                        )
+                        for name in self.tool_names
+                    ],
+                ),
+                partial=False,
+                turn_complete=True,
+            )
+        else:
+            yield LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text="All tools are done.")],
+                ),
+                partial=False,
+                turn_complete=True,
+            )
+
+
+def _tool(name: str) -> AGUITool:
+    return AGUITool(
+        name=name,
+        description=f"{name} tool",
+        parameters={"type": "object", "properties": {}},
+    )
+
+
+@pytest_asyncio.fixture
+async def reset_session_manager():
+    SessionManager.reset_instance()
+    yield
+    SessionManager.reset_instance()
+
+
+def _make_agent(llm: _LroThenTextLlm) -> ADKAgent:
+    return ADKAgent.from_app(
+        App(
+            name="multi_lro",
+            root_agent=LlmAgent(
+                name="MultiLroAgent",
+                model=llm,
+                tools=[AGUIToolset()],
+                instruction="Call the tools.",
+            ),
+            resumability_config=ResumabilityConfig(is_resumable=True),
+        ),
+        user_id="user_1",
+        session_service=InMemorySessionService(),
+    )
+
+
+async def _run(adk: ADKAgent, thread_id: str, run_id: str, messages):
+    """Drive one AG-UI run; return (tool_call_ids_by_name, saw_run_error)."""
+    start_ids: Dict[str, str] = {}
+    saw_run_error = False
+    async for event in adk.run(
+        RunAgentInput(
+            thread_id=thread_id,
+            run_id=run_id,
+            state={},
+            messages=messages,
+            tools=[_tool(TOOL_A), _tool(TOOL_B)],
+            context=[],
+            forwarded_props={},
+        )
+    ):
+        name = type(event).__name__
+        if name == "ToolCallStartEvent":
+            start_ids[event.tool_call_name] = event.tool_call_id
+        elif name == "RunErrorEvent":
+            saw_run_error = True
+    return start_ids, saw_run_error
+
+
+def _assert_no_mismatch(llm: _LroThenTextLlm) -> None:
+    """The model must never be handed a turn whose function responses don't
+    match its function calls (a Gemini 400)."""
+    mismatched = [
+        (fc, fr) for (fc, fr) in llm.request_balances if fr > 0 and fc != fr
+    ]
+    assert not mismatched, (
+        f"Model received request(s) with mismatched function call/response "
+        f"counts {mismatched} (would 400 on Gemini). "
+        f"All balances seen: {llm.request_balances}"
+    )
+
+
+class TestMultiLroResumeGating:
+    @pytest.mark.asyncio
+    async def test_partial_result_does_not_resume_model(
+        self, reset_session_manager
+    ):
+        """Two long-running calls in one turn → the first result must NOT resume
+        the model; the model resumes once, after the second result."""
+        llm = _LroThenTextLlm(model="scripted", tool_names=[TOOL_A, TOOL_B])
+        adk = _make_agent(llm)
+        thread_id = str(uuid.uuid4())
+
+        # --- Run 1: one model turn emits two long-running tool calls ---
+        start_ids, err1 = await _run(
+            adk, thread_id, "r1", [UserMessage(id="u1", content="Use both tools.")]
+        )
+        assert not err1
+        assert set(start_ids) == {TOOL_A, TOOL_B}, start_ids
+        assert llm.turn_count == 1
+        id_a, id_b = start_ids[TOOL_A], start_ids[TOOL_B]
+
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert set(pending or []) == {id_a, id_b}, (
+            f"both LRO calls should be pending after run 1, got {pending}"
+        )
+
+        assistant = AssistantMessage(
+            id="a1",
+            content=None,
+            tool_calls=[
+                ToolCall(id=id_a, function=FunctionCall(name=TOOL_A, arguments="{}")),
+                ToolCall(id=id_b, function=FunctionCall(name=TOOL_B, arguments="{}")),
+            ],
+        )
+        history = [UserMessage(id="u1", content="Use both tools."), assistant]
+
+        # --- Run 2: only tool_a's result (tool_b still pending) ---
+        _, err2 = await _run(
+            adk,
+            thread_id,
+            "r2",
+            history + [ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a)],
+        )
+        assert not err2
+        assert llm.turn_count == 1, (
+            f"Model was resumed after only the first of two long-running results "
+            f"(turn_count={llm.turn_count}); that turn has 2 calls / 1 response "
+            f"→ Gemini 400."
+        )
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert set(pending or []) == {id_b}, (
+            f"tool_a resolved, tool_b still pending; got {pending}"
+        )
+
+        # --- Run 3: tool_b's result → turn complete, resume once ---
+        _, err3 = await _run(
+            adk,
+            thread_id,
+            "r3",
+            history
+            + [
+                ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a),
+                ToolMessage(id="t_b", content='{"ok": true}', tool_call_id=id_b),
+            ],
+        )
+        assert not err3
+        assert llm.turn_count == 2, (
+            f"Model should resume exactly once, after BOTH results are in "
+            f"(turn_count={llm.turn_count})."
+        )
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert not (pending or []), f"no calls should remain pending, got {pending}"
+
+        _assert_no_mismatch(llm)
+
+    @pytest.mark.asyncio
+    async def test_single_lro_resumes_immediately(self, reset_session_manager):
+        """Control: a turn with ONE long-running call must resume as soon as its
+        result arrives — the gate must not defer the ordinary HITL case."""
+        llm = _LroThenTextLlm(model="scripted", tool_names=[TOOL_A])
+        adk = _make_agent(llm)
+        thread_id = str(uuid.uuid4())
+
+        start_ids, err1 = await _run(
+            adk, thread_id, "r1", [UserMessage(id="u1", content="Use one tool.")]
+        )
+        assert not err1
+        assert set(start_ids) == {TOOL_A}, start_ids
+        assert llm.turn_count == 1
+        id_a = start_ids[TOOL_A]
+
+        assistant = AssistantMessage(
+            id="a1",
+            content=None,
+            tool_calls=[
+                ToolCall(id=id_a, function=FunctionCall(name=TOOL_A, arguments="{}"))
+            ],
+        )
+
+        # Submit the single result → the model resumes immediately.
+        _, err2 = await _run(
+            adk,
+            thread_id,
+            "r2",
+            [
+                UserMessage(id="u1", content="Use one tool."),
+                assistant,
+                ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a),
+            ],
+        )
+        assert not err2
+        assert llm.turn_count == 2, (
+            f"Single-call turn must resume on its result (turn_count={llm.turn_count})."
+        )
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert not (pending or []), f"no calls should remain pending, got {pending}"
+
+        _assert_no_mismatch(llm)
