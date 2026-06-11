@@ -1607,9 +1607,65 @@ class ADKAgent:
             return
 
         try:
+            user_id = self._get_user_id(input)
+
+            # Snapshot the turn's pending long-running calls BEFORE marking any
+            # of the arriving results answered. ``still_pending_after`` is what
+            # would remain outstanding once this submission's results apply —
+            # used by the guard immediately below.
+            pending_before = set(
+                await self._get_pending_tool_call_ids(thread_id, user_id) or []
+            )
+            arriving_ids = {tr["message"].tool_call_id for tr in tool_results}
+            still_pending_after = pending_before - arriving_ids
+
+            # Guard: a trailing user/system message accompanied these results
+            # while OTHER long-running calls from the same turn are still
+            # unanswered. We can neither resume nor silently absorb it:
+            #   - Resuming replays a turn whose function-call parts outnumber its
+            #     function-response parts, which the provider 400s (see the
+            #     "All-results" gate below).
+            #   - The pre-fix behavior forwarded that under-answered turn anyway;
+            #     it marked the message processed *before* the model ran, so the
+            #     400 surfaced as an opaque provider error AND the user's message
+            #     was silently dropped (never re-delivered).
+            # There is no correct middleware-only merge — the message is wedged
+            # between unanswered calls and may even be directed at the open
+            # widget rather than the conversation; that is a client-side concern
+            # (answer/cancel the pending call before sending text). So fail
+            # loudly and mutate NOTHING: leave pending_tool_calls and every
+            # message untouched, returning a clear, dedicated error so the client
+            # can resolve or cancel the outstanding call(s) and resubmit. Once
+            # all of the turn's results arrive together the message rides along
+            # normally (``still_pending_after`` is then empty). A trailing
+            # message with no other call pending is the legitimate
+            # "FunctionResponse + follow-up message in one turn" case and is not
+            # gated. See PR_multi_lro_resume_gating.md ("user message while a
+            # call is still pending") and google/adk-python discussion #2739.
+            if still_pending_after and trailing_messages:
+                logger.warning(
+                    "Rejecting tool-result submission for thread %s: a trailing "
+                    "message arrived while %d long-running call(s) from the same "
+                    "turn are still pending %s. The client must submit their "
+                    "results (or cancel them) before sending a new message.",
+                    thread_id,
+                    len(still_pending_after),
+                    sorted(still_pending_after),
+                )
+                yield RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=(
+                        "Cannot start a new message while long-running tool "
+                        f"call(s) {sorted(still_pending_after)} from the current "
+                        "turn are still pending. Submit their results or cancel "
+                        "them before sending another message."
+                    ),
+                    code="PENDING_TOOL_CALLS",
+                )
+                return
+
             # Remove tool calls from pending list and track which ones we processed
             processed_tool_ids = []
-            user_id = self._get_user_id(input)
             for tool_result in tool_results:
                 tool_call_id = tool_result['message'].tool_call_id
                 has_pending = await self._has_pending_tool_calls(thread_id, user_id)
@@ -1630,10 +1686,11 @@ class ADKAgent:
             # unanswered, persist what we just received and stop here without
             # resuming; the buffered responses are merged with the remaining
             # ones (ADK's _rearrange_events_for_latest_function_response) once
-            # the final result arrives. A trailing user message is an explicit
-            # new turn, so never gate that.
+            # the final result arrives. (The trailing-message variant of this
+            # situation was already rejected by the guard above, so reaching here
+            # with remaining_pending implies there was no trailing message.)
             remaining_pending = await self._get_pending_tool_call_ids(thread_id, user_id)
-            if remaining_pending and not trailing_messages:
+            if remaining_pending:
                 logger.info(
                     "Buffering %d tool result(s) for thread %s; %d long-running "
                     "call(s) from the same turn still pending %s — deferring "
@@ -1665,9 +1722,9 @@ class ADKAgent:
                 )
                 return
 
-            # All of this turn's long-running calls are answered (or a trailing
-            # user message forces a new turn): resume the model with the results.
-            # Use trailing_messages if provided, otherwise fall back to candidate_messages
+            # All of this turn's long-running calls are answered: resume the
+            # model with the results. Use trailing_messages if provided,
+            # otherwise fall back to candidate_messages.
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
 
             async for event in self._start_new_execution(
