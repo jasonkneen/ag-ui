@@ -1685,6 +1685,68 @@ class ADKAgent:
                 code="TOOL_RESULT_PROCESSING_ERROR"
             )
     
+    def _build_function_response_parts(
+        self,
+        tool_results: List[Dict],
+        lro_id_remap: Dict[str, str],
+    ) -> List[types.Part]:
+        """Convert AG-UI tool-result messages into ADK FunctionResponse parts.
+
+        Shared by the resume path (``_run_async_impl``) and the buffer path
+        (``_buffer_tool_results``). Applies the client->ADK LRO id remap and
+        parses each result's content as JSON when possible, falling back to
+        wrapping the raw string; empty content becomes an empty success.
+        """
+        function_response_parts: List[types.Part] = []
+        for tool_result in tool_results:
+            tool_call_id = tool_result["message"].tool_call_id
+            # Apply LRO ID remap: convert client-facing ID to ADK-persisted ID.
+            tool_call_id = lro_id_remap.get(tool_call_id, tool_call_id)
+            content = tool_result["message"].content
+
+            logger.debug(
+                f"Received tool result for call {tool_call_id}: "
+                f"content='{content}', type={type(content)}"
+            )
+
+            # Parse content - try JSON first, fall back to plain string.
+            try:
+                if content and content.strip():
+                    try:
+                        result = json.loads(content)
+                    except json.JSONDecodeError:
+                        # Not valid JSON - treat as plain string result.
+                        result = {"success": True, "result": content, "status": "completed"}
+                        logger.debug(
+                            f"Tool result for {tool_call_id} is plain string, "
+                            "wrapped in result object"
+                        )
+                else:
+                    # Handle empty content as a success with empty result.
+                    result = {"success": True, "result": None, "status": "completed"}
+                    logger.warning(
+                        f"Empty tool result content for tool call {tool_call_id}, "
+                        "using empty success result"
+                    )
+            except Exception as e:
+                # Handle any other error.
+                result = {"success": True, "result": str(content) if content else None, "status": "completed"}
+                logger.warning(
+                    f"Error processing tool result for {tool_call_id}: {e}, "
+                    "using string fallback"
+                )
+
+            function_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=tool_call_id,
+                        name=tool_result["tool_name"],
+                        response=result,
+                    )
+                )
+            )
+        return function_response_parts
+
     async def _buffer_tool_results(
         self,
         input: RunAgentInput,
@@ -1724,33 +1786,11 @@ class ADKAgent:
             backend_session_id, app_name, user_id
         )
 
-        function_response_parts: List[types.Part] = []
-        for tool_result in tool_results:
-            tool_call_id = tool_result["message"].tool_call_id
-            tool_call_id = lro_id_remap.get(tool_call_id, tool_call_id)
-            content = tool_result["message"].content
-            # Mirror the resume path's parsing: JSON when possible, else wrap the
-            # raw string; empty content becomes an empty success.
-            try:
-                if content and content.strip():
-                    try:
-                        result = json.loads(content)
-                    except json.JSONDecodeError:
-                        result = {"success": True, "result": content, "status": "completed"}
-                else:
-                    result = {"success": True, "result": None, "status": "completed"}
-            except Exception as e:
-                result = {"success": True, "result": str(content) if content else None, "status": "completed"}
-                logger.warning(f"Error buffering tool result for {tool_call_id}: {e}")
-            function_response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        id=tool_call_id,
-                        name=tool_result["tool_name"],
-                        response=result,
-                    )
-                )
-            )
+        # Mirror the resume path's parsing (JSON when possible, else wrap the
+        # raw string; empty content becomes an empty success).
+        function_response_parts = self._build_function_response_parts(
+            tool_results, lro_id_remap
+        )
 
         # Tag with the originating FunctionCall event's invocation_id so ADK
         # pairs this response with its call (and DatabaseSessionService receives
@@ -2440,43 +2480,9 @@ class ADKAgent:
             if active_tool_results and user_message:
                 # We have BOTH tool results AND a user message
                 # Add FunctionResponse as a separate event to the session, then send user message
-                function_response_parts = []
-                for tool_msg in active_tool_results:
-                    tool_call_id = tool_msg['message'].tool_call_id
-                    # Apply LRO ID remap: convert client-facing ID to ADK-persisted ID
-                    tool_call_id = lro_id_remap.get(tool_call_id, tool_call_id)
-                    content = tool_msg['message'].content
-
-                    # Debug: Log the actual tool message content we received
-                    logger.debug(f"Received tool result for call {tool_call_id}: content='{content}', type={type(content)}")
-
-                    # Parse content - try JSON first, fall back to plain string
-                    try:
-                        if content and content.strip():
-                            # Try to parse as JSON first
-                            try:
-                                result = json.loads(content)
-                            except json.JSONDecodeError:
-                                # Not valid JSON - treat as plain string result
-                                result = {"success": True, "result": content, "status": "completed"}
-                                logger.debug(f"Tool result for {tool_call_id} is plain string, wrapped in result object")
-                        else:
-                            # Handle empty content as a success with empty result
-                            result = {"success": True, "result": None, "status": "completed"}
-                            logger.warning(f"Empty tool result content for tool call {tool_call_id}, using empty success result")
-                    except Exception as e:
-                        # Handle any other error
-                        result = {"success": True, "result": str(content) if content else None, "status": "completed"}
-                        logger.warning(f"Error processing tool result for {tool_call_id}: {e}, using string fallback")
-
-                    updated_function_response_part = types.Part(
-                        function_response=types.FunctionResponse(
-                            id=tool_call_id,
-                            name=tool_msg["tool_name"],
-                            response=result,
-                        )
-                    )
-                    function_response_parts.append(updated_function_response_part)
+                function_response_parts = self._build_function_response_parts(
+                    active_tool_results, lro_id_remap
+                )
 
                 # Add FunctionResponse as separate event to session
                 # (session was already obtained from _ensure_session_exists above)
@@ -2505,41 +2511,9 @@ class ADKAgent:
 
             elif active_tool_results:
                 # Tool results WITHOUT user message - send FunctionResponse alone
-                function_response_parts = []
-                for tool_msg in active_tool_results:
-                    tool_call_id = tool_msg['message'].tool_call_id
-                    # Apply LRO ID remap: convert client-facing ID to ADK-persisted ID
-                    tool_call_id = lro_id_remap.get(tool_call_id, tool_call_id)
-                    content = tool_msg['message'].content
-
-                    logger.debug(f"Received tool result for call {tool_call_id}: content='{content}', type={type(content)}")
-
-                    # Parse content - try JSON first, fall back to plain string
-                    try:
-                        if content and content.strip():
-                            # Try to parse as JSON first
-                            try:
-                                result = json.loads(content)
-                            except json.JSONDecodeError:
-                                # Not valid JSON - treat as plain string result
-                                result = {"success": True, "result": content, "status": "completed"}
-                                logger.debug(f"Tool result for {tool_call_id} is plain string, wrapped in result object")
-                        else:
-                            result = {"success": True, "result": None, "status": "completed"}
-                            logger.warning(f"Empty tool result content for tool call {tool_call_id}, using empty success result")
-                    except Exception as e:
-                        # Handle any other error
-                        result = {"success": True, "result": str(content) if content else None, "status": "completed"}
-                        logger.warning(f"Error processing tool result for {tool_call_id}: {e}, using string fallback")
-
-                    updated_function_response_part = types.Part(
-                        function_response=types.FunctionResponse(
-                            id=tool_call_id,
-                            name=tool_msg["tool_name"],
-                            response=result,
-                        )
-                    )
-                    function_response_parts.append(updated_function_response_part)
+                function_response_parts = self._build_function_response_parts(
+                    active_tool_results, lro_id_remap
+                )
 
                 function_response_content = types.Content(parts=function_response_parts, role='user')
 
