@@ -16,6 +16,7 @@ except ImportError:
     from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
     
 from langchain_core.runnables import RunnableConfig, ensure_config
+from langchain_core.runnables.config import merge_configs
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
@@ -651,12 +652,22 @@ class LangGraphAgent:
             as_node=next_nodes[0] if next_nodes else "__start__",
         )
 
+        # ``fork`` only carries the checkpoint-level configurable keys
+        # (``thread_id``, ``checkpoint_id``, ``checkpoint_ns``).  Pass it
+        # alone and runtime settings from the caller's config -- notably
+        # ``recursion_limit`` and ``callbacks`` -- are silently dropped,
+        # so LangGraph stamps the default ``recursion_limit=25`` and any
+        # tracing / observability callbacks are lost.  Merge the caller's
+        # config underneath the fork so checkpoint keys still win but
+        # everything else is preserved.  Fixes #1749.
+        merged_config = merge_configs(config, fork)
+
         stream_input = self.langgraph_default_merge_state(time_travel_checkpoint.values, [message_checkpoint], input)
         subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs', True) if input.forwarded_props else True
 
         kwargs = self.get_stream_kwargs(
             input=stream_input,
-            config=fork,
+            config=merged_config,
             subgraphs=bool(subgraphs_stream_enabled),
             version="v2",
         )
@@ -1499,6 +1510,17 @@ class LangGraphAgent:
             )
             return
 
+        # A text-less chunk is still meaningful when it carries the provider's
+        # canonical reasoning id (the `response.output_item.added` /
+        # `…summary_part.added` chunks): stash the id so the first text delta
+        # opens the reasoning message under it, WITHOUT opening a message here
+        # — a summary-less (store=true) reasoning item must keep rendering
+        # nothing.
+        if not reasoning_data["text"]:
+            if reasoning_data.get("id"):
+                self.active_run["pending_reasoning_id"] = reasoning_data["id"]
+            return
+
         reasoning_step_index = reasoning_data.get("index", 0)
 
         if (self.active_run.get("reasoning_process") and
@@ -1522,7 +1544,17 @@ class LangGraphAgent:
             self.active_run["reasoning_process"] = None
 
         if not self.active_run.get("reasoning_process"):
-            message_id = str(uuid.uuid4())
+            # Prefer the provider's canonical reasoning id (e.g. OpenAI
+            # ``rs_…``) when the stream carried one: the snapshot converter
+            # (_reasoning_block_to_agui_message) re-emits this same reasoning
+            # under that id, and only a matching id lets the client reconcile
+            # the streamed copy with the snapshot copy instead of rendering
+            # both.
+            message_id = (
+                reasoning_data.get("id")
+                or self.active_run.pop("pending_reasoning_id", None)
+                or str(uuid.uuid4())
+            )
             yield self._dispatch_event(
                 ReasoningStartEvent(
                     type=EventType.REASONING_START,
@@ -1688,9 +1720,14 @@ class LangGraphAgent:
             version=version,
         )
 
-        # Only add context if supported
+        # LangGraph may expose context either as a named parameter or through
+        # **kwargs, depending on the installed version.
         sig = inspect.signature(self.graph.astream_events)
-        if 'context' in sig.parameters:
+        accepts_context = (
+            'context' in sig.parameters
+            or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+        )
+        if accepts_context:
             base_context = {}
             if isinstance(config, dict) and 'configurable' in config and isinstance(config['configurable'], dict):
                 base_context.update(config['configurable'])
