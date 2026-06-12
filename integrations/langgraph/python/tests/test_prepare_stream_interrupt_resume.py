@@ -49,6 +49,7 @@ def _make_input(
     messages,
     thread_id="t1",
     forwarded_props=None,
+    resume=None,
 ):
     """Build a RunAgentInput-compatible mock."""
     inp = MagicMock()
@@ -59,6 +60,7 @@ def _make_input(
     inp.context = []
     inp.run_id = "run-1"
     inp.forwarded_props = forwarded_props or {}
+    inp.resume = resume
     return inp
 
 
@@ -589,6 +591,90 @@ class TestResumeInputJSONParseLogging(unittest.IsolatedAsyncioTestCase):
         call_args = mock_logger.warning.call_args
         formatted = call_args[0][0] % call_args[0][1:]
         self.assertIn(malformed, formatted)
+
+
+class TestInterruptShortCircuitOutcomeLegacyOff(unittest.IsolatedAsyncioTestCase):
+    """When enable_legacy_on_interrupt_event=False, the short-circuit path
+    must emit RUN_FINISHED(outcome=interrupt) without CustomEvent(on_interrupt)."""
+
+    async def test_no_resume_short_circuit_no_legacy_custom_event(self):
+        from ag_ui_langgraph.agent import LangGraphAgent
+
+        agent = LangGraphAgent(
+            name="test",
+            graph=MagicMock(),
+            enable_legacy_on_interrupt_event=False,
+        )
+        agent.active_run = {"id": "run-1", "mode": "start"}
+
+        checkpoint_messages = [
+            HumanMessage(id="h1", content="do something"),
+            AIMessage(
+                id="ai1",
+                content="",
+                tool_calls=[{"id": "tc-1", "name": "approval", "args": {}}],
+            ),
+        ]
+        state = _make_state(
+            messages=checkpoint_messages,
+            tasks=[FakeTask(interrupts=[FakeInterrupt(value="confirm?")])],
+        )
+
+        frontend_messages = [
+            UserMessage(id="h1", role="user", content="do something"),
+        ]
+        inp = _make_input(messages=frontend_messages, forwarded_props={})
+
+        agent.prepare_regenerate_stream = AsyncMock()
+        config = {"configurable": {"thread_id": "t1"}}
+
+        result = await agent.prepare_stream(inp, state, config)
+
+        self.assertIsNone(result.get("stream"))
+        events = result.get("events_to_dispatch", [])
+        types = [getattr(e, "type", None) for e in events]
+        self.assertIn(EventType.RUN_STARTED, types)
+        self.assertNotIn(EventType.CUSTOM, types)
+        self.assertIn(EventType.RUN_FINISHED, types)
+
+        finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
+        self.assertEqual(len(finished_events), 1)
+        self.assertEqual(finished_events[0].outcome.type, "interrupt")
+
+    async def test_no_resume_short_circuit_with_legacy_on(self):
+        agent = make_agent()
+        agent.active_run = {"id": "run-1", "mode": "start"}
+
+        checkpoint_messages = [
+            HumanMessage(id="h1", content="do something"),
+            AIMessage(
+                id="ai1",
+                content="",
+                tool_calls=[{"id": "tc-1", "name": "approval", "args": {}}],
+            ),
+        ]
+        state = _make_state(
+            messages=checkpoint_messages,
+            tasks=[FakeTask(interrupts=[FakeInterrupt(value="confirm?")])],
+        )
+
+        frontend_messages = [
+            UserMessage(id="h1", role="user", content="do something"),
+        ]
+        inp = _make_input(messages=frontend_messages, forwarded_props={})
+
+        agent.prepare_regenerate_stream = AsyncMock()
+        config = {"configurable": {"thread_id": "t1"}}
+
+        result = await agent.prepare_stream(inp, state, config)
+
+        events = result.get("events_to_dispatch", [])
+        types = [getattr(e, "type", None) for e in events]
+        self.assertIn(EventType.CUSTOM, types)
+        self.assertIn(EventType.RUN_FINISHED, types)
+
+        finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
+        self.assertEqual(finished_events[0].outcome.type, "interrupt")
 
 
 class TestCheckpointSignature(unittest.TestCase):

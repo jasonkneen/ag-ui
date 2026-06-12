@@ -8,7 +8,7 @@ import {
   Assistant,
   Message as LangGraphMessage,
   Config,
-  Interrupt,
+  Interrupt as LangGraphInterrupt,
   Thread,
 } from "@langchain/langgraph-sdk";
 import { randomUUID } from "@ag-ui/client";
@@ -29,14 +29,18 @@ import {
 } from "./types";
 import {
   AbstractAgent,
+  AgentCapabilities,
   AgentConfig,
   CustomEvent,
   EventType,
+  Interrupt as AGUIInterrupt,
   MessagesSnapshotEvent,
   RawEvent,
+  ResumeEntry,
   RunAgentInput,
   RunErrorEvent,
   RunFinishedEvent,
+  RunFinishedInterruptOutcome,
   RunStartedEvent,
   StateDeltaEvent,
   StateSnapshotEvent,
@@ -56,6 +60,7 @@ import {
   ReasoningEndEvent,
   ReasoningEncryptedValueEvent,
 } from "@ag-ui/client";
+import { langGraphInterruptToAGUI, langGraphInterruptsToAGUI, buildLgCommandResumeFromAgui } from "./interrupts";
 import { RunsStreamPayload } from "@langchain/langgraph-sdk/dist/types";
 import {
   aguiMessagesToLangChain,
@@ -68,7 +73,14 @@ import {
   resolveEncryptedReasoningContent,
 } from "@/utils";
 import { ToolMessage } from "@langchain/core/messages";
-import { ToolMessageFieldsWithToolCallId } from "@langchain/core/dist/messages/tool";
+
+type ToolMessageFieldsWithToolCallId = {
+  type?: string;
+  tool_call_id: string;
+  name?: string;
+  content: unknown;
+  id?: string;
+};
 
 export type ProcessedEvents =
   | TextMessageStartEvent
@@ -142,6 +154,9 @@ export interface LangGraphAgentConfig extends AgentConfig {
    * variable that could be mutated by a different clone or request.
    */
   headerFactory?: () => Record<string, string>;
+  /** Emit legacy CUSTOM(name="on_interrupt") events alongside the new
+   *  RUN_FINISHED.outcome=interrupt. Default true during the migration window. */
+  enableLegacyOnInterruptEvent?: boolean;
 }
 
 const ROOT_SUBGRAPH_NAME = "root";
@@ -179,10 +194,12 @@ export class LangGraphAgent extends AbstractAgent {
   subscriber: Subscriber<ProcessedEvents>;
   constantSchemaKeys: string[] = DEFAULT_SCHEMA_KEYS;
   config: LangGraphAgentConfig;
+  enableLegacyOnInterruptEvent: boolean;
 
   constructor(config: LangGraphAgentConfig) {
     super(config);
     this.config = config;
+    this.enableLegacyOnInterruptEvent = config.enableLegacyOnInterruptEvent ?? true;
     this.messagesInProcess = {};
     this.agentName = config.agentName;
     this.graphId = config.graphId;
@@ -237,6 +254,7 @@ export class LangGraphAgent extends AbstractAgent {
       constantSchemaKeys: [...this.constantSchemaKeys],
       headers: { ...this.headers },
       client: this.client,
+      enableLegacyOnInterruptEvent: this.enableLegacyOnInterruptEvent,
 
       assistant: this.assistant,
       activeRun: this.activeRun ? structuredClone(this.activeRun) : undefined,
@@ -275,6 +293,37 @@ export class LangGraphAgent extends AbstractAgent {
   dispatchEvent(event: ProcessedEvents) {
     this.subscriber.next(event);
     return true;
+  }
+
+  private dispatchInterruptFinish(args: {
+    threadId: string;
+    runId: string;
+    lgInterrupts: LangGraphInterrupt[];
+  }) {
+    const { threadId, runId, lgInterrupts } = args;
+    const aguiInterrupts: AGUIInterrupt[] = this.interruptsToAGUI(lgInterrupts);
+
+    if (this.enableLegacyOnInterruptEvent) {
+      for (const lg of lgInterrupts) {
+        this.dispatchEvent({
+          type: EventType.CUSTOM,
+          name: LangGraphEventTypes.OnInterrupt,
+          value:
+            typeof lg.value === "string" ? lg.value : JSON.stringify(lg.value),
+          rawEvent: lg,
+        });
+      }
+    }
+
+    this.dispatchEvent({
+      type: EventType.RUN_FINISHED,
+      threadId,
+      runId,
+      outcome: {
+        type: "interrupt",
+        interrupts: aguiInterrupts,
+      } satisfies RunFinishedInterruptOutcome,
+    });
   }
 
   run(input: RunAgentInput) {
@@ -418,6 +467,22 @@ export class LangGraphAgent extends AbstractAgent {
     const nodeNameInput = forwardedProps?.nodeName;
     const threadId = inputThreadId ?? randomUUID();
 
+    const aguiResume: ResumeEntry[] | undefined =
+      input.resume && input.resume.length ? input.resume : undefined;
+    const legacyResume = forwardedProps?.command?.resume;
+
+    if (aguiResume && legacyResume !== undefined) {
+      console.warn(
+        "[@ag-ui/langgraph] both input.resume and forwardedProps.command.resume were provided; input.resume wins.",
+      );
+    } else if (!aguiResume && legacyResume !== undefined) {
+      console.warn(
+        "[@ag-ui/langgraph] forwardedProps.command.resume is deprecated; send RunAgentInput.resume[] instead.",
+      );
+    }
+
+    const hasResume = aguiResume !== undefined || legacyResume !== undefined;
+
     if (!this.assistant) {
       this.assistant = await this.getAssistant();
     }
@@ -460,12 +525,12 @@ export class LangGraphAgent extends AbstractAgent {
       (m) => m.role !== "system",
     ).length;
 
-    // Skip regeneration detection when command.resume is set — a resume from
+    // Skip regeneration detection when a resume is set — a resume from
     // interrupt is explicitly NOT a regeneration. On the second interrupt-resume
     // cycle the LangGraph thread state has accumulated tool/AI messages from the
     // first interrupt while the frontend's input.messages hasn't, which would
     // otherwise trigger the regeneration path and ignore the resume.
-    if (!forwardedProps?.command?.resume && stateNonSystemCount > inputNonSystemCount) {
+    if (!hasResume && stateNonSystemCount > inputNonSystemCount) {
       // A higher checkpoint count than the frontend sent does NOT always mean a
       // regeneration. If an SSE stream dropped before MESSAGES_SNAPSHOT, the
       // client never learned the persisted message IDs and resends the new user
@@ -529,7 +594,7 @@ export class LangGraphAgent extends AbstractAgent {
     );
 
     const mode =
-      !forwardedProps?.command?.resume &&
+      !hasResume &&
       threadId &&
       this.activeRun!.nodeName != "__end__" &&
       this.activeRun!.nodeName
@@ -568,9 +633,25 @@ export class LangGraphAgent extends AbstractAgent {
     // this continuation path (instead of returning early via regenerate), so guard
     // against an undefined value here rather than throwing on destructure.
     const { command, ...restProps } = forwardedProps ?? {};
-    if (command?.resume && typeof command.resume === "string") {
+
+    // Collect interrupts from ALL tasks, not just tasks[0] (fixes #1409).
+    // The SDK doesn't export a Task type, so we use `any` here.
+    const interrupts = (agentState.tasks ?? []).flatMap(
+      (t: any) => t.interrupts ?? [],
+    ) as LangGraphInterrupt[];
+
+    let effectiveCommand = command;
+
+    if (aguiResume) {
+      effectiveCommand = {
+        ...(command ?? {}),
+        resume: this.buildCommandResumeFromAgui(aguiResume, {
+          openInterrupts: this.interruptsToAGUI(interrupts),
+        }),
+      };
+    } else if (effectiveCommand?.resume && typeof effectiveCommand.resume === "string") {
       try {
-        command.resume = JSON.parse(command.resume);
+        effectiveCommand.resume = JSON.parse(effectiveCommand.resume);
       } catch {
         // Keep as string if not valid JSON
       }
@@ -672,7 +753,7 @@ export class LangGraphAgent extends AbstractAgent {
 
     const payload: Record<string, unknown> = {
       ...restProps,
-      command,
+      command: effectiveCommand,
       streamMode,
       input: payloadInput,
       config: configForPayload,
@@ -680,12 +761,7 @@ export class LangGraphAgent extends AbstractAgent {
     };
 
     // If there are still outstanding unresolved interrupts, we must force resolution of them before moving forward
-    // Collect interrupts from ALL tasks, not just tasks[0] (fixes #1409).
-    // The SDK doesn't export a Task type, so we use `any` here.
-    const interrupts = (agentState.tasks ?? []).flatMap(
-      (t: any) => t.interrupts ?? [],
-    ) as Interrupt[];
-    if (interrupts?.length && !forwardedProps?.command?.resume) {
+    if (interrupts?.length && !hasResume) {
       this.dispatchEvent({
         type: EventType.RUN_STARTED,
         threadId,
@@ -693,23 +769,12 @@ export class LangGraphAgent extends AbstractAgent {
       });
       this.handleNodeChange(nodeNameInput);
 
-      interrupts.forEach((interrupt) => {
-        this.dispatchEvent({
-          type: EventType.CUSTOM,
-          name: LangGraphEventTypes.OnInterrupt,
-          value:
-            typeof interrupt.value === "string"
-              ? interrupt.value
-              : JSON.stringify(interrupt.value),
-          rawEvent: interrupt,
-        });
-      });
-
-      this.dispatchEvent({
-        type: EventType.RUN_FINISHED,
+      this.dispatchInterruptFinish({
         threadId,
         runId: input.runId,
+        lgInterrupts: interrupts,
       });
+
       return this.subscriber.complete();
     }
 
@@ -1020,7 +1085,7 @@ export class LangGraphAgent extends AbstractAgent {
       // Collect interrupts from ALL tasks, not just tasks[0] (fixes #1409)
       const interrupts = (tasks ?? []).flatMap(
         (t: any) => t.interrupts ?? [],
-      ) as Interrupt[];
+      ) as LangGraphInterrupt[];
       const isEndNode = state.next.length === 0;
       const writes = state.metadata?.writes ?? {};
 
@@ -1033,29 +1098,26 @@ export class LangGraphAgent extends AbstractAgent {
           : (state.next[0] ?? Object.keys(writes)[0]);
       }
 
-      interrupts.forEach((interrupt) => {
-        this.dispatchEvent({
-          type: EventType.CUSTOM,
-          name: LangGraphEventTypes.OnInterrupt,
-          value:
-            typeof interrupt.value === "string"
-              ? interrupt.value
-              : JSON.stringify(interrupt.value),
-          rawEvent: interrupt,
-        });
-      });
-
       this.handleNodeChange(newNodeName);
       // Immediately turn off new step
       this.handleNodeChange(undefined);
 
       await this.getStateAndMessagesSnapshots(threadId);
 
-      this.dispatchEvent({
-        type: EventType.RUN_FINISHED,
-        threadId,
-        runId: this.activeRun!.id,
-      });
+      if (interrupts.length) {
+        this.dispatchInterruptFinish({
+          threadId,
+          runId: this.activeRun!.id,
+          lgInterrupts: interrupts,
+        });
+      } else {
+        this.dispatchEvent({
+          type: EventType.RUN_FINISHED,
+          threadId,
+          runId: this.activeRun!.id,
+        });
+      }
+
       // Reset cancel flags when run completes
       this.cancelRequested = false;
       this.cancelSent = false;
@@ -1572,6 +1634,27 @@ export class LangGraphAgent extends AbstractAgent {
     }
   }
 
+  protected interruptsToAGUI(
+    list: readonly LangGraphInterrupt[],
+  ): AGUIInterrupt[] {
+    const out: AGUIInterrupt[] = [];
+    for (const lg of list) out.push(...this.interruptValueToAGUI(lg));
+    return out;
+  }
+
+  protected interruptValueToAGUI(
+    lg: LangGraphInterrupt,
+  ): AGUIInterrupt[] {
+    return [langGraphInterruptToAGUI(lg)];
+  }
+
+  protected buildCommandResumeFromAgui(
+    entries: readonly ResumeEntry[],
+    _ctx: { openInterrupts: AGUIInterrupt[] },
+  ): unknown {
+    return buildLgCommandResumeFromAgui(entries);
+  }
+
   // Request cancellation of the current run via LangGraph Platform SDK
   public abortRun() {
     this.cancelRequested = true;
@@ -1588,6 +1671,19 @@ export class LangGraphAgent extends AbstractAgent {
         });
     }
     super.abortRun();
+  }
+
+  async getCapabilities(): Promise<AgentCapabilities> {
+    return {
+      identity: { type: "langgraph" },
+      humanInTheLoop: {
+        supported: true,
+        interrupts: true,
+        approveWithEdits: true,
+      },
+      state: { snapshots: true, deltas: false, persistentState: true },
+      transport: { streaming: true },
+    };
   }
 
   handleReasoningEvent(reasoningData: LangGraphReasoning) {
