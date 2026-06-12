@@ -1612,12 +1612,70 @@ class ADKAgent:
             # Snapshot the turn's pending long-running calls BEFORE marking any
             # of the arriving results answered. ``still_pending_after`` is what
             # would remain outstanding once this submission's results apply —
-            # used by the guard immediately below.
+            # used by both the guard immediately below and the "all-results"
+            # buffer gate further down.
             pending_before = set(
                 await self._get_pending_tool_call_ids(thread_id, user_id) or []
             )
             arriving_ids = {tr["message"].tool_call_id for tr in tool_results}
             still_pending_after = pending_before - arriving_ids
+
+            # ``pending_tool_calls`` is thread-global, so a leaked/orphaned entry
+            # from an earlier turn — e.g. a call the model re-issued under a fresh
+            # id, orphaning the original (observed on main) — would otherwise gate
+            # EVERY future submission forever: the model silently stops resuming.
+            # Scope the gate to THIS model turn: a leftover pending call only
+            # blocks the resume if it shares the arriving results' invocation_id,
+            # i.e. it is a genuine sibling long-running call of the same turn.
+            # pending/arriving ids are client-facing while session FunctionCall
+            # events store ADK-persisted ids, so apply the LRO id remap before
+            # each lookup. If the backend session or the arriving turn can't be
+            # resolved, fall back to the unscoped set (preserves the multi-LRO
+            # gate rather than risking a premature resume).
+            if still_pending_after:
+                gate_backend_session_id = self._get_backend_session_id(
+                    thread_id, user_id
+                )
+                gate_session = (
+                    await self._session_manager.get_session(
+                        gate_backend_session_id, app_name, user_id
+                    )
+                    if gate_backend_session_id
+                    else None
+                )
+                if gate_session is not None:
+                    gate_remap = await self._get_lro_id_remap(
+                        gate_backend_session_id, app_name, user_id
+                    )
+                    arriving_invocations = {
+                        self._find_function_call_invocation_id(
+                            gate_session, gate_remap.get(aid, aid)
+                        )
+                        for aid in arriving_ids
+                    }
+                    arriving_invocations.discard(None)
+                    if arriving_invocations:
+                        same_turn = {
+                            pid
+                            for pid in still_pending_after
+                            if self._find_function_call_invocation_id(
+                                gate_session, gate_remap.get(pid, pid)
+                            )
+                            in arriving_invocations
+                        }
+                        orphaned = still_pending_after - same_turn
+                        if orphaned:
+                            logger.warning(
+                                "Thread %s: ignoring %d pending tool call(s) %s "
+                                "outside the arriving turn (invocation(s) %s) — "
+                                "likely leaked/orphaned pending state; they will "
+                                "not gate this resume.",
+                                thread_id,
+                                len(orphaned),
+                                sorted(orphaned),
+                                sorted(arriving_invocations),
+                            )
+                        still_pending_after = same_turn
 
             # Guard: a trailing user/system message accompanied these results
             # while OTHER long-running calls from the same turn are still
@@ -1664,17 +1722,6 @@ class ADKAgent:
                 )
                 return
 
-            # Remove tool calls from pending list and track which ones we processed
-            processed_tool_ids = []
-            for tool_result in tool_results:
-                tool_call_id = tool_result['message'].tool_call_id
-                has_pending = await self._has_pending_tool_calls(thread_id, user_id)
-
-                if has_pending:
-                    # Remove from pending tool calls now that we're processing it
-                    await self._remove_pending_tool_call(thread_id, tool_call_id, user_id)
-                    processed_tool_ids.append(tool_call_id)
-
             # "All-results" gate for a turn with multiple long-running calls.
             # The client returns each long-running result independently (an
             # instant frontend tool resolves before a HITL one, etc.). Resuming
@@ -1688,21 +1735,55 @@ class ADKAgent:
             # ones (ADK's _rearrange_events_for_latest_function_response) once
             # the final result arrives. (The trailing-message variant of this
             # situation was already rejected by the guard above, so reaching here
-            # with remaining_pending implies there was no trailing message.)
-            remaining_pending = await self._get_pending_tool_call_ids(thread_id, user_id)
-            if remaining_pending:
+            # with calls still pending implies there was no trailing message.)
+            # Reuse the turn-scoped snapshot from above. A fresh global re-read
+            # here would resurrect leaked/orphaned entries the scope check
+            # already excluded, re-introducing the buffer-forever stall.
+            if still_pending_after:
                 logger.info(
                     "Buffering %d tool result(s) for thread %s; %d long-running "
                     "call(s) from the same turn still pending %s — deferring "
                     "model resume until the turn is complete.",
                     len(tool_results),
                     thread_id,
-                    len(remaining_pending),
-                    remaining_pending,
+                    len(still_pending_after),
+                    sorted(still_pending_after),
                 )
-                await self._buffer_tool_results(input, tool_results)
-                # Mark these results processed so they aren't re-extracted when
-                # the next result arrives and we finally resume.
+                # Persist FIRST, then advance bookkeeping only on success. Until
+                # the append lands, the arriving calls are still pending and
+                # their messages still unprocessed, so a persistence failure
+                # surfaces a dedicated RUN_ERROR and mutates NOTHING — the client
+                # can simply resubmit. (Doing the pending-removal / mark-processed
+                # before persisting could leave the turn unable to ever balance
+                # while the result was silently dropped.)
+                try:
+                    await self._buffer_tool_results(input, tool_results)
+                except Exception as buffer_error:
+                    logger.error(
+                        "Failed to buffer tool result(s) for thread %s: %s",
+                        thread_id,
+                        buffer_error,
+                        exc_info=True,
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        message=(
+                            "Failed to persist tool result(s) while waiting for "
+                            f"the rest of the turn: {buffer_error}. No state was "
+                            "changed; resubmit the result(s)."
+                        ),
+                        code="TOOL_RESULT_BUFFER_ERROR",
+                    )
+                    return
+                # Persisted: now it is safe to remove the arriving calls from the
+                # pending set and mark their messages processed so they aren't
+                # re-extracted when the turn finally resumes.
+                for tool_result in tool_results:
+                    tool_call_id = tool_result["message"].tool_call_id
+                    if await self._has_pending_tool_calls(thread_id, user_id):
+                        await self._remove_pending_tool_call(
+                            thread_id, tool_call_id, user_id
+                        )
                 buffered_message_ids = self._collect_message_ids(
                     [tr["message"] for tr in tool_results]
                 )
@@ -1722,9 +1803,15 @@ class ADKAgent:
                 )
                 return
 
-            # All of this turn's long-running calls are answered: resume the
-            # model with the results. Use trailing_messages if provided,
-            # otherwise fall back to candidate_messages.
+            # All of this turn's long-running calls are answered: remove them
+            # from the pending set, then resume the model with the results. Use
+            # trailing_messages if provided, otherwise fall back to
+            # candidate_messages.
+            for tool_result in tool_results:
+                tool_call_id = tool_result["message"].tool_call_id
+                if await self._has_pending_tool_calls(thread_id, user_id):
+                    await self._remove_pending_tool_call(thread_id, tool_call_id, user_id)
+
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
 
             async for event in self._start_new_execution(
@@ -1831,11 +1918,15 @@ class ADKAgent:
             else None
         )
         if session is None:
-            logger.warning(
-                "Cannot buffer tool results for thread %s: no backend session.",
-                input.thread_id,
+            # Raise rather than silently no-op. The caller (the buffer gate)
+            # advances pending/processed bookkeeping only AFTER this returns, so
+            # a silent drop here would wedge the turn — it could never balance —
+            # while the result vanished. Surfacing it lets the caller emit a
+            # RUN_ERROR and leave state untouched for a clean resubmit.
+            raise RuntimeError(
+                f"Cannot buffer tool results for thread {input.thread_id}: "
+                "no backend session."
             )
-            return
 
         # Same client->ADK id remap the resume path uses: with SSE streaming the
         # partial and final events can carry different function-call ids.
@@ -1866,6 +1957,13 @@ class ADKAgent:
                 content=types.Content(parts=function_response_parts, role="user"),
                 invocation_id=invocation_id,
             ),
+        )
+        # Mirror the resume path (see the append_event calls in _run_async_impl):
+        # drop the cached session snapshot so a later read in the same execution
+        # observes this just-appended FunctionResponse rather than a stale
+        # pre-append copy.
+        self._session_manager.invalidate_session(
+            backend_session_id, app_name, user_id
         )
         logger.debug(
             "Buffered %d FunctionResponse(s) for thread %s (invocation_id=%s) "
@@ -2777,8 +2875,21 @@ class ADKAgent:
 
                 # If sending FunctionResponse, look for the original FunctionCall in session
                 if active_tool_results:
-                    tool_call_id = active_tool_results[0]['message'].tool_call_id
-                    logger.info(f"[SESSION_DEBUG] Looking for FunctionCall with id={tool_call_id}")
+                    # Session FunctionCall events store the ADK-persisted id, so
+                    # apply the same client->ADK remap the resume path uses below
+                    # before searching. Without it this check reports "NOT FOUND"
+                    # (and the misleading "ADK will fail") on every SSE-remapped
+                    # resume — including ones that actually succeed.
+                    client_tool_call_id = active_tool_results[0]['message'].tool_call_id
+                    tool_call_id = lro_id_remap.get(client_tool_call_id, client_tool_call_id)
+                    logger.info(
+                        f"[SESSION_DEBUG] Looking for FunctionCall with id={tool_call_id}"
+                        + (
+                            f" (remapped from client id {client_tool_call_id})"
+                            if tool_call_id != client_tool_call_id
+                            else ""
+                        )
+                    )
 
                     # Log all function calls in session for debugging
                     all_function_call_ids = []

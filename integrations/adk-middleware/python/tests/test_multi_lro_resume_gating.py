@@ -29,6 +29,7 @@ gate does NOT defer the ordinary one-tool HITL case.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import AsyncGenerator, Dict, List, Tuple
 
@@ -305,6 +306,163 @@ class TestMultiLroResumeGating:
         pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
         assert not (pending or []), f"no calls should remain pending, got {pending}"
 
+        _assert_no_mismatch(llm)
+
+    @pytest.mark.asyncio
+    async def test_orphaned_pending_call_does_not_gate_resume(
+        self, reset_session_manager, caplog
+    ):
+        """A leaked/orphaned ``pending_tool_calls`` entry from OUTSIDE the
+        arriving turn must not gate the resume forever.
+
+        ``pending_tool_calls`` is thread-global. If a stale id lingers — e.g. a
+        call the model re-issued under a fresh id, orphaning the original
+        (observed on main) — the unscoped gate would treat every later
+        single-result submission as "still pending" and buffer it forever, so
+        the model silently stops responding. The gate is scoped to the arriving
+        turn's invocation, so an orphan that matches no FunctionCall in this turn
+        is ignored (and surfaced at WARNING for diagnosability), and the resume
+        proceeds.
+        """
+        llm = _LroThenTextLlm(model="scripted", tool_names=[TOOL_A])
+        adk = _make_agent(llm)
+        thread_id = str(uuid.uuid4())
+
+        # --- Run 1: a single long-running call ---
+        start_ids, err1 = await _run(
+            adk, thread_id, "r1", [UserMessage(id="u1", content="Use one tool.")]
+        )
+        assert not err1
+        id_a = start_ids[TOOL_A]
+
+        # Inject a leaked pending entry belonging to NO call in this turn,
+        # simulating orphaned pending state left behind by an earlier turn.
+        session_id, app_name, user_id = adk._get_session_metadata(thread_id, "user_1")
+        await adk._add_pending_tool_call_with_context(
+            thread_id, "orphan-call-id", app_name, user_id
+        )
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert set(pending or []) == {id_a, "orphan-call-id"}, pending
+
+        assistant = AssistantMessage(
+            id="a1",
+            content=None,
+            tool_calls=[
+                ToolCall(id=id_a, function=FunctionCall(name=TOOL_A, arguments="{}"))
+            ],
+        )
+
+        # --- Run 2: submit the real call's result ---
+        # Pre-fix: the orphan keeps the (unscoped) pending set non-empty → the
+        # result is buffered forever and the model never resumes. Post-fix: the
+        # orphan isn't part of this turn, so it's dropped from the gate and the
+        # model resumes.
+        with caplog.at_level(logging.WARNING, logger="ag_ui_adk.adk_agent"):
+            _, err2 = await _run(
+                adk,
+                thread_id,
+                "r2",
+                [
+                    UserMessage(id="u1", content="Use one tool."),
+                    assistant,
+                    ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a),
+                ],
+            )
+        assert not err2
+        assert llm.turn_count == 2, (
+            f"An orphaned pending entry must not gate the resume forever "
+            f"(turn_count={llm.turn_count})."
+        )
+        # The orphan was surfaced (diagnosable, not a silent stall).
+        assert any(
+            r.levelno == logging.WARNING and "orphan-call-id" in r.getMessage()
+            for r in caplog.records
+        ), "expected a WARNING naming the orphaned pending id"
+        _assert_no_mismatch(llm)
+
+    @pytest.mark.asyncio
+    async def test_buffer_failure_errors_without_mutating_state(
+        self, reset_session_manager
+    ):
+        """If persisting a buffered result fails, the submission must surface a
+        dedicated RUN_ERROR and mutate NOTHING — pending state untouched, the
+        message left unprocessed, the model not resumed — so the client can
+        resubmit cleanly. (Pre-fix the call was removed from pending and the
+        message marked processed before/around the append, so a failed or
+        no-op persist left the turn unable to ever balance with the result
+        silently dropped.)
+        """
+        llm = _LroThenTextLlm(model="scripted", tool_names=[TOOL_A, TOOL_B])
+        adk = _make_agent(llm)
+        thread_id = str(uuid.uuid4())
+
+        # --- Run 1: one turn emits two long-running tool calls ---
+        start_ids, err1 = await _run(
+            adk, thread_id, "r1", [UserMessage(id="u1", content="Use both tools.")]
+        )
+        assert not err1
+        id_a, id_b = start_ids[TOOL_A], start_ids[TOOL_B]
+        assistant = AssistantMessage(
+            id="a1",
+            content=None,
+            tool_calls=[
+                ToolCall(id=id_a, function=FunctionCall(name=TOOL_A, arguments="{}")),
+                ToolCall(id=id_b, function=FunctionCall(name=TOOL_B, arguments="{}")),
+            ],
+        )
+        history = [UserMessage(id="u1", content="Use both tools."), assistant]
+
+        # Force the buffer persistence to fail.
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated persistence failure")
+
+        original_buffer = adk._buffer_tool_results
+        adk._buffer_tool_results = _boom
+
+        # --- Run 2: tool_a's result (tool_b pending) → buffer attempt fails ---
+        _, err2 = await _run(
+            adk,
+            thread_id,
+            "r2",
+            history + [ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a)],
+        )
+        assert err2 is not None and err2.code == "TOOL_RESULT_BUFFER_ERROR", err2
+        # Model not resumed.
+        assert llm.turn_count == 1, (
+            f"buffer failure must not resume the model (turn_count={llm.turn_count})."
+        )
+        # Mutate-nothing: BOTH calls remain pending (tool_a not removed).
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert set(pending or []) == {id_a, id_b}, (
+            f"buffer failure must not mutate pending state; got {pending}"
+        )
+        # The message was not marked processed, so it is still re-extractable.
+        processed = adk._session_manager.get_processed_message_ids(
+            adk._get_session_metadata(thread_id, "user_1")[1], thread_id
+        )
+        assert "t_a" not in processed, (
+            "buffer failure must not mark the result message processed"
+        )
+
+        # --- Recovery: persistence restored, resubmit both together ---
+        adk._buffer_tool_results = original_buffer
+        _, err3 = await _run(
+            adk,
+            thread_id,
+            "r3",
+            history
+            + [
+                ToolMessage(id="t_a", content='{"ok": true}', tool_call_id=id_a),
+                ToolMessage(id="t_b", content='{"ok": true}', tool_call_id=id_b),
+            ],
+        )
+        assert not err3, f"recovery submission should succeed, got {err3}"
+        assert llm.turn_count == 2, (
+            f"with all results answered the model resumes once "
+            f"(turn_count={llm.turn_count})."
+        )
+        pending = await adk._get_pending_tool_call_ids(thread_id, "user_1")
+        assert not (pending or []), f"no calls should remain pending, got {pending}"
         _assert_no_mismatch(llm)
 
     @pytest.mark.asyncio
