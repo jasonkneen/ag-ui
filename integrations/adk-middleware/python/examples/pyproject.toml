@@ -1,4 +1,11 @@
 tool.uv.package = true
+# Keep this examples env on the same google-adk 1.x line as the ag_ui_adk package
+# (its [tool.uv].constraint-dependencies isn't inherited by this separate uv project).
+# ag_ui_adk now depends on a2ui-agent-sdk, which floors google-adk at >=1.28.1; without
+# this cap uv would pull adk 2.x → google-genai 2.8, whose aiohttp readline(max_line_length=)
+# call breaks live Gemini streaming. Pinning <2.0 keeps genai on 1.x (no aiohttp issue),
+# matching the package's tested resolution.
+tool.uv.constraint-dependencies = ["google-adk<2.0"]
 
 [project]
 name = "adk-middleware-examples"
