@@ -2272,6 +2272,11 @@ class ADKAgent:
         if isinstance(sub_agents, (list, tuple)):
             for sub in sub_agents:
                 ADKAgent._collect_output_schema_agent_names(sub, result)
+        graph = getattr(agent, 'graph', None)
+        graph_nodes = getattr(graph, 'nodes', None)
+        if isinstance(graph_nodes, (list, tuple)):
+            for node in graph_nodes:
+                ADKAgent._collect_output_schema_agent_names(node, result)
         return result
 
     @staticmethod
