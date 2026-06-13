@@ -25,14 +25,15 @@ dependencies = [
     # We import ONLY the A2A-free subset (a2ui.schema / a2ui.parser / a2ui.basic_catalog);
     # a2ui's top-level __init__ imports only .version and those subpackages import no
     # `a2a` (enforced by tests/test_a2ui_import_hygiene.py), so we add NO a2a-sdk pin.
-    # a2ui-agent-sdk only requires google-adk>=1.28.1 + google-genai>=1.27.0, both on
-    # the 1.x line. To avoid uv pulling google-adk 2.x (which forces google-genai>=2.4
-    # and an aiohttp>=3.14 floor for genai 2.8's readline(max_line_length=) call), we
-    # pin resolution to google-adk <2.0 via [tool.uv].constraint-dependencies below —
-    # a MINOR adk bump (1.26→1.x-latest), genai stays 1.x. The published google-adk
-    # range still allows 2.x for consumers.
+    # a2ui-agent-sdk floors google-adk at >=1.28.1, so adding it raises our effective
+    # adk floor; we keep the full google-adk<3.0 range (do NOT cap at <2.0) so the
+    # package supports — and we test against — adk 2.x, which consumers use. adk 2.x
+    # pulls google-genai>=2.4 (2.8.x), whose async streaming calls aiohttp
+    # StreamReader.readline(max_line_length=) — only present in aiohttp >= 3.14.0 — so
+    # the aiohttp floor below is raised to keep live Gemini streaming working. (That's
+    # the real requirement; capping adk would just hide it.)
     "a2ui-agent-sdk>=0.2.4,<0.3.0",
-    "aiohttp>=3.12.0",
+    "aiohttp>=3.14.1",
     "asyncio>=3.4.3",
     "fastapi>=0.115.2",
     # Compatible with both google-adk 1.x and 2.x.
@@ -68,15 +69,6 @@ license = "MIT"
 
 [tool.ag-ui.scripts]
 test = "python -m pytest"
-
-# Resolution-only constraint (dev/CI; NOT part of the published wheel metadata, so
-# consumers' own resolution is unaffected and the `google-adk>=1.16.0,<3.0.0` range
-# above still permits 2.x). Pins our lock to google-adk 1.x so adding a2ui-agent-sdk
-# (floor >=1.28.1) is a minor bump rather than a jump to adk 2.x — which would pull
-# google-genai>=2.4 and an aiohttp>=3.14 floor with it. See the a2ui-agent-sdk note
-# in [project].dependencies.
-[tool.uv]
-constraint-dependencies = ["google-adk<2.0"]
 
 [build-system]
 requires = ["uv_build>=0.8.0,<0.11"]
