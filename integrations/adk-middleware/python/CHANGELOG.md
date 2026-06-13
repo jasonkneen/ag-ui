@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FIX**: `output_schema` text suppression now reaches agents used as Workflow
+  graph nodes (#1889, fixes #1860, thanks @he-yufeng). The #1390 suppression
+  walks the agent tree to find `LlmAgent`s with an `output_schema` and tells
+  `EventTranslator` to drop their `TEXT_MESSAGE_*` events, so the structured
+  JSON they emit never leaks into the chat transcript. The collector only
+  traversed `.sub_agents`, but an ADK 2.x `Workflow`'s child agents live in
+  `workflow.graph.nodes`, not `.sub_agents` — so an `output_schema` agent used
+  as a graph node (the canonical Workflow pattern) was never added to the
+  suppression set, and its structured output, including the streamed
+  `partial=True` chunks, leaked as visible text.
+  `ADKAgent._collect_output_schema_agent_names` now also descends into
+  `agent.graph.nodes` when present, leaving the existing `.sub_agents`
+  traversal unchanged.
 - **FIX**: Resume is gated until all of a turn's long-running results arrive
   (#1935). When one model turn emits **multiple long-running tool calls** and
   their results arrive in **separate submissions** (an instant frontend tool
