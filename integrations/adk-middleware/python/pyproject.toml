@@ -52,7 +52,14 @@ dependencies = [
     #                 because Workflow._run_impl rehydrates from new_message.parts only).
     # NodeInterruptedError (2.0-only) is a BaseException subclass, NOT an Exception, so
     # existing `except Exception:` blocks correctly let HITL interruption propagate.
-    "google-adk>=1.16.0,<3.0.0",
+    # Floor = a2ui-agent-sdk's own minimum (1.28.1), which is the TRUE resolver floor —
+    # the old 1.16.0 was dead weight (a2ui-agent-sdk overrode it). The middleware
+    # feature-detects the adk shape at runtime (_ADK_OVERRIDES_INVOCATION_ID,
+    # _adk_supports_streaming_fc_args) and version-gated tests skip where a feature is
+    # absent, so the whole [1.28.1, 3.0) range is genuinely supported. The lock pins
+    # 1.35.0 only as the dev/CI resolution — the version where the full suite runs
+    # unskipped — NOT a declared cap.
+    "google-adk>=1.28.1,<3.0.0",
     "pydantic>=2.11.7",
     # Primary SSE response implementation. Used unconditionally so the FastAPI
     # floor stays at >=0.115.2 (rather than the >=0.135.0 jump that would be
