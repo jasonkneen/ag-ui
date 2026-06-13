@@ -39,8 +39,8 @@ a2ui_tool = get_a2ui_tool({
     "model": Gemini(model=_MODEL),
     "default_catalog_id": CUSTOM_CATALOG_ID,
     "guidelines": {"composition_guide": COMPOSITION_GUIDE},
-    # Recovery runs by default; set explicitly for the showcase. No catalog ->
-    # structural validation (all this demo's forced error needs).
+    # Recovery runs by default; set explicitly for the showcase. Each rejected
+    # attempt's structural validation errors are fed back into the retry prompt.
     "recovery": {"maxAttempts": 3},
     "on_a2ui_attempt": _log_attempt,
 })

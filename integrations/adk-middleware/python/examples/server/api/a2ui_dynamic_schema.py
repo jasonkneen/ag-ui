@@ -16,7 +16,10 @@ from google.adk.models import Gemini
 from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint, get_a2ui_tool
 
 # Catalog the dojo renders this demo against (HotelCard / ProductCard /
-# TeamMemberCard / Row). The subagent never picks a catalog — the host sets it.
+# TeamMemberCard / Row). The client (dojo page) supplies the catalog via the
+# CopilotKit `a2ui` prop; the middleware injects it into the run, and the adapter
+# renders it into the sub-agent prompt (Google's render_as_llm_instructions) and
+# validates against it (toolkit, structural/lenient). The subagent never picks one.
 CUSTOM_CATALOG_ID = "https://a2ui.org/demos/dojo/dynamic_catalog.json"
 
 # Project-specific composition rules — tells the subagent how to use the

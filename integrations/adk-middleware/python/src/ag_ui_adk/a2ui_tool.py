@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any, Optional
 
@@ -43,8 +44,15 @@ from ag_ui_a2ui_toolkit import (
     wrap_error_envelope,
 )
 
+from .a2ui_google_sdk import (
+    heal_json_arg,
+    normalize_catalog_dict,
+    render_catalog_instructions,
+)
 from .event_translator import adk_events_to_messages
 from .session_manager import CONTEXT_STATE_KEY
+
+logger = logging.getLogger("ag_ui_adk")
 
 # The inner structured-output tool the subagent is forced to call.
 _RENDER_A2UI_NAME = "render_a2ui"
@@ -139,7 +147,21 @@ class A2UISubAgentTool(BaseTool):
         # (intent="update"); the genai conversation drives the subagent call.
         messages = self._normalize_a2ui_tool_results(adk_events_to_messages(events))
         conversation = self._conversation_contents(events)
-        state = self._state_view(tool_context)
+        state, schema_value = self._state_view(tool_context)
+
+        # Single catalog, client-sourced (no drift): prefer a host-supplied catalog
+        # param, else the middleware-injected schema. Render it via Google's
+        # render_as_llm_instructions (server-to-client envelope + common-types
+        # DEFINITIONS the injected catalog only references + components) into the
+        # prompt slot — richer than dumping the raw catalog. Render is best-effort
+        # and tolerates the client's non-conformant catalog; on failure we leave the
+        # raw schema text in the slot (today's behavior).
+        catalog_source = self._catalog or schema_value
+        instructions = render_catalog_instructions(
+            catalog_source, default_catalog_id=self._default_catalog_id
+        )
+        if instructions is not None:
+            state.setdefault("ag-ui", {})["a2ui_schema"] = instructions
 
         prep = prepare_a2ui_request(
             intent=intent,
@@ -151,6 +173,14 @@ class A2UISubAgentTool(BaseTool):
         )
         if prep.get("error"):
             return wrap_error_envelope(prep["error"])
+
+        # Validate with the toolkit's structural/lenient validator against the SAME
+        # client catalog (membership; it does not strict-resolve $refs, so the
+        # non-conformant catalog is fine) — parity with the LangGraph/Declarative
+        # A2UI demos. None → pure structural validation.
+        validation_catalog = normalize_catalog_dict(
+            catalog_source, default_catalog_id=self._default_catalog_id
+        )
 
         # One stable nested tool-call id, reused across every recovery attempt so
         # the middleware/client swap the in-progress surface in place rather than
@@ -180,7 +210,7 @@ class A2UISubAgentTool(BaseTool):
         result = await asyncio.to_thread(
             run_a2ui_generation_with_recovery,
             base_prompt=prep["prompt"],
-            catalog=self._catalog,
+            catalog=validation_catalog,
             config=self._recovery,
             invoke_subagent=_invoke_subagent,
             build_envelope=_build_envelope,
@@ -296,19 +326,22 @@ class A2UISubAgentTool(BaseTool):
 
     @staticmethod
     def _coerce_freeform_args(args: dict) -> dict:
-        """Parse the free-form JSON-string ``components``/``data`` Gemini returns
-        back into the structured list/dict the toolkit validates and emits.
+        """Heal + parse the free-form JSON-string ``components``/``data`` Gemini
+        returns into the structured list/dict the toolkit validates and emits.
 
-        A model may also return them already-structured (e.g. inline) — those are
-        left untouched. Unparseable strings are left as-is so the toolkit's
-        validator rejects them (non-list / non-dict) and the recovery loop retries
-        rather than committing garbage."""
-        for key in ("components", "data"):
+        Uses the Google SDK's ``parse_and_fix`` (smart quotes, trailing commas,
+        single-object→list wrap) rather than a bare ``json.loads`` — Gemini's
+        free-form JSON often needs that healing. A model may also return them
+        already-structured (inline) — those are left untouched. On a hard parse
+        failure the value is left as the original string, so the toolkit validator
+        rejects it (non-list / non-dict) and the recovery loop retries rather than
+        committing garbage."""
+        for key, expect in (("components", "list"), ("data", "dict")):
             value = args.get(key)
             if isinstance(value, str):
                 try:
-                    args[key] = json.loads(value)
-                except (ValueError, TypeError):
+                    args[key] = heal_json_arg(value, expect=expect)
+                except ValueError:
                     pass
         return args
 
@@ -404,15 +437,18 @@ class A2UISubAgentTool(BaseTool):
                 contents.append(content)
         return contents
 
-    def _state_view(self, tool_context: Any) -> dict:
+    def _state_view(self, tool_context: Any) -> tuple[dict, Optional[str]]:
         """Remap ADK session context into the ``state['ag-ui']`` shape the
-        toolkit's ``build_context_prompt`` expects.
+        toolkit's ``build_context_prompt`` expects, and return the raw A2UI schema
+        value alongside it.
 
         The ADK middleware stores AG-UI context (a flat ``{description, value}``
         list) under ``CONTEXT_STATE_KEY``. The A2UI schema entry (matched by its
         exact description) is routed to ``ag-ui.a2ui_schema`` so it renders as
         the "Available Components" section rather than generic context — mirrors
-        the LangGraph adapter's remap.
+        the LangGraph adapter's remap. The raw schema value is also returned so
+        ``run_async`` can try to build a Google SDK catalog from it (the hybrid
+        path overrides ``a2ui_schema`` with the rendered schema block).
         """
         state = getattr(tool_context, "state", None)
         raw_context: Any = []
@@ -439,7 +475,7 @@ class A2UISubAgentTool(BaseTool):
         ag_ui: dict = {"context": regular_context}
         if schema_value is not None:
             ag_ui["a2ui_schema"] = schema_value
-        return {"ag-ui": ag_ui}
+        return {"ag-ui": ag_ui}, schema_value
 
 
 def get_a2ui_tool(params: A2UIToolParams) -> BaseTool:
