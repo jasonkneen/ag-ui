@@ -297,6 +297,31 @@ def add_adk_fastapi_endpoint(
         across route switches is expected. During HITL or long-running tool
         resumption, the resolver is responsible for returning the same agent
         that originated the open tool call.
+
+        A resolver can pin tool-result resumptions by checking inbound
+        ``ToolMessage`` objects before applying normal state-based routing:
+
+        .. code-block:: python
+
+            AGENT_REGISTRY = {
+                "supervisor": supervisor_agent,
+                "subagent1": subagent1_agent,
+            }
+            OPEN_TOOL_CALL_AGENT = {
+                # Persist this when the selected agent emits TOOL_CALL_START
+                # for a HITL or long-running client tool call.
+                "tool-call-123": "subagent1",
+            }
+
+            async def agent_resolver(request, input_data):
+                for message in input_data.messages:
+                    if getattr(message, "role", None) != "tool":
+                        continue
+                    agent_key = OPEN_TOOL_CALL_AGENT.get(message.tool_call_id)
+                    if agent_key:
+                        return AGENT_REGISTRY.get(agent_key)
+
+                return AGENT_REGISTRY.get(input_data.state.get("to_agent"))
     """
     extract_state_fn = extract_state_from_request
     if extract_headers is not None:

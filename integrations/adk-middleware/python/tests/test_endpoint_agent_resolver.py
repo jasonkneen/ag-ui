@@ -249,10 +249,25 @@ def test_agents_state_uses_resolved_agent_after_extractor_merge():
     default_agent._session_manager.get_session_state.assert_not_awaited()
 
 
-def test_tool_result_routing_remains_resolver_responsibility():
+def test_tool_result_resolver_can_pin_to_originating_agent():
     default_agent = _agent("default")
-    selected_agent = _agent("selected")
-    resolver = AsyncMock(return_value=selected_agent)
+    originating_agent = _agent("originating")
+    state_routed_agent = _agent("state-routed")
+    agent_registry = {
+        "originating": originating_agent,
+        "state-routed": state_routed_agent,
+    }
+    open_tool_call_agents = {"tool-call-1": "originating"}
+
+    async def resolver(request, input_data):
+        for message in input_data.messages:
+            if getattr(message, "role", None) != "tool":
+                continue
+            agent_key = open_tool_call_agents.get(message.tool_call_id)
+            if agent_key:
+                return agent_registry.get(agent_key)
+
+        return agent_registry.get(input_data.state.get("agent"))
 
     app = FastAPI()
     add_adk_fastapi_endpoint(
@@ -263,6 +278,7 @@ def test_tool_result_routing_remains_resolver_responsibility():
     response = client.post(
         "/agent",
         json=_run_input(
+            state={"agent": "state-routed"},
             messages=[
                 ToolMessage(
                     id="tool-message-1",
@@ -275,6 +291,6 @@ def test_tool_result_routing_remains_resolver_responsibility():
     )
 
     assert response.status_code == 200
-    resolver.assert_awaited_once()
-    selected_agent.run.assert_called_once()
+    originating_agent.run.assert_called_once()
+    state_routed_agent.run.assert_not_called()
     default_agent.run.assert_not_called()
