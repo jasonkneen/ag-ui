@@ -6,14 +6,21 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 from ag_ui.core import (
+    AssistantMessage,
     EventType,
+    FunctionCall,
     RunAgentInput,
     RunStartedEvent,
+    ToolCall,
     ToolMessage,
     UserMessage,
 )
 from ag_ui_adk.adk_agent import ADKAgent
-from ag_ui_adk.endpoint import add_adk_fastapi_endpoint, create_adk_app
+from ag_ui_adk.endpoint import (
+    add_adk_fastapi_endpoint,
+    create_adk_app,
+    resolve_agent_from_message_history,
+)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -74,6 +81,51 @@ def _state_agent(name: str, state: dict):
         return_value=session
     )
     return agent
+
+
+def _assistant_tool_message(
+    *,
+    message_id: str,
+    name: str | None,
+    tool_call_id: str,
+) -> AssistantMessage:
+    return AssistantMessage(
+        id=message_id,
+        role="assistant",
+        name=name,
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id=tool_call_id,
+                function=FunctionCall(name="client_tool", arguments="{}"),
+            )
+        ],
+    )
+
+
+def _tool_result_message(
+    *,
+    message_id: str,
+    tool_call_id: str,
+) -> ToolMessage:
+    return ToolMessage(
+        id=message_id,
+        role="tool",
+        tool_call_id=tool_call_id,
+        content='{"ok": true}',
+    )
+
+
+def _history_resolver_client(default_agent, agent_registry):
+    async def resolver(request, input_data):
+        history_agent = resolve_agent_from_message_history(input_data, agent_registry)
+        if history_agent is not None:
+            return history_agent
+        return agent_registry.get(input_data.state.get("agent"))
+
+    app = FastAPI()
+    add_adk_fastapi_endpoint(app, default_agent, path="/agent", agent_resolver=resolver)
+    return TestClient(app)
 
 
 def test_resolver_runs_after_extractor_and_can_fallback_to_default_agent():
@@ -249,7 +301,7 @@ def test_agents_state_uses_resolved_agent_after_extractor_merge():
     default_agent._session_manager.get_session_state.assert_not_awaited()
 
 
-def test_tool_result_resolver_can_pin_to_originating_agent():
+def test_message_history_resolver_routes_by_assistant_name_and_ignores_conflicting_state():
     default_agent = _agent("default")
     originating_agent = _agent("originating")
     state_routed_agent = _agent("state-routed")
@@ -257,36 +309,23 @@ def test_tool_result_resolver_can_pin_to_originating_agent():
         "originating": originating_agent,
         "state-routed": state_routed_agent,
     }
-    open_tool_call_agents = {"tool-call-1": "originating"}
-
-    async def resolver(request, input_data):
-        for message in input_data.messages:
-            if getattr(message, "role", None) != "tool":
-                continue
-            agent_key = open_tool_call_agents.get(message.tool_call_id)
-            if agent_key:
-                return agent_registry.get(agent_key)
-
-        return agent_registry.get(input_data.state.get("agent"))
-
-    app = FastAPI()
-    add_adk_fastapi_endpoint(
-        app, default_agent, path="/agent", agent_resolver=resolver
-    )
-    client = TestClient(app)
+    client = _history_resolver_client(default_agent, agent_registry)
 
     response = client.post(
         "/agent",
         json=_run_input(
             state={"agent": "state-routed"},
             messages=[
-                ToolMessage(
-                    id="tool-message-1",
-                    role="tool",
+                _assistant_tool_message(
+                    message_id="assistant-1",
+                    name="originating",
                     tool_call_id="tool-call-1",
-                    content='{"ok": true}',
-                )
-            ]
+                ),
+                _tool_result_message(
+                    message_id="tool-message-1",
+                    tool_call_id="tool-call-1",
+                ),
+            ],
         ).model_dump(),
     )
 
@@ -294,3 +333,198 @@ def test_tool_result_resolver_can_pin_to_originating_agent():
     originating_agent.run.assert_called_once()
     state_routed_agent.run.assert_not_called()
     default_agent.run.assert_not_called()
+
+
+def test_message_history_resolver_accepts_messages_directly():
+    originating_agent = _agent("originating")
+    agent_registry = {"originating": originating_agent}
+    messages = [
+        _assistant_tool_message(
+            message_id="assistant-1",
+            name="originating",
+            tool_call_id="tool-call-1",
+        ),
+        _tool_result_message(
+            message_id="tool-message-1",
+            tool_call_id="tool-call-1",
+        ),
+    ]
+
+    assert (
+        resolve_agent_from_message_history(messages, agent_registry)
+        is originating_agent
+    )
+
+
+def test_message_history_resolver_allows_multiple_tool_results_from_same_agent():
+    originating_agent = _agent("originating")
+    agent_registry = {"originating": originating_agent}
+    input_data = _run_input(
+        messages=[
+            _assistant_tool_message(
+                message_id="assistant-1",
+                name="originating",
+                tool_call_id="tool-call-1",
+            ),
+            _assistant_tool_message(
+                message_id="assistant-2",
+                name="originating",
+                tool_call_id="tool-call-2",
+            ),
+            _tool_result_message(
+                message_id="tool-message-1",
+                tool_call_id="tool-call-1",
+            ),
+            _tool_result_message(
+                message_id="tool-message-2",
+                tool_call_id="tool-call-2",
+            ),
+        ],
+    )
+
+    assert (
+        resolve_agent_from_message_history(input_data, agent_registry)
+        is originating_agent
+    )
+
+
+def test_message_history_resolver_missing_history_falls_back_to_state_agent():
+    default_agent = _agent("default")
+    state_routed_agent = _agent("state-routed")
+    agent_registry = {"state-routed": state_routed_agent}
+    client = _history_resolver_client(default_agent, agent_registry)
+
+    response = client.post(
+        "/agent",
+        json=_run_input(
+            state={"agent": "state-routed"},
+            messages=[
+                _tool_result_message(
+                    message_id="tool-message-1",
+                    tool_call_id="tool-call-1",
+                ),
+            ],
+        ).model_dump(),
+    )
+
+    assert response.status_code == 200
+    state_routed_agent.run.assert_called_once()
+    default_agent.run.assert_not_called()
+
+
+def test_message_history_resolver_unknown_or_missing_name_falls_back_to_state_agent():
+    default_agent = _agent("default")
+    state_routed_agent = _agent("state-routed")
+    agent_registry = {"state-routed": state_routed_agent}
+    client = _history_resolver_client(default_agent, agent_registry)
+
+    unknown_name_response = client.post(
+        "/agent",
+        json=_run_input(
+            run_id="run-unknown-name",
+            state={"agent": "state-routed"},
+            messages=[
+                _assistant_tool_message(
+                    message_id="assistant-unknown",
+                    name="unknown",
+                    tool_call_id="tool-call-unknown",
+                ),
+                _tool_result_message(
+                    message_id="tool-message-unknown",
+                    tool_call_id="tool-call-unknown",
+                ),
+            ],
+        ).model_dump(),
+    )
+    missing_name_response = client.post(
+        "/agent",
+        json=_run_input(
+            run_id="run-missing-name",
+            state={"agent": "state-routed"},
+            messages=[
+                _assistant_tool_message(
+                    message_id="assistant-missing",
+                    name=None,
+                    tool_call_id="tool-call-missing",
+                ),
+                _tool_result_message(
+                    message_id="tool-message-missing",
+                    tool_call_id="tool-call-missing",
+                ),
+            ],
+        ).model_dump(),
+    )
+
+    assert unknown_name_response.status_code == 200
+    assert missing_name_response.status_code == 200
+    assert state_routed_agent.run.call_count == 2
+    default_agent.run.assert_not_called()
+
+
+def test_message_history_resolver_conflicting_assistant_names_falls_back_to_state_agent():
+    default_agent = _agent("default")
+    first_agent = _agent("first")
+    second_agent = _agent("second")
+    state_routed_agent = _agent("state-routed")
+    agent_registry = {
+        "first": first_agent,
+        "second": second_agent,
+        "state-routed": state_routed_agent,
+    }
+    client = _history_resolver_client(default_agent, agent_registry)
+
+    response = client.post(
+        "/agent",
+        json=_run_input(
+            state={"agent": "state-routed"},
+            messages=[
+                _assistant_tool_message(
+                    message_id="assistant-first",
+                    name="first",
+                    tool_call_id="tool-call-first",
+                ),
+                _assistant_tool_message(
+                    message_id="assistant-second",
+                    name="second",
+                    tool_call_id="tool-call-second",
+                ),
+                _tool_result_message(
+                    message_id="tool-message-first",
+                    tool_call_id="tool-call-first",
+                ),
+                _tool_result_message(
+                    message_id="tool-message-second",
+                    tool_call_id="tool-call-second",
+                ),
+            ],
+        ).model_dump(),
+    )
+
+    assert response.status_code == 200
+    state_routed_agent.run.assert_called_once()
+    first_agent.run.assert_not_called()
+    second_agent.run.assert_not_called()
+    default_agent.run.assert_not_called()
+
+
+def test_message_history_resolver_returns_none_without_inbound_tool_messages():
+    originating_agent = _agent("originating")
+    agent_registry = {"originating": originating_agent}
+    input_data = _run_input(
+        messages=[
+            _assistant_tool_message(
+                message_id="assistant-1",
+                name="originating",
+                tool_call_id="tool-call-1",
+            )
+        ],
+    )
+
+    assert resolve_agent_from_message_history(input_data, agent_registry) is None
+
+
+def test_message_history_resolver_is_exported_from_package():
+    from ag_ui_adk import resolve_agent_from_message_history as package_export
+    from ag_ui_adk.endpoint import resolve_agent_from_message_history as endpoint_export
+
+    assert package_export is endpoint_export

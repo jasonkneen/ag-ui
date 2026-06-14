@@ -5,9 +5,17 @@
 import logging
 import uuid
 import warnings
-from typing import Any, Awaitable, Callable, Coroutine, List, Optional
+from collections.abc import Sequence
+from typing import Any, Awaitable, Callable, Coroutine, List, Mapping, Optional
 
-from ag_ui.core import EventType, RunAgentInput, RunErrorEvent
+from ag_ui.core import (
+    AssistantMessage,
+    EventType,
+    Message,
+    RunAgentInput,
+    RunErrorEvent,
+    ToolMessage,
+)
 from ag_ui.encoder import EventEncoder
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -31,6 +39,68 @@ from .event_translator import adk_events_to_messages
 logger = logging.getLogger(__name__)
 
 AgentResolver = Callable[[Request, RunAgentInput], Awaitable[ADKAgent | None]]
+
+
+def resolve_agent_from_message_history(
+    input_data: RunAgentInput | Sequence[Message],
+    agent_registry: Mapping[str, ADKAgent],
+) -> ADKAgent | None:
+    """Resolve a tool-result resumption to its originating agent.
+
+    This helper treats ``AssistantMessage.name`` as an explicit agent registry
+    key. It matches inbound ``ToolMessage.tool_call_id`` values to prior
+    ``AssistantMessage.tool_calls[].id`` values in the same message history and
+    returns the corresponding registry agent when every matched tool result
+    points at the same known key.
+
+    ``None`` is returned when the request has no tool result messages, the
+    matching assistant message is absent, the assistant message has no
+    registry key in ``name``, the key is unknown, or multiple tool results
+    resolve to different agents. This keeps the helper conservative so the
+    caller can safely fall back to its normal routing policy.
+    """
+    if isinstance(input_data, RunAgentInput):
+        messages = input_data.messages
+    else:
+        messages = input_data
+    if not messages:
+        return None
+
+    tool_call_agent_keys: dict[str, set[str | None]] = {}
+    matched_agent_keys: set[str] = set()
+    saw_tool_message = False
+
+    for message in messages:
+        if isinstance(message, AssistantMessage):
+            if not message.tool_calls:
+                continue
+            for tool_call in message.tool_calls:
+                if tool_call.id:
+                    tool_call_agent_keys.setdefault(tool_call.id, set()).add(
+                        message.name
+                    )
+            continue
+
+        if not isinstance(message, ToolMessage):
+            continue
+
+        saw_tool_message = True
+        agent_keys = tool_call_agent_keys.get(message.tool_call_id)
+        if not agent_keys or len(agent_keys) != 1:
+            return None
+
+        agent_key = next(iter(agent_keys))
+        if not agent_key or agent_key not in agent_registry:
+            return None
+
+        matched_agent_keys.add(agent_key)
+        if len(matched_agent_keys) > 1:
+            return None
+
+    if not saw_tool_message or not matched_agent_keys:
+        return None
+
+    return agent_registry[next(iter(matched_agent_keys))]
 
 
 def _build_run_error(message: str, code: str) -> RunErrorEvent:
@@ -298,28 +368,28 @@ def add_adk_fastapi_endpoint(
         resumption, the resolver is responsible for returning the same agent
         that originated the open tool call.
 
-        A resolver can pin tool-result resumptions by checking inbound
-        ``ToolMessage`` objects before applying normal state-based routing:
+        A resolver can pin tool-result resumptions to the agent that emitted
+        the matching tool call by treating ``AssistantMessage.name`` as the
+        agent registry key. For this convention to work, the inbound message
+        history must preserve the assistant message that created the tool call,
+        with ``name`` set to that registry key.
 
         .. code-block:: python
+
+            from ag_ui_adk import resolve_agent_from_message_history
 
             AGENT_REGISTRY = {
                 "supervisor": supervisor_agent,
                 "subagent1": subagent1_agent,
             }
-            OPEN_TOOL_CALL_AGENT = {
-                # Persist this when the selected agent emits TOOL_CALL_START
-                # for a HITL or long-running client tool call.
-                "tool-call-123": "subagent1",
-            }
 
             async def agent_resolver(request, input_data):
-                for message in input_data.messages:
-                    if getattr(message, "role", None) != "tool":
-                        continue
-                    agent_key = OPEN_TOOL_CALL_AGENT.get(message.tool_call_id)
-                    if agent_key:
-                        return AGENT_REGISTRY.get(agent_key)
+                history_agent = resolve_agent_from_message_history(
+                    input_data,
+                    AGENT_REGISTRY,
+                )
+                if history_agent is not None:
+                    return history_agent
 
                 return AGENT_REGISTRY.get(input_data.state.get("to_agent"))
     """
