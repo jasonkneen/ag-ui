@@ -718,7 +718,28 @@ class TestConvertADKEventToAGUIMessage:
         assert result.id == "assistant_1"
         assert result.role == "assistant"
         assert result.content == "I can help you with that."
+        assert result.name is None
         assert result.tool_calls is None
+
+    def test_convert_agent_author_to_assistant_name(self):
+        """Test preserving concrete ADK agent authors as AssistantMessage.name."""
+        mock_event = MagicMock()
+        mock_event.id = "assistant_agent_1"
+        mock_event.author = "subagent1"
+        mock_event.content = MagicMock()
+
+        mock_part = MagicMock()
+        mock_part.text = "Handled by subagent1."
+        mock_part.function_call = None
+        mock_event.content.parts = [mock_part]
+
+        result = convert_adk_event_to_ag_ui_message(mock_event)
+
+        assert isinstance(result, AssistantMessage)
+        assert result.id == "assistant_agent_1"
+        assert result.role == "assistant"
+        assert result.name == "subagent1"
+        assert result.content == "Handled by subagent1."
 
     def test_convert_assistant_event_with_function_call(self):
         """Test converting assistant event with function call."""
@@ -739,6 +760,7 @@ class TestConvertADKEventToAGUIMessage:
 
         assert isinstance(result, AssistantMessage)
         assert result.content is None
+        assert result.name is None
         assert len(result.tool_calls) == 1
 
         tool_call = result.tool_calls[0]
