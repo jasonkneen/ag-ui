@@ -172,7 +172,7 @@ class A2UISubAgentTool(BaseTool):
             guidelines=self._guidelines,
         )
         if prep.get("error"):
-            return wrap_error_envelope(prep["error"])
+            return self._as_tool_return(wrap_error_envelope(prep["error"]))
 
         # Validate with the toolkit's structural/lenient validator against the SAME
         # client catalog (membership; it does not strict-resolve $refs, so the
@@ -216,7 +216,28 @@ class A2UISubAgentTool(BaseTool):
             build_envelope=_build_envelope,
             on_attempt=self._on_a2ui_attempt,
         )
-        return result["envelope"]
+        return self._as_tool_return(result["envelope"])
+
+    @staticmethod
+    def _as_tool_return(envelope: str) -> Any:
+        """Return the toolkit envelope in the shape the A2UI middleware can read.
+
+        The toolkit hands back a JSON *string* (an ``a2ui_operations`` envelope on
+        success, or an ``a2ui_recovery_exhausted`` / ``error`` envelope otherwise).
+        ADK wraps a non-dict tool return as ``{"result": <string>}``, which buries
+        those top-level keys so the middleware's ``tryParseA2UIOperations`` /
+        ``tryParseRecoveryFailure`` never see them — silently dropping the
+        hard-failure UI on exhaustion. Returning the parsed dict makes ADK
+        serialize the bare envelope JSON, matching how LangGraph delivers the
+        tool result. Valid surfaces still paint via the streamed render_a2ui
+        events; the middleware dedups the outer result against the inner surface
+        by tool-call id, so this does not double-paint.
+        """
+        try:
+            parsed = json.loads(envelope)
+        except (ValueError, TypeError):
+            return envelope
+        return parsed if isinstance(parsed, dict) else envelope
 
     async def _stream_one_attempt(
         self, prompt: str, attempt: int, tool_call_id: str, conversation: list
@@ -315,9 +336,11 @@ class A2UISubAgentTool(BaseTool):
         )
         # Fall back to carrying the prompt as the user turn only when there is no
         # conversation (defensive — a real run always has the triggering message).
-        contents = list(conversation) if conversation else [
-            types.Content(role="user", parts=[types.Part(text=prompt)])
-        ]
+        contents = (
+            list(conversation)
+            if conversation
+            else [types.Content(role="user", parts=[types.Part(text=prompt)])]
+        )
         return LlmRequest(
             model=getattr(self._model, "model", None),
             contents=contents,
@@ -371,10 +394,12 @@ class A2UISubAgentTool(BaseTool):
         """Pull an ``a2ui_operations`` envelope out of an ADK tool-result string,
         unwrapping the layers ADK adds.
 
-        A generate_a2ui result returns the envelope as a JSON *string*; ADK wraps a
-        string tool return as ``{"result": <string>}`` and the translator
-        ``json.dumps`` it — so the stored content can be double-encoded and/or
-        nested under ``result``. Peel those layers until an envelope dict surfaces."""
+        ``run_async`` now returns the envelope as a dict, which the translator
+        ``json.dumps`` straight into the canonical ``{"a2ui_operations": ...}``
+        string. Older sessions (or a string-returning tool) can still have the
+        envelope nested under ``result`` (ADK wraps a string tool return as
+        ``{"result": <string>}``) and/or double-encoded — so peel up to a few
+        layers until an envelope dict surfaces, staying backward compatible."""
         payload: Any = content
         for _ in range(3):
             if isinstance(payload, str):
@@ -431,8 +456,16 @@ class A2UISubAgentTool(BaseTool):
             if not parts:
                 continue
             has_text = any(getattr(p, "text", None) for p in parts)
-            has_calls = bool(ev.get_function_calls()) if hasattr(ev, "get_function_calls") else False
-            has_responses = bool(ev.get_function_responses()) if hasattr(ev, "get_function_responses") else False
+            has_calls = (
+                bool(ev.get_function_calls())
+                if hasattr(ev, "get_function_calls")
+                else False
+            )
+            has_responses = (
+                bool(ev.get_function_responses())
+                if hasattr(ev, "get_function_responses")
+                else False
+            )
             if has_text and not has_calls and not has_responses:
                 contents.append(content)
         return contents

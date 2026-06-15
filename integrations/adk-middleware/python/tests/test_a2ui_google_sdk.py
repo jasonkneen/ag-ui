@@ -27,6 +27,13 @@ from ag_ui_adk.a2ui_google_sdk import (
     render_catalog_instructions,
 )
 
+
+def _envelope_text(result) -> str:
+    """``run_async`` returns the envelope as a dict (ADK serializes it as the
+    bare envelope JSON); re-serialize for tests that assert on that text."""
+    return result if isinstance(result, str) else json.dumps(result)
+
+
 CID = "https://a2ui.org/demos/dojo/dynamic_catalog.json"
 
 # A clean inline catalog (loose types, no internal $refs).
@@ -35,12 +42,20 @@ CLEAN_CATALOG = {
     "components": {
         "Row": {
             "type": "object",
-            "properties": {"id": {"type": "string"}, "component": {"const": "Row"}, "children": {}},
+            "properties": {
+                "id": {"type": "string"},
+                "component": {"const": "Row"},
+                "children": {},
+            },
             "required": ["id", "component", "children"],
         },
         "HotelCard": {
             "type": "object",
-            "properties": {"id": {"type": "string"}, "component": {"const": "HotelCard"}, "name": {}},
+            "properties": {
+                "id": {"type": "string"},
+                "component": {"const": "HotelCard"},
+                "name": {},
+            },
             "required": ["id", "component", "name"],
         },
     },
@@ -73,25 +88,40 @@ NONCONFORMANT_CATALOG = {
 
 
 def test_normalize_inline_dict_injects_default_id():
-    out = normalize_catalog_dict({"components": CLEAN_CATALOG["components"]}, default_catalog_id="cat://x")
+    out = normalize_catalog_dict(
+        {"components": CLEAN_CATALOG["components"]}, default_catalog_id="cat://x"
+    )
     assert out["catalogId"] == "cat://x" and "Row" in out["components"]
 
 
 def test_normalize_existing_id_wins():
-    assert normalize_catalog_dict(CLEAN_CATALOG, default_catalog_id="cat://other")["catalogId"] == CID
+    assert (
+        normalize_catalog_dict(CLEAN_CATALOG, default_catalog_id="cat://other")[
+            "catalogId"
+        ]
+        == CID
+    )
 
 
 def test_normalize_json_string():
-    assert normalize_catalog_dict(json.dumps(CLEAN_CATALOG), default_catalog_id=None)["catalogId"] == CID
+    assert (
+        normalize_catalog_dict(json.dumps(CLEAN_CATALOG), default_catalog_id=None)[
+            "catalogId"
+        ]
+        == CID
+    )
 
 
 def test_normalize_non_json_string_returns_none():
-    assert normalize_catalog_dict("Card, Text, Row", default_catalog_id="cat://x") is None
+    assert (
+        normalize_catalog_dict("Card, Text, Row", default_catalog_id="cat://x") is None
+    )
 
 
 def test_normalize_legacy_list_form():
     out = normalize_catalog_dict(
-        [{"name": "HotelCard", "props": {"name": {"type": "string"}}}], default_catalog_id="cat://x"
+        [{"name": "HotelCard", "props": {"name": {"type": "string"}}}],
+        default_catalog_id="cat://x",
     )
     assert out["catalogId"] == "cat://x" and "HotelCard" in out["components"]
 
@@ -132,7 +162,9 @@ def test_render_survives_nonconformant_catalog():
 
 
 def test_render_unusable_source_returns_none():
-    assert render_catalog_instructions("Card, Text, Row", default_catalog_id=CID) is None
+    assert (
+        render_catalog_instructions("Card, Text, Row", default_catalog_id=CID) is None
+    )
     assert render_catalog_instructions({}, default_catalog_id=CID) is None
 
 
@@ -148,9 +180,9 @@ def test_render_is_cached():
 
 
 def test_heal_smart_quotes_and_trailing_comma():
-    assert heal_json_arg('[{“id”:“root”,“component”:“Text”,“text”:“Hi”,}]', expect="list") == [
-        {"id": "root", "component": "Text", "text": "Hi"}
-    ]
+    assert heal_json_arg(
+        "[{“id”:“root”,“component”:“Text”,“text”:“Hi”,}]", expect="list"
+    ) == [{"id": "root", "component": "Text", "text": "Hi"}]
 
 
 def test_heal_dict_unwraps_single_object():
@@ -184,7 +216,13 @@ class _RenderLlm(BaseLlm):
         yield LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(name="render_a2ui", args=self.args))],
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="render_a2ui", args=self.args
+                        )
+                    )
+                ],
             ),
             partial=False,
             turn_complete=True,
@@ -198,11 +236,23 @@ class _Ctx:
 
 @pytest.mark.asyncio
 async def test_client_catalog_is_google_rendered_into_prompt():
-    model = _RenderLlm(model="m", args={"surfaceId": "s", "components": [{"id": "root", "component": "HotelCard", "name": "Ritz"}]})
+    model = _RenderLlm(
+        model="m",
+        args={
+            "surfaceId": "s",
+            "components": [{"id": "root", "component": "HotelCard", "name": "Ritz"}],
+        },
+    )
     tool = get_a2ui_tool({"model": model, "default_catalog_id": CID})
     tool.event_queue = asyncio.Queue()
-    state = {CONTEXT_STATE_KEY: [
-        {"description": A2UI_SCHEMA_CONTEXT_DESCRIPTION, "value": json.dumps(CLEAN_CATALOG)}]}
+    state = {
+        CONTEXT_STATE_KEY: [
+            {
+                "description": A2UI_SCHEMA_CONTEXT_DESCRIPTION,
+                "value": json.dumps(CLEAN_CATALOG),
+            }
+        ]
+    }
     await tool.run_async(args={"intent": "create"}, tool_context=_Ctx(state=state))
     prompt = model.prompts[0]
     # The client catalog was rendered via Google's schema block (markers prove it
@@ -215,14 +265,21 @@ async def test_client_catalog_is_google_rendered_into_prompt():
 @pytest.mark.asyncio
 async def test_freeform_string_args_are_healed_and_committed():
     # Gemini returns components as a JSON STRING with smart quotes + trailing comma.
-    model = _RenderLlm(model="m", args={
-        "surfaceId": "s",
-        "components": '[{“id”:“root”,“component”:“Text”,“text”:“Hi”,}]',
-    })
+    model = _RenderLlm(
+        model="m",
+        args={
+            "surfaceId": "s",
+            "components": "[{“id”:“root”,“component”:“Text”,“text”:“Hi”,}]",
+        },
+    )
     tool = get_a2ui_tool({"model": model})
     tool.event_queue = asyncio.Queue()
     result = await tool.run_async(args={"intent": "create"}, tool_context=_Ctx())
-    assert "a2ui_operations" in result
-    env = json.loads(result)
-    comps = next(op["updateComponents"]["components"] for op in env["a2ui_operations"] if "updateComponents" in op)
+    assert "a2ui_operations" in _envelope_text(result)
+    env = json.loads(_envelope_text(result))
+    comps = next(
+        op["updateComponents"]["components"]
+        for op in env["a2ui_operations"]
+        if "updateComponents" in op
+    )
     assert comps[0]["component"] == "Text" and comps[0]["id"] == "root"

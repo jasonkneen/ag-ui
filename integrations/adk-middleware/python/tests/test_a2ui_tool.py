@@ -25,6 +25,14 @@ from ag_ui_adk import get_a2ui_tool, CONTEXT_STATE_KEY, ADKAgent, A2UISubAgentTo
 from ag_ui_adk.a2ui_tool import A2UI_SCHEMA_CONTEXT_DESCRIPTION
 
 
+def _envelope_text(result) -> str:
+    """``run_async`` returns the envelope as a dict so ADK serializes it as the
+    bare envelope JSON the A2UI middleware inspects (rather than wrapping a string
+    return as ``{"result": ...}``). Tests assert on that serialized text, so
+    re-serialize the dict the same way ADK does."""
+    return result if isinstance(result, str) else json.dumps(result)
+
+
 # A structurally-valid single-root surface (no catalog, no children, no bindings).
 VALID_ARGS = {
     "surfaceId": "s1",
@@ -85,7 +93,10 @@ class _ToolResultEvent:
 
     def __init__(self, envelope_str, call_id):
         from types import SimpleNamespace
-        self.content = types.Content(role="user", parts=[types.Part(text="(tool result)")])
+
+        self.content = types.Content(
+            role="user", parts=[types.Part(text="(tool result)")]
+        )
         self.author = "user"
         self.partial = False
         self.id = call_id
@@ -110,8 +121,13 @@ class _RecordingRenderLlm(BaseLlm):
         yield LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(
-                    name="render_a2ui", args=VALID_ARGS))],
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="render_a2ui", args=VALID_ARGS
+                        )
+                    )
+                ],
             ),
             partial=False,
             turn_complete=True,
@@ -128,16 +144,20 @@ class _FreeformRenderLlm(BaseLlm):
         yield LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(
-                    name="render_a2ui",
-                    args={
-                        "surfaceId": "s1",
-                        "components": json.dumps(
-                            [{"id": "root", "component": "Text", "text": "Hi"}]
-                        ),
-                        "data": "{}",
-                    },
-                ))],
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="render_a2ui",
+                            args={
+                                "surfaceId": "s1",
+                                "components": json.dumps(
+                                    [{"id": "root", "component": "Text", "text": "Hi"}]
+                                ),
+                                "data": "{}",
+                            },
+                        )
+                    )
+                ],
             ),
             partial=False,
             turn_complete=True,
@@ -218,8 +238,8 @@ async def test_valid_first_attempt_emits_envelope_and_tool_call_events():
     )
 
     # A validated surface was committed as an operations envelope.
-    assert "a2ui_operations" in result
-    envelope = json.loads(result)
+    assert "a2ui_operations" in _envelope_text(result)
+    envelope = json.loads(_envelope_text(result))
     assert "a2ui_operations" in envelope
 
     # Exactly one model attempt (valid on first try — no retry).
@@ -253,7 +273,7 @@ async def test_invalid_first_attempt_recovers_and_reuses_stable_id():
     # Two attempts; only the valid surface (Text root) is committed — the faulty
     # Row-with-unresolved-child never reaches the envelope.
     assert model.calls == 2
-    assert "Text" in result and "Row" not in result
+    assert "Text" in _envelope_text(result) and "Row" not in _envelope_text(result)
     assert [a["ok"] for a in attempts] == [False, True]
 
     # The retry prompt was re-augmented with the prior attempt's structured error.
@@ -281,10 +301,10 @@ async def test_exhaustion_returns_recovery_exhausted_envelope():
     )
 
     assert model.calls == 3
-    envelope = json.loads(result)
+    envelope = json.loads(_envelope_text(result))
     assert envelope["code"] == "a2ui_recovery_exhausted"
     # No faulty surface committed.
-    assert "a2ui_operations" not in result
+    assert "a2ui_operations" not in _envelope_text(result)
 
 
 @pytest.mark.asyncio
@@ -298,7 +318,10 @@ async def test_context_and_schema_routed_into_subagent_prompt():
     state = {
         CONTEXT_STATE_KEY: [
             {"description": "User preferences", "value": "dark mode please"},
-            {"description": A2UI_SCHEMA_CONTEXT_DESCRIPTION, "value": "Card, Text, Row"},
+            {
+                "description": A2UI_SCHEMA_CONTEXT_DESCRIPTION,
+                "value": "Card, Text, Row",
+            },
         ]
     }
 
@@ -334,10 +357,13 @@ async def test_subagent_call_mirrors_langgraph_system_instruction_and_conversati
     # conversation messages must be forwarded as contents (not the prompt as a
     # lone user turn, and not the user request smuggled in as a context entry).
     model = _RecordingRenderLlm(model="rec")
-    tool = get_a2ui_tool({"model": model, "guidelines": {"composition_guide": "USE Row + HotelCard."}})
+    tool = get_a2ui_tool(
+        {"model": model, "guidelines": {"composition_guide": "USE Row + HotelCard."}}
+    )
     tool.event_queue = asyncio.Queue()
     ctx = _FakeToolContextWithSession(
-        state={}, events=[_user_event("Compare 3 luxury hotels with ratings and prices.")]
+        state={},
+        events=[_user_event("Compare 3 luxury hotels with ratings and prices.")],
     )
 
     await tool.run_async(args={"intent": "create"}, tool_context=ctx)
@@ -366,30 +392,51 @@ async def test_update_intent_finds_prior_surface_and_skips_create():
     # produce an UPDATE (no createSurface). The prior generate_a2ui result is
     # stored by ADK as a wrapped/serialized function response, which the adapter
     # must unwrap so the toolkit's find_prior_surface can read a2ui_operations.
-    prior_env = json.dumps({"a2ui_operations": [
-        {"version": "v0.9", "createSurface": {
-            "surfaceId": "hotel-comparison", "catalogId": "cat://dynamic"}},
-        {"version": "v0.9", "updateComponents": {
-            "surfaceId": "hotel-comparison",
-            "components": [{"id": "root", "component": "Row"}]}},
-    ]})
+    prior_env = json.dumps(
+        {
+            "a2ui_operations": [
+                {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": "hotel-comparison",
+                        "catalogId": "cat://dynamic",
+                    },
+                },
+                {
+                    "version": "v0.9",
+                    "updateComponents": {
+                        "surfaceId": "hotel-comparison",
+                        "components": [{"id": "root", "component": "Row"}],
+                    },
+                },
+            ]
+        }
+    )
     tool = get_a2ui_tool({"model": _FreeformRenderLlm(model="ff")})
     tool.event_queue = asyncio.Queue()
-    ctx = _FakeToolContextWithSession(state={}, events=[
-        _ToolResultEvent(prior_env, "call_prev"),
-        _user_event("Make the layout a single column instead of a row."),
-    ])
+    ctx = _FakeToolContextWithSession(
+        state={},
+        events=[
+            _ToolResultEvent(prior_env, "call_prev"),
+            _user_event("Make the layout a single column instead of a row."),
+        ],
+    )
 
     result = await tool.run_async(
-        args={"intent": "update", "target_surface_id": "hotel-comparison",
-              "changes": "use a column layout"},
+        args={
+            "intent": "update",
+            "target_surface_id": "hotel-comparison",
+            "changes": "use a column layout",
+        },
         tool_context=ctx,
     )
 
     # Prior was found (not an error envelope) and committed as an UPDATE.
-    assert "a2ui_operations" in result, result
-    assert "createSurface" not in result  # update reuses the surface, never re-creates
-    env = json.loads(result)
+    assert "a2ui_operations" in _envelope_text(result), result
+    assert "createSurface" not in _envelope_text(
+        result
+    )  # update reuses the surface, never re-creates
+    env = json.loads(_envelope_text(result))
     assert any("updateComponents" in op for op in env["a2ui_operations"])
 
 
@@ -421,8 +468,8 @@ async def test_freeform_string_args_are_parsed_into_a_structured_surface():
         args={"intent": "create"}, tool_context=_FakeToolContext()
     )
 
-    assert "a2ui_operations" in result
-    env = json.loads(result)
+    assert "a2ui_operations" in _envelope_text(result)
+    env = json.loads(_envelope_text(result))
     comps = next(
         op["updateComponents"]["components"]
         for op in env["a2ui_operations"]

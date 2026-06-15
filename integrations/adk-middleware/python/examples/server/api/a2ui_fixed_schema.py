@@ -56,7 +56,9 @@ HOTEL_SURFACE_ID = "hotel-search-results"
 HOTEL_SCHEMA = _load_schema("hotel_schema.json")
 
 
-def _envelope(surface_id: str, schema: list[dict[str, Any]], data: dict[str, Any]) -> dict[str, Any]:
+def _envelope(
+    surface_id: str, schema: list[dict[str, Any]], data: dict[str, Any]
+) -> dict[str, Any]:
     """Build the A2UI operations envelope dict for a fixed-schema surface."""
     return {
         A2UI_OPERATIONS_KEY: [
