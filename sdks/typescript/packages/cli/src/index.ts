@@ -29,7 +29,7 @@ ${RESET}
 
 const description = `
 Quickly scaffold AG-UI enabled applications for your favorite agent frameworks.
-`
+`;
 
 async function createProject() {
   displayBanner();
@@ -47,8 +47,8 @@ async function createProject() {
     "llamaindex",
     "pydanticAi",
     "agno",
-    "adk"
-  ].some(flag => options[flag]);
+    "adk",
+  ].some((flag) => options[flag]);
 
   if (isFrameworkDefined) {
     await handleCopilotKitNextJs();
@@ -175,10 +175,7 @@ async function handleCliClient() {
 }
 
 // Metadata
-program
-  .name("create-ag-ui-app")
-  .description(description)
-  .version("0.0.36");
+program.name("create-ag-ui-app").description(description).version("0.0.36");
 
 // Add framework flags
 program
@@ -190,7 +187,7 @@ program
   .option("--llamaindex", "Use the LlamaIndex framework")
   .option("--agno", "Use the Agno framework")
   .option("--ag2", "Use the AG2 framework")
-  .option("--adk", "Use the ADK framework")
+  .option("--adk", "Use the ADK framework");
 
 program.action(async () => {
   await createProject();

@@ -53,12 +53,5 @@ export function buildCopilotKitCreateArgs(
     frameworkArgs.push("-f", "adk");
   }
 
-  return [
-    COPILOTKIT_CLI_SPEC,
-    "create",
-    "--no-banner",
-    "-n",
-    projectName,
-    ...frameworkArgs,
-  ];
+  return [COPILOTKIT_CLI_SPEC, "create", "--no-banner", "-n", projectName, ...frameworkArgs];
 }
