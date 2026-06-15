@@ -118,7 +118,9 @@ def _tool_result_message(
 
 def _history_resolver_client(default_agent, agent_registry):
     async def resolver(request, input_data):
-        history_agent = resolve_agent_from_message_history(input_data, agent_registry)
+        history_agent = resolve_agent_from_message_history(
+            input_data.messages, agent_registry
+        )
         if history_agent is not None:
             return history_agent
         return agent_registry.get(input_data.state.get("agent"))
@@ -356,7 +358,7 @@ def test_message_history_resolver_accepts_messages_directly():
     )
 
 
-def test_message_history_resolver_allows_multiple_tool_results_from_same_agent():
+def test_message_history_resolver_handles_latest_tool_result_from_same_agent_batch():
     originating_agent = _agent("originating")
     agent_registry = {"originating": originating_agent}
     input_data = _run_input(
@@ -383,9 +385,63 @@ def test_message_history_resolver_allows_multiple_tool_results_from_same_agent()
     )
 
     assert (
-        resolve_agent_from_message_history(input_data, agent_registry)
+        resolve_agent_from_message_history(input_data.messages, agent_registry)
         is originating_agent
     )
+
+
+def test_message_history_resolver_ignores_prior_completed_tool_results():
+    first_agent = _agent("first")
+    second_agent = _agent("second")
+    agent_registry = {"first": first_agent, "second": second_agent}
+    input_data = _run_input(
+        messages=[
+            _assistant_tool_message(
+                message_id="assistant-first",
+                name="first",
+                tool_call_id="tool-call-first",
+            ),
+            _tool_result_message(
+                message_id="tool-message-first",
+                tool_call_id="tool-call-first",
+            ),
+            _assistant_tool_message(
+                message_id="assistant-second",
+                name="second",
+                tool_call_id="tool-call-second",
+            ),
+            _tool_result_message(
+                message_id="tool-message-second",
+                tool_call_id="tool-call-second",
+            ),
+        ],
+    )
+
+    assert (
+        resolve_agent_from_message_history(input_data.messages, agent_registry)
+        is second_agent
+    )
+
+
+def test_message_history_resolver_requires_latest_message_to_be_tool_result():
+    originating_agent = _agent("originating")
+    agent_registry = {"originating": originating_agent}
+    input_data = _run_input(
+        messages=[
+            _assistant_tool_message(
+                message_id="assistant-1",
+                name="originating",
+                tool_call_id="tool-call-1",
+            ),
+            _tool_result_message(
+                message_id="tool-message-1",
+                tool_call_id="tool-call-1",
+            ),
+            UserMessage(id="user-2", role="user", content="next turn"),
+        ],
+    )
+
+    assert resolve_agent_from_message_history(input_data.messages, agent_registry) is None
 
 
 def test_message_history_resolver_missing_history_falls_back_to_state_agent():
@@ -461,7 +517,7 @@ def test_message_history_resolver_unknown_or_missing_name_falls_back_to_state_ag
     default_agent.run.assert_not_called()
 
 
-def test_message_history_resolver_conflicting_assistant_names_falls_back_to_state_agent():
+def test_message_history_resolver_uses_latest_tool_message_owner():
     default_agent = _agent("default")
     first_agent = _agent("first")
     second_agent = _agent("second")
@@ -501,9 +557,9 @@ def test_message_history_resolver_conflicting_assistant_names_falls_back_to_stat
     )
 
     assert response.status_code == 200
-    state_routed_agent.run.assert_called_once()
+    second_agent.run.assert_called_once()
     first_agent.run.assert_not_called()
-    second_agent.run.assert_not_called()
+    state_routed_agent.run.assert_not_called()
     default_agent.run.assert_not_called()
 
 
@@ -520,7 +576,7 @@ def test_message_history_resolver_returns_none_without_inbound_tool_messages():
         ],
     )
 
-    assert resolve_agent_from_message_history(input_data, agent_registry) is None
+    assert resolve_agent_from_message_history(input_data.messages, agent_registry) is None
 
 
 def test_message_history_resolver_is_exported_from_package():

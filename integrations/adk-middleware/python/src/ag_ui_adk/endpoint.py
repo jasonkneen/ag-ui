@@ -42,65 +42,40 @@ AgentResolver = Callable[[Request, RunAgentInput], Awaitable[ADKAgent | None]]
 
 
 def resolve_agent_from_message_history(
-    input_data: RunAgentInput | Sequence[Message],
+    messages: Sequence[Message],
     agent_registry: Mapping[str, ADKAgent],
 ) -> ADKAgent | None:
     """Resolve a tool-result resumption to its originating agent.
 
     This helper treats ``AssistantMessage.name`` as an explicit agent registry
-    key. It matches inbound ``ToolMessage.tool_call_id`` values to prior
-    ``AssistantMessage.tool_calls[].id`` values in the same message history and
-    returns the corresponding registry agent when every matched tool result
-    points at the same known key.
+    key. It scopes routing to the latest ``ToolMessage``, matches its
+    ``ToolMessage.tool_call_id`` value to prior
+    ``AssistantMessage.tool_calls[].id`` values in the same message history,
+    and returns the corresponding registry agent.
 
-    ``None`` is returned when the request has no tool result messages, the
+    ``None`` is returned when the latest message is not a tool result, the
     matching assistant message is absent, the assistant message has no
-    registry key in ``name``, the key is unknown, or multiple tool results
-    resolve to different agents. This keeps the helper conservative so the
-    caller can safely fall back to its normal routing policy.
+    registry key in ``name``, or the key is unknown. This keeps the helper
+    conservative so the caller can safely fall back to its normal routing
+    policy.
     """
-    if isinstance(input_data, RunAgentInput):
-        messages = input_data.messages
-    else:
-        messages = input_data
-    if not messages:
+    if not messages or not isinstance(messages[-1], ToolMessage):
         return None
 
-    tool_call_agent_keys: dict[str, set[str | None]] = {}
-    matched_agent_keys: set[str] = set()
-    saw_tool_message = False
-
-    for message in messages:
-        if isinstance(message, AssistantMessage):
-            if not message.tool_calls:
-                continue
-            for tool_call in message.tool_calls:
-                if tool_call.id:
-                    tool_call_agent_keys.setdefault(tool_call.id, set()).add(
-                        message.name
-                    )
+    tool_message = messages[-1]
+    for message in reversed(messages[:-1]):
+        if not isinstance(message, AssistantMessage):
             continue
 
-        if not isinstance(message, ToolMessage):
+        tool_call_ids = {tool_call.id for tool_call in message.tool_calls or []}
+        if tool_message.tool_call_id not in tool_call_ids:
             continue
 
-        saw_tool_message = True
-        agent_keys = tool_call_agent_keys.get(message.tool_call_id)
-        if not agent_keys or len(agent_keys) != 1:
+        if not message.name:
             return None
+        return agent_registry.get(message.name)
 
-        agent_key = next(iter(agent_keys))
-        if not agent_key or agent_key not in agent_registry:
-            return None
-
-        matched_agent_keys.add(agent_key)
-        if len(matched_agent_keys) > 1:
-            return None
-
-    if not saw_tool_message or not matched_agent_keys:
-        return None
-
-    return agent_registry[next(iter(matched_agent_keys))]
+    return None
 
 
 def _build_run_error(message: str, code: str) -> RunErrorEvent:
@@ -372,7 +347,8 @@ def add_adk_fastapi_endpoint(
         the matching tool call by treating ``AssistantMessage.name`` as the
         agent registry key. For this convention to work, the inbound message
         history must preserve the assistant message that created the tool call,
-        with ``name`` set to that registry key.
+        with ``name`` set to that registry key. Histories built only from live
+        reducer events may not include that key unless the client preserves it.
 
         .. code-block:: python
 
@@ -385,13 +361,14 @@ def add_adk_fastapi_endpoint(
 
             async def agent_resolver(request, input_data):
                 history_agent = resolve_agent_from_message_history(
-                    input_data,
+                    input_data.messages,
                     AGENT_REGISTRY,
                 )
                 if history_agent is not None:
                     return history_agent
 
-                return AGENT_REGISTRY.get(input_data.state.get("to_agent"))
+                state = input_data.state if isinstance(input_data.state, dict) else {}
+                return AGENT_REGISTRY.get(state.get("to_agent"))
     """
     extract_state_fn = extract_state_from_request
     if extract_headers is not None:

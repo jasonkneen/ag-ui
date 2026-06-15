@@ -246,6 +246,7 @@ def convert_ag_ui_messages_to_adk(messages: List[Message]) -> List[ADKEvent]:
                     )
 
             elif isinstance(message, AssistantMessage):
+                event.author = message.name or "model"
                 parts = []
 
                 # Add text content if present
