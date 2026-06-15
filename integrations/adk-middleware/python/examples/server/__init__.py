@@ -27,6 +27,7 @@ from .api import (
     backend_tool_rendering_app,
     predictive_state_updates_app,
     a2ui_dynamic_schema_app,
+    a2ui_fixed_schema_app,
     a2ui_recovery_app,
 )
 
@@ -35,6 +36,7 @@ app = FastAPI(title='ADK Middleware Demo')
 # Include routers instead of mounting apps to show routes in docs
 app.include_router(agentic_chat_app.router, prefix='/chat', tags=['Agentic Chat'])
 app.include_router(a2ui_dynamic_schema_app.router, prefix='/adk-a2ui-dynamic-schema', tags=['A2UI Dynamic Schema'])
+app.include_router(a2ui_fixed_schema_app.router, prefix='/adk-a2ui-fixed-schema', tags=['A2UI Fixed Schema'])
 app.include_router(a2ui_recovery_app.router, prefix='/adk-a2ui-recovery', tags=['A2UI Error Recovery'])
 app.include_router(agentic_generative_ui_app.router, prefix='/adk-agentic-generative-ui', tags=['Agentic Generative UI'])
 app.include_router(tool_based_generative_ui_app.router, prefix='/adk-tool-based-generative-ui', tags=['Tool Based Generative UI'])
@@ -59,6 +61,7 @@ async def root():
             "predictive_state_updates": "/adk-predictive-state-agent",
             "agentic_chat_reasoning": "/adk-reasoning-chat",
             "a2ui_dynamic_schema": "/adk-a2ui-dynamic-schema",
+            "a2ui_fixed_schema": "/adk-a2ui-fixed-schema",
             "a2ui_recovery": "/adk-a2ui-recovery",
             "docs": "/docs"
         }

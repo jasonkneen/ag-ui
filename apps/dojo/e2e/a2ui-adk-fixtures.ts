@@ -14,8 +14,9 @@
  * the OpenAI LangGraph demos. Register BEFORE registerA2UIRecoveryFixtures so a
  * Gemini request matches here first; gpt-4o requests fall through.
  *
- * Covers: a2ui_dynamic_schema (valid hotel surface) and a2ui_recovery
- * (recover: invalid→valid; exhaust: always invalid).
+ * Covers: a2ui_fixed_schema (backend search_flights / search_hotels tools that
+ * return a fixed-layout surface), a2ui_dynamic_schema (valid hotel surface) and
+ * a2ui_recovery (recover: invalid→valid; exhaust: always invalid).
  */
 import type { LLMock, ChatMessage } from "@copilotkit/aimock";
 
@@ -64,10 +65,71 @@ const renderArgsGemini = (valid: boolean) =>
     data: JSON.stringify({ items: HOTELS }),
   });
 
+// --- fixed_schema (backend tools) ---------------------------------------
+// The main agent calls search_flights / search_hotels directly (no sub-agent).
+// These are plain backend tools: the LLM supplies the row data, the ADK tool
+// loads the fixed component layout and returns the a2ui_operations envelope.
+// Args are structured here (flat arrays of flat objects) — Gemini fills these
+// fine, unlike the nested array<object> of the dynamic render_a2ui schema.
+const FLIGHTS = [
+  {
+    id: "1",
+    airline: "United Airlines",
+    airlineLogo: "https://www.google.com/s2/favicons?domain=united.com&sz=128",
+    flightNumber: "UA 123",
+    origin: "SFO",
+    destination: "JFK",
+    date: "Tue, Apr 8",
+    departureTime: "8:00 AM",
+    arrivalTime: "4:30 PM",
+    duration: "5h 30m",
+    status: "On Time",
+    statusIcon: "https://placehold.co/12/22c55e/22c55e.png",
+    price: "$289",
+  },
+  {
+    id: "2",
+    airline: "Delta",
+    airlineLogo: "https://www.google.com/s2/favicons?domain=delta.com&sz=128",
+    flightNumber: "DL 456",
+    origin: "SFO",
+    destination: "JFK",
+    date: "Tue, Apr 8",
+    departureTime: "10:00 AM",
+    arrivalTime: "6:45 PM",
+    duration: "5h 45m",
+    status: "On Time",
+    statusIcon: "https://placehold.co/12/22c55e/22c55e.png",
+    price: "$315",
+  },
+];
+const HOTELS_FIXED = [
+  { id: "1", name: "The Manhattan Grand", location: "Downtown Manhattan", rating: 4.5, price: "$350" },
+  { id: "2", name: "Downtown Boutique Hotel", location: "SoHo", rating: 4.0, price: "$280" },
+];
+
 export function registerA2UIADKFixtures(mockServer: LLMock): void {
   const hasTool = (req: any, name: string) => req.tools?.some((t: any) => t.function.name === name);
   const wantsA2UI = (req: any) =>
     isHotelCreate(userText(req.messages)) || isRecover(userText(req.messages)) || isExhaust(userText(req.messages));
+
+  // 0) fixed_schema — backend search_flights tool (user asks about flights).
+  mockServer.addFixture({
+    match: {
+      predicate: (req: any) =>
+        isGemini(req) && hasTool(req, "search_flights") && /flights/i.test(userText(req.messages)),
+    },
+    response: { toolCalls: [{ name: "search_flights", arguments: JSON.stringify({ flights: FLIGHTS }) }] },
+  });
+
+  // 0b) fixed_schema — backend search_hotels tool (user asks about hotels).
+  mockServer.addFixture({
+    match: {
+      predicate: (req: any) =>
+        isGemini(req) && hasTool(req, "search_hotels") && /hotels/i.test(userText(req.messages)),
+    },
+    response: { toolCalls: [{ name: "search_hotels", arguments: JSON.stringify({ hotels: HOTELS_FIXED }) }] },
+  });
 
   // 1) Main ADK agent: A2UI prompt → call the generate_a2ui sub-agent tool.
   mockServer.addFixture({
