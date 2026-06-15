@@ -1,10 +1,10 @@
 import { expect, test } from "vitest";
 import { buildCopilotKitCreateArgs } from "./build-args";
 
-test("pins copilotkit@3 and forwards name + --no-banner", () => {
+test("uses copilotkit@latest and forwards name + --no-banner", () => {
   const args = buildCopilotKitCreateArgs({ langgraphPy: true }, "my-app");
   expect(args).toEqual([
-    "copilotkit@3",
+    "copilotkit@latest",
     "create",
     "--no-banner",
     "-n",
@@ -23,7 +23,7 @@ test("maps --crewai-flows (crewaiFlows) to -f flows", () => {
 test("emits no -f when no framework flag is set", () => {
   const args = buildCopilotKitCreateArgs({}, "demo");
   expect(args).not.toContain("-f");
-  expect(args).toEqual(["copilotkit@3", "create", "--no-banner", "-n", "demo"]);
+  expect(args).toEqual(["copilotkit@latest", "create", "--no-banner", "-n", "demo"]);
 });
 
 test("maps each framework flag to its canonical -f value", () => {

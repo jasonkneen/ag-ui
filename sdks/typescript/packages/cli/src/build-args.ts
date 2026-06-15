@@ -1,9 +1,9 @@
 /**
- * Version spec for the underlying CopilotKit CLI. Pinned to the v3 line (not
- * `@latest`) so a future major with different arguments cannot silently break
- * `create-ag-ui-app`; `@3` still picks up bug-fix releases within v3.
+ * Version spec for the underlying CopilotKit CLI. Tracks `@latest` so
+ * `create-ag-ui-app` always scaffolds with the current CopilotKit CLI rather
+ * than freezing on a pinned major.
  */
-export const COPILOTKIT_CLI_SPEC = "copilotkit@3";
+export const COPILOTKIT_CLI_SPEC = "copilotkit@latest";
 
 /** Framework flags as parsed by commander, in selection-priority order. */
 export interface FrameworkOptions {
@@ -20,7 +20,7 @@ export interface FrameworkOptions {
 
 /**
  * Builds the argv passed to `npx` to invoke the CopilotKit CLI's `create`
- * command. Pure and exported so the mapping (and the version pin) is unit
+ * command. Pure and exported so the mapping (and the version spec) is unit
  * tested without spawning a process.
  *
  * @param options - Parsed commander framework flags.
