@@ -701,6 +701,22 @@ class StrandsAgent:
                         if tc.id and tc_name:
                             _tool_call_id_to_name[tc.id] = tc_name
 
+            # On delta-only continuation payloads, the assistant message that
+            # carries the tool_call is absent from input_data.messages, so the
+            # lookup above misses. The session manager still holds the full
+            # native history — scan its ``toolUse`` blocks so we resolve the
+            # tool that actually executed rather than guessing.
+            for _smsg in session_msgs:
+                if not isinstance(_smsg, dict) or _smsg.get("role") != "assistant":
+                    continue
+                for _block in (_smsg.get("content") or []):
+                    tool_use = _block.get("toolUse") if isinstance(_block, dict) else None
+                    if tool_use:
+                        tu_id = tool_use.get("toolUseId")
+                        tu_name = tool_use.get("name")
+                        if tu_id and tu_name and tu_id not in _tool_call_id_to_name:
+                            _tool_call_id_to_name[tu_id] = tu_name
+
             # Get the latest user message for state context builder.
             # For continuation runs (has_pending_tool_result), derive a meaningful
             # message from the frontend tool that was just executed so the agent
@@ -712,14 +728,19 @@ class StrandsAgent:
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
                         if tool_name and tool_name in frontend_tool_names:
                             user_message = f"{tool_name} executed successfully with no return value."
-                        elif frontend_tool_names:
-                            fallback_name = next(iter(frontend_tool_names))
-                            user_message = f"{fallback_name} executed successfully with no return value."
+                        else:
+                            # Could not resolve the executed tool's name from
+                            # input messages or session history. Leave the
+                            # continuation message empty rather than guessing:
+                            # picking an arbitrary frontend tool would feed false
+                            # context to the LLM when several frontend tools exist.
+                            # Strands still has the real tool result in session
+                            # history to conclude the round-trip from.
                             logger.warning(
                                 f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
-                                f"from input messages (assistant message with tool_calls may be "
-                                f"missing — delta-only payload). Falling back to frontend tool "
-                                f"name '{fallback_name}' from input_data.tools."
+                                f"from input messages or session history (assistant message with "
+                                f"tool_calls may be missing — delta-only payload). Leaving the "
+                                f"continuation message empty."
                             )
                         break
             elif input_data.messages:
