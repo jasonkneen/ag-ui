@@ -142,12 +142,23 @@ export function getA2UITools<TModel = A2UISubagentModel>(
         config: recovery,
         onAttempt: onA2UIAttempt,
         invokeSubagent: async (prompt) => {
-          const response: any = await modelWithTool.invoke([
+          // Stream (not invoke) the render sub-agent so its inner render_a2ui
+          // tool-call arg deltas surface on the graph's event stream and reach
+          // the a2ui middleware as TOOL_CALL_ARGS, so the surface paints
+          // progressively as it generates instead of appearing all at once when
+          // the call completes. The chat-completions provider streams tool-call
+          // args incrementally; we accumulate the chunks and hand the final
+          // structured args to the recovery loop.
+          const stream = await modelWithTool.stream([
             new SystemMessage(prompt),
             ...messages,
           ] as any);
+          let final: any = undefined;
+          for await (const chunk of stream) {
+            final = final === undefined ? chunk : final.concat(chunk);
+          }
           const toolCalls: Array<{ args?: Record<string, unknown> }> =
-            response.tool_calls ?? [];
+            final?.tool_calls ?? [];
           return toolCalls.length ? (toolCalls[0].args ?? {}) : null;
         },
         buildEnvelope: (args) =>
