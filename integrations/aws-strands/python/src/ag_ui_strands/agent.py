@@ -332,6 +332,14 @@ class StrandsAgent:
         # would clobber the other.
         self._thread_init_lock = asyncio.Lock()
 
+    def _will_emit_tool_snapshot(self, behavior: Any, emit_snapshots: bool) -> bool:
+        # ``emit_snapshots`` is the per-run gate (config flag AND not a
+        # delta-only payload); callers pass it so snapshot emission stays
+        # suppressed on delta payloads that would otherwise wipe prior turns.
+        return emit_snapshots and not (
+            behavior and behavior.skip_messages_snapshot
+        )
+
     async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
         """Run the Strands agent and yield AG-UI events."""
 
@@ -785,6 +793,10 @@ class StrandsAgent:
             message_id = str(uuid.uuid4())
             message_started = False
             accumulated_text = ""
+            # Tracks the latest assistant text id that was actually emitted on
+            # the wire. Tool calls use it only when no snapshot will expose the
+            # tool-call AssistantMessage id.
+            last_emitted_text_message_id: str | None = None
             tool_calls_seen = {}
             current_state = dict(input_data.state or {})  # Track state for final snapshot
             stop_text_streaming = False
@@ -877,6 +889,7 @@ class StrandsAgent:
                                 role="assistant",
                             )
                             message_started = True
+                            last_emitted_text_message_id = message_id
 
                         text_chunk = str(event["data"])
                         accumulated_text += text_chunk
@@ -1347,11 +1360,17 @@ class StrandsAgent:
                                             value=predict_state_payload,
                                         )
 
+                                # Must mirror the later tool snapshot emission condition.
+                                tool_parent_message_id = (
+                                    message_id
+                                    if self._will_emit_tool_snapshot(behavior_now, emit_snapshots)
+                                    else last_emitted_text_message_id
+                                )
                                 yield ToolCallStartEvent(
                                     type=EventType.TOOL_CALL_START,
                                     tool_call_id=tool_use_id,
                                     tool_call_name=tool_name,
-                                    parent_message_id=message_id,
+                                    parent_message_id=tool_parent_message_id,
                                 )
                                 tool_calls_seen[tool_use_id]["start_emitted"] = True
                         elif tool_name and tool_use_id in tool_calls_seen:
@@ -1483,13 +1502,7 @@ class StrandsAgent:
                                         tool_call_id=tool_use_id,
                                     )
 
-                                    if (
-                                        emit_snapshots
-                                        and not (
-                                            behavior
-                                            and behavior.skip_messages_snapshot
-                                        )
-                                    ):
+                                    if self._will_emit_tool_snapshot(behavior, emit_snapshots):
                                         snapshot_messages.append(
                                             AssistantMessage(
                                                 id=message_id,
@@ -1606,11 +1619,17 @@ class StrandsAgent:
                                         message_started = False
                                         message_id = str(uuid.uuid4())
 
+                                    # Must mirror the later tool snapshot emission condition.
+                                    tool_parent_message_id = (
+                                        message_id
+                                        if self._will_emit_tool_snapshot(behavior, emit_snapshots)
+                                        else last_emitted_text_message_id
+                                    )
                                     yield ToolCallStartEvent(
                                         type=EventType.TOOL_CALL_START,
                                         tool_call_id=tool_use_id,
                                         tool_call_name=tool_name,
-                                        parent_message_id=message_id,
+                                        parent_message_id=tool_parent_message_id,
                                     )
 
                                     try:
@@ -1639,13 +1658,7 @@ class StrandsAgent:
                                         tool_call_id=tool_use_id,
                                     )
 
-                                    if (
-                                        emit_snapshots
-                                        and not (
-                                            behavior
-                                            and behavior.skip_messages_snapshot
-                                        )
-                                    ):
+                                    if self._will_emit_tool_snapshot(behavior, emit_snapshots):
                                         snapshot_messages.append(
                                             AssistantMessage(
                                                 id=message_id,
