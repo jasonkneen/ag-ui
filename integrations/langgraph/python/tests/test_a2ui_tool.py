@@ -53,9 +53,16 @@ class _BoundModel:
         self._parent.captured_prompts.append(messages[0].content)
         return SimpleNamespace(tool_calls=[{"args": self._parent.args}])
 
+    def stream(self, messages):
+        # The adapter streams the sub-agent (so inner render_a2ui arg deltas
+        # surface for progressive paint) and accumulates the chunks. Replay the
+        # fixed tool call as a single chunk — the accumulation reduces to it.
+        self._parent.captured_prompts.append(messages[0].content)
+        yield SimpleNamespace(tool_calls=[{"args": self._parent.args}])
+
 
 class FakeModel:
-    """Minimal chat-model stand-in: only ``bind_tools`` + ``invoke`` are used."""
+    """Minimal chat-model stand-in: only ``bind_tools`` + ``stream`` are used."""
 
     def __init__(self, args):
         self.args = args

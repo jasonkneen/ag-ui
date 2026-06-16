@@ -122,12 +122,21 @@ def get_a2ui_tools(params: A2UIToolParams):
         )
 
         def _invoke_subagent(prompt, _attempt):
-            response = model_with_tool.invoke(
+            # Stream (not invoke) the render sub-agent so its inner render_a2ui
+            # tool-call arg deltas surface on the graph's event stream
+            # (OnChatModelStream) and reach the a2ui middleware as TOOL_CALL_ARGS,
+            # so the surface paints progressively as it generates instead of
+            # appearing all at once when the call completes. The chat-completions
+            # provider streams tool-call args incrementally; we accumulate the
+            # chunks and hand the final structured args to the recovery loop.
+            final = None
+            for chunk in model_with_tool.stream(
                 [SystemMessage(content=prompt), *messages]
-            )
-            if not response.tool_calls:
+            ):
+                final = chunk if final is None else final + chunk
+            if not final or not final.tool_calls:
                 return None
-            return response.tool_calls[0]["args"]
+            return final.tool_calls[0]["args"]
 
         def _build_envelope(args):
             return build_a2ui_envelope(
