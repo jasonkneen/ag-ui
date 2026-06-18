@@ -1,20 +1,19 @@
 /**
  * Tests for the LangGraph A2UI tool's streaming subagent.
  *
- * The parity fix: the inner render_a2ui call must be surfaced as PROGRESSIVE
- * start -> many args deltas -> end, mirroring the Strands adapter — not one
- * final bulk push. `streamRenderSubagent` is the piece that produces those
- * deltas; we drive it with a fake model that streams a fixed render_a2ui call
- * as several AIMessageChunks (one arg fragment each), like a real provider.
+ * `streamRenderSubagent` STREAMS the model (`stream`) so the nested render_a2ui
+ * tool-call arg deltas surface natively as the graph's OnChatModelStream events
+ * — which the generic agent.ts translator paints progressively. The subagent
+ * emits nothing itself; it just accumulates the streamed chunks and returns the
+ * final render args for the recovery loop. We drive it with a fake model that
+ * streams a fixed render_a2ui call as several AIMessageChunks (one arg fragment
+ * each), like a real provider, and assert the fragments reconstruct.
  */
 
 import { describe, it, expect } from "vitest";
 import { AIMessageChunk } from "@langchain/core/messages";
 
-import {
-  streamRenderSubagent,
-  type A2UIRenderStreamEvent,
-} from "./a2ui-tool";
+import { streamRenderSubagent } from "./a2ui-tool";
 
 // A structurally-valid render_a2ui result.
 const VALID_ARGS = {
@@ -60,49 +59,28 @@ function fakeBoundModel(args: unknown, callId = "call-1") {
   };
 }
 
-describe("streamRenderSubagent (progressive A2UI paint)", () => {
-  it("pushes incremental args deltas, not one bulk paint", async () => {
-    const pushed: A2UIRenderStreamEvent[] = [];
+describe("streamRenderSubagent", () => {
+  it("accumulates streamed chunks into the full render args", async () => {
+    // The render call arrives as several partial AIMessageChunk fragments; the
+    // subagent must merge them back into the complete structured args for the
+    // recovery loop. (Surfacing the deltas on the wire is langgraph's job, via
+    // the OnChatModelStream events the stream emits — not this function's.)
     const captured = await streamRenderSubagent(
       fakeBoundModel(VALID_ARGS),
       "PROMPT",
       [],
-      (e) => pushed.push(e),
     );
-
-    const kinds = pushed.map((p) => p.kind);
-    // Exactly one start, one end, and MULTIPLE args deltas in between — this is
-    // the whole point: incremental emission, not one bulk paint.
-    expect(kinds[0]).toBe("start");
-    expect(kinds[kinds.length - 1]).toBe("end");
-    expect(kinds.filter((k) => k === "start")).toHaveLength(1);
-    expect(kinds.filter((k) => k === "end")).toHaveLength(1);
-    const argsDeltas = pushed.filter((p) => p.kind === "args");
-    expect(argsDeltas.length).toBeGreaterThan(1);
-
-    // The start carries the render tool name + a stable id reused by every
-    // delta and the end.
-    expect(pushed[0].toolCallName).toBe("render_a2ui");
-    const callId = pushed[0].toolCallId;
-    expect(pushed.every((p) => p.toolCallId === callId)).toBe(true);
-
-    // Concatenating the streamed deltas reconstructs the full render args JSON —
-    // the deltas ARE the surface, not a placeholder.
-    const joined = argsDeltas.map((p) => p.delta).join("");
-    expect(JSON.parse(joined)).toEqual(VALID_ARGS);
-
-    // And the captured args (fed to the recovery loop / envelope) parse back to
-    // the same surface.
     expect(captured).toEqual(VALID_ARGS);
   });
 
-  it("returns the captured render args for the envelope", async () => {
-    const captured = await streamRenderSubagent(
-      fakeBoundModel(VALID_ARGS),
-      "PROMPT",
-      [],
-      () => {},
-    );
-    expect(captured).toEqual(VALID_ARGS);
+  it("returns null when the model produces no render call", async () => {
+    const emptyModel = {
+      // eslint-disable-next-line require-yield
+      async *stream(_messages: unknown[]) {
+        return;
+      },
+    };
+    const captured = await streamRenderSubagent(emptyModel, "PROMPT", []);
+    expect(captured).toBeNull();
   });
 });

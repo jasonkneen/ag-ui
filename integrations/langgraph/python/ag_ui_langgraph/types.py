@@ -20,15 +20,6 @@ class CustomEventNames(str, Enum):
     ManuallyEmitToolCall = "manually_emit_tool_call"
     ManuallyEmitState = "manually_emit_state"
     Exit = "exit"
-    # Granular inner tool-call lifecycle. Unlike ManuallyEmitToolCall (which
-    # emits START/ARGS/END in one shot), these surface a single TOOL_CALL_*
-    # event each so a streaming subagent (e.g. the A2UI render subagent) can
-    # push START, many ARGS deltas, then END as the inner call generates —
-    # driving the a2ui middleware's progressive paint. This is the LangGraph
-    # analogue of the Strands adapter's per-delta `push({"kind": ...})`.
-    A2UIRenderStart = "a2ui_render_start"
-    A2UIRenderArgs = "a2ui_render_args"
-    A2UIRenderEnd = "a2ui_render_end"
 
 State = Dict[str, Any]
 

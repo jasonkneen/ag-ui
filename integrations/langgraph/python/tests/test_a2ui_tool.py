@@ -169,62 +169,36 @@ class TestGetA2UITools(unittest.TestCase):
 
 
 class TestStreamRenderSubagent(unittest.TestCase):
-    """The parity fix: the inner render_a2ui call must be surfaced as PROGRESSIVE
-    start -> many args deltas -> end, mirroring the Strands adapter — not one
-    final bulk push."""
+    """The subagent STREAMS the model (``astream``) so the nested render_a2ui
+    tool-call arg deltas surface natively as the graph's OnChatModelStream
+    events — which the generic agent.py / agent.ts translator paints
+    progressively. This adapter emits nothing itself; it just accumulates the
+    streamed chunks and returns the final render args for the recovery loop.
+    Verify that multi-chunk accumulation reconstructs the full surface."""
 
-    def _run_stream(self, model_args, num_parts=4):
-        model = FakeModel(model_args)
+    def test_accumulates_streamed_chunks_into_final_args(self):
+        model = FakeModel(VALID_ARGS)
         # _stream_render_subagent expects an already-bound model (bind_tools is
-        # done by the factory); the fake's bound model ignores the tool def.
+        # done by the factory); the fake's bound model ignores the tool def and
+        # replays the render call as several partial AIMessageChunk fragments.
         bound = model.bind_tools([])
-        pushed: list[dict] = []
-
-        async def _push(step: dict) -> None:
-            pushed.append(step)
-
-        captured = asyncio.run(
-            _stream_render_subagent(bound, "PROMPT", [], _push)
-        )
-        return captured, pushed
-
-    def test_progressive_deltas_are_pushed(self):
-        captured, pushed = self._run_stream(VALID_ARGS)
-
-        kinds = [p["kind"] for p in pushed]
-        # Exactly one start, one end, and MULTIPLE args deltas in between —
-        # this is the whole point: incremental emission, not one bulk paint.
-        self.assertEqual(kinds[0], "start")
-        self.assertEqual(kinds[-1], "end")
-        self.assertEqual(kinds.count("start"), 1)
-        self.assertEqual(kinds.count("end"), 1)
-        args_deltas = [p for p in pushed if p["kind"] == "args"]
-        self.assertGreater(
-            len(args_deltas),
-            1,
-            "expected multiple incremental args deltas (progressive paint), "
-            f"got {len(args_deltas)}",
-        )
-
-        # The start carries the render tool name + a stable id; every delta and
-        # the end reuse that same id.
-        start = pushed[0]
-        self.assertEqual(start["tool_call_name"], "render_a2ui")
-        call_id = start["tool_call_id"]
-        self.assertTrue(all(p["tool_call_id"] == call_id for p in pushed))
-
-        # Concatenating the streamed deltas reconstructs the full render args
-        # JSON — the deltas ARE the surface, not a placeholder.
-        joined = "".join(p["delta"] for p in args_deltas)
-        self.assertEqual(json.loads(joined), VALID_ARGS)
-
-        # And the captured args (fed to the recovery loop / envelope) parse back
-        # to the same surface.
-        self.assertEqual(captured["surfaceId"], "s1")
-
-    def test_captured_args_returned_for_envelope(self):
-        captured, _ = self._run_stream(VALID_ARGS)
+        captured = asyncio.run(_stream_render_subagent(bound, "PROMPT", []))
+        # The chunk fragments merged back into the full structured args.
         self.assertEqual(captured, VALID_ARGS)
+
+    def test_returns_none_when_no_render_call(self):
+        # A stream that produces no render_a2ui call -> None, which the recovery
+        # loop records as a failed attempt (retry / hard-failure envelope).
+        model = FakeModel(VALID_ARGS)
+        bound = model.bind_tools([])
+
+        async def _empty_astream(_messages):
+            if False:  # pragma: no cover - generator with no yields
+                yield None
+
+        bound.astream = _empty_astream
+        captured = asyncio.run(_stream_render_subagent(bound, "PROMPT", []))
+        self.assertIsNone(captured)
 
 
 if __name__ == "__main__":

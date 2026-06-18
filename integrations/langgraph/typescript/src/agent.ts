@@ -1323,49 +1323,6 @@ export class LangGraphAgent extends AbstractAgent {
           break;
         }
 
-        if (event.name === CustomEventNames.A2UIRenderStart) {
-          // Granular inner tool-call START (the A2UI render subagent opening
-          // its render_a2ui call). Mirrors the Strands adapter's
-          // push({ kind: "start" }). Flag hasFunctionStreaming so a later
-          // OnToolEnd for this id doesn't re-emit Start/Args/End.
-          this.activeRun!.hasFunctionStreaming = true;
-          this.dispatchEvent({
-            type: EventType.TOOL_CALL_START,
-            toolCallId: event.data.id,
-            toolCallName: event.data.name,
-            parentMessageId: event.data.id,
-            rawEvent: event,
-          });
-          break;
-        }
-
-        if (event.name === CustomEventNames.A2UIRenderArgs) {
-          // Granular inner tool-call ARGS delta. One event per incremental
-          // chunk the subagent streams -> progressive paint. Mirrors the
-          // Strands adapter's push({ kind: "args", delta }).
-          this.dispatchEvent({
-            type: EventType.TOOL_CALL_ARGS,
-            toolCallId: event.data.id,
-            delta:
-              typeof event.data.delta === "string"
-                ? event.data.delta
-                : JSON.stringify(event.data.delta),
-            rawEvent: event,
-          });
-          break;
-        }
-
-        if (event.name === CustomEventNames.A2UIRenderEnd) {
-          // Granular inner tool-call END. Mirrors the Strands adapter's
-          // push({ kind: "end" }).
-          this.dispatchEvent({
-            type: EventType.TOOL_CALL_END,
-            toolCallId: event.data.id,
-            rawEvent: event,
-          });
-          break;
-        }
-
         if (event.name === CustomEventNames.ManuallyEmitState) {
           this.activeRun!.manuallyEmittedState = event.data;
           this.dispatchEvent({
