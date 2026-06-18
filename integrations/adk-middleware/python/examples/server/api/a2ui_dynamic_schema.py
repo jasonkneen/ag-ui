@@ -1,20 +1,13 @@
 """A2UI Dynamic Schema feature (OSS-158).
 
 ADK port of the LangGraph ``a2ui_dynamic_schema`` example, using the adapter's
-A2UI **auto-injection**: the ``LlmAgent`` wires no A2UI tool itself. The
-ADKAgent injects ``generate_a2ui`` onto the agent and infers the sub-agent
-model from the agent's ``canonical_model``. Inside the tool, a forced
-``render_a2ui`` sub-agent generates a v0.9 A2UI surface and the toolkit's
-validate->retry recovery loop runs. The result is wrapped as
-``a2ui_operations``, which the A2UI middleware detects in the tool result and
-renders automatically.
-
-Injection here is opted in via the backend ``a2ui["inject_a2ui_tool"]`` flag
-rather than the runtime ``injectA2UITool`` forwarded-prop: the dojo only
-forwards that prop for integrations whose A2UI demos are ALL subagent-based,
-and the ADK integration also ships ``a2ui_fixed_schema`` (direct tools, no
-``generate_a2ui``), which an integration-wide flag would wrongly inject into.
-The backend flag scopes injection to exactly this demo.
+A2UI **auto-injection**: the ``LlmAgent`` wires no A2UI tool itself. When the
+runtime forwards ``injectA2UITool``, the ADKAgent injects ``generate_a2ui``
+onto the agent and infers the sub-agent model from the agent's
+``canonical_model``. Inside the tool, a forced ``render_a2ui`` sub-agent
+generates a v0.9 A2UI surface and the toolkit's validate->retry recovery loop
+runs. The result is wrapped as ``a2ui_operations``, which the A2UI middleware
+detects in the tool result and renders automatically.
 """
 
 from __future__ import annotations
@@ -99,12 +92,10 @@ adk_a2ui_dynamic_schema = ADKAgent(
     user_id="demo_user",
     session_timeout_seconds=3600,
     use_in_memory_services=True,
-    # Auto-inject generate_a2ui for this demo. inject_a2ui_tool opts in from the
-    # backend (the dojo does not forward injectA2UITool for adk-middleware — see
-    # the module docstring); default_catalog_id + guidelines are rendered into
-    # the sub-agent prompt.
+    # Optional A2UI preferences; the runtime's injectA2UITool flag (forwarded by
+    # the dojo's per-agent A2UIMiddleware) triggers injection and the adapter
+    # renders these into the sub-agent prompt.
     a2ui={
-        "inject_a2ui_tool": True,
         "default_catalog_id": CUSTOM_CATALOG_ID,
         "guidelines": {"composition_guide": COMPOSITION_GUIDE},
     },
