@@ -1335,6 +1335,48 @@ class LangGraphAgent:
                     ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=event["data"]["id"], raw_event=event)
                 )
 
+            elif event["name"] == CustomEventNames.A2UIRenderStart:
+                # Granular inner tool-call START (the A2UI render subagent
+                # opening its render_a2ui call). Mirrors the Strands adapter's
+                # push({"kind": "start"}). Tracked in streamed_tool_call_ids so
+                # a later OnToolEnd for the SAME id doesn't re-emit Start/Args/End.
+                tool_call_id = event["data"]["id"]
+                self.active_run["streamed_tool_call_ids"].add(tool_call_id)
+                yield self._dispatch_event(
+                    ToolCallStartEvent(
+                        type=EventType.TOOL_CALL_START,
+                        tool_call_id=tool_call_id,
+                        tool_call_name=event["data"]["name"],
+                        parent_message_id=tool_call_id,
+                        raw_event=event,
+                    )
+                )
+
+            elif event["name"] == CustomEventNames.A2UIRenderArgs:
+                # Granular inner tool-call ARGS delta. One event per incremental
+                # chunk the subagent streams -> progressive paint. Mirrors the
+                # Strands adapter's push({"kind": "args", "delta": ...}).
+                delta = event["data"]["delta"]
+                yield self._dispatch_event(
+                    ToolCallArgsEvent(
+                        type=EventType.TOOL_CALL_ARGS,
+                        tool_call_id=event["data"]["id"],
+                        delta=delta if isinstance(delta, str) else json.dumps(delta),
+                        raw_event=event,
+                    )
+                )
+
+            elif event["name"] == CustomEventNames.A2UIRenderEnd:
+                # Granular inner tool-call END. Mirrors the Strands adapter's
+                # push({"kind": "end"}).
+                yield self._dispatch_event(
+                    ToolCallEndEvent(
+                        type=EventType.TOOL_CALL_END,
+                        tool_call_id=event["data"]["id"],
+                        raw_event=event,
+                    )
+                )
+
             elif event["name"] == CustomEventNames.ManuallyEmitState:
                 self.active_run["manually_emitted_state"] = event["data"]
                 yield self._dispatch_event(
