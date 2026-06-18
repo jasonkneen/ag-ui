@@ -195,11 +195,13 @@ jobs:
   # Exercises the suite against google-adk 2.x. pyproject advertises
   # google-adk>=1.16.0,<3.0.0 ("compatible with 1.x and 2.x"), but the lockfile
   # resolves 1.x (see #1946), so CI never sees 2.x. The suite is currently red
-  # under 2.x (#1947), so this leg is allowed to fail (continue-on-error) — it
-  # surfaces the breakage to burn down without blocking merges.
+  # under 2.x (#1947). This leg is INFORMATIONAL: the test step is
+  # continue-on-error, so the job stays green and never blocks a merge, while a
+  # failing 2.x run is surfaced as a warning annotation and a job summary. Once
+  # the 2.x failures are burned down, drop the step's continue-on-error to make
+  # this a required, blocking check.
   adk-middleware-python-adk-2x:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - name: Checkout code
@@ -235,8 +237,22 @@ jobs:
           uv run --no-sync python -c "import importlib.metadata as m; print('google-adk', m.version('google-adk'))"
 
       - name: Run tests (google-adk 2.x)
+        id: adk2x-tests
+        continue-on-error: true
         working-directory: integrations/adk-middleware/python
         run: uv run --no-sync python -m pytest tests/ -v
+
+      - name: Report google-adk 2.x result
+        if: always()
+        run: |
+          if [ "${{ steps.adk2x-tests.outcome }}" = "success" ]; then
+            echo "### ✅ google-adk 2.x: suite passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "The suite now passes under \`google-adk>=2,<3\`. Consider dropping the step's \`continue-on-error\` to make this a required check (#1947)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=google-adk 2.x suite is red (#1947)::Informational leg — does not block merges. See the job summary."
+            echo "### ⚠️ google-adk 2.x: suite is currently red (#1947)" >> "$GITHUB_STEP_SUMMARY"
+            echo "This leg runs the suite against \`google-adk>=2,<3\` and is allowed to fail until the 2.x failures are burned down. It does not block merges." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   aws-strands-python:
     runs-on: ubuntu-latest
