@@ -522,3 +522,283 @@ async def test_adk_agent_injects_per_run_event_queue_into_a2ui_tool():
     assert run_tool.event_queue is run_queue  # per-run queue injected
     assert run_tool is not a2ui  # replaced, not the shared original
     assert a2ui.event_queue is None  # construction-time tool untouched
+
+
+# ---------------------------------------------------------------------------
+# Auto-inject decision — plan_a2ui_injection
+#
+# Mirrors the Strands suite (integrations/aws-strands/python/tests/
+# test_a2ui_tool.py). String literals mirror the shared wire contracts
+# (GENERATE_A2UI_TOOL_NAME from the toolkit, render_a2ui +
+# A2UI_SCHEMA_CONTEXT_DESCRIPTION from the middleware), hardcoded ON PURPOSE so
+# the suite fails if an upstream constant drifts.
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+from ag_ui.core import Context
+from ag_ui_adk import is_auto_injected_a2ui_tool, plan_a2ui_injection
+
+_GENERATE_A2UI_TOOL_NAME = "generate_a2ui"
+_RENDER_A2UI_TOOL_NAME = "render_a2ui"
+_STUB_MODEL = MagicMock(name="stub-model")
+_CATALOG = {
+    "components": {
+        "Row": {"required": ["children"]},
+        "HotelCard": {"required": ["name", "rating"]},
+    }
+}
+
+
+def _plan_input(forwarded_props=None, context=None, tools=None) -> RunAgentInput:
+    return RunAgentInput(
+        thread_id="thread-1",
+        run_id="run-1",
+        state={},
+        messages=[],
+        tools=tools or [],
+        context=context or [],
+        forwarded_props=forwarded_props or {},
+    )
+
+
+def test_plan_injects_when_flag_true_and_model_present():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(forwarded_props={"injectA2UITool": True}),
+        existing_tool_names=[],
+    )
+    assert plan is not None
+    assert plan["tool_name"] == _GENERATE_A2UI_TOOL_NAME
+    assert _RENDER_A2UI_TOOL_NAME in plan["drop_tool_names"]
+    assert isinstance(plan["tool"], A2UISubAgentTool)
+
+
+def test_plan_drops_custom_named_render_tool_when_flag_is_string():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(forwarded_props={"injectA2UITool": "render_ui_custom"}),
+        existing_tool_names=[],
+    )
+    assert plan is not None
+    assert "render_ui_custom" in plan["drop_tool_names"]
+
+
+def test_plan_skips_and_warns_when_no_model_inferable():
+    log = MagicMock()
+    plan = plan_a2ui_injection(
+        model=None,
+        input=_plan_input(forwarded_props={"injectA2UITool": True}),
+        existing_tool_names=[],
+        log=log,
+    )
+    assert plan is None
+    log.warning.assert_called_once()
+
+
+def test_plan_no_inject_without_flag_or_override():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(),
+        existing_tool_names=[],
+    )
+    assert plan is None
+
+
+def test_plan_backend_override_injects_without_runtime_flag():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(),
+        existing_tool_names=[],
+        config={"inject_a2ui_tool": True},
+    )
+    assert plan is not None
+    assert plan["tool_name"] == _GENERATE_A2UI_TOOL_NAME
+
+
+def test_plan_runtime_false_disables_backend_override():
+    # Explicit runtime injectA2UITool=False wins over a backend opt-in.
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(forwarded_props={"injectA2UITool": False}),
+        existing_tool_names=[],
+        config={"inject_a2ui_tool": True},
+    )
+    assert plan is None
+
+
+def test_plan_user_prevails_no_double_inject():
+    # THE "USER PREVAILS" REQUIREMENT: explicit dev wiring wins.
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(forwarded_props={"injectA2UITool": True}),
+        existing_tool_names=[_GENERATE_A2UI_TOOL_NAME],
+    )
+    assert plan is None
+
+
+def test_plan_resolves_catalog_from_schema_context_entry():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(
+            forwarded_props={"injectA2UITool": True},
+            context=[
+                Context(
+                    description=A2UI_SCHEMA_CONTEXT_DESCRIPTION,
+                    value=json.dumps(_CATALOG),
+                )
+            ],
+        ),
+        existing_tool_names=[],
+    )
+    assert plan is not None
+    assert plan["catalog"] == _CATALOG
+
+
+def test_plan_marker_distinguishes_auto_injected_from_dev_wired():
+    plan = plan_a2ui_injection(
+        model=_STUB_MODEL,
+        input=_plan_input(forwarded_props={"injectA2UITool": True}),
+        existing_tool_names=[],
+    )
+    assert plan is not None
+    assert is_auto_injected_a2ui_tool(plan["tool"]) is True
+    # A dev-wired tool carries no marker.
+    assert is_auto_injected_a2ui_tool(get_a2ui_tool({"model": _STUB_MODEL})) is False
+
+
+@pytest.mark.asyncio
+async def test_adk_agent_auto_injects_generate_a2ui_when_flag_forwarded():
+    # No A2UI tool wired on the agent; the runtime flag triggers injection of a
+    # per-run generate_a2ui bound to this run's event_queue.
+    root = LlmAgent(
+        name="root",
+        model=_ScriptedRenderLlm(model="scripted"),
+        instruction="be helpful",
+    )
+    agent = ADKAgent(
+        adk_agent=root,
+        app_name="a2ui_app",
+        user_id="u",
+        use_in_memory_services=True,
+        a2ui={"default_catalog_id": "cat-1"},
+    )
+
+    captured: list = []
+
+    async def _noop(self, **kwargs):
+        captured.append(kwargs)
+        return None
+
+    with patch.object(ADKAgent, "_run_adk_in_background", _noop):
+        execution = await agent._start_background_execution(
+            RunAgentInput(
+                thread_id="thread-A",
+                run_id="run_A",
+                messages=[UserMessage(id="m1", role="user", content="hi")],
+                context=[],
+                state={},
+                tools=[],
+                forwarded_props={"injectA2UITool": True},
+            )
+        )
+        await asyncio.gather(execution.task, return_exceptions=True)
+
+    run_tree = captured[0]["adk_agent"]
+    run_queue = captured[0]["event_queue"]
+    injected = [t for t in run_tree.tools if isinstance(t, A2UISubAgentTool)]
+
+    assert len(injected) == 1
+    assert injected[0].name == _GENERATE_A2UI_TOOL_NAME
+    assert is_auto_injected_a2ui_tool(injected[0]) is True
+    assert injected[0].event_queue is run_queue  # per-run queue bound
+    # The construction-time agent stays clean (no A2UI tool leaks onto it).
+    assert not any(isinstance(t, A2UISubAgentTool) for t in (root.tools or []))
+
+
+@pytest.mark.asyncio
+async def test_adk_agent_no_auto_inject_without_flag():
+    root = LlmAgent(
+        name="root",
+        model=_ScriptedRenderLlm(model="scripted"),
+        instruction="be helpful",
+    )
+    agent = ADKAgent(
+        adk_agent=root,
+        app_name="a2ui_app",
+        user_id="u",
+        use_in_memory_services=True,
+        a2ui={"default_catalog_id": "cat-1"},
+    )
+
+    captured: list = []
+
+    async def _noop(self, **kwargs):
+        captured.append(kwargs)
+        return None
+
+    with patch.object(ADKAgent, "_run_adk_in_background", _noop):
+        execution = await agent._start_background_execution(
+            RunAgentInput(
+                thread_id="thread-A",
+                run_id="run_A",
+                messages=[UserMessage(id="m1", role="user", content="hi")],
+                context=[],
+                state={},
+                tools=[],
+                forwarded_props={},  # no injectA2UITool
+            )
+        )
+        await asyncio.gather(execution.task, return_exceptions=True)
+
+    run_tree = captured[0]["adk_agent"]
+    assert not any(isinstance(t, A2UISubAgentTool) for t in (run_tree.tools or []))
+
+
+@pytest.mark.asyncio
+async def test_adk_agent_user_prevails_over_auto_inject():
+    # USER PREVAILS: a dev-wired generate_a2ui beats auto-injection even when
+    # the runtime forwards injectA2UITool. Exactly one tool survives — the
+    # dev's (no marker) — and it still gets this run's event_queue bound.
+    dev_tool = get_a2ui_tool({"model": _ScriptedRenderLlm(model="scripted")})
+    root = LlmAgent(
+        name="root",
+        model=_ScriptedRenderLlm(model="scripted"),
+        instruction="be helpful",
+        tools=[dev_tool],
+    )
+    agent = ADKAgent(
+        adk_agent=root,
+        app_name="a2ui_app",
+        user_id="u",
+        use_in_memory_services=True,
+        a2ui={"default_catalog_id": "cat-1"},
+    )
+
+    captured: list = []
+
+    async def _noop(self, **kwargs):
+        captured.append(kwargs)
+        return None
+
+    with patch.object(ADKAgent, "_run_adk_in_background", _noop):
+        execution = await agent._start_background_execution(
+            RunAgentInput(
+                thread_id="thread-A",
+                run_id="run_A",
+                messages=[UserMessage(id="m1", role="user", content="hi")],
+                context=[],
+                state={},
+                tools=[],
+                forwarded_props={"injectA2UITool": True},
+            )
+        )
+        await asyncio.gather(execution.task, return_exceptions=True)
+
+    run_tree = captured[0]["adk_agent"]
+    run_queue = captured[0]["event_queue"]
+    a2ui_tools = [t for t in run_tree.tools if isinstance(t, A2UISubAgentTool)]
+
+    assert len(a2ui_tools) == 1  # no double-inject
+    assert is_auto_injected_a2ui_tool(a2ui_tools[0]) is False  # the dev's tool
+    assert a2ui_tools[0].event_queue is run_queue  # still per-run bound

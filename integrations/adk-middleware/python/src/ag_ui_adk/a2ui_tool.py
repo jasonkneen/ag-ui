@@ -27,6 +27,7 @@ from google.genai import types
 
 from ag_ui.core import (
     EventType,
+    RunAgentInput,
     ToolCallArgsEvent,
     ToolCallEndEvent,
     ToolCallStartEvent,
@@ -36,6 +37,7 @@ from ag_ui.core import (
 from ag_ui_a2ui_toolkit import (
     A2UI_OPERATIONS_KEY,
     A2UIToolParams,
+    GENERATE_A2UI_TOOL_NAME,
     RENDER_A2UI_TOOL_DEF,
     build_a2ui_envelope,
     prepare_a2ui_request,
@@ -56,6 +58,17 @@ logger = logging.getLogger("ag_ui_adk")
 
 # The inner structured-output tool the subagent is forced to call.
 _RENDER_A2UI_NAME = "render_a2ui"
+
+#: Default name of the render tool the A2UI middleware injects as a frontend
+#: tool (and that auto-injection drops, so the model calls ``generate_a2ui``
+#: directly instead of the bare render proxy). Sourced from the shared toolkit
+#: contract so a rename upstream propagates here.
+RENDER_A2UI_TOOL_NAME: str = RENDER_A2UI_TOOL_DEF["function"]["name"]
+
+#: Attribute marking a ``generate_a2ui`` tool this adapter auto-injected, so the
+#: per-run wiring can tell its OWN injection apart from a dev-wired tool (which
+#: always wins — see the USER-PREVAILS branch in ``plan_a2ui_injection``).
+_A2UI_AUTOINJECT_ATTR = "_a2ui_auto_injected"
 
 # Description the A2UI middleware stamps on the schema context entry. MUST stay
 # byte-identical to the middleware's exported A2UI_SCHEMA_CONTEXT_DESCRIPTION
@@ -107,6 +120,11 @@ class A2UISubAgentTool(BaseTool):
         """
         clone = A2UISubAgentTool(self._cfg)
         clone.event_queue = event_queue
+        # Preserve the auto-inject marker so a per-run clone of an auto-injected
+        # tool is still recognized as auto-injected (parity with the dev-wired
+        # path, which carries no marker).
+        if getattr(self, _A2UI_AUTOINJECT_ATTR, False):
+            setattr(clone, _A2UI_AUTOINJECT_ATTR, True)
         return clone
 
     def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
@@ -527,3 +545,145 @@ def get_a2ui_tool(params: A2UIToolParams) -> BaseTool:
     """
     cfg = resolve_a2ui_tool_params(params)
     return A2UISubAgentTool(cfg)
+
+
+def is_auto_injected_a2ui_tool(tool: Any) -> bool:
+    """True if ``tool`` is a ``generate_a2ui`` this adapter auto-injected."""
+    return getattr(tool, _A2UI_AUTOINJECT_ATTR, False) is True
+
+
+# ---------------------------------------------------------------------------
+# Auto-inject decision
+# ---------------------------------------------------------------------------
+
+
+def _resolve_catalog_from_context(input: RunAgentInput) -> Optional[dict]:
+    """Pull the A2UI catalog the middleware stamped into ``RunAgentInput.context``.
+
+    Matches the schema entry by its exact description (the same byte-identical
+    contract ``_state_view`` uses) and parses its JSON value. Returns ``None``
+    when absent/unparseable — auto-injection then proceeds with a ``None``
+    catalog (the tool also resolves the catalog from live session state at
+    run time, so this is parity glue with the Strands adapter rather than the
+    sole catalog source).
+    """
+    for entry in input.context or []:
+        # Entries are pydantic Context models on the validated path, but this is
+        # exported API — tolerate dict-shaped entries too (mirrors the adapter's
+        # own context normalization).
+        if isinstance(entry, dict):
+            description = entry.get("description")
+            value = entry.get("value")
+        else:
+            description = getattr(entry, "description", None)
+            value = getattr(entry, "value", None)
+        if description != A2UI_SCHEMA_CONTEXT_DESCRIPTION:
+            continue
+        if not value:
+            logger.warning(
+                "A2UI schema context entry has an empty value; "
+                "catalog-aware recovery disabled."
+            )
+            continue
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as err:
+            logger.warning(
+                "A2UI schema context entry present but unparseable; "
+                "catalog-aware recovery disabled: %s",
+                err,
+            )
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning(
+            "A2UI schema context entry is valid JSON but not an object; "
+            "catalog-aware recovery disabled (got %s)",
+            type(parsed).__name__,
+        )
+    return None
+
+
+def plan_a2ui_injection(
+    *,
+    model: Any,
+    input: RunAgentInput,
+    existing_tool_names: list,
+    config: Optional[dict] = None,
+    log: Optional[logging.Logger] = None,
+) -> Optional[dict]:
+    """Decide whether to auto-inject ``generate_a2ui`` for this run.
+
+    Mirrors the Strands adapter's ``plan_a2ui_injection`` (and the LangGraph
+    "no injectA2UITool, no injection" contract):
+
+    1. Off unless the runtime forwarded ``injectA2UITool`` (``True``, or a
+       string naming the injected RENDER tool to drop) OR a backend
+       ``config["inject_a2ui_tool"]`` override.
+    2. USER PREVAILS — a dev-wired ``generate_a2ui`` (already in
+       ``existing_tool_names``) is never double-injected.
+    3. No inferable model (e.g. a non-LlmAgent orchestrator root) -> warn + skip.
+    4. Otherwise build the tool (threading the catalog + guidelines) and report
+       the injected render proxy to drop from the frontend tools.
+
+    ``model`` is the already-resolved framework model the sub-agent invokes (the
+    ADKAgent passes the root ``LlmAgent.canonical_model``) — kept out of this
+    pure decision so it stays framework-agnostic.
+
+    Returns ``{"tool", "tool_name", "drop_tool_names", "catalog"}`` or ``None``.
+    """
+    log = log or logger
+    config = config or {}
+
+    # `forwarded_props` is Any on the wire; tolerate non-dict shapes.
+    forwarded = (
+        input.forwarded_props if isinstance(input.forwarded_props, dict) else {}
+    )
+    flag = forwarded.get("injectA2UITool")
+    if flag is None:
+        # Nullish fallback, mirroring the TS adapter's `??`: an explicit runtime
+        # `injectA2UITool: false` disables injection even when the backend
+        # config opts in.
+        flag = config.get("inject_a2ui_tool")
+    if not flag:
+        return None
+
+    tool_name = GENERATE_A2UI_TOOL_NAME
+    # USER PREVAILS: explicit dev wiring wins — never double-inject.
+    if tool_name in existing_tool_names:
+        return None
+
+    if model is None:
+        log.warning(
+            "A2UI tool injection requested but no model could be inferred from "
+            "the agent (a non-LlmAgent orchestrator root has no model). Skipping "
+            "auto-injection — wire get_a2ui_tool() onto an LlmAgent explicitly."
+        )
+        return None
+
+    render_tool_name = flag if isinstance(flag, str) else RENDER_A2UI_TOOL_NAME
+    # Nullish (not falsy) fallback, mirroring the TS adapter's `??`.
+    catalog = config.get("catalog")
+    if catalog is None:
+        catalog = _resolve_catalog_from_context(input)
+
+    tool = get_a2ui_tool(
+        {
+            "model": model,
+            "tool_name": tool_name,
+            "catalog": catalog,
+            "default_catalog_id": config.get("default_catalog_id"),
+            "guidelines": config.get("guidelines"),
+            "recovery": config.get("recovery"),
+        }
+    )
+    setattr(tool, _A2UI_AUTOINJECT_ATTR, True)
+
+    return {
+        "tool": tool,
+        "tool_name": tool_name,
+        "drop_tool_names": [render_tool_name],
+        "catalog": catalog,
+    }

@@ -1,19 +1,21 @@
 """A2UI Dynamic Schema feature (OSS-158).
 
-ADK port of the LangGraph ``a2ui_dynamic_schema`` example. The main agent calls
-the ``generate_a2ui`` tool (from ``get_a2ui_tool``); inside it, a forced
-``render_a2ui`` sub-agent generates a v0.9 A2UI surface and the toolkit's
-validate->retry recovery loop runs. The result is wrapped as ``a2ui_operations``,
-which the A2UI middleware detects in the tool result and renders automatically.
+ADK port of the LangGraph ``a2ui_dynamic_schema`` example, using the adapter's
+A2UI **auto-injection**: the ``LlmAgent`` wires no A2UI tool itself. When the
+runtime forwards ``injectA2UITool``, the ADKAgent injects ``generate_a2ui``
+onto the agent and infers the sub-agent model from the agent's
+``canonical_model``. Inside the tool, a forced ``render_a2ui`` sub-agent
+generates a v0.9 A2UI surface and the toolkit's validate->retry recovery loop
+runs. The result is wrapped as ``a2ui_operations``, which the A2UI middleware
+detects in the tool result and renders automatically.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 from google.adk.agents import LlmAgent
-from google.adk.models import Gemini
 
-from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint, get_a2ui_tool
+from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint
 
 # Catalog the dojo renders this demo against (HotelCard / ProductCard /
 # TeamMemberCard / Row). The client (dojo page) supplies the catalog via the
@@ -72,21 +74,16 @@ When the user asks to MODIFY a surface you already rendered, call generate_a2ui 
 intent="update" and target_surface_id set to that surface's id.
 IMPORTANT: After calling the tool, do NOT repeat the data in your text response. The tool renders UI automatically. Just confirm what was rendered."""
 
-# gemini-2.5-pro reliably produces valid, in-catalog A2UI for this demo; the
-# sub-agent uses a Gemini model instance (get_a2ui_tool invokes it directly).
+# gemini-2.5-pro reliably produces valid, in-catalog A2UI for this demo. The
+# auto-injected generate_a2ui tool infers its sub-agent model from this agent's
+# canonical_model (the registry resolves the string to a Gemini instance).
 _MODEL = "gemini-2.5-pro"
-
-a2ui_tool = get_a2ui_tool({
-    "model": Gemini(model=_MODEL),
-    "default_catalog_id": CUSTOM_CATALOG_ID,
-    "guidelines": {"composition_guide": COMPOSITION_GUIDE},
-})
 
 dynamic_schema_agent = LlmAgent(
     model=_MODEL,
     name="a2ui_dynamic_schema",
     instruction=SYSTEM_PROMPT,
-    tools=[a2ui_tool],
+    # generate_a2ui is auto-injected by the adapter; nothing wired here.
 )
 
 adk_a2ui_dynamic_schema = ADKAgent(
@@ -95,6 +92,12 @@ adk_a2ui_dynamic_schema = ADKAgent(
     user_id="demo_user",
     session_timeout_seconds=3600,
     use_in_memory_services=True,
+    # Optional A2UI preferences; the runtime's injectA2UITool flag triggers
+    # injection and the adapter renders these into the sub-agent prompt.
+    a2ui={
+        "default_catalog_id": CUSTOM_CATALOG_ID,
+        "guidelines": {"composition_guide": COMPOSITION_GUIDE},
+    },
 )
 
 app = FastAPI(title="ADK Middleware A2UI Dynamic Schema")
