@@ -13,6 +13,7 @@ import { Observable, firstValueFrom, toArray } from "rxjs";
 import {
   A2UIMiddleware,
   A2UIActivityType,
+  A2UI_SCHEMA_CONTEXT_DESCRIPTION,
   RENDER_A2UI_TOOL_NAME,
   LOG_A2UI_EVENT_TOOL_NAME,
   extractSurfaceIds,
@@ -69,6 +70,13 @@ async function collectEvents(observable: Observable<BaseEvent>): Promise<BaseEve
   return firstValueFrom(observable.pipe(toArray()));
 }
 
+// OSS-162: the a2ui-surface activity now also carries pre-paint lifecycle
+// snapshots (`content.status` = "building" | "retrying" | "failed", no
+// a2ui_operations). Tests that assert PAINT behaviour filter to snapshots that
+// actually carry operations.
+const isPaint = (e: BaseEvent): boolean =>
+  e.type === EventType.ACTIVITY_SNAPSHOT && Array.isArray((e as any).content?.a2ui_operations);
+
 describe("A2UIMiddleware", () => {
   describe("tool injection", () => {
     it("should inject render_a2ui tool when injectA2UITool is true", async () => {
@@ -84,6 +92,23 @@ describe("A2UIMiddleware", () => {
       expect(mockAgent.runCalls).toHaveLength(1);
       const tools = mockAgent.runCalls[0].tools;
       expect(tools.some((t) => t.name === RENDER_A2UI_TOOL_NAME)).toBe(true);
+      // The flag is forwarded so downstream (e.g. LangGraph) can surface it into state.
+      expect(mockAgent.runCalls[0].forwardedProps?.injectA2UITool).toBe(true);
+    });
+
+    it("should forward a custom injectA2UITool tool name as the flag", async () => {
+      const middleware = new A2UIMiddleware({ injectA2UITool: "custom_render" });
+      const mockAgent = new MockAgent([
+        { type: EventType.RUN_STARTED, runId: "test", threadId: "test" },
+        { type: EventType.RUN_FINISHED, runId: "test", threadId: "test" },
+      ]);
+
+      const input = createRunAgentInput();
+      await collectEvents(middleware.run(input, mockAgent));
+
+      const tools = mockAgent.runCalls[0].tools;
+      expect(tools.some((t) => t.name === "custom_render")).toBe(true);
+      expect(mockAgent.runCalls[0].forwardedProps?.injectA2UITool).toBe("custom_render");
     });
 
     it("should not inject tool by default", async () => {
@@ -99,6 +124,8 @@ describe("A2UIMiddleware", () => {
       expect(mockAgent.runCalls).toHaveLength(1);
       const tools = mockAgent.runCalls[0].tools;
       expect(tools.some((t) => t.name === RENDER_A2UI_TOOL_NAME)).toBe(false);
+      // No injection -> flag must not be forwarded.
+      expect(mockAgent.runCalls[0].forwardedProps?.injectA2UITool).toBeUndefined();
     });
 
     it("should not duplicate tool if already present", async () => {
@@ -210,10 +237,8 @@ describe("A2UIMiddleware", () => {
       const input = createRunAgentInput();
       const events = await collectEvents(middleware.run(input, mockAgent));
 
-      // Streaming handler should have emitted ACTIVITY_SNAPSHOT during TOOL_CALL_ARGS
-      const activityEvent = events.find(
-        (e) => e.type === EventType.ACTIVITY_SNAPSHOT
-      );
+      // Streaming handler should have emitted a painted ACTIVITY_SNAPSHOT during TOOL_CALL_ARGS
+      const activityEvent = events.find(isPaint);
       expect(activityEvent).toBeDefined();
       expect((activityEvent as any).activityType).toBe(A2UIActivityType);
       // Should have createSurface + updateComponents (first emission)
@@ -303,9 +328,7 @@ describe("A2UIMiddleware", () => {
       const input = createRunAgentInput();
       const events = await collectEvents(middleware.run(input, mockAgent));
 
-      const activitySnapshots = events.filter(
-        (e) => e.type === EventType.ACTIVITY_SNAPSHOT
-      );
+      const activitySnapshots = events.filter(isPaint);
       expect(activitySnapshots.length).toBeGreaterThanOrEqual(1);
 
       // createSurface is emitted early — the first snapshot creates the surface
@@ -361,7 +384,7 @@ describe("A2UIMiddleware", () => {
 
       const input = createRunAgentInput();
       const events = await collectEvents(middleware.run(input, mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
 
       // Never emit a component without a `component` type (would throw in web_core).
       for (const snap of snapshots) {
@@ -441,7 +464,7 @@ describe("A2UIMiddleware", () => {
       ]);
 
       const events = await collectEvents(middleware.run(createRunAgentInput(), mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
 
       // Every snapshot that carries createSurface must also carry components in
       // the same payload — an empty surface would make the renderer throw
@@ -479,7 +502,7 @@ describe("A2UIMiddleware", () => {
       ]);
 
       const events = await collectEvents(middleware.run(createRunAgentInput(), mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       // The createSurface op's catalogId must never be the empty string the
       // host accidentally configured — fall through to the basic catalog
       // (which the renderer can at least surface as a real, recognizable error).
@@ -490,6 +513,98 @@ describe("A2UIMiddleware", () => {
             expect(op.createSurface.catalogId).not.toBe("");
             expect(typeof op.createSurface.catalogId).toBe("string");
             expect((op.createSurface.catalogId as string).length).toBeGreaterThan(0);
+          }
+        }
+      }
+    });
+
+    it("falls back to the frontend-registered catalog id when no defaultCatalogId is configured", async () => {
+      // Zero-config path: the host sets NO defaultCatalogId. The renderer ships
+      // the catalog it registered as the A2UI schema context entry
+      // ({ catalogId, components }). The middleware must stamp createSurface with
+      // THAT id — not "basic" — so the surface resolves against the catalog the
+      // frontend actually has.
+      const middleware = new A2UIMiddleware({});
+      const toolCallId = "tc-fe-catalog";
+
+      const fullArgs = JSON.stringify({
+        surfaceId: "s-fe",
+        components: [
+          { id: "root", component: "Row", children: { componentId: "card", path: "/items" } },
+          { id: "card", component: "HotelCard", name: { path: "name" } },
+        ],
+        data: { items: [{ name: "A" }] },
+      });
+
+      const mockAgent = new MockAgent([
+        { type: EventType.RUN_STARTED, runId: "test", threadId: "test" },
+        { type: EventType.TOOL_CALL_START, toolCallId, toolCallName: "render_a2ui" },
+        { type: EventType.TOOL_CALL_ARGS, toolCallId, delta: fullArgs } as BaseEvent,
+        { type: EventType.TOOL_CALL_END, toolCallId },
+        { type: EventType.RUN_FINISHED, runId: "test", threadId: "test" },
+      ]);
+
+      const input = createRunAgentInput({
+        context: [
+          {
+            description: A2UI_SCHEMA_CONTEXT_DESCRIPTION,
+            value: JSON.stringify({ catalogId: "declarative-gen-ui-catalog", components: {} }),
+          },
+        ],
+      });
+
+      const events = await collectEvents(middleware.run(input, mockAgent));
+      const snapshots = events.filter(isPaint);
+      expect(snapshots.length).toBeGreaterThan(0);
+      for (const snap of snapshots) {
+        const ops = (snap as any).content.a2ui_operations as any[];
+        for (const op of ops) {
+          if (op.createSurface) {
+            expect(op.createSurface.catalogId).toBe("declarative-gen-ui-catalog");
+          }
+        }
+      }
+    });
+
+    it("configured defaultCatalogId wins over the frontend-registered catalog id", async () => {
+      // Explicit host override must take precedence over the frontend-shipped id.
+      const middleware = new A2UIMiddleware({ defaultCatalogId: "server://override" });
+      const toolCallId = "tc-config-wins";
+
+      const fullArgs = JSON.stringify({
+        surfaceId: "s-override",
+        components: [
+          { id: "root", component: "Row", children: { componentId: "card", path: "/items" } },
+          { id: "card", component: "HotelCard", name: { path: "name" } },
+        ],
+        data: { items: [{ name: "A" }] },
+      });
+
+      const mockAgent = new MockAgent([
+        { type: EventType.RUN_STARTED, runId: "test", threadId: "test" },
+        { type: EventType.TOOL_CALL_START, toolCallId, toolCallName: "render_a2ui" },
+        { type: EventType.TOOL_CALL_ARGS, toolCallId, delta: fullArgs } as BaseEvent,
+        { type: EventType.TOOL_CALL_END, toolCallId },
+        { type: EventType.RUN_FINISHED, runId: "test", threadId: "test" },
+      ]);
+
+      const input = createRunAgentInput({
+        context: [
+          {
+            description: A2UI_SCHEMA_CONTEXT_DESCRIPTION,
+            value: JSON.stringify({ catalogId: "declarative-gen-ui-catalog", components: {} }),
+          },
+        ],
+      });
+
+      const events = await collectEvents(middleware.run(input, mockAgent));
+      const snapshots = events.filter(isPaint);
+      expect(snapshots.length).toBeGreaterThan(0);
+      for (const snap of snapshots) {
+        const ops = (snap as any).content.a2ui_operations as any[];
+        for (const op of ops) {
+          if (op.createSurface) {
+            expect(op.createSurface.catalogId).toBe("server://override");
           }
         }
       }
@@ -520,7 +635,7 @@ describe("A2UIMiddleware", () => {
       ]);
 
       const events = await collectEvents(middleware.run(createRunAgentInput(), mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       // The custom-named tool's args must produce streaming ACTIVITY_SNAPSHOTs.
       expect(snapshots.length).toBeGreaterThan(0);
       const hasCreate = snapshots.some((s) =>
@@ -560,7 +675,7 @@ describe("A2UIMiddleware", () => {
       ]);
 
       const events = await collectEvents(middleware.run(createRunAgentInput(), mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       expect(snapshots.length).toBeGreaterThan(0);
       const hasCreate = snapshots.some((s) =>
         (s as any).content.a2ui_operations.some(
@@ -616,7 +731,7 @@ describe("A2UIMiddleware", () => {
       ]);
 
       const events = await collectEvents(middleware.run(createRunAgentInput(), mockAgent));
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       const surfaceIds = new Set<string>();
       for (const snap of snapshots) {
         const ops = (snap as any).content.a2ui_operations as any[];
@@ -682,18 +797,16 @@ describe("A2UIMiddleware", () => {
       const events = await collectEvents(middleware.run(input, mockAgent));
 
       // Should have two distinct ACTIVITY_SNAPSHOT events with different messageIds
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       expect(snapshots).toHaveLength(2);
 
       const messageId1 = (snapshots[0] as any).messageId;
       const messageId2 = (snapshots[1] as any).messageId;
       expect(messageId1).not.toBe(messageId2);
 
-      // Both should include the surfaceId
-      expect(messageId1).toContain("shared-surface");
-      expect(messageId2).toContain("shared-surface");
-
-      // Each should include its own toolCallId
+      // OSS-162: the messageId is keyed by the (outer) call, not the surfaceId,
+      // so the whole lifecycle for a call shares one id and the paint replaces the
+      // skeleton in place. Distinct calls still get distinct ids via their toolCallId.
       expect(messageId1).toContain(toolCallId1);
       expect(messageId2).toContain(toolCallId2);
     });
@@ -754,7 +867,7 @@ describe("A2UIMiddleware", () => {
       const input = createRunAgentInput();
       const events = await collectEvents(middleware.run(input, mockAgent));
 
-      const snapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+      const snapshots = events.filter(isPaint);
       expect(snapshots).toHaveLength(2);
 
       const messageId1 = (snapshots[0] as any).messageId;
@@ -821,7 +934,7 @@ describe("A2UI auto-detection in tool results", () => {
     expect(resultEvents).toHaveLength(1);
 
     // Should have auto-detected A2UI and emitted ACTIVITY_SNAPSHOT
-    const activitySnapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+    const activitySnapshots = events.filter(isPaint);
     expect(activitySnapshots.length).toBeGreaterThanOrEqual(1);
     expect((activitySnapshots[0] as any).activityType).toBe(A2UIActivityType);
     expect((activitySnapshots[0] as any).content.a2ui_operations).toHaveLength(2);
@@ -856,7 +969,7 @@ describe("A2UI auto-detection in tool results", () => {
     const input = createRunAgentInput();
     const events = await collectEvents(middleware.run(input, mockAgent));
 
-    const activitySnapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+    const activitySnapshots = events.filter(isPaint);
     expect(activitySnapshots).toHaveLength(0);
 
     const activityDeltas = events.filter((e) => e.type === EventType.ACTIVITY_DELTA);
@@ -894,7 +1007,7 @@ describe("A2UI auto-detection in tool results", () => {
     const events = await collectEvents(middleware.run(input, mockAgent));
 
     // Should have exactly one ACTIVITY_SNAPSHOT (from streaming, not auto-detection)
-    const activitySnapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+    const activitySnapshots = events.filter(isPaint);
     expect(activitySnapshots).toHaveLength(1);
   });
 
@@ -927,7 +1040,7 @@ describe("A2UI auto-detection in tool results", () => {
     const input = createRunAgentInput();
     const events = await collectEvents(middleware.run(input, mockAgent));
 
-    const activitySnapshots = events.filter((e) => e.type === EventType.ACTIVITY_SNAPSHOT);
+    const activitySnapshots = events.filter(isPaint);
     expect(activitySnapshots).toHaveLength(0);
   });
 });

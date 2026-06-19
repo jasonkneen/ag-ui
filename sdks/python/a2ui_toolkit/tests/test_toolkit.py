@@ -11,8 +11,13 @@ import unittest
 
 from ag_ui_a2ui_toolkit import (
     A2UI_OPERATIONS_KEY,
+    A2UI_SCHEMA_CONTEXT_DESCRIPTION,
     BASIC_CATALOG_ID,
+    DEFAULT_DESIGN_GUIDELINES,
+    DEFAULT_GENERATION_GUIDELINES,
     DEFAULT_SURFACE_ID,
+    GENERATE_A2UI_TOOL_DESCRIPTION,
+    GENERATE_A2UI_TOOL_NAME,
     RENDER_A2UI_TOOL_DEF,
     assemble_ops,
     build_a2ui_envelope,
@@ -21,6 +26,9 @@ from ag_ui_a2ui_toolkit import (
     create_surface,
     find_prior_surface,
     prepare_a2ui_request,
+    resolve_a2ui_catalog,
+    resolve_a2ui_tool_params,
+    split_a2ui_schema_context,
     update_components,
     update_data_model,
     wrap_as_operations_envelope,
@@ -136,6 +144,126 @@ class TestBuildContextPrompt(unittest.TestCase):
     def test_empty_entries_dropped(self):
         prompt = build_context_prompt({"ag-ui": {"context": [{}]}})
         self.assertEqual(prompt, "")
+
+
+class TestSplitA2UISchemaContext(unittest.TestCase):
+    def test_splits_schema_from_regular(self):
+        ctx = [
+            {"description": "Style guide", "value": "use cards"},
+            {"description": A2UI_SCHEMA_CONTEXT_DESCRIPTION, "value": "<catalog>"},
+        ]
+        schema_value, regular = split_a2ui_schema_context(ctx)
+        self.assertEqual(schema_value, "<catalog>")
+        self.assertEqual(len(regular), 1)
+        self.assertEqual(regular[0]["description"], "Style guide")
+
+    def test_none_when_no_schema_entry(self):
+        schema_value, regular = split_a2ui_schema_context(
+            [{"description": "Style guide", "value": "use cards"}]
+        )
+        self.assertIsNone(schema_value)
+        self.assertEqual(len(regular), 1)
+
+    def test_handles_none_and_objects(self):
+        self.assertEqual(split_a2ui_schema_context(None), (None, []))
+
+        class _Entry:
+            def __init__(self, description, value):
+                self.description = description
+                self.value = value
+
+        schema_value, regular = split_a2ui_schema_context(
+            [_Entry(A2UI_SCHEMA_CONTEXT_DESCRIPTION, "obj-catalog")]
+        )
+        self.assertEqual(schema_value, "obj-catalog")
+        self.assertEqual(regular, [])
+
+    def test_roundtrips_into_build_context_prompt(self):
+        ctx = [
+            {"description": "App context", "value": "on dashboard"},
+            {"description": A2UI_SCHEMA_CONTEXT_DESCRIPTION, "value": "<catalog>"},
+        ]
+        schema_value, regular = split_a2ui_schema_context(ctx)
+        prompt = build_context_prompt(
+            {"ag-ui": {"context": regular, "a2ui_schema": schema_value}}
+        )
+        self.assertIn("## Available Components", prompt)
+        self.assertIn("<catalog>", prompt)
+        self.assertIn("## App context", prompt)
+        self.assertNotIn(A2UI_SCHEMA_CONTEXT_DESCRIPTION, prompt)
+
+
+class TestResolveA2UICatalog(unittest.TestCase):
+    def test_native_ag_ui_schema_path(self):
+        state = {
+            "ag-ui": {
+                "a2ui_schema": json.dumps(
+                    {"catalogId": "my-catalog", "components": []}
+                )
+            }
+        }
+        schema, catalog_id = resolve_a2ui_catalog(state)
+        # Native path: toolkit reads a2ui_schema from state for the prompt, so
+        # only the id is surfaced (schema None).
+        self.assertIsNone(schema)
+        self.assertEqual(catalog_id, "my-catalog")
+
+    def test_native_schema_already_parsed_dict(self):
+        state = {"ag-ui": {"a2ui_schema": {"catalogId": "parsed-cat"}}}
+        _, catalog_id = resolve_a2ui_catalog(state)
+        self.assertEqual(catalog_id, "parsed-cat")
+
+    def test_native_malformed_json_yields_no_id(self):
+        state = {"ag-ui": {"a2ui_schema": "{not json"}}
+        schema, catalog_id = resolve_a2ui_catalog(state)
+        self.assertIsNone(schema)
+        self.assertIsNone(catalog_id)
+
+    def test_ag_ui_context_path(self):
+        # Canonical key — what a plain AG-UI adapter (e.g. Strands) has; no
+        # "copilotkit" alias present.
+        state = {
+            "ag-ui": {
+                "context": [
+                    {"description": "Registered A2UI catalog", "value": "- ag-ui-cat"}
+                ]
+            }
+        }
+        schema, catalog_id = resolve_a2ui_catalog(state)
+        self.assertEqual(catalog_id, "ag-ui-cat")
+        self.assertIn("ag-ui-cat", schema)
+
+    def test_context_path_picks_first_listed_catalog(self):
+        state = {
+            "ag-ui": {
+                "context": [
+                    {"description": "unrelated", "value": "x"},
+                    {
+                        "description": "Registered A2UI catalog",
+                        "value": "- custom-cat\n- basic",
+                    },
+                ]
+            }
+        }
+        schema, catalog_id = resolve_a2ui_catalog(state)
+        self.assertEqual(catalog_id, "custom-cat")
+        self.assertIn("custom-cat", schema)
+
+    def test_schema_entry_takes_precedence_over_context(self):
+        state = {
+            "ag-ui": {
+                "a2ui_schema": json.dumps({"catalogId": "native-cat"}),
+                "context": [
+                    {"description": "A2UI catalog", "value": "- ctx-cat"}
+                ],
+            },
+        }
+        _, catalog_id = resolve_a2ui_catalog(state)
+        self.assertEqual(catalog_id, "native-cat")
+
+    def test_no_catalog_returns_none(self):
+        self.assertIsNone(resolve_a2ui_catalog({}))
+        self.assertIsNone(resolve_a2ui_catalog({"ag-ui": {"context": []}}))
 
 
 class _ToolMessage:
@@ -380,20 +508,69 @@ class TestFindPriorSurface(unittest.TestCase):
 
 
 class TestBuildSubagentPrompt(unittest.TestCase):
+    # Suppress both built-in default blocks so the structural tests below can
+    # assert exact output without the (large) DEFAULT_* text. Empty string is
+    # the documented escape hatch (None → default; "" → block omitted).
+    SUPPRESS = {"generation_guidelines": "", "design_guidelines": ""}
+
+    def test_defaults_applied_when_unset(self):
+        # No guidelines → both built-in blocks land in the prompt, with the
+        # design block under its "## Design Guidelines" header (OSS-248).
+        prompt = build_subagent_prompt(context_prompt="ctx")
+        self.assertIn(DEFAULT_GENERATION_GUIDELINES, prompt)
+        self.assertIn("## Design Guidelines", prompt)
+        self.assertIn(DEFAULT_DESIGN_GUIDELINES, prompt)
+        self.assertIn("ctx", prompt)
+
+    def test_section_order(self):
+        # generation → design → context → composition.
+        prompt = build_subagent_prompt(
+            context_prompt="CTXMARK",
+            guidelines={
+                "generation_guidelines": "GENMARK",
+                "design_guidelines": "DESMARK",
+                "composition_guide": "COMPMARK",
+            },
+        )
+        self.assertLess(prompt.index("GENMARK"), prompt.index("DESMARK"))
+        self.assertLess(prompt.index("DESMARK"), prompt.index("CTXMARK"))
+        self.assertLess(prompt.index("CTXMARK"), prompt.index("COMPMARK"))
+
+    def test_per_field_override_keeps_other_default(self):
+        # Override generation only → design still falls back to its default.
+        prompt = build_subagent_prompt(
+            context_prompt="ctx",
+            guidelines={"generation_guidelines": "CUSTOM_GEN"},
+        )
+        self.assertIn("CUSTOM_GEN", prompt)
+        self.assertNotIn(DEFAULT_GENERATION_GUIDELINES, prompt)
+        self.assertIn(DEFAULT_DESIGN_GUIDELINES, prompt)
+
+    def test_empty_string_suppresses_block(self):
+        prompt = build_subagent_prompt(
+            context_prompt="ctx", guidelines=self.SUPPRESS
+        )
+        self.assertNotIn(DEFAULT_GENERATION_GUIDELINES, prompt)
+        self.assertNotIn(DEFAULT_DESIGN_GUIDELINES, prompt)
+        self.assertNotIn("## Design Guidelines", prompt)
+
     def test_context_only(self):
         self.assertEqual(
-            build_subagent_prompt(context_prompt="ctx"), "ctx"
+            build_subagent_prompt(context_prompt="ctx", guidelines=self.SUPPRESS),
+            "ctx",
         )
 
     def test_appends_composition_guide(self):
         prompt = build_subagent_prompt(
-            context_prompt="ctx", composition_guide="guide"
+            context_prompt="ctx",
+            guidelines={**self.SUPPRESS, "composition_guide": "guide"},
         )
         self.assertEqual(prompt, "ctx\nguide")
 
     def test_edit_block(self):
         prompt = build_subagent_prompt(
             context_prompt="ctx",
+            guidelines=self.SUPPRESS,
             edit_context={
                 "surfaceId": "s1",
                 "prior": {
@@ -413,12 +590,16 @@ class TestBuildSubagentPrompt(unittest.TestCase):
     def test_omits_requested_changes_when_none(self):
         prompt = build_subagent_prompt(
             context_prompt="ctx",
+            guidelines=self.SUPPRESS,
             edit_context={"surfaceId": "s1", "prior": {"components": [], "data": None}},
         )
         self.assertNotIn("Requested changes", prompt)
 
-    def test_empty_context_returns_empty(self):
-        self.assertEqual(build_subagent_prompt(context_prompt=""), "")
+    def test_empty_everything_returns_empty(self):
+        # Empty context AND both default blocks suppressed → empty prompt.
+        self.assertEqual(
+            build_subagent_prompt(context_prompt="", guidelines=self.SUPPRESS), ""
+        )
 
 
 class TestAssembleOps(unittest.TestCase):
@@ -512,7 +693,7 @@ class TestPrepareA2UIRequest(unittest.TestCase):
             changes=None,
             messages=[],
             state={"ag-ui": {"context": [{"value": "ctx"}]}},
-            composition_guide="guide",
+            guidelines={"composition_guide": "guide"},
         )
         self.assertIsNone(prep.get("error"))
         self.assertFalse(prep["is_update"])
@@ -666,6 +847,35 @@ class TestBuildA2UIEnvelope(unittest.TestCase):
         ops = env[A2UI_OPERATIONS_KEY]
         self.assertFalse(any("createSurface" in o for o in ops))
         self.assertEqual(ops[0]["updateComponents"]["surfaceId"], "s1")
+
+
+class TestResolveA2UIToolParams(unittest.TestCase):
+    def test_fills_canonical_defaults(self):
+        r = resolve_a2ui_tool_params({"model": "M"})
+        self.assertEqual(r["model"], "M")
+        self.assertEqual(r["default_surface_id"], DEFAULT_SURFACE_ID)
+        self.assertEqual(r["default_catalog_id"], BASIC_CATALOG_ID)
+        self.assertEqual(r["tool_name"], GENERATE_A2UI_TOOL_NAME)
+        self.assertEqual(r["tool_description"], GENERATE_A2UI_TOOL_DESCRIPTION)
+        self.assertIsNone(r["guidelines"])
+
+    def test_empty_string_override_falls_back_to_default(self):
+        r = resolve_a2ui_tool_params(
+            {"model": "M", "tool_name": "", "default_catalog_id": ""}
+        )
+        self.assertEqual(r["tool_name"], GENERATE_A2UI_TOOL_NAME)
+        self.assertEqual(r["default_catalog_id"], BASIC_CATALOG_ID)
+
+    def test_overrides_pass_through(self):
+        r = resolve_a2ui_tool_params(
+            {
+                "model": "M",
+                "tool_name": "custom_tool",
+                "guidelines": {"composition_guide": "g"},
+            }
+        )
+        self.assertEqual(r["tool_name"], "custom_tool")
+        self.assertEqual(r["guidelines"], {"composition_guide": "g"})
 
 
 if __name__ == "__main__":
