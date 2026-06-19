@@ -41,7 +41,7 @@ async function getHandler(integrationId: string) {
   // the LangGraph a2ui demos define their tools in-backend and must keep their
   // existing (no-injection) a2ui config so their passing tests are unaffected.
   const injectsA2UITool =
-    integrationId === "aws-strands-typescript" || integrationId === "aws-strands";
+    integrationId === "aws-strands-typescript" || integrationId === "aws-strands" || integrationId.includes("langgraph");
 
   const runtime = new CopilotRuntime({
     agents: agents as Record<string, AbstractAgent>,
