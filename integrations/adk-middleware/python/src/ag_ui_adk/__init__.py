@@ -22,6 +22,12 @@ from .endpoint import (
 )
 from .config import PredictStateMapping, normalize_predict_state
 from .agui_toolset import AGUIToolset
+from .a2ui_tool import (
+    get_a2ui_tool,
+    A2UISubAgentTool,
+    plan_a2ui_injection,
+    is_auto_injected_a2ui_tool,
+)
 __all__ = [
     'ADKAgent',
     'AgentResolver',
@@ -36,6 +42,10 @@ __all__ = [
     'normalize_predict_state',
     'adk_events_to_messages',
     'AGUIToolset',
+    'get_a2ui_tool',
+    'A2UISubAgentTool',
+    'plan_a2ui_injection',
+    'is_auto_injected_a2ui_tool',
 ]
 
 __version__ = "0.1.0"
