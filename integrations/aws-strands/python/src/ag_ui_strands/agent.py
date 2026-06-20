@@ -1747,6 +1747,46 @@ class StrandsInterruptHook:
         if not approved:
             event.cancel_tool = f"User denied approval for '{tool_name}'."
 
+# Prefix of the ``description`` the A2UI middleware (@ag-ui/a2ui-middleware,
+# A2UI_SCHEMA_CONTEXT_DESCRIPTION) stamps on the context entry carrying the
+# component catalog. That entry is consumed via the ``render_a2ui`` tool path
+# (host-resolved catalog + tool guidelines), NOT by dumping the raw schema into
+# the prompt — injecting it derails A2UI rendering. Matched by prefix so a
+# punctuation/version drift in the full string can't let the catalog leak in.
+_A2UI_SCHEMA_CONTEXT_PREFIX = "A2UI Component Schema"
+
+
+def _format_agui_context(agui_context: List[Dict[str, Any]]) -> str:
+    """Render application-provided ``RunAgentInput.context`` as a text block for
+    the model prompt.
+
+    ``agui_context`` is stored on ``strands_agent.state`` for tools to read, but
+    nothing surfaces it to the model — so context the app injects (e.g. via
+    ``useCopilotReadable``) was invisible to the LLM. The A2UI component-schema
+    entry is excluded (handled by the ``render_a2ui`` tool path)."""
+    lines: List[str] = []
+    for ctx in agui_context or []:
+        description = (ctx.get("description") or "").strip()
+        if description.startswith(_A2UI_SCHEMA_CONTEXT_PREFIX):
+            continue
+        value = ctx.get("value")
+        value_str = value if isinstance(value, str) else json.dumps(value)
+        lines.append(f"- {description}: {value_str}" if description else f"- {value_str}")
+    if not lines:
+        return ""
+    return "Context provided by the application:\n" + "\n".join(lines)
+
+
+def _prepend_context_message(
+    history: List[Dict[str, Any]], context_block: str
+) -> List[Dict[str, Any]]:
+    """Insert ``context_block`` as a SEPARATE leading user message. We do not
+    modify the existing last user message — request routing / fixtures key off
+    the latest user (and system) message content, so altering it changes agent
+    behaviour. A distinct leading message reaches the model without that risk."""
+    if not context_block:
+        return history
+    return [{"role": "user", "content": [{"text": context_block}]}, *history]
 
 
 class StrandsAgent:
