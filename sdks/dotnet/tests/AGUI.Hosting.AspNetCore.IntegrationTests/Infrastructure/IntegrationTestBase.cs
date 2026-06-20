@@ -221,7 +221,7 @@ public abstract class IntegrationTestBase<TEntryPoint> : IClassFixture<WebApplic
         {
             foreach (var kvp in options.AdditionalProperties)
             {
-                if (kvp.Key == AGUI.Server.AGUIConstants.RunAgentInputKey)
+                if (kvp.Value is RunAgentInput)
                 {
                     continue;
                 }

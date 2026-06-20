@@ -24,7 +24,8 @@ internal sealed class SharedStateAgent : DelegatingChatClient
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         // Extract AG-UI input to check for state
-        var agentInput = options?.AdditionalProperties?[AGUIConstants.RunAgentInputKey] as RunAgentInput;
+        RunAgentInput? agentInput = null;
+        options?.TryGetRunAgentInput(out agentInput);
         if (agentInput?.State is not { ValueKind: not JsonValueKind.Undefined } state)
         {
             await foreach (var update in base.GetStreamingResponseAsync(chatMessages, options, cancellationToken).ConfigureAwait(false))

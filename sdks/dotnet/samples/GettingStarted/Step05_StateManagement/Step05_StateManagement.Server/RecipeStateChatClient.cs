@@ -44,8 +44,8 @@ internal sealed class RecipeStateChatClient : DelegatingChatClient
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        if (options?.AdditionalProperties?.TryGetValue(AGUIConstants.RunAgentInputKey, out var inputObj) is true
-            && inputObj is RunAgentInput input
+        if (options is not null
+            && options.TryGetRunAgentInput(out var input)
             && input.State is { ValueKind: JsonValueKind.Object } state
             && HasProperties(state))
         {

@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text.Json;
 using AGUI.Abstractions;
@@ -18,7 +19,8 @@ public static class RunAgentInputExtensions
     /// <summary>
     /// Adapts an AG-UI <see cref="RunAgentInput"/> into a <see cref="ChatRequestContext"/>
     /// containing a <see cref="ChatMessage"/> list, a <see cref="ChatOptions"/> with the
-    /// originating input stashed under <c>AdditionalProperties[AGUIConstants.RunAgentInputKey]</c>, the
+    /// originating input stashed on <see cref="ChatOptions.AdditionalProperties"/> (recoverable via
+    /// <see cref="TryGetRunAgentInput"/>), the
     /// supplied <see cref="JsonSerializerOptions"/>, and (optionally) caller-provided
     /// <see cref="AGUIStreamOptions"/>.
     /// </summary>
@@ -106,6 +108,34 @@ public static class RunAgentInputExtensions
             jsonSerializerOptions,
             isContinuation,
             clientToolNames);
+    }
+
+    /// <summary>
+    /// Recovers the originating AG-UI <see cref="RunAgentInput"/> that
+    /// <see cref="ToChatRequestContext"/> stashed on the request's
+    /// <see cref="ChatOptions"/>.<see cref="ChatOptions.AdditionalProperties"/>. Delegating
+    /// <see cref="IChatClient"/> implementations and agents use this to read AG-UI inputs such as
+    /// <see cref="RunAgentInput.State"/> without depending on the hosting layer's internals.
+    /// </summary>
+    /// <param name="options">The chat options flowed to the inner client or agent.</param>
+    /// <param name="input">
+    /// When this method returns <see langword="true"/>, contains the recovered
+    /// <see cref="RunAgentInput"/>; otherwise <see langword="null"/>.
+    /// </param>
+    /// <returns><see langword="true"/> if an AG-UI input was present; otherwise <see langword="false"/>.</returns>
+    public static bool TryGetRunAgentInput(this ChatOptions options, [NotNullWhen(true)] out RunAgentInput? input)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (options.AdditionalProperties?.TryGetValue(AGUIConstants.RunAgentInputKey, out var value) is true
+            && value is RunAgentInput runAgentInput)
+        {
+            input = runAgentInput;
+            return true;
+        }
+
+        input = null;
+        return false;
     }
 
     private static bool TryDecodeToolApprovalResume(
