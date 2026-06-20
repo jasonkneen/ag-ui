@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <RootNamespace>AGUI.Client</RootNamespace>
+    <PackageId>AGUI.Client</PackageId>
+    <Description>AG-UI HTTP client and IChatClient implementation for consuming AG-UI agent endpoints.</Description>
+    <PackageTags>$(PackageTags);client;http;chat;microsoft-extensions-ai;sse</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

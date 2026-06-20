@@ -3,6 +3,9 @@
   <PropertyGroup>
     <TargetFrameworks>$(TargetFrameworksCore)</TargetFrameworks>
     <RootNamespace>AGUI.Server</RootNamespace>
+    <PackageId>AGUI.Server</PackageId>
+    <Description>Framework-agnostic server adapter for converting Microsoft.Extensions.AI chat streams into AG-UI event streams.</Description>
+    <PackageTags>$(PackageTags);server;adapter;streaming;chat;microsoft-extensions-ai</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

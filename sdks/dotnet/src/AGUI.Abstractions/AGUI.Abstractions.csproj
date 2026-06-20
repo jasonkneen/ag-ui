@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <RootNamespace>AGUI.Abstractions</RootNamespace>
+    <PackageId>AGUI.Abstractions</PackageId>
+    <Description>Protocol types, messages, events, capabilities, tools, and JSON serialization for AG-UI .NET applications.</Description>
+    <PackageTags>$(PackageTags);abstractions;events;messages;tools;json;serialization</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

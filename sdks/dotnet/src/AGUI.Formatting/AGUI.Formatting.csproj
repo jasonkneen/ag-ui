@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <RootNamespace>AGUI.Formatting</RootNamespace>
+    <PackageId>AGUI.Formatting</PackageId>
+    <Description>Wire-format abstractions and Server-Sent Events formatting for AG-UI event streams.</Description>
+    <PackageTags>$(PackageTags);formatting;sse;server-sent-events;streaming;transport</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

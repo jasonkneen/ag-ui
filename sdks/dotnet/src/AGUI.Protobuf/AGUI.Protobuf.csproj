@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <RootNamespace>AGUI.Protobuf</RootNamespace>
+    <PackageId>AGUI.Protobuf</PackageId>
+    <Description>Protobuf encoding, decoding, and event stream formatting for AG-UI binary transports.</Description>
+    <PackageTags>$(PackageTags);protobuf;binary;codec;transport;serialization</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
