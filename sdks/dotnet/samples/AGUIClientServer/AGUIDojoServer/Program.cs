@@ -33,7 +33,11 @@ app.MapDojoEndpoint("/agentic_generative_ui",
     systemPrompt: ChatClientAgentFactory.AgenticUISystemPrompt,
     configureStreamOptions: _ => ChatClientAgentFactory.CreateAgenticUIStreamOptions());
 
-app.MapDojoEndpoint("/shared_state", ChatClientAgentFactory.CreateSharedState(jsonOptions.Value.SerializerOptions));
+app.MapDojoEndpoint("/shared_state",
+    ChatClientAgentFactory.CreateSharedState(),
+    serverTools: ChatClientAgentFactory.CreateSharedStateTools(jsonOptions.Value.SerializerOptions),
+    systemPrompt: ChatClientAgentFactory.SharedStateSystemPrompt,
+    configureStreamOptions: _ => ChatClientAgentFactory.CreateSharedStateStreamOptions());
 
 app.MapDojoEndpoint("/predictive_state_updates",
     ChatClientAgentFactory.CreatePredictiveStateUpdates(),

@@ -143,35 +143,70 @@ internal static class ChatClientAgentFactory
         return options;
     }
 
-    public static IChatClient CreateSharedState(JsonSerializerOptions options)
+    public static IChatClient CreateSharedState()
     {
-        var innerClient = s_chatClient!.AsIChatClient()
-            .AsBuilder()
-            .UseFunctionInvocation()
-            .Build();
-
-        return new SharedStateAgent(innerClient, options);
+        return CreateBaseChatClient();
     }
+
+    public const string SharedStateSystemPrompt = """
+        You are a helpful recipe assistant that maintains a shared recipe state with the user.
+
+        IMPORTANT:
+        - When the user asks you to create, change, or improve a recipe, call the
+          `generate_recipe` tool with a COMPLETE recipe: a title, skill_level, cooking_time,
+          special_preferences, the full list of ingredients (each with an icon, name and
+          amount) and the step-by-step instructions.
+        - Always include every ingredient the recipe needs, keeping any the user already added.
+        - When the user only asks a question about the recipe, answer in plain text and do
+          NOT call the tool.
+        """;
+
+    public static IList<AITool> CreateSharedStateTools(JsonSerializerOptions options)
+    {
+        return
+        [
+            AIFunctionFactory.Create(
+                GenerateRecipe,
+                name: "generate_recipe",
+                description: "Generate or update the shared recipe and display it to the user.",
+                options)
+        ];
+    }
+
+    public static AGUIStreamOptions CreateSharedStateStreamOptions()
+    {
+        var options = new AGUIStreamOptions();
+        options.MapResultAsStateSnapshot("generate_recipe");
+        return options;
+    }
+
+    [Description("Generate or update the shared recipe and display it to the user.")]
+    private static RecipeResponse GenerateRecipe(
+        [Description("The complete recipe to display.")] Recipe recipe) => new() { Recipe = recipe };
 
     public static IChatClient CreatePredictiveStateUpdates()
     {
-        return CreateBaseChatClient();
+        // Deliberately NOT wrapped with UseFunctionInvocation: write_document_local is declared
+        // so the model calls it, but the call is intercepted by the stream mapping
+        // (CreatePredictiveStateUpdatesStreamOptions) — which streams the document into state and
+        // injects a confirm_changes tool call — rather than executed server-side. That leaves the
+        // run finishing with the confirm_changes call pending for the human-in-the-loop modal.
+        return s_chatClient!.AsIChatClient();
     }
 
     public const string PredictiveStateUpdatesSystemPrompt = """
         You are a document editor assistant. When asked to write or edit content:
 
         IMPORTANT:
-        - Use the `write_document` tool with the full document text in Markdown format
+        - Use the `write_document_local` tool with the full document text in Markdown format
         - Format the document extensively so it's easy to read
         - You can use all kinds of markdown (headings, lists, bold, etc.)
         - However, do NOT use italic or strike-through formatting
         - You MUST write the full document, even when changing only a few words
         - When making edits to the document, try to make them minimal - do not change every word
         - Keep stories SHORT!
-        - After you are done writing the document you MUST call a confirm_changes tool after you call write_document
 
-        After the user confirms the changes, provide a brief summary of what you wrote.
+        After writing the document, briefly summarize the changes you made in at most two sentences.
         """;
 
     public static IList<AITool> CreatePredictiveStateUpdatesTools(JsonSerializerOptions options)
@@ -180,7 +215,7 @@ internal static class ChatClientAgentFactory
         [
             AIFunctionFactory.Create(
                 WriteDocument,
-                name: "write_document",
+                name: "write_document_local",
                 description: "Write a document. Use markdown formatting to format the document.",
                 AGUIDojoServerSerializerContext.Default.Options)
         ];
@@ -190,7 +225,7 @@ internal static class ChatClientAgentFactory
     {
         string? lastEmittedDocument = null;
         var options = new AGUIStreamOptions();
-        options.MapCall("write_document", fcc =>
+        options.MapCall("write_document_local", fcc =>
         {
             var documentContent = fcc.Arguments?.TryGetValue("document", out var documentValue) == true
                 ? documentValue?.ToString()
@@ -219,6 +254,28 @@ internal static class ChatClientAgentFactory
 
                 events.Add(new StateSnapshotEvent { Snapshot = stateJson });
             }
+
+            // Complete the write_document_local call (its document is now reflected in the
+            // document state) so the only tool call the client sees pending is confirm_changes.
+            events.Add(new ToolCallResultEvent
+            {
+                MessageId = Guid.NewGuid().ToString("N"),
+                ToolCallId = fcc.CallId,
+                Content = "Document written.",
+                Role = "tool",
+            });
+
+            // Inject a client-side `confirm_changes` tool call so the dojo human-in-the-loop
+            // approval modal renders. This mirrors the crewai predictive_state_updates flow,
+            // whose backend appends a synthetic confirm_changes tool call after writing the
+            // document — the dojo registers `confirm_changes` via useHumanInTheLoop and shows
+            // the confirm/reject modal in response to the call. The call is parented to a fresh
+            // assistant message id so the client tracks it correctly across multiple rounds.
+            var confirmCallId = Guid.NewGuid().ToString("N");
+            var confirmMessageId = Guid.NewGuid().ToString("N");
+            events.Add(new ToolCallStartEvent { ToolCallId = confirmCallId, ToolCallName = "confirm_changes", ParentMessageId = confirmMessageId });
+            events.Add(new ToolCallArgsEvent { ToolCallId = confirmCallId, Delta = "{}" });
+            events.Add(new ToolCallEndEvent { ToolCallId = confirmCallId });
 
             lastEmittedDocument = documentContent;
             return events;

@@ -432,6 +432,7 @@ export const agentsIntegrations = {
       (path) => new HttpAgent({ url: `${envVars.aguiDotnetUrl}/${path}` }),
       {
         agentic_chat: "agentic_chat",
+        v1_agentic_chat: "agentic_chat",
         backend_tool_rendering: "backend_tool_rendering",
         human_in_the_loop: "human_in_the_loop",
         agentic_generative_ui: "agentic_generative_ui",
