@@ -11,7 +11,7 @@ public sealed class AgenticChatExtraTests
 
     public AgenticChatExtraTests(TsServerFixture fixture) => _fixture = fixture;
 
-    private AGUIChatClient Client(HttpClient http) => new(http, $"{_fixture.BaseUrl}/agentic_chat");
+    private AGUIChatClient Client(HttpClient http) => new(new(http, $"{_fixture.BaseUrl}/agentic_chat"));
 
     [Fact]
     public async Task MultiTurnContext_FullHistoryIsForwarded()

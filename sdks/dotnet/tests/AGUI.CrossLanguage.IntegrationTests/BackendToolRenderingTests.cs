@@ -14,7 +14,7 @@ public sealed class BackendToolRenderingTests
     public async Task ReceivesToolCallAndFollowUpText()
     {
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/backend_tool_rendering");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/backend_tool_rendering"));
 
         ChatMessage[] messages =
         [

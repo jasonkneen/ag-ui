@@ -21,7 +21,7 @@ public sealed class ToolCallScenarioTests
         // (a) reassemble the JSON args from every delta and surface them as
         // a FunctionCallContent, and (b) NOT fabricate a FunctionResultContent.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/frontend_only_tool");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/frontend_only_tool"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];
@@ -63,7 +63,7 @@ public sealed class ToolCallScenarioTests
         // them in order so the resulting ChatResponseUpdate stream has both
         // text chunks and the function call/result in the right sequence.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/multi_message_run");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/multi_message_run"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];

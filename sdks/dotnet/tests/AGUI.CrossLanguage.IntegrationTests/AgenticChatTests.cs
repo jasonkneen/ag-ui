@@ -33,7 +33,7 @@ public sealed class AgenticChatTests
     public async Task ReceivesTextResponse_ForSimpleGreeting()
     {
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/agentic_chat");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/agentic_chat"));
 
         ChatMessage[] messages =
         [

@@ -29,7 +29,7 @@ public sealed class HumanInTheLoopTests
         // at that tool call. The C# AGUIChatClient materialises this as a
         // ToolApprovalRequestContent rather than a plain FunctionCallContent.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/human_in_the_loop");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/human_in_the_loop"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatMessage> messages = [new(ChatRole.User, "Clean up /tmp/cache")];

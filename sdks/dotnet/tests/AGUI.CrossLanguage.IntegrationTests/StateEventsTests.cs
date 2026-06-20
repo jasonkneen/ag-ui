@@ -20,7 +20,7 @@ public sealed class StateEventsTests
         // AGUIChatClient passes both through as ChatResponseUpdate.RawRepresentation
         // so consumers can subscribe to state changes alongside the chat stream.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/state_events");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/state_events"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];

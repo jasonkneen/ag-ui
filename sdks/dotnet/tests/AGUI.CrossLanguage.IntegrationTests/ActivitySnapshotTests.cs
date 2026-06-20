@@ -20,7 +20,7 @@ public sealed class ActivitySnapshotTests
         // RawRepresentation with all fields intact (messageId, activityType,
         // content with the nested steps array, replace flag).
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/activity_snapshot");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/activity_snapshot"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];

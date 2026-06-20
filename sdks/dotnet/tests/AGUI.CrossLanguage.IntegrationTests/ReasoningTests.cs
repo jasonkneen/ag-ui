@@ -19,7 +19,7 @@ public sealed class ReasoningTests
         // Contents, so the C# client can render the model's thinking
         // separately from its final answer (matching the dojo reasoning UI).
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/reasoning");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/reasoning"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];

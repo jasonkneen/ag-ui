@@ -20,7 +20,7 @@ public sealed class PassthroughEventTests
         // This proves a producer can pass arbitrary signals across the
         // language boundary without crashing the client.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/custom_event");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/custom_event"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];
@@ -52,7 +52,7 @@ public sealed class PassthroughEventTests
         // RAW events carry provider-native payloads (e.g. OpenAI tokens
         // metadata) and follow the same pass-through contract as CUSTOM.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/raw_event");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/raw_event"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         List<ChatResponseUpdate> updates = [];
@@ -80,7 +80,7 @@ public sealed class PassthroughEventTests
         // the C# client surfaces RUN_ERROR as InvalidOperationException
         // with the message verbatim. Same contract over the wire.
         using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
-        AGUIChatClient client = new(http, $"{_fixture.BaseUrl}/run_error");
+        AGUIChatClient client = new(new(http, $"{_fixture.BaseUrl}/run_error"));
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(20));
 
         InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
