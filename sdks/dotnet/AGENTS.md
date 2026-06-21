@@ -98,7 +98,7 @@ The integration test project references every `samples/GettingStarted/Step*` pro
 
 ## Running samples
 
-Each sample under `samples/GettingStarted/` (Step01 through Step13) is a Server/Client pair. The server hosts an AG-UI endpoint as an ASP.NET Core app (the ASP.NET glue comes from the shared `samples/AGUI.Samples.Shared` project); the client drives it through `AGUIChatClient`. To run a sample server manually:
+Each sample under `samples/GettingStarted/` (Step01 through Step14) is a Server/Client pair. The server hosts an AG-UI endpoint as an ASP.NET Core app (the ASP.NET glue comes from the shared `samples/AGUI.Samples.Shared` project); the client drives it through `AGUIChatClient`. To run a sample server manually:
 
 ```bash
 dotnet run --project samples/GettingStarted/Step01_GettingStarted/Step01_GettingStarted.Server/
@@ -120,7 +120,7 @@ The `samples/AGUIClientServer/` directory contains a full Dojo server with multi
 - `tests/AGUI.Protobuf.UnitTests/` — Protobuf codec and formatter tests.
 - `tests/AGUI.Server.UnitTests/` — Stream conversion unit tests.
 - `tests/AGUI.Hosting.AspNetCore.IntegrationTests/` — End-to-end tests with `WebApplicationFactory`, parameterized over `TransportFormat`, including sample replay tests (name kept after the `AGUI.Server` rename).
-- `samples/GettingStarted/` — Progressive Server/Client sample pairs (Step01–Step13; Step12 = parallel tool calls, Step13 = protobuf).
+- `samples/GettingStarted/` — Progressive Server/Client sample pairs (Step01–Step14; Step12 = parallel tool calls, Step13 = protobuf, Step14 = OpenTelemetry tracing).
 - `samples/AGUIClientServer/` — Full Dojo server with multiple agent scenarios.
 
 ## Endpoint pattern

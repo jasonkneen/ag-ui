@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -292,6 +293,13 @@ public sealed class AGUIChatClient : DelegatingChatClient
             if (serviceType == typeof(ChatClientMetadata))
             {
                 return Metadata;
+            }
+
+            // Surface the AG-UI client ActivitySource so the function-invoking client that
+            // AGUIChatClient owns can emit execute_tool spans for client-side tools.
+            if (serviceType == typeof(ActivitySource))
+            {
+                return AGUIClientInstrumentation.ActivitySource;
             }
 
             return null;

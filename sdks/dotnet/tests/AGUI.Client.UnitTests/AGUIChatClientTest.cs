@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -201,6 +202,77 @@ public sealed class AGUIChatClientTest
     {
         await foreach (var _ in updates.ConfigureAwait(false))
         {
+        }
+    }
+
+    [Fact]
+    public async Task ClientToolExecution_EmitsExecuteToolSpan_OnAGUIClientSource()
+    {
+        var activities = new List<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == AGUIClientInstrumentation.ActivitySourceName,
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = activity =>
+            {
+                lock (activities)
+                {
+                    activities.Add(activity);
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        // Turn 1 surfaces a call to the client tool; turn 2 (after the client executes it) finishes.
+        var transport = new SequencedTransport(
+            new BaseEvent[]
+            {
+                new ToolCallStartEvent { ToolCallId = "call-1", ToolCallName = "probe_location" },
+                new ToolCallArgsEvent { ToolCallId = "call-1", Delta = "{}" },
+                new ToolCallEndEvent { ToolCallId = "call-1" },
+            },
+            System.Array.Empty<BaseEvent>());
+
+        var client = new AGUIChatClient(new AGUIChatClientOptions { Transport = transport });
+        var tool = AIFunctionFactory.Create(() => "Amsterdam, NL", "probe_location", "Gets the user's location.");
+        var options = new ChatOptions { Tools = [tool] };
+
+        await foreach (var _ in client.GetStreamingResponseAsync(
+            [new ChatMessage(ChatRole.User, "Where am I?")], options).ConfigureAwait(false))
+        {
+        }
+
+        List<Activity> snapshot;
+        lock (activities)
+        {
+            snapshot = activities.ToList();
+        }
+
+        Assert.Contains(snapshot, a =>
+            a.DisplayName == "execute_tool probe_location"
+            && (string?)a.GetTagItem("gen_ai.tool.name") == "probe_location");
+    }
+
+    private sealed class SequencedTransport(params BaseEvent[][] turns) : IAGUITransport
+    {
+        private int _call;
+
+        public async IAsyncEnumerable<BaseEvent> SendAsync(RunAgentInput input, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            var index = System.Math.Min(_call, turns.Length - 1);
+            _call++;
+
+            yield return new RunStartedEvent { ThreadId = input.ThreadId, RunId = input.RunId };
+
+            foreach (var evt in turns[index])
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return evt;
+            }
+
+            yield return new RunFinishedEvent { ThreadId = input.ThreadId, RunId = input.RunId };
+
+            await Task.CompletedTask.ConfigureAwait(false);
         }
     }
 

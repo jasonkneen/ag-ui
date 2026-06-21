@@ -1,4 +1,6 @@
 #nullable enable
+AGUI.Server.AGUIServerInstrumentation
+const AGUI.Server.AGUIServerInstrumentation.ActivitySourceName = "Experimental.AGUI.Server" -> string!
 AGUI.Server.ChatResponseUpdateAGUIExtensions
 static AGUI.Server.ChatResponseUpdateAGUIExtensions.AsAGUIEventStreamAsync(this System.Collections.Generic.IAsyncEnumerable<Microsoft.Extensions.AI.ChatResponseUpdate!>! updates, AGUI.Server.ChatRequestContext! context, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Collections.Generic.IAsyncEnumerable<AGUI.Abstractions.BaseEvent!>!
 AGUI.Server.AGUIStreamOptions

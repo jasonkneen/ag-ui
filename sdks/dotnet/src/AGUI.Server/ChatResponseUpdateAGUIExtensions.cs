@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
@@ -32,14 +33,119 @@ public static class ChatResponseUpdateAGUIExtensions
     /// <param name="context">The request context produced by <see cref="RunAgentInputExtensions.ToChatRequestContext"/>.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>An async enumerable of AG-UI events.</returns>
-    public static async IAsyncEnumerable<BaseEvent> AsAGUIEventStreamAsync(
+    /// <remarks>
+    /// When a listener is subscribed to the <see cref="AGUIServerInstrumentation.ActivitySourceName"/>
+    /// source, the produced run is wrapped in an <c>agui.run</c> span; otherwise there is no tracing overhead.
+    /// </remarks>
+    public static IAsyncEnumerable<BaseEvent> AsAGUIEventStreamAsync(
         this IAsyncEnumerable<ChatResponseUpdate> updates,
         ChatRequestContext context,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
         ArgumentNullException.ThrowIfNull(context);
 
+        return AGUIServerInstrumentation.ActivitySource.HasListeners()
+            ? InstrumentedAsync(updates, context, cancellationToken)
+            : CoreAsync(updates, context, cancellationToken);
+    }
+
+    private const string RunOutcomeSuccess = "success";
+    private const string RunOutcomeInterrupt = "interrupt";
+    private const string RunOutcomeError = "error";
+
+    private static async IAsyncEnumerable<BaseEvent> InstrumentedAsync(
+        IAsyncEnumerable<ChatResponseUpdate> updates,
+        ChatRequestContext context,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var input = context.Input;
+        using var activity = AGUIServerInstrumentation.ActivitySource.StartActivity("agui.run", ActivityKind.Internal);
+
+        if (activity is not null)
+        {
+            activity.SetTag("agui.thread_id", input.ThreadId);
+            activity.SetTag("agui.run_id", input.RunId);
+            if (!string.IsNullOrEmpty(input.ParentRunId))
+            {
+                activity.SetTag("agui.parent_run_id", input.ParentRunId);
+            }
+
+            if (context.IsContinuation)
+            {
+                activity.SetTag("agui.continuation", true);
+            }
+        }
+
+        var eventCount = 0;
+        var outcome = RunOutcomeSuccess;
+
+        var enumerator = CoreAsync(updates, context, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            while (true)
+            {
+                BaseEvent current;
+                try
+                {
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false))
+                    {
+                        break;
+                    }
+
+                    current = enumerator.Current;
+                }
+                catch (Exception ex)
+                {
+                    RecordError(activity, ex, eventCount);
+                    throw;
+                }
+
+                eventCount++;
+                outcome = current switch
+                {
+                    RunFinishedEvent { Outcome: RunFinishedInterruptOutcome } => RunOutcomeInterrupt,
+                    RunErrorEvent => RunOutcomeError,
+                    _ => outcome,
+                };
+
+                yield return current;
+            }
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+
+            if (activity is not null && activity.Status != ActivityStatusCode.Error)
+            {
+                activity.SetTag("agui.run.outcome", outcome);
+                activity.SetTag("agui.events.count", eventCount);
+                if (outcome == RunOutcomeError)
+                {
+                    activity.SetStatus(ActivityStatusCode.Error);
+                }
+            }
+        }
+    }
+
+    private static void RecordError(Activity? activity, Exception exception, int eventCount)
+    {
+        if (activity is null)
+        {
+            return;
+        }
+
+        activity.SetTag("error.type", exception.GetType().FullName);
+        activity.SetTag("agui.run.outcome", RunOutcomeError);
+        activity.SetTag("agui.events.count", eventCount);
+        activity.SetStatus(ActivityStatusCode.Error, exception.Message);
+    }
+
+    private static async IAsyncEnumerable<BaseEvent> CoreAsync(
+        IAsyncEnumerable<ChatResponseUpdate> updates,
+        ChatRequestContext context,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
         var threadId = context.Input.ThreadId;
         var runId = context.Input.RunId;
         var options = context.StreamOptions;

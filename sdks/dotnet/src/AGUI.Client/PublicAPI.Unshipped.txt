@@ -1,5 +1,7 @@
 #nullable enable
 AGUI.Client.AGUIChatClient
+AGUI.Client.AGUIClientInstrumentation
+const AGUI.Client.AGUIClientInstrumentation.ActivitySourceName = "Experimental.AGUI.Client" -> string!
 AGUI.Client.AGUIChatClient.AGUIChatClient(AGUI.Client.AGUIChatClientOptions! options) -> void
 AGUI.Client.AGUIChatClientOptions
 AGUI.Client.AGUIChatClientOptions.AGUIChatClientOptions() -> void
