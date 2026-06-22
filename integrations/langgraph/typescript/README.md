@@ -123,17 +123,24 @@ Consumers should migrate to reading `outcome` from `RunFinishedEvent` rather tha
 If your graph uses a middleware whose interrupt value carries structured payloads (e.g. LangChain's `HumanInTheLoopMiddleware` with `action_requests` / `review_configs`), you can override two protected methods instead of monkey-patching the run loop:
 
 ```ts
-import { LangGraphAgent } from "@ag-ui/langgraph";
+import { LangGraphAgent, langGraphInterruptToAGUI } from "@ag-ui/langgraph";
 import type { Interrupt as AGUIInterrupt, ResumeEntry } from "@ag-ui/core";
 import type { Interrupt as LangGraphInterrupt } from "@langchain/langgraph-sdk";
 
 class HITLLangGraphAgent extends LangGraphAgent {
-  protected interruptValueToAGUI(lg: LangGraphInterrupt): AGUIInterrupt[] {
-    const value = lg.value;
-    if (typeof value === "object" && value !== null && "action_requests" in value) {
-      return myActionRequestsToAGUI(value);
+  protected interruptsToAGUI(
+    list: readonly LangGraphInterrupt[],
+  ): AGUIInterrupt[] {
+    const out: AGUIInterrupt[] = [];
+    for (const lg of list) {
+      const value = lg.value;
+      if (typeof value === "object" && value !== null && "action_requests" in value) {
+        out.push(...myActionRequestsToAGUI(value));
+      } else {
+        out.push(langGraphInterruptToAGUI(lg));
+      }
     }
-    return super.interruptValueToAGUI(lg);
+    return out;
   }
 
   protected buildCommandResumeFromAgui(

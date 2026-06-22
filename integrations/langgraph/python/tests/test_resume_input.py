@@ -26,7 +26,7 @@ from tests._helpers import make_agent
 @dataclass
 class FakeInterrupt:
     value: Any
-    id: str = None
+    id: str = "fake-interrupt"
 
 
 @dataclass
@@ -183,9 +183,12 @@ class TestInputResumeTakesPrecedenceOverLegacy(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(stream_input.resume, {"new": True})
 
         warn_calls = [str(c) for c in mock_logger.warning.call_args_list]
-        self.assertTrue(
+        # The conflict warning is emitted in `run`, not `prepare_stream`,
+        # so the unit-level prepare_stream call must stay silent. See
+        # TestRunEmitsLegacyWarningOnce for end-to-end coverage.
+        self.assertFalse(
             any("both input.resume and forwardedProps.command.resume" in c for c in warn_calls),
-            f"Expected precedence warning, got: {warn_calls}",
+            f"prepare_stream must not log the conflict warning (run emits it once): {warn_calls}",
         )
 
 
@@ -227,9 +230,10 @@ class TestLegacyResumeStillWorks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream_input.resume, "yes")
 
         warn_calls = [str(c) for c in mock_logger.warning.call_args_list]
-        self.assertTrue(
-            any("deprecated" in c for c in warn_calls),
-            f"Expected deprecation warning, got: {warn_calls}",
+        # Deprecation warning is owned by `run`, not `prepare_stream`.
+        self.assertFalse(
+            any("forwardedProps.command.resume is deprecated" in c for c in warn_calls),
+            f"prepare_stream must not log the deprecation warning (run emits it once): {warn_calls}",
         )
 
 
@@ -319,3 +323,70 @@ class TestEmptyResumeArrayTreatedAsAbsent(unittest.IsolatedAsyncioTestCase):
 
         finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
         self.assertEqual(finished_events[0].outcome.type, "interrupt")
+
+
+class TestRunEmitsLegacyWarningOnce(unittest.IsolatedAsyncioTestCase):
+    """The deprecation / conflict warnings must be emitted exactly once per
+    request (from ``run`` only), not duplicated by ``prepare_stream``."""
+
+    async def _drive(self, agent, inp):
+        # Drive ``run`` past the warning block but short-circuit before any
+        # real graph work by stubbing prepare_stream to return an
+        # events_to_dispatch payload — that triggers the early ``return`` at
+        # the top of ``_handle_stream_events``.
+        # ``run`` does ``input.copy(update={...})``; on a MagicMock that
+        # returns a fresh mock with stringified attributes, so route the
+        # copy back through the configured fixture to preserve thread_id
+        # and forwarded_props.
+        def _identity_copy(update=None):
+            if update:
+                for k, v in update.items():
+                    setattr(inp, k, v)
+            return inp
+        inp.copy = _identity_copy
+
+        sentinel = MagicMock()
+        agent.prepare_stream = AsyncMock(return_value={
+            "stream": None,
+            "state": None,
+            "config": None,
+            "events_to_dispatch": [sentinel],
+        })
+        agent._dispatch_event = MagicMock(side_effect=lambda e: e)
+        async for _ in agent.run(inp):
+            pass
+
+    async def test_deprecation_warning_emitted_exactly_once(self):
+        agent = make_agent()
+        inp = _make_input(
+            messages=[UserMessage(id="h1", role="user", content="x")],
+            forwarded_props={"command": {"resume": "yes"}},
+        )
+
+        with patch.object(agent_module, "logger") as mock_logger:
+            await self._drive(agent, inp)
+
+        warn_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        deprecation = [c for c in warn_calls if "forwardedProps.command.resume is deprecated" in c]
+        self.assertEqual(
+            len(deprecation), 1,
+            f"deprecation warning must fire exactly once, got {len(deprecation)}: {warn_calls}",
+        )
+
+    async def test_conflict_warning_emitted_exactly_once(self):
+        agent = make_agent()
+        inp = _make_input(
+            messages=[UserMessage(id="h1", role="user", content="x")],
+            forwarded_props={"command": {"resume": "legacy"}},
+            resume=[ResumeEntry(interrupt_id="i1", status="resolved", payload={"new": True})],
+        )
+
+        with patch.object(agent_module, "logger") as mock_logger:
+            await self._drive(agent, inp)
+
+        warn_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        conflict = [c for c in warn_calls if "both input.resume and forwardedProps.command.resume" in c]
+        self.assertEqual(
+            len(conflict), 1,
+            f"conflict warning must fire exactly once, got {len(conflict)}: {warn_calls}",
+        )

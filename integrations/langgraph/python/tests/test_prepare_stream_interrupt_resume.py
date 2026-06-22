@@ -28,6 +28,7 @@ from tests._helpers import make_agent
 @dataclass
 class FakeInterrupt:
     value: Any
+    id: str = "fake-interrupt"
 
 
 @dataclass

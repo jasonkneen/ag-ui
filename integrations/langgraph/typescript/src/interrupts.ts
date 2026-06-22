@@ -1,4 +1,3 @@
-import { randomUUID } from "@ag-ui/client";
 import type { Interrupt as LangGraphInterrupt } from "@langchain/langgraph-sdk";
 import type { Interrupt as AGUIInterrupt, ResumeEntry } from "@ag-ui/core";
 
@@ -11,7 +10,15 @@ export function langGraphInterruptToAGUI(
   const raw = lg.value;
   const dict = isPlainObject(raw) ? raw : null;
 
-  const id = lg.id || `lg-${randomUUID()}`;
+  if (!lg.id) {
+    throw new Error(
+      "LangGraph Interrupt is missing `id`. The id is required to match a " +
+        "resume answer back to the originating step; synthesising an id here " +
+        "would silently misroute multi-interrupt resumes. Upgrade to " +
+        "@langchain/langgraph-sdk that always populates Interrupt.id.",
+    );
+  }
+  const id = lg.id;
   const reason =
     (dict?.reason as string | undefined) ?? "langgraph:interrupt";
 

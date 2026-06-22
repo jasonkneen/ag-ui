@@ -115,15 +115,20 @@ If your graph uses a middleware whose interrupt value carries structured payload
 
 ```python
 from ag_ui_langgraph import LangGraphAgent
+from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
 from ag_ui.core import Interrupt as AGUIInterrupt
 from langgraph.types import Command
 
 class HITLLangGraphAgent(LangGraphAgent):
-    def _interrupt_value_to_agui(self, lg_interrupt):
-        value = lg_interrupt.value
-        if isinstance(value, dict) and "action_requests" in value:
-            return my_action_requests_to_agui(value)
-        return super()._interrupt_value_to_agui(lg_interrupt)
+    def _interrupts_to_agui(self, lg_interrupts):
+        out = []
+        for lg in lg_interrupts:
+            value = lg.value
+            if isinstance(value, dict) and "action_requests" in value:
+                out.extend(my_action_requests_to_agui(value))
+            else:
+                out.append(lg_interrupt_to_agui(lg))
+        return out
 
     def _build_command_from_agui_resume(self, entries, *, open_interrupts=None):
         return Command(

@@ -1,9 +1,10 @@
 """Tests for the subclass hooks defined in §4.5 of INTERRUPT_MIGRATION_DESIGN.md.
 
 These tests verify:
-1. Default hook implementations match module-level function output.
-2. Subclasses can fan out 1 LG interrupt into N AG-UI Interrupts.
-3. Default _build_command_from_agui_resume invariants (single-resolved →
+1. Default ``_interrupts_to_agui`` matches the module-level helper.
+2. Subclasses can fan out 1 LG interrupt into N AG-UI Interrupts via the
+   single collapsed hook.
+3. Default ``_build_command_from_agui_resume`` invariants (single-resolved →
    payload verbatim, single-cancelled → sentinel, multi → resume map).
 4. Event ordering invariant: STATE_SNAPSHOT / MESSAGES_SNAPSHOT still
    precede RUN_FINISHED(outcome=interrupt) even when hooks fan out.
@@ -36,7 +37,7 @@ from tests._helpers import make_agent, _record_dispatch
 @dataclass
 class FakeInterrupt:
     value: Any
-    id: str = None
+    id: str = "int-default"
 
 
 @dataclass
@@ -44,22 +45,9 @@ class FakeTask:
     interrupts: List[FakeInterrupt] = field(default_factory=list)
 
 
-class TestDefaultHooksMatchModuleFunctions(unittest.TestCase):
-    """Default _interrupt_value_to_agui / _interrupts_to_agui must produce
-    identical output to the module-level lg_interrupt_to_agui /
-    lg_interrupts_to_agui."""
-
-    def test_single_interrupt_default_hook_matches_module(self):
-        agent = make_agent()
-        lg = FakeInterrupt(value={"reason": "confirm", "message": "ok?"}, id="int-1")
-
-        hook_result = agent._interrupt_value_to_agui(lg)
-        module_result = lg_interrupt_to_agui(lg)
-
-        self.assertEqual(len(hook_result), 1)
-        self.assertEqual(hook_result[0].id, module_result.id)
-        self.assertEqual(hook_result[0].reason, module_result.reason)
-        self.assertEqual(hook_result[0].message, module_result.message)
+class TestDefaultHookMatchesModuleFunction(unittest.TestCase):
+    """Default ``_interrupts_to_agui`` must produce identical output to the
+    module-level ``lg_interrupts_to_agui``."""
 
     def test_vectorized_hook_matches_module(self):
         agent = make_agent()
@@ -121,41 +109,32 @@ class TestDefaultHooksMatchModuleFunctions(unittest.TestCase):
 
 
 class FanOutAgent(LangGraphAgent):
-    """Test subclass that fans 1 LG interrupt into 2 AG-UI Interrupts."""
+    """Test subclass that fans 1 LG interrupt into N AG-UI Interrupts.
 
-    def _interrupt_value_to_agui(self, lg_interrupt) -> List[AGUIInterrupt]:
-        value = lg_interrupt.value
-        if isinstance(value, dict) and "action_requests" in value:
-            requests = value["action_requests"]
-            results = []
-            for req in requests:
-                results.append(AGUIInterrupt(
-                    id=f"fan-{req.get('id', 'unknown')}",
-                    reason=req.get("reason", "langgraph:interrupt"),
-                    message=req.get("message"),
-                    metadata={"langgraph": {"raw": value}},
-                ))
-            return results
-        return super()._interrupt_value_to_agui(lg_interrupt)
+    Demonstrates the documented fan-out pattern: override the single
+    ``_interrupts_to_agui`` hook and write the loop yourself.
+    """
+
+    def _interrupts_to_agui(self, lg_interrupts) -> List[AGUIInterrupt]:
+        out: List[AGUIInterrupt] = []
+        for lg in lg_interrupts:
+            value = lg.value
+            if isinstance(value, dict) and "action_requests" in value:
+                for req in value["action_requests"]:
+                    out.append(AGUIInterrupt(
+                        id=f"fan-{req.get('id', 'unknown')}",
+                        reason=req.get("reason", "langgraph:interrupt"),
+                        message=req.get("message"),
+                        metadata={"langgraph": {"raw": value}},
+                    ))
+            else:
+                out.append(lg_interrupt_to_agui(lg))
+        return out
 
 
 class TestSubclassFanOut(unittest.TestCase):
     """A subclass that fans out 1 LG interrupt into N AG-UI Interrupts
     must have the correct outcome.interrupts length and event ordering."""
-
-    def test_fan_out_produces_multiple_agui_interrupts(self):
-        agent = FanOutAgent(name="test", graph=MagicMock())
-        lg = FakeInterrupt(value={
-            "action_requests": [
-                {"id": "a1", "reason": "approve A", "message": "A?"},
-                {"id": "a2", "reason": "approve B", "message": "B?"},
-            ]
-        })
-
-        result = agent._interrupt_value_to_agui(lg)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0].id, "fan-a1")
-        self.assertEqual(result[1].id, "fan-a2")
 
     def test_fan_out_vectorized(self):
         agent = FanOutAgent(name="test", graph=MagicMock())
@@ -165,12 +144,15 @@ class TestSubclassFanOut(unittest.TestCase):
                     {"id": "a1", "reason": "approve A"},
                     {"id": "a2", "reason": "approve B"},
                 ]
-            }),
-            FakeInterrupt(value="simple"),
+            }, id="int-1"),
+            FakeInterrupt(value="simple", id="int-2"),
         ]
 
         result = agent._interrupts_to_agui(interrupts)
         self.assertEqual(len(result), 3)
+        self.assertEqual(result[0].id, "fan-a1")
+        self.assertEqual(result[1].id, "fan-a2")
+        self.assertEqual(result[2].id, "int-2")
 
     def test_emit_interrupt_finish_with_fan_out(self):
         agent = FanOutAgent(name="test", graph=MagicMock(), enable_legacy_on_interrupt_event=False)
@@ -182,7 +164,7 @@ class TestSubclassFanOut(unittest.TestCase):
                     {"id": "a1", "reason": "approve A"},
                     {"id": "a2", "reason": "approve B"},
                 ]
-            }),
+            }, id="int-1"),
         ]
 
         events = agent._emit_interrupt_finish(
@@ -206,7 +188,7 @@ class TestSubclassFanOut(unittest.TestCase):
                     {"id": "a1", "reason": "approve A"},
                     {"id": "a2", "reason": "approve B"},
                 ]
-            }),
+            }, id="int-1"),
         ]
 
         events = agent._emit_interrupt_finish(
@@ -220,14 +202,6 @@ class TestSubclassFanOut(unittest.TestCase):
 
         self.assertEqual(len(custom_events), 1)
         self.assertEqual(len(finished.outcome.interrupts), 2)
-
-    def test_non_action_request_uses_default(self):
-        agent = FanOutAgent(name="test", graph=MagicMock())
-        lg = FakeInterrupt(value="simple string interrupt")
-
-        result = agent._interrupt_value_to_agui(lg)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].reason, "langgraph:interrupt")
 
 
 class TestSubclassResumeHook(unittest.TestCase):

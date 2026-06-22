@@ -2,6 +2,13 @@ import { HttpAgent } from "@ag-ui/client";
 
 export * from './agent'
 export {
+  langGraphInterruptToAGUI,
+  langGraphInterruptsToAGUI,
+  buildLgCommandResumeFromAgui,
+  DEFAULT_RESUME_SENTINEL_CANCELLED,
+  DEFAULT_RESUME_SENTINEL_MAP,
+} from './interrupts'
+export {
   getA2UITools,
   A2UI_OPERATIONS_KEY,
   BASIC_CATALOG_ID,

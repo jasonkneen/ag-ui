@@ -658,7 +658,7 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
     (agent as any).dispatchInterruptFinish({
       threadId: "t1",
       runId: "run-1",
-      lgInterrupts: [{ value: "confirm?" }],
+      lgInterrupts: [{ value: "confirm?", id: "int-1" }],
     });
 
     const customEvents = events.filter(
@@ -675,7 +675,7 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
     (agent as any).dispatchInterruptFinish({
       threadId: "t1",
       runId: "run-1",
-      lgInterrupts: [{ value: "confirm?" }],
+      lgInterrupts: [{ value: "confirm?", id: "int-1" }],
     });
 
     const customEvents = events.filter(
@@ -741,7 +741,7 @@ describe("prepareStream input.resume protocol", () => {
 
     (agent as any).client.threads.getState = vi.fn().mockResolvedValue({
       values: { messages: [] },
-      tasks: [{ interrupts: [{ value: { reason: "r" } }] }],
+      tasks: [{ interrupts: [{ value: { reason: "r" }, id: "int-1" }] }],
     });
 
     await agent.prepareStream(input as any, [
@@ -808,7 +808,7 @@ describe("prepareStream input.resume protocol", () => {
 
     (agent as any).client.threads.getState = vi.fn().mockResolvedValue({
       values: { messages: [] },
-      tasks: [{ interrupts: [{ value: { reason: "r" } }] }],
+      tasks: [{ interrupts: [{ value: { reason: "r" }, id: "int-1" }] }],
     });
 
     await agent.prepareStream(input as any, [
@@ -839,7 +839,7 @@ describe("prepareStream input.resume protocol", () => {
 
     (agent as any).client.threads.getState = vi.fn().mockResolvedValue({
       values: { messages: [] },
-      tasks: [{ interrupts: [{ value: { reason: "r" } }] }],
+      tasks: [{ interrupts: [{ value: { reason: "r" }, id: "int-1" }] }],
     });
 
     await agent.prepareStream(input as any, [

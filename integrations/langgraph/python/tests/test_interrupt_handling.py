@@ -25,6 +25,7 @@ from ag_ui_langgraph.types import LangGraphEventTypes
 @dataclass
 class FakeInterrupt:
     value: Any
+    id: Any = None
 
 
 @dataclass
@@ -241,3 +242,51 @@ class TestEmitInterruptFinish:
         metadata = finished.outcome.interrupts[0].metadata
         assert "langgraph" in metadata
         assert metadata["langgraph"]["raw"] == {"reason": "r"}
+
+
+class TestInterruptMappingHardening:
+    """Tests covering the four review hardenings on the mapping layer."""
+
+    def test_missing_lg_id_raises_rather_than_synthesises(self):
+        """Without a real LangGraph id we can't round-trip a resume answer
+        back to the originating step, so refuse the mapping outright."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        lg = FakeInterrupt(value="confirm", id=None)
+
+        with pytest.raises(ValueError, match="missing `id`"):
+            lg_interrupt_to_agui(lg)
+
+    def test_real_lg_id_is_used_verbatim(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value="x", id="lg-real-42"))
+        assert result.id == "lg-real-42"
+
+    def test_empty_string_tool_call_id_is_preserved(self):
+        """`or` would drop "" → fallback; `??`-equivalent keeps it."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(value={"tool_call_id": ""}, id="int-1")
+        )
+        assert result.tool_call_id == ""
+
+    def test_empty_dict_response_schema_is_preserved(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(value={"response_schema": {}}, id="int-1")
+        )
+        assert result.response_schema == {}
+
+    def test_camel_case_wins_over_snake_case_for_tool_call_id(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(
+                value={"toolCallId": "camel", "tool_call_id": "snake"},
+                id="int-1",
+            )
+        )
+        assert result.tool_call_id == "camel"

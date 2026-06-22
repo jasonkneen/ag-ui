@@ -12,10 +12,10 @@ import { LangGraphAgent, LangGraphAgentConfig } from "./agent";
 
 describe("langGraphInterruptToAGUI", () => {
   it("should map string value to message", () => {
-    const result = langGraphInterruptToAGUI({ value: "confirm please" });
+    const result = langGraphInterruptToAGUI({ value: "confirm please", id: "int-1" });
     expect(result.message).toBe("confirm please");
     expect(result.reason).toBe("langgraph:interrupt");
-    expect(result.id).toMatch(/^lg-/);
+    expect(result.id).toBe("int-1");
   });
 
   it("should use lg.id when present", () => {
@@ -26,26 +26,29 @@ describe("langGraphInterruptToAGUI", () => {
     expect(result.id).toBe("int-42");
   });
 
-  it("should generate fallback id when lg.id is missing", () => {
-    const result = langGraphInterruptToAGUI({ value: "x" });
-    expect(result.id).toMatch(/^lg-/);
+  it("should throw when lg.id is missing", () => {
+    expect(() => langGraphInterruptToAGUI({ value: "x" } as any)).toThrow(
+      /missing `id`/,
+    );
   });
 
   it("should extract reason from dict value", () => {
     const result = langGraphInterruptToAGUI({
       value: { reason: "confirm action" },
+      id: "int-1",
     });
     expect(result.reason).toBe("confirm action");
   });
 
   it("should default reason to langgraph:interrupt when not in dict", () => {
-    const result = langGraphInterruptToAGUI({ value: { foo: "bar" } });
+    const result = langGraphInterruptToAGUI({ value: { foo: "bar" }, id: "int-1" });
     expect(result.reason).toBe("langgraph:interrupt");
   });
 
   it("should extract message from dict value", () => {
     const result = langGraphInterruptToAGUI({
       value: { message: "Please confirm" },
+      id: "int-1",
     });
     expect(result.message).toBe("Please confirm");
   });
@@ -53,6 +56,7 @@ describe("langGraphInterruptToAGUI", () => {
   it("should extract toolCallId from dict (camelCase)", () => {
     const result = langGraphInterruptToAGUI({
       value: { toolCallId: "tc1" },
+      id: "int-1",
     });
     expect(result.toolCallId).toBe("tc1");
   });
@@ -60,6 +64,7 @@ describe("langGraphInterruptToAGUI", () => {
   it("should extract tool_call_id from dict (snake_case)", () => {
     const result = langGraphInterruptToAGUI({
       value: { tool_call_id: "tc1" },
+      id: "int-1",
     });
     expect(result.toolCallId).toBe("tc1");
   });
@@ -67,14 +72,24 @@ describe("langGraphInterruptToAGUI", () => {
   it("should prefer camelCase toolCallId over snake_case", () => {
     const result = langGraphInterruptToAGUI({
       value: { toolCallId: "tc-camel", tool_call_id: "tc-snake" },
+      id: "int-1",
     });
     expect(result.toolCallId).toBe("tc-camel");
+  });
+
+  it("should preserve empty-string toolCallId (?? semantics, not ||)", () => {
+    const result = langGraphInterruptToAGUI({
+      value: { toolCallId: "" },
+      id: "int-1",
+    });
+    expect(result.toolCallId).toBe("");
   });
 
   it("should extract responseSchema from dict (camelCase)", () => {
     const schema = { type: "object", properties: { approved: { type: "boolean" } } };
     const result = langGraphInterruptToAGUI({
       value: { responseSchema: schema },
+      id: "int-1",
     });
     expect(result.responseSchema).toEqual(schema);
   });
@@ -83,13 +98,23 @@ describe("langGraphInterruptToAGUI", () => {
     const schema = { type: "string" };
     const result = langGraphInterruptToAGUI({
       value: { response_schema: schema },
+      id: "int-1",
     });
     expect(result.responseSchema).toEqual(schema);
+  });
+
+  it("should preserve empty-object responseSchema", () => {
+    const result = langGraphInterruptToAGUI({
+      value: { responseSchema: {} },
+      id: "int-1",
+    });
+    expect(result.responseSchema).toEqual({});
   });
 
   it("should extract expiresAt from dict (camelCase)", () => {
     const result = langGraphInterruptToAGUI({
       value: { expiresAt: "2026-12-31T23:59:59Z" },
+      id: "int-1",
     });
     expect(result.expiresAt).toBe("2026-12-31T23:59:59Z");
   });
@@ -97,6 +122,7 @@ describe("langGraphInterruptToAGUI", () => {
   it("should extract expires_at from dict (snake_case)", () => {
     const result = langGraphInterruptToAGUI({
       value: { expires_at: "2026-12-31T23:59:59Z" },
+      id: "int-1",
     });
     expect(result.expiresAt).toBe("2026-12-31T23:59:59Z");
   });
@@ -104,6 +130,7 @@ describe("langGraphInterruptToAGUI", () => {
   it("should set metadata.langgraph with raw, ns, resumable, when", () => {
     const lg = {
       value: { reason: "test" },
+      id: "int-1",
       ns: ["node:abc"],
       resumable: true,
       when: "during",
@@ -120,7 +147,7 @@ describe("langGraphInterruptToAGUI", () => {
   });
 
   it("should not set optional fields when absent", () => {
-    const result = langGraphInterruptToAGUI({ value: "simple" });
+    const result = langGraphInterruptToAGUI({ value: "simple", id: "int-1" });
     expect(result.toolCallId).toBeUndefined();
     expect(result.responseSchema).toBeUndefined();
     expect(result.expiresAt).toBeUndefined();
@@ -130,8 +157,8 @@ describe("langGraphInterruptToAGUI", () => {
 describe("langGraphInterruptsToAGUI", () => {
   it("should map a list of interrupts", () => {
     const results = langGraphInterruptsToAGUI([
-      { value: "a" },
-      { value: { reason: "b" } },
+      { value: "a", id: "int-1" },
+      { value: { reason: "b" }, id: "int-2" },
     ]);
     expect(results).toHaveLength(2);
     expect(results[0].message).toBe("a");
@@ -196,14 +223,6 @@ describe("subclass hooks", () => {
   }
 
   describe("default hook implementations match module-level functions", () => {
-    it("interruptValueToAGUI returns exactly one AG-UI Interrupt", () => {
-      const agent = makeAgent() as any;
-      const lg = { value: { reason: "confirm" } } as LangGraphInterrupt;
-      const result = agent.interruptValueToAGUI(lg) as AGUIInterrupt[];
-      expect(result).toHaveLength(1);
-      expect(result[0].reason).toBe("confirm");
-    });
-
     it("interruptsToAGUI matches langGraphInterruptsToAGUI", () => {
       const agent = makeAgent() as any;
       const interrupts = [
@@ -262,58 +281,34 @@ describe("subclass hooks", () => {
 
   describe("subclass fan-out", () => {
     class FanOutAgent extends LangGraphAgent {
-      protected override interruptValueToAGUI(
-        lg: LangGraphInterrupt,
+      protected override interruptsToAGUI(
+        list: readonly LangGraphInterrupt[],
       ): AGUIInterrupt[] {
-        const value = lg.value;
-        if (
-          typeof value === "object" &&
-          value !== null &&
-          "action_requests" in (value as Record<string, unknown>)
-        ) {
-          const requests = (value as Record<string, unknown>)
-            .action_requests as Array<Record<string, unknown>>;
-          return requests.map((req) => ({
-            id: `fan-${req.id ?? "unknown"}`,
-            reason: (req.reason as string) ?? "langgraph:interrupt",
-            message: req.message as string | undefined,
-            metadata: { langgraph: { raw: value } },
-          }));
+        const out: AGUIInterrupt[] = [];
+        for (const lg of list) {
+          const value = lg.value;
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            "action_requests" in (value as Record<string, unknown>)
+          ) {
+            const requests = (value as Record<string, unknown>)
+              .action_requests as Array<Record<string, unknown>>;
+            for (const req of requests) {
+              out.push({
+                id: `fan-${req.id ?? "unknown"}`,
+                reason: (req.reason as string) ?? "langgraph:interrupt",
+                message: req.message as string | undefined,
+                metadata: { langgraph: { raw: value } },
+              });
+            }
+          } else {
+            out.push(langGraphInterruptToAGUI(lg));
+          }
         }
-        return super.interruptValueToAGUI(lg);
+        return out;
       }
     }
-
-    it("fans out 1 LG interrupt into N AG-UI Interrupts", () => {
-      const agent = new FanOutAgent({
-        graphId: "test-graph",
-        deploymentUrl: "http://localhost:8000",
-      }) as any;
-      const lg = {
-        value: {
-          action_requests: [
-            { id: "a1", reason: "approve A", message: "A?" },
-            { id: "a2", reason: "approve B", message: "B?" },
-          ],
-        },
-      } as LangGraphInterrupt;
-
-      const result = agent.interruptValueToAGUI(lg) as AGUIInterrupt[];
-      expect(result).toHaveLength(2);
-      expect(result[0].id).toBe("fan-a1");
-      expect(result[1].id).toBe("fan-a2");
-    });
-
-    it("falls back to default for non-action_requests interrupts", () => {
-      const agent = new FanOutAgent({
-        graphId: "test-graph",
-        deploymentUrl: "http://localhost:8000",
-      }) as any;
-      const lg = { value: "simple string" } as LangGraphInterrupt;
-      const result = agent.interruptValueToAGUI(lg) as AGUIInterrupt[];
-      expect(result).toHaveLength(1);
-      expect(result[0].reason).toBe("langgraph:interrupt");
-    });
 
     it("vectorized interruptsToAGUI works with fan-out", () => {
       const agent = new FanOutAgent({
@@ -322,6 +317,7 @@ describe("subclass hooks", () => {
       }) as any;
       const interrupts = [
         {
+          id: "int-1",
           value: {
             action_requests: [
               { id: "a1", reason: "approve A" },
@@ -329,11 +325,27 @@ describe("subclass hooks", () => {
             ],
           },
         },
-        { value: "simple" },
+        { id: "int-2", value: "simple" },
       ] as LangGraphInterrupt[];
 
       const result = agent.interruptsToAGUI(interrupts) as AGUIInterrupt[];
       expect(result).toHaveLength(3);
+      expect(result[0].id).toBe("fan-a1");
+      expect(result[1].id).toBe("fan-a2");
+      expect(result[2].id).toBe("int-2");
+    });
+
+    it("falls back to default for non-action_requests interrupts", () => {
+      const agent = new FanOutAgent({
+        graphId: "test-graph",
+        deploymentUrl: "http://localhost:8000",
+      }) as any;
+      const interrupts = [
+        { id: "int-1", value: "simple string" },
+      ] as LangGraphInterrupt[];
+      const result = agent.interruptsToAGUI(interrupts) as AGUIInterrupt[];
+      expect(result).toHaveLength(1);
+      expect(result[0].reason).toBe("langgraph:interrupt");
     });
   });
 

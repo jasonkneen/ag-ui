@@ -75,7 +75,7 @@ from ag_ui.core import (
     ReasoningEndEvent,
     ReasoningEncryptedValueEvent,
 )
-from .interrupts import lg_interrupt_to_agui, lg_interrupts_to_agui, DEFAULT_RESUME_SENTINEL_CANCELLED, DEFAULT_RESUME_SENTINEL_MAP
+from .interrupts import lg_interrupts_to_agui, DEFAULT_RESUME_SENTINEL_CANCELLED, DEFAULT_RESUME_SENTINEL_MAP
 from ag_ui.encoder import EventEncoder
 from ag_ui_a2ui_toolkit import split_a2ui_schema_context
 
@@ -504,7 +504,11 @@ class LangGraphAgent:
         # AG-UI standard: RunAgentInput.resume = [ResumeEntry, ...]
         agui_resume: Optional[list] = list(input.resume) if input.resume else None
 
-        # Legacy fallback: forwardedProps.command.resume (LangGraph private)
+        # Legacy fallback: forwardedProps.command.resume (LangGraph private).
+        # The conflict / deprecation warnings are emitted once in ``run`` (the
+        # request entry point); ``prepare_stream`` only needs the values to
+        # construct the LangGraph Command and stays silent to avoid the
+        # duplicate-log issue the reviewer flagged.
         command_input = forwarded_props.get('command', {})
         legacy_command_resume = (
             command_input.get('resume', None) if isinstance(command_input, dict) else None
@@ -514,19 +518,6 @@ class LangGraphAgent:
             and 'resume' in command_input
             and legacy_command_resume is not None
         )
-
-        if agui_resume is not None and legacy_has_resume:
-            logger.warning(
-                "both input.resume and forwardedProps.command.resume were provided; "
-                "input.resume wins (thread_id=%r, run_id=%r)",
-                thread_id, self.active_run.get("id"),
-            )
-        if legacy_has_resume and agui_resume is None:
-            logger.warning(
-                "forwardedProps.command.resume is deprecated; please send "
-                "RunAgentInput.resume[] (thread_id=%r, run_id=%r)",
-                thread_id, self.active_run.get("id"),
-            )
 
         has_resume_input = agui_resume is not None or legacy_has_resume
 
@@ -1072,30 +1063,16 @@ class LangGraphAgent:
                 return msg
         return None
 
-    def _interrupt_value_to_agui(self, lg_interrupt) -> List[AGUIInterrupt]:
-        """Map ONE LangGraph task interrupt to one or more AG-UI Interrupts.
-
-        Override when a single LangGraph interrupt carries multiple
-        logical user-decisions (e.g. HumanInTheLoopMiddleware's
-        action_requests/review_configs). Returning more than one item
-        is the supported way to fan out N decisions per LangGraph
-        interrupt without duplicating event-flow code.
-
-        Default: returns a single-element list via lg_interrupt_to_agui.
-        """
-        return [lg_interrupt_to_agui(lg_interrupt)]
-
     def _interrupts_to_agui(self, lg_interrupts) -> List[AGUIInterrupt]:
-        """Vectorized helper used by emit / short-circuit paths.
+        """Map LangGraph task interrupts to AG-UI Interrupts.
 
-        Subclasses normally override _interrupt_value_to_agui (singular)
-        only. Override this one only if you need cross-interrupt context
-        (rare).
+        Default: one-to-one via ``lg_interrupt_to_agui``. Override when a
+        single LangGraph interrupt carries multiple logical user-decisions
+        (e.g. HumanInTheLoopMiddleware's ``action_requests`` /
+        ``review_configs``) and you need to fan out N AG-UI Interrupts per
+        LangGraph interrupt — write the loop yourself in the override.
         """
-        out: List[AGUIInterrupt] = []
-        for lg in lg_interrupts:
-            out.extend(self._interrupt_value_to_agui(lg))
-        return out
+        return lg_interrupts_to_agui(lg_interrupts)
 
     def _emit_interrupt_finish(
         self,

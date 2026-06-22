@@ -60,7 +60,7 @@ import {
   ReasoningEndEvent,
   ReasoningEncryptedValueEvent,
 } from "@ag-ui/client";
-import { langGraphInterruptToAGUI, langGraphInterruptsToAGUI, buildLgCommandResumeFromAgui } from "./interrupts";
+import { langGraphInterruptsToAGUI, buildLgCommandResumeFromAgui } from "./interrupts";
 import { RunsStreamPayload } from "@langchain/langgraph-sdk/dist/types";
 import {
   aguiMessagesToLangChain,
@@ -1637,15 +1637,7 @@ export class LangGraphAgent extends AbstractAgent {
   protected interruptsToAGUI(
     list: readonly LangGraphInterrupt[],
   ): AGUIInterrupt[] {
-    const out: AGUIInterrupt[] = [];
-    for (const lg of list) out.push(...this.interruptValueToAGUI(lg));
-    return out;
-  }
-
-  protected interruptValueToAGUI(
-    lg: LangGraphInterrupt,
-  ): AGUIInterrupt[] {
-    return [langGraphInterruptToAGUI(lg)];
+    return langGraphInterruptsToAGUI(list);
   }
 
   protected buildCommandResumeFromAgui(

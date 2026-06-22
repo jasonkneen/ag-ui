@@ -1,5 +1,4 @@
 from typing import Any, List, Mapping
-from uuid import uuid4
 
 from ag_ui.core import Interrupt as AGUIInterrupt
 from langgraph.types import Interrupt as LangGraphInterrupt
@@ -7,31 +6,40 @@ from langgraph.types import Interrupt as LangGraphInterrupt
 from .utils import make_json_safe
 
 
+def _first_not_none(*values):
+    return next((v for v in values if v is not None), None)
+
+
 def lg_interrupt_to_agui(lg: LangGraphInterrupt) -> AGUIInterrupt:
     raw = lg.value
     is_dict = isinstance(raw, Mapping)
 
-    interrupt_id = getattr(lg, "id", None) or f"lg-{uuid4()}"
+    interrupt_id = getattr(lg, "id", None)
+    if not interrupt_id:
+        raise ValueError(
+            "LangGraph Interrupt is missing `id`. The id is required to "
+            "match a resume answer back to the originating step; synthesising "
+            "an id here would silently misroute multi-interrupt resumes. "
+            "Upgrade to langgraph>=0.4 (which always populates Interrupt.id)."
+        )
+
     reason = (raw.get("reason") if is_dict else None) or "langgraph:interrupt"
 
     message = (
         raw if isinstance(raw, str)
         else raw.get("message") if is_dict else None
     )
-    tool_call_id = (
-        raw.get("toolCallId") if is_dict else None
-    ) or (
-        raw.get("tool_call_id") if is_dict else None
+    tool_call_id = _first_not_none(
+        raw.get("toolCallId") if is_dict else None,
+        raw.get("tool_call_id") if is_dict else None,
     )
-    response_schema = (
-        raw.get("responseSchema") if is_dict else None
-    ) or (
-        raw.get("response_schema") if is_dict else None
+    response_schema = _first_not_none(
+        raw.get("responseSchema") if is_dict else None,
+        raw.get("response_schema") if is_dict else None,
     )
-    expires_at = (
-        raw.get("expiresAt") if is_dict else None
-    ) or (
-        raw.get("expires_at") if is_dict else None
+    expires_at = _first_not_none(
+        raw.get("expiresAt") if is_dict else None,
+        raw.get("expires_at") if is_dict else None,
     )
 
     metadata: dict[str, Any] = {
