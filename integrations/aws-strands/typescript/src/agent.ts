@@ -170,12 +170,19 @@ function _coerceText(content: unknown): string {
  * JSON object/array, emit it as `{ json: parsed }` so the LLM sees a real
  * structured result. Fall back to `{ text: ... }` for everything else.
  */
-function _buildToolResultContent(
+export function _buildToolResultContent(
   content: unknown,
 ): { text: string } | { json: unknown } {
   const text = _coerceText(content);
   const trimmed = text.trim();
-  if (trimmed.length === 0) return { text };
+  // Render-only frontend tools (e.g. CopilotKit `useComponent`) legitimately
+  // produce an empty client tool result. Forwarding an empty `text` block to
+  // the Strands model reaches OpenAI, which rejects tool messages with empty
+  // content (HTTP 400). Synthesize a non-empty acknowledgement instead — this
+  // matches the Python adapter's behavior. The UI-bound TOOL_CALL_RESULT event
+  // is emitted on a separate path and stays faithfully empty.
+  if (trimmed.length === 0)
+    return { text: "Tool executed successfully with no return value." };
   const first = trimmed[0];
   if (first !== "{" && first !== "[") return { text };
   try {
