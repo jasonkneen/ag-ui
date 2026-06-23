@@ -557,6 +557,9 @@ importers:
       publint:
         specifier: ^0.3.12
         version: 0.3.17
+      rxjs:
+        specifier: 7.8.1
+        version: 7.8.1
       tsdown:
         specifier: ^0.20.1
         version: 0.20.1(publint@0.3.17)(typescript@5.9.3)
