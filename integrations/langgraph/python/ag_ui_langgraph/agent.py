@@ -16,6 +16,7 @@ except ImportError:
     from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
     
 from langchain_core.runnables import RunnableConfig, ensure_config
+from langchain_core.runnables.config import merge_configs
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
@@ -72,6 +73,7 @@ from ag_ui.core import (
     ReasoningEncryptedValueEvent,
 )
 from ag_ui.encoder import EventEncoder
+from ag_ui_a2ui_toolkit import split_a2ui_schema_context
 
 ProcessedEvents = Union[
     TextMessageStartEvent,
@@ -651,12 +653,22 @@ class LangGraphAgent:
             as_node=next_nodes[0] if next_nodes else "__start__",
         )
 
+        # ``fork`` only carries the checkpoint-level configurable keys
+        # (``thread_id``, ``checkpoint_id``, ``checkpoint_ns``).  Pass it
+        # alone and runtime settings from the caller's config -- notably
+        # ``recursion_limit`` and ``callbacks`` -- are silently dropped,
+        # so LangGraph stamps the default ``recursion_limit=25`` and any
+        # tracing / observability callbacks are lost.  Merge the caller's
+        # config underneath the fork so checkpoint keys still win but
+        # everything else is preserved.  Fixes #1749.
+        merged_config = merge_configs(config, fork)
+
         stream_input = self.langgraph_default_merge_state(time_travel_checkpoint.values, [message_checkpoint], input)
         subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs', True) if input.forwarded_props else True
 
         kwargs = self.get_stream_kwargs(
             input=stream_input,
-            config=fork,
+            config=merged_config,
             subgraphs=bool(subgraphs_stream_enabled),
             version="v2",
         )
@@ -877,22 +889,10 @@ class LangGraphAgent:
         # The A2UI schema goes into state["ag-ui"]["a2ui_schema"] so agents
         # can read it directly from state (e.g., for the generate_a2ui tool),
         # instead of it being dumped into the system prompt with all other context.
-        # This string MUST stay byte-identical to the A2UI middleware's exported
-        # A2UI_SCHEMA_CONTEXT_DESCRIPTION (middlewares/a2ui-middleware/src/index.ts).
-        # The match below is exact-equality, so any drift silently routes the schema
-        # into the system prompt instead of state. Covered by
+        # The split (constant + matcher) lives in the shared a2ui toolkit so the
+        # LangGraph and Strands adapters agree on it. Covered by
         # test_a2ui_schema_context_routed_into_ag_ui_state.
-        A2UI_SCHEMA_CONTEXT_DESCRIPTION = "A2UI Component Schema \u2014 available components for generating UI surfaces. Use these component names and properties when creating A2UI operations."
-
-        all_context = input.context or []
-        a2ui_schema_value = None
-        regular_context = []
-        for entry in all_context:
-            desc = entry.get("description", "") if isinstance(entry, dict) else getattr(entry, "description", "")
-            if desc == A2UI_SCHEMA_CONTEXT_DESCRIPTION:
-                a2ui_schema_value = entry.get("value", "") if isinstance(entry, dict) else getattr(entry, "value", "")
-            else:
-                regular_context.append(entry)
+        a2ui_schema_value, regular_context = split_a2ui_schema_context(input.context)
 
         ag_ui_state: dict = {
             "tools": unique_tools,
@@ -1386,7 +1386,7 @@ class LangGraphAgent:
                                 type=EventType.TOOL_CALL_START,
                                 tool_call_id=tool_msg.tool_call_id,
                                 tool_call_name=tool_msg.name or event.get("name", ""),
-                                parent_message_id=tool_msg.id,
+                                parent_message_id=str(tool_msg.id or tool_msg.tool_call_id),
                                 raw_event=event,
                             )
                         )
@@ -1411,7 +1411,8 @@ class LangGraphAgent:
                         ToolCallResultEvent(
                             type=EventType.TOOL_CALL_RESULT,
                             tool_call_id=tool_msg.tool_call_id,
-                            message_id=str(uuid.uuid4()),
+                            # Match ToolMessage.id (or tool_call_id) so MESSAGES_SNAPSHOT merge works.
+                            message_id=str(tool_msg.id or tool_msg.tool_call_id),
                             content=normalize_tool_content(tool_msg.content),
                             role="tool"
                         )
@@ -1439,7 +1440,7 @@ class LangGraphAgent:
                         type=EventType.TOOL_CALL_START,
                         tool_call_id=tool_call_output.tool_call_id,
                         tool_call_name=tool_call_output.name or event.get("name", ""),
-                        parent_message_id=tool_call_output.id,
+                        parent_message_id=str(tool_call_output.id or tool_call_output.tool_call_id),
                         raw_event=event,
                     )
                 )
@@ -1464,7 +1465,8 @@ class LangGraphAgent:
                 ToolCallResultEvent(
                     type=EventType.TOOL_CALL_RESULT,
                     tool_call_id=tool_call_output.tool_call_id,
-                    message_id=str(uuid.uuid4()),
+                    # Match ToolMessage.id (or tool_call_id) so MESSAGES_SNAPSHOT merge works.
+                    message_id=str(tool_call_output.id or tool_call_output.tool_call_id),
                     content=normalize_tool_content(tool_call_output.content),
                     role="tool"
                 )
@@ -1709,9 +1711,14 @@ class LangGraphAgent:
             version=version,
         )
 
-        # Only add context if supported
+        # LangGraph may expose context either as a named parameter or through
+        # **kwargs, depending on the installed version.
         sig = inspect.signature(self.graph.astream_events)
-        if 'context' in sig.parameters:
+        accepts_context = (
+            'context' in sig.parameters
+            or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+        )
+        if accepts_context:
             base_context = {}
             if isinstance(config, dict) and 'configurable' in config and isinstance(config['configurable'], dict):
                 base_context.update(config['configurable'])
