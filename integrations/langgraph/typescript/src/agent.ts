@@ -850,9 +850,18 @@ export class LangGraphAgent extends AbstractAgent {
         }
 
         const chunkData = chunk.data;
-        const metadata = chunkData.metadata ?? {};
+        // messages-tuple chunks arrive as [AIMessageChunk, metadata] arrays;
+        // events-mode chunks are objects with metadata/event properties. Read
+        // metadata from the right slot so langgraph_node is extracted in both
+        // cases (otherwise messages-tuple-only flows never call
+        // handleNodeChange and node-scoped behavior degrades to no-op).
+        const metadata = Array.isArray(chunkData)
+          ? (chunkData[1] ?? {})
+          : (chunkData.metadata ?? {});
         const currentNodeName = metadata.langgraph_node;
-        const eventType = chunkData.event;
+        const eventType = Array.isArray(chunkData)
+          ? undefined
+          : chunkData.event;
 
         // Subgraph detection via langgraph_checkpoint_ns
         // ns format: "" | "node:uuid" | "node:uuid|inner:uuid"
@@ -1230,14 +1239,15 @@ export class LangGraphAgent extends AbstractAgent {
         if (isMessageContentEvent && shouldEmitMessages) {
           // No existing message yet, also init the message
           if (!currentStream) {
+            const messageId = this.getOrPinTextMessageId(event.data.chunk.id);
             this.dispatchEvent({
               type: EventType.TEXT_MESSAGE_START,
               role: "assistant",
-              messageId: event.data.chunk.id,
+              messageId,
               rawEvent: event,
             });
             this.setMessageInProgress(this.activeRun!.id, {
-              id: event.data.chunk.id,
+              id: messageId,
               toolCallId: null,
               toolCallName: null,
             });
@@ -1540,13 +1550,14 @@ export class LangGraphAgent extends AbstractAgent {
     // Handle text content streaming
     if (content) {
       if (!currentStream) {
+        const messageId = this.getOrPinTextMessageId(chunk.id);
         this.dispatchEvent({
           type: EventType.TEXT_MESSAGE_START,
           role: "assistant",
-          messageId: chunk.id,
+          messageId,
         });
         this.setMessageInProgress(this.activeRun!.id, {
-          id: chunk.id,
+          id: messageId,
           toolCallId: null,
           toolCallName: null,
         });
@@ -1945,8 +1956,29 @@ export class LangGraphAgent extends AbstractAgent {
       if (nodeName) {
         this.startStep(nodeName);
       }
+      // Clear the pinned text message id: a new node should mint its own
+      // bubble. See RunMetadata.currentTextMessageId.
+      if (this.activeRun) {
+        this.activeRun.currentTextMessageId = undefined;
+      }
     }
     this.activeRun!.nodeName = nodeName;
+  }
+
+  /**
+   * Returns the messageId to use for a TEXT_MESSAGE_START emission, pinning
+   * the first id per node. chunk.id changes per LLM invocation, so a
+   * text→tool→text sequence within one node would otherwise render as
+   * multiple bubbles; pinning keeps them in one. handleNodeChange clears
+   * the pin on every node transition, so different nodes (e.g. a supervisor
+   * routing to specialist agents) get fresh ids and stay in separate
+   * bubbles. See #1317.
+   */
+  private getOrPinTextMessageId(fallbackId: string): string {
+    const messageId =
+      this.activeRun!.currentTextMessageId ?? fallbackId;
+    this.activeRun!.currentTextMessageId = messageId;
+    return messageId;
   }
 
   startStep(nodeName: string) {

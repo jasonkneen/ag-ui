@@ -1307,18 +1307,19 @@ class LangGraphAgent:
                     return
 
                 if bool(current_stream and current_stream.get("id")) == False:
+                    message_id = self._get_or_pin_text_message_id(chunk_id)
                     yield self._dispatch_event(
                         TextMessageStartEvent(
                             type=EventType.TEXT_MESSAGE_START,
                             role="assistant",
-                            message_id=chunk_id,
+                            message_id=message_id,
                             raw_event=event,
                         )
                     )
                     self.set_message_in_progress(
                         self.active_run["id"],
                         MessageInProgress(
-                            id=chunk_id,
+                            id=message_id,
                             tool_call_id=None,
                             tool_call_name=None
                         )
@@ -1700,6 +1701,20 @@ class LangGraphAgent:
             f"(thread_id={thread_id!r}, snapshots_scanned={len(history_list)})"
         )
 
+    def _get_or_pin_text_message_id(self, fallback_id: str) -> str:
+        """Returns the message_id to use for a TEXT_MESSAGE_START emission,
+        pinning the first id per node. chunk_id changes per LLM invocation,
+        so a text→tool→text sequence within one node would otherwise render
+        as multiple bubbles; pinning keeps them in one. handle_node_change
+        clears the pin on every node transition, so different nodes (e.g. a
+        supervisor routing to specialist agents) get fresh ids and stay in
+        separate bubbles. See #1317.
+        """
+        stored = self.active_run.get("current_text_message_id")
+        message_id = stored if stored is not None else fallback_id
+        self.active_run["current_text_message_id"] = message_id
+        return message_id
+
     def handle_node_change(self, node_name: Optional[str]) -> Generator[ProcessedEvents, None, None]:
         """
         Centralized method to handle node name changes and step transitions.
@@ -1721,6 +1736,10 @@ class LangGraphAgent:
             if node_name:
                 for event in self.start_step(node_name):
                     yield event
+
+            # Clear the pinned text message id: a new node should mint its own
+            # bubble. See RunMetadata.current_text_message_id.
+            self.active_run["current_text_message_id"] = None
 
         self.active_run["node_name"] = node_name
 
