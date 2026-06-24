@@ -15,16 +15,13 @@ dependencies = [
     "yfinance>=0.2.63",
     "fastapi>=0.116.1",
     "uvicorn>=0.35.0",
-    "ag-ui-protocol",
+    "ag-ui-protocol>=0.1.19",
     "dotenv (>=0.9.9,<0.10.0)",
 ]
 authors = [
     {name = "AG-UI Team"}
 ]
 
-
-[tool.uv.sources]
-ag-ui-protocol = { path = "../../../../sdks/python/" }
 
 [project.scripts]
 dev = "server:main"
