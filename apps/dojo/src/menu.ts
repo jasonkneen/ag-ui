@@ -184,6 +184,21 @@ export const menuIntegrations = [
       "predictive_state_updates",
       "shared_state",
       "tool_based_generative_ui",
+      "subgraphs",
+    ],
+  },
+  {
+    id: "ag-ui-dotnet",
+    name: "AG-UI .NET SDK",
+    features: [
+      "agentic_chat",
+      "v1_agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "agentic_generative_ui",
+      "predictive_state_updates",
+      "shared_state",
+      "tool_based_generative_ui",
     ],
   },
   {
