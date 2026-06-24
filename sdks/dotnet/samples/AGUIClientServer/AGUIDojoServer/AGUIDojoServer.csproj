@@ -2,6 +2,11 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <!-- This server is launched with `dotnet run`, which refuses a multi-targeting
+         project. Opt out of the repo-wide multi-TFM default (Directory.Build.props
+         sets <TargetFrameworks>) by clearing it and pinning a single target, so the
+         project is a genuine single-target build and `dotnet run` needs no --framework. -->
+    <TargetFrameworks></TargetFrameworks>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsAotCompatible>false</IsAotCompatible>
