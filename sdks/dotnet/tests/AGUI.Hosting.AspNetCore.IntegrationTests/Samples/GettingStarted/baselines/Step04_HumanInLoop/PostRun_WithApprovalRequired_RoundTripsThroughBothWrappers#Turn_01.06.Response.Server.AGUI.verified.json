@@ -38,7 +38,7 @@
   {
     "type": "TOOL_CALL_ARGS",
     "toolCallId": "call_Id_1",
-    "delta": "{\r\n  \u0022request\u0022: {\r\n    \u0022approval_Id_1\u0022: \u0022ficc_Id_1\u0022,\r\n    \u0022function_name\u0022: \u0022ApproveExpenseReport\u0022,\r\n    \u0022function_arguments\u0022: {\r\n      \u0022expenseReportId\u0022: \u0022EXP-2024-001\u0022\r\n    },\r\n    \u0022message\u0022: \u0022Approve execution of \u0027ApproveExpenseReport\u0027?\u0022\r\n  }\r\n}",
+    "delta": "{\n  \u0022request\u0022: {\n    \u0022approval_Id_1\u0022: \u0022ficc_Id_1\u0022,\n    \u0022function_name\u0022: \u0022ApproveExpenseReport\u0022,\n    \u0022function_arguments\u0022: {\n      \u0022expenseReportId\u0022: \u0022EXP-2024-001\u0022\n    },\n    \u0022message\u0022: \u0022Approve execution of \u0027ApproveExpenseReport\u0027?\u0022\n  }\n}",
     "rawEvent": {
       "role": "assistant",
       "contents": [

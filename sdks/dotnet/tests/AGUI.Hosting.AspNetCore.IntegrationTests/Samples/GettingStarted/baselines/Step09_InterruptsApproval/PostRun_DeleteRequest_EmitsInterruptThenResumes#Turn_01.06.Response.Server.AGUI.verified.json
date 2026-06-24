@@ -35,7 +35,7 @@
   {
     "type": "TOOL_CALL_ARGS",
     "toolCallId": "call_Id_1",
-    "delta": "{\r\n  \u0022filename\u0022: \u0022report-draft.txt\u0022\r\n}",
+    "delta": "{\n  \u0022filename\u0022: \u0022report-draft.txt\u0022\n}",
     "rawEvent": {
       "role": "assistant",
       "contents": [

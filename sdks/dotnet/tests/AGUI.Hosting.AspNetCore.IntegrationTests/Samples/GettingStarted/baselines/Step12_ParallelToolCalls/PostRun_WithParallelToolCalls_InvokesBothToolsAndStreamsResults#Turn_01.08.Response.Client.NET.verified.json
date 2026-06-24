@@ -125,7 +125,7 @@
     "contents": [
       {
         "$type": "functionResult",
-        "result": "{\r\n        \u0022City\u0022: \u0022Paris\u0022,\r\n        \u0022Conditions\u0022: \u0022sunny\u0022,\r\n        \u0022TemperatureCelsius\u0022: 22\r\n      }",
+        "result": "{\n        \u0022City\u0022: \u0022Paris\u0022,\n        \u0022Conditions\u0022: \u0022sunny\u0022,\n        \u0022TemperatureCelsius\u0022: 22\n      }",
         "callId": "call_Id_1"
       }
     ],
@@ -134,7 +134,7 @@
       "type": "TOOL_CALL_RESULT",
       "messageId": "call_Id_1",
       "toolCallId": "call_Id_1",
-      "content": "{\r\n        \u0022City\u0022: \u0022Paris\u0022,\r\n        \u0022Conditions\u0022: \u0022sunny\u0022,\r\n        \u0022TemperatureCelsius\u0022: 22\r\n      }",
+      "content": "{\n        \u0022City\u0022: \u0022Paris\u0022,\n        \u0022Conditions\u0022: \u0022sunny\u0022,\n        \u0022TemperatureCelsius\u0022: 22\n      }",
       "rawEvent": {
         "authorName": null,
         "role": "tool",
@@ -176,7 +176,7 @@
     "contents": [
       {
         "$type": "functionResult",
-        "result": "{\r\n        \u0022Timezone\u0022: \u0022Asia/Tokyo\u0022,\r\n        \u0022CurrentTime\u0022: \u00222026-06-18 09:30 UTC\u0022\r\n      }",
+        "result": "{\n        \u0022Timezone\u0022: \u0022Asia/Tokyo\u0022,\n        \u0022CurrentTime\u0022: \u00222026-06-18 09:30 UTC\u0022\n      }",
         "callId": "call_Id_2"
       }
     ],
@@ -185,7 +185,7 @@
       "type": "TOOL_CALL_RESULT",
       "messageId": "call_Id_2",
       "toolCallId": "call_Id_2",
-      "content": "{\r\n        \u0022Timezone\u0022: \u0022Asia/Tokyo\u0022,\r\n        \u0022CurrentTime\u0022: \u00222026-06-18 09:30 UTC\u0022\r\n      }",
+      "content": "{\n        \u0022Timezone\u0022: \u0022Asia/Tokyo\u0022,\n        \u0022CurrentTime\u0022: \u00222026-06-18 09:30 UTC\u0022\n      }",
       "rawEvent": {
         "authorName": null,
         "role": "tool",

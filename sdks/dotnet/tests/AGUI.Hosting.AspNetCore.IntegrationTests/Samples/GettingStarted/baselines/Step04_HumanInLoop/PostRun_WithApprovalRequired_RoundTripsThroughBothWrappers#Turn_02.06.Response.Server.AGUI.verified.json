@@ -29,7 +29,7 @@
   {
     "type": "TOOL_CALL_ARGS",
     "toolCallId": "call_Id_1",
-    "delta": "{\r\n  \u0022expenseReportId\u0022: \u0022EXP-2024-001\u0022\r\n}",
+    "delta": "{\n  \u0022expenseReportId\u0022: \u0022EXP-2024-001\u0022\n}",
     "rawEvent": {
       "role": "assistant",
       "contents": [
