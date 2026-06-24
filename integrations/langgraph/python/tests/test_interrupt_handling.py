@@ -6,6 +6,7 @@ tool call has the interrupt on tasks[1] or later, it's silently missed.
 These tests call the actual LangGraphAgent._collect_interrupts() method
 so that reverting the fix in agent.py will cause test failures.
 """
+import unittest
 import pytest
 from unittest.mock import MagicMock
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ def make_agent():
     return LangGraphAgent(name="test", graph=mock_graph)
 
 
-class TestCollectInterrupts:
+class TestCollectInterrupts(unittest.TestCase):
     """Test LangGraphAgent._collect_interrupts() across all tasks."""
 
     def test_single_task_with_interrupt(self):
