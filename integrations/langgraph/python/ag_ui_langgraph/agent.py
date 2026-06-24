@@ -495,6 +495,21 @@ class LangGraphAgent:
         # resume values as present so falsy resume payloads remain valid while
         # resume=None follows the no-resume interrupt path. Fixes #1743.
         if not has_resume_input:
+            # Detect a content edit on any HumanMessage that exists in the checkpoint
+            # under the same ID. ``is_continuation`` below compares IDs only, so a
+            # same-ID edit is otherwise silently swallowed (the checkpoint keeps the
+            # old content and the user's edit is lost). Fixes #1748.
+            edited_message = self._detect_edited_human_message(
+                langchain_messages,
+                agent_state.values.get("messages", []),
+            )
+            if edited_message:
+                return await self.prepare_regenerate_stream(
+                    input=input,
+                    message_checkpoint=edited_message,
+                    config=config,
+                )
+
             non_system_messages = [msg for msg in langchain_messages if not isinstance(msg, SystemMessage)]
             if len(agent_state.values.get("messages", [])) > len(non_system_messages):
                 # Only trigger time-travel regeneration if the incoming messages are NOT already
@@ -971,6 +986,47 @@ class LangGraphAgent:
             task_interrupts = getattr(task, "interrupts", None) or []
             interrupts.extend(task_interrupts)
         return interrupts
+
+    @staticmethod
+    def _normalized_content(content):
+        # Canonical form for edit detection: plain strings compare directly;
+        # structured/multimodal content compares via a key-order-insensitive
+        # projection so checkpoint re-serialization isn't mistaken for an edit.
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, sort_keys=True, default=str)
+    
+    @staticmethod
+    def _detect_edited_human_message(
+        incoming_messages: List[BaseMessage],
+        checkpoint_messages: List[BaseMessage],
+    ) -> Optional[HumanMessage]:
+        """Return the earliest incoming ``HumanMessage`` whose content
+        was edited relative to the checkpoint, or ``None`` if no edit
+        was detected.
+
+        Two messages are considered to be the same message when they
+        share an ``id``; an edit is a same-``id`` pair with different
+        ``content``. The ``is_continuation`` heuristic in
+        ``prepare_stream`` compares ``id``\\ s only, so without this
+        check a same-id content edit is silently swallowed (the
+        checkpoint keeps the old content and the user's edit is lost).
+        Fixes #1748.
+        """
+        checkpoint_by_id = {
+            getattr(m, "id", None): m
+            for m in checkpoint_messages
+            if isinstance(m, HumanMessage) and getattr(m, "id", None)
+        }
+        if not checkpoint_by_id:
+            return None
+        for msg in incoming_messages:
+            if not isinstance(msg, HumanMessage) or not getattr(msg, "id", None):
+                continue
+            ckpt = checkpoint_by_id.get(msg.id)
+            if ckpt is not None and LangGraphAgent._normalized_content(ckpt.content) != LangGraphAgent._normalized_content(msg.content):
+                return msg
+        return None
 
     def get_state_snapshot(self, state: State) -> State:
         # Invariant: callers always operate within an active run.
