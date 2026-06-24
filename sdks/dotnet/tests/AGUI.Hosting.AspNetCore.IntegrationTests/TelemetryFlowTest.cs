@@ -211,6 +211,12 @@ public sealed class TelemetryFlowTest
         private readonly ActivitySource _rootSource = new("Test.Telemetry.Flow");
         private readonly List<Activity> _activities = [];
 
+        // The listener is process-global, and the AG-UI/MEAI sources are shared, so a
+        // telemetry test running in parallel (e.g. RunTelemetryIntegrationTest) would
+        // otherwise leak its spans into this capture. Every span of a scenario shares the
+        // in-process trace started by Root(), so record only spans on an owned trace.
+        private readonly HashSet<ActivityTraceId> _ownedTraces = [];
+
         public SpanCapture()
         {
             var sources = new HashSet<string>(StringComparer.Ordinal)
@@ -228,14 +234,29 @@ public sealed class TelemetryFlowTest
                 {
                     lock (_activities)
                     {
-                        _activities.Add(activity);
+                        if (_ownedTraces.Contains(activity.TraceId))
+                        {
+                            _activities.Add(activity);
+                        }
                     }
                 },
             };
             ActivitySource.AddActivityListener(_listener);
         }
 
-        public Activity? Root(string name) => _rootSource.StartActivity(name);
+        public Activity? Root(string name)
+        {
+            var root = _rootSource.StartActivity(name);
+            if (root is not null)
+            {
+                lock (_activities)
+                {
+                    _ownedTraces.Add(root.TraceId);
+                }
+            }
+
+            return root;
+        }
 
         public IReadOnlyList<Activity> Snapshot()
         {
