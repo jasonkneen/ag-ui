@@ -1024,7 +1024,7 @@ class LangGraphAgent:
             if not isinstance(msg, HumanMessage) or not getattr(msg, "id", None):
                 continue
             ckpt = checkpoint_by_id.get(msg.id)
-            if ckpt is not None and self._normalized_content(ckpt.content) != self._normalized_content(msg.content):
+            if ckpt is not None and LangGraphAgent._normalized_content(ckpt.content) != LangGraphAgent._normalized_content(msg.content):
                 return msg
         return None
 
