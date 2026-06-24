@@ -136,6 +136,24 @@ projects:
       autoDeployTrigger: commit
       rootDir: integrations/aws-strands/python/examples
     - type: web
+      name: ag-ui-dojo-strands-typescript
+      runtime: node
+      repo: https://github.com/ag-ui-protocol/ag-ui
+      plan: standard
+      scaling:
+        minInstances: 1
+        maxInstances: 3
+        targetMemoryPercent: 70
+        targetCPUPercent: 70
+      envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      region: virginia
+      buildCommand: cd ../../../.. && pnpm install && npx nx run @ag-ui/aws-strands:build
+      startCommand: npx tsx server/server.ts
+      autoDeployTrigger: commit
+      rootDir: integrations/aws-strands/typescript/examples
+    - type: web
       name: ag-ui-dojo-agno
       runtime: python
       repo: https://github.com/ag-ui-protocol/ag-ui
@@ -358,7 +376,7 @@ projects:
       name: ag-ui-dojo-claude-agent-sdk-python
       runtime: python
       repo: https://github.com/ag-ui-protocol/ag-ui
-      plan: starter
+      plan: standard
       scaling:
         minInstances: 1
         maxInstances: 3
@@ -376,7 +394,7 @@ projects:
       name: ag-ui-dojo-claude-agent-sdk-typescript
       runtime: node
       repo: https://github.com/ag-ui-protocol/ag-ui
-      plan: starter
+      plan: standard
       scaling:
         minInstances: 1
         maxInstances: 3
@@ -386,7 +404,7 @@ projects:
       - key: ANTHROPIC_API_KEY
         sync: false
       region: virginia
-      buildCommand: cd ../../.. && npm install -g pnpm && pnpm install && npx nx run @ag-ui/claude-agent-sdk:build
+      buildCommand: cd ../../.. && pnpm install && npx nx run @ag-ui/claude-agent-sdk:build
       startCommand: npx tsx examples/server.ts
       autoDeployTrigger: commit
       rootDir: integrations/claude-agent-sdk/typescript
@@ -426,17 +444,17 @@ projects:
       - key: CREW_AI_URL
         value: https://ag-ui-dojo-crewai.onrender.com
       - key: AGENT_SPEC_URL
-        value: https://ag-ui-dojo-open-agent-spec.onrender.com
+        value: https://ag-ui-p7fw.onrender.com
       - key: PYDANTIC_AI_URL
-        value: https://ag-ui-dojo-pydantic-ai.onrender.com
+        value: https://pydantic-ai.onrender.com
       - key: ADK_MIDDLEWARE_URL
-        value: https://ag-ui-adk.onrender.com
+        value: https://ag-ui.onrender.com
       - key: AGENT_FRAMEWORK_PYTHON_URL
         value: https://ag-ui-dojo-maf-python.onrender.com
       - key: AGENT_FRAMEWORK_DOTNET_URL
         value: https://ag-ui-dojo-maf-dotnet.onrender.com
       - key: A2A_MIDDLEWARE_BUILDINGS_MANAGEMENT_URL
-        value: https://ag-ui-dojo-a2a-middleware-businesses-management.onrender.com
+        value: https://ag-ui-dojo-a2a-middleware-businesses.onrender.com
       - key: A2A_MIDDLEWARE_FINANCE_URL
         value: https://ag-ui-dojo-a2a-middleware-finance.onrender.com
       - key: A2A_MIDDLEWARE_IT_URL
@@ -445,6 +463,8 @@ projects:
         value: https://ag-ui-dojo-a2a-middleware-orchestrator.onrender.com
       - key: AWS_STRANDS_URL
         value: https://ag-ui-dojo-strands-python.onrender.com
+      - key: AWS_STRANDS_TYPESCRIPT_URL
+        value: https://ag-ui-dojo-strands-typescript.onrender.com
       - key: CLAUDE_AGENT_SDK_PYTHON_URL
         value: https://ag-ui-dojo-claude-agent-sdk-python.onrender.com
       - key: CLAUDE_AGENT_SDK_TYPESCRIPT_URL

@@ -40,7 +40,7 @@ type RemoteMastraAgent = ReturnType<MastraClient["getAgent"]>;
 
 export interface MastraAgentConfig extends AgentConfig {
   agent: LocalMastraAgent | RemoteMastraAgent;
-  resourceId: string;
+  resourceId?: string;
   requestContext?: RequestContext;
 }
 
@@ -69,8 +69,9 @@ interface MastraAgentStreamOptions {
 
 export class MastraAgent extends AbstractAgent {
   agent: LocalMastraAgent | RemoteMastraAgent;
-  resourceId: string;
+  resourceId?: string;
   requestContext?: RequestContext;
+  public headers?: Record<string, string>;
 
   constructor(private config: MastraAgentConfig) {
     const { agent, resourceId, requestContext, ...rest } = config;
@@ -81,7 +82,11 @@ export class MastraAgent extends AbstractAgent {
   }
 
   public clone() {
-    return new MastraAgent(this.config);
+    const cloned = new MastraAgent(this.config);
+    if (this.headers) {
+      cloned.headers = { ...this.headers };
+    }
+    return cloned;
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -104,7 +109,10 @@ export class MastraAgent extends AbstractAgent {
 
         // resume: false means the user explicitly declined the tool call.
         // Close the run cleanly without calling resumeStream.
-        if (forwardedCommand?.resume === false && forwardedCommand?.interruptEvent) {
+        if (
+          forwardedCommand?.resume === false &&
+          forwardedCommand?.interruptEvent
+        ) {
           await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
           subscriber.next({
             type: EventType.RUN_FINISHED,
@@ -115,7 +123,10 @@ export class MastraAgent extends AbstractAgent {
           return;
         }
 
-        if (forwardedCommand?.resume != null && forwardedCommand?.interruptEvent) {
+        if (
+          forwardedCommand?.resume != null &&
+          forwardedCommand?.interruptEvent
+        ) {
           // Safely parse interruptEvent — client-supplied data
           let interruptEvent: any;
           try {
@@ -135,9 +146,7 @@ export class MastraAgent extends AbstractAgent {
           // Validate required fields for resume
           if (!interruptEvent?.toolCallId || !interruptEvent?.runId) {
             subscriber.error(
-              new Error(
-                "Invalid interruptEvent: missing toolCallId or runId",
-              ),
+              new Error("Invalid interruptEvent: missing toolCallId or runId"),
             );
             return;
           }
@@ -153,23 +162,38 @@ export class MastraAgent extends AbstractAgent {
           }
 
           try {
+            const resumeOptions: Record<string, unknown> = {
+              toolCallId: interruptEvent.toolCallId,
+              runId: interruptEvent.runId,
+              memory: {
+                thread: input.threadId,
+                resource: this.resourceId ?? input.threadId,
+              },
+              requestContext: this.requestContext,
+            };
+            if (this.headers && Object.keys(this.headers).length > 0) {
+              resumeOptions.modelSettings = {
+                ...((resumeOptions.modelSettings as
+                  | Record<string, unknown>
+                  | undefined) ?? {}),
+                headers: this.headers,
+              };
+            }
             const response = await this.agent.resumeStream(
               forwardedCommand.resume,
-              {
-                toolCallId: interruptEvent.toolCallId,
-                runId: interruptEvent.runId,
-                memory: {
-                  thread: input.threadId,
-                  resource: this.resourceId ?? input.threadId,
-                },
-                requestContext: this.requestContext,
-              },
+              resumeOptions,
             );
 
             // Null/invalid response from resumeStream is an error
-            if (!response || typeof response !== "object" || !response.fullStream) {
+            if (
+              !response ||
+              typeof response !== "object" ||
+              !response.fullStream
+            ) {
               subscriber.error(
-                new Error("resumeStream returned no valid response (missing fullStream)"),
+                new Error(
+                  "resumeStream returned no valid response (missing fullStream)",
+                ),
               );
               return;
             }
@@ -177,7 +201,9 @@ export class MastraAgent extends AbstractAgent {
             const callbacks = this.makeStreamCallbacks(
               subscriber,
               () => messageId,
-              (id) => { messageId = id; },
+              (id) => {
+                messageId = id;
+              },
               input.runId,
             );
             const hadError = await this.processFullStream(response.fullStream, {
@@ -209,14 +235,23 @@ export class MastraAgent extends AbstractAgent {
               requestContext: this.requestContext,
             });
 
-            if (
-              memory &&
-              input.state &&
-              Object.keys(input.state).length > 0
-            ) {
-              let thread: StorageThreadType | null = await memory.getThreadById({
-                threadId: input.threadId,
-              });
+            if (memory && input.state && Object.keys(input.state).length > 0) {
+              let thread: StorageThreadType | null = await memory.getThreadById(
+                {
+                  threadId: input.threadId,
+                  // Mastra's abstract Memory.getThreadById type is narrower than
+                  // its runtime contract — concrete Memory subclasses (and
+                  // `AGENT_MEMORY_MISSING_RESOURCE_ID` checks along the thread
+                  // lifecycle) expect `resourceId`. We forward it here to stay
+                  // consistent with the sibling saveThread call below (which
+                  // also normalizes `thread.resourceId`) and the
+                  // `emitWorkingMemorySnapshot` call to `getWorkingMemory`, and
+                  // to match the rest of the run's memory options (`resource:`
+                  // on `.stream()` / `.resumeStream()` in `streamMastraAgent`).
+                  // @ts-expect-error upstream type omits resourceId; runtime accepts it
+                  resourceId: this.resourceId ?? input.threadId,
+                },
+              );
 
               if (!thread) {
                 thread = {
@@ -246,6 +281,15 @@ export class MastraAgent extends AbstractAgent {
               await memory.saveThread({
                 thread: {
                   ...thread,
+                  // Ensure resourceId is always set on the persisted thread.
+                  // If storage returned a thread with a stale/missing
+                  // resourceId (migrated data, foreign writer, etc.) the
+                  // naive `...thread` spread would carry that through and
+                  // Mastra's Memory would reject the save with
+                  // AGENT_MEMORY_MISSING_RESOURCE_ID. Normalize to the run's
+                  // authoritative resourceId, matching the sibling
+                  // getThreadById call above.
+                  resourceId: this.resourceId ?? input.threadId,
                   metadata: {
                     ...thread.metadata,
                     workingMemory,
@@ -263,7 +307,9 @@ export class MastraAgent extends AbstractAgent {
           const streamCallbacks = this.makeStreamCallbacks(
             subscriber,
             () => messageId,
-            (id) => { messageId = id; },
+            (id) => {
+              messageId = id;
+            },
             input.runId,
           );
 
@@ -320,7 +366,7 @@ export class MastraAgent extends AbstractAgent {
       });
       if (memory) {
         const workingMemory = await memory.getWorkingMemory({
-          resourceId: this.resourceId,
+          resourceId: this.resourceId ?? threadId,
           threadId,
           memoryConfig: {
             workingMemory: {
@@ -666,7 +712,7 @@ export class MastraAgent extends AbstractAgent {
 
     if (this.isLocalMastraAgent(this.agent)) {
       try {
-        const response = await this.agent.stream(convertedMessages, {
+        const streamOptions: Record<string, unknown> = {
           memory: {
             thread: threadId,
             resource: resourceId,
@@ -674,7 +720,19 @@ export class MastraAgent extends AbstractAgent {
           runId,
           clientTools,
           requestContext,
-        });
+        };
+        if (this.headers && Object.keys(this.headers).length > 0) {
+          streamOptions.modelSettings = {
+            ...((streamOptions.modelSettings as
+              | Record<string, unknown>
+              | undefined) ?? {}),
+            headers: this.headers,
+          };
+        }
+        const response = await this.agent.stream(
+          convertedMessages,
+          streamOptions,
+        );
 
         if (response && typeof response === "object") {
           const hadError = await this.processFullStream(response.fullStream, {
@@ -699,7 +757,7 @@ export class MastraAgent extends AbstractAgent {
     } else {
       let stopped = false;
       try {
-        const response = await this.agent.stream(convertedMessages, {
+        const streamOptions: Record<string, unknown> = {
           memory: {
             thread: threadId,
             resource: resourceId,
@@ -707,7 +765,19 @@ export class MastraAgent extends AbstractAgent {
           runId,
           clientTools,
           requestContext,
-        });
+        };
+        if (this.headers && Object.keys(this.headers).length > 0) {
+          streamOptions.modelSettings = {
+            ...((streamOptions.modelSettings as
+              | Record<string, unknown>
+              | undefined) ?? {}),
+            headers: this.headers,
+          };
+        }
+        const response = await this.agent.stream(
+          convertedMessages,
+          streamOptions,
+        );
 
         // Remote agents use processDataStream (callback-based) — share
         // chunk handling logic via createChunkProcessor.

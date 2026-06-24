@@ -7,6 +7,7 @@ import {
   ToolCall,
   AssistantMessage,
   AgentCapabilities,
+  Interrupt,
 } from "@ag-ui/core";
 
 import {
@@ -30,13 +31,15 @@ import { LegacyRuntimeProtocolEvent } from "@/legacy/types";
 import { lastValueFrom } from "rxjs";
 import { transformChunks } from "@/chunks";
 import { AgentStateMutation, AgentSubscriber, runSubscribersWithMutation } from "./subscriber";
-import { AGUIConnectNotImplementedError } from "@ag-ui/core";
+import { AGUIConnectNotImplementedError, AGUIError } from "@ag-ui/core";
+import { isInterruptExpired } from "@/interrupts";
 import {
   Middleware,
   MiddlewareFunction,
   FunctionMiddleware,
   BackwardCompatibility_0_0_39,
   BackwardCompatibility_0_0_45,
+  BackwardCompatibility_0_0_47,
 } from "@/middleware";
 import packageJson from "../../package.json";
 
@@ -55,6 +58,10 @@ export abstract class AbstractAgent {
   private _debugLogger: DebugLogger | undefined;
   public subscribers: AgentSubscriber[] = [];
   public isRunning: boolean = false;
+  /** Interrupts emitted by the most recent run that have not yet been resolved.
+   *  Populated when RUN_FINISHED arrives with outcome.type === "interrupt".
+   *  Cleared when a subsequent run completes successfully. */
+  public pendingInterrupts: Interrupt[] = [];
   private middlewares: Middleware[] = [];
   // Emits to immediately detach from the active run (stop processing its stream)
   private activeRunDetach$?: Subject<void>;
@@ -112,6 +119,13 @@ export abstract class AbstractAgent {
     if (compareVersions(this.maxVersion, "0.0.45") <= 0) {
       this.middlewares.unshift(new BackwardCompatibility_0_0_45());
     }
+
+    // Auto-insert BackwardCompatibility_0_0_47 for backward compatibility
+    // with legacy BinaryInputContent (maps to dedicated image/audio/video/document types)
+    if (compareVersions(this.maxVersion, "0.0.47") <= 0) {
+      this.middlewares.unshift(new BackwardCompatibility_0_0_47());
+    }
+
   }
 
   public subscribe(subscriber: AgentSubscriber) {
@@ -159,7 +173,9 @@ export abstract class AbstractAgent {
       const subscribers: AgentSubscriber[] = [
         {
           onRunFinishedEvent: (params) => {
-            result = params.result;
+            if (params.outcome === "success") {
+              result = params.result;
+            }
           },
         },
         ...this.subscribers,
@@ -253,7 +269,9 @@ export abstract class AbstractAgent {
       const subscribers: AgentSubscriber[] = [
         {
           onRunFinishedEvent: (params) => {
-            result = params.result;
+            if (params.outcome === "success") {
+              result = params.result;
+            }
           },
         },
         ...this.subscribers,
@@ -371,10 +389,28 @@ export abstract class AbstractAgent {
       forwardedProps: structuredClone_(parameters?.forwardedProps ?? {}),
       state: structuredClone_(this.state),
       messages: messagesWithoutActivity,
+      ...(parameters?.resume !== undefined ? { resume: structuredClone_(parameters.resume) } : {}),
     };
   }
 
   protected async onInitialize(input: RunAgentInput, subscribers: AgentSubscriber[]) {
+    if (this.pendingInterrupts.length > 0) {
+      const resumeIds = new Set((input.resume ?? []).map((r) => r.interruptId));
+      const uncovered = this.pendingInterrupts
+        .map((i) => i.id)
+        .filter((id) => !resumeIds.has(id));
+      if (uncovered.length > 0) {
+        throw new AGUIError(
+          `Thread has ${uncovered.length} pending interrupt(s) not addressed by resume: ${uncovered.join(", ")}`,
+        );
+      }
+      for (const i of this.pendingInterrupts) {
+        if (isInterruptExpired(i)) {
+          throw new AGUIError(`Interrupt ${i.id} expired at ${i.expiresAt}`);
+        }
+      }
+    }
+
     const onRunInitializedMutation = await runSubscribersWithMutation(
       subscribers,
       this.messages,
@@ -525,6 +561,7 @@ export abstract class AbstractAgent {
     cloned.isRunning = this.isRunning;
     cloned.subscribers = [...this.subscribers];
     cloned.middlewares = [...this.middlewares];
+    cloned.pendingInterrupts = structuredClone_(this.pendingInterrupts);
 
     return cloned;
   }
