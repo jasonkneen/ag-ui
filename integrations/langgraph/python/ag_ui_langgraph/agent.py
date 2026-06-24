@@ -999,6 +999,15 @@ class LangGraphAgent:
         return interrupts
 
     @staticmethod
+    def _normalized_content(content):
+        # Canonical form for edit detection: plain strings compare directly;
+        # structured/multimodal content compares via a key-order-insensitive
+        # projection so checkpoint re-serialization isn't mistaken for an edit.
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, sort_keys=True, default=str)
+    
+    @staticmethod
     def _detect_edited_human_message(
         incoming_messages: List[BaseMessage],
         checkpoint_messages: List[BaseMessage],
