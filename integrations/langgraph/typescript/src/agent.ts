@@ -31,6 +31,7 @@ import {
   AbstractAgent,
   AgentCapabilities,
   AgentConfig,
+  AgentSubscriber,
   CustomEvent,
   EventType,
   Interrupt as AGUIInterrupt,
@@ -60,7 +61,11 @@ import {
   ReasoningEndEvent,
   ReasoningEncryptedValueEvent,
 } from "@ag-ui/client";
-import { langGraphInterruptsToAGUI, buildLgCommandResumeFromAgui } from "./interrupts";
+import {
+  langGraphInterruptsToAGUI,
+  buildLgCommandResumeFromAgui,
+  reconcileLegacyResumeInterrupts,
+} from "./interrupts";
 import { RunsStreamPayload } from "@langchain/langgraph-sdk/dist/types";
 import {
   aguiMessagesToLangChain,
@@ -154,9 +159,27 @@ export interface LangGraphAgentConfig extends AgentConfig {
    * variable that could be mutated by a different clone or request.
    */
   headerFactory?: () => Record<string, string>;
-  /** Emit legacy CUSTOM(name="on_interrupt") events alongside the new
-   *  RUN_FINISHED.outcome=interrupt. Default true during the migration window. */
+  /** Emit legacy CUSTOM(name="on_interrupt") events alongside the terminating
+   *  RUN_FINISHED. Default true during the migration window. (The RUN_FINISHED
+   *  carries outcome={type:"interrupt"} only when `emitInterruptOutcome` is
+   *  enabled — or when this flag is false, which forces the outcome on to avoid
+   *  surfacing the interrupt via neither channel.) */
   enableLegacyOnInterruptEvent?: boolean;
+  /**
+   * Terminate interrupted runs with the AG-UI structured outcome
+   * `RUN_FINISHED.outcome={type:"interrupt", interrupts:[...]}`.
+   *
+   * Default **false**. Opt-in: released clients that drive interrupts through
+   * the legacy `forwardedProps.command.resume` channel (e.g. CopilotKit's
+   * `useLangGraphInterrupt`, as of v1.60.x) stop sending any resume directive
+   * once they observe the structured outcome, which silently strands the run.
+   * Until those clients adopt `RunAgentInput.resume[]`, emitting the outcome by
+   * default would break them — so it must be explicitly enabled by clients that
+   * understand the canonical resume protocol. When false, interrupted runs end
+   * with a plain `RUN_FINISHED` (plus the legacy on_interrupt event), exactly as
+   * before structured interrupts existed.
+   */
+  emitInterruptOutcome?: boolean;
 }
 
 const ROOT_SUBGRAPH_NAME = "root";
@@ -195,11 +218,13 @@ export class LangGraphAgent extends AbstractAgent {
   constantSchemaKeys: string[] = DEFAULT_SCHEMA_KEYS;
   config: LangGraphAgentConfig;
   enableLegacyOnInterruptEvent: boolean;
+  emitInterruptOutcome: boolean;
 
   constructor(config: LangGraphAgentConfig) {
     super(config);
     this.config = config;
     this.enableLegacyOnInterruptEvent = config.enableLegacyOnInterruptEvent ?? true;
+    this.emitInterruptOutcome = config.emitInterruptOutcome ?? false;
     this.messagesInProcess = {};
     this.agentName = config.agentName;
     this.graphId = config.graphId;
@@ -255,6 +280,7 @@ export class LangGraphAgent extends AbstractAgent {
       headers: { ...this.headers },
       client: this.client,
       enableLegacyOnInterruptEvent: this.enableLegacyOnInterruptEvent,
+      emitInterruptOutcome: this.emitInterruptOutcome,
 
       assistant: this.assistant,
       activeRun: this.activeRun ? structuredClone(this.activeRun) : undefined,
@@ -315,15 +341,42 @@ export class LangGraphAgent extends AbstractAgent {
       }
     }
 
+    // Emit the structured outcome when opted in, OR whenever the legacy
+    // on_interrupt event is disabled — otherwise the interrupt would be
+    // surfaced by neither channel and silently swallowed. By default
+    // (legacy on, emitInterruptOutcome off) this is a plain RUN_FINISHED:
+    // released clients that resume via forwardedProps.command.resume stop
+    // sending a resume directive when they see the structured outcome, so it
+    // stays opt-in until they adopt RunAgentInput.resume[]. See
+    // LangGraphAgentConfig.emitInterruptOutcome.
+    const includeOutcome =
+      this.emitInterruptOutcome || !this.enableLegacyOnInterruptEvent;
     this.dispatchEvent({
       type: EventType.RUN_FINISHED,
       threadId,
       runId,
-      outcome: {
-        type: "interrupt",
-        interrupts: aguiInterrupts,
-      } satisfies RunFinishedInterruptOutcome,
+      ...(includeOutcome
+        ? {
+            outcome: {
+              type: "interrupt",
+              interrupts: aguiInterrupts,
+            } satisfies RunFinishedInterruptOutcome,
+          }
+        : {}),
     });
+  }
+
+  protected async onInitialize(
+    input: RunAgentInput,
+    subscribers: AgentSubscriber[],
+  ) {
+    // Back-compat: when emitInterruptOutcome is enabled, an interrupted run sets
+    // AbstractAgent.pendingInterrupts. A client still resuming via the legacy
+    // forwardedProps.command.resume channel never populates RunAgentInput.resume[],
+    // so the base lifecycle would reject the resume run. Drop the tracked
+    // interrupts for that case — runAgentStream resolves the legacy resume itself.
+    reconcileLegacyResumeInterrupts(this, input);
+    return super.onInitialize(input, subscribers);
   }
 
   run(input: RunAgentInput) {

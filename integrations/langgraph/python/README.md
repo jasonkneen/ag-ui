@@ -56,7 +56,7 @@ The LangGraph integration now supports the AG-UI standard interrupt protocol. Ke
 
 ### Detecting a paused run
 
-`RunFinishedEvent.outcome.type == "interrupt"` is the canonical signal that a run has paused for human input. The `outcome.interrupts` list contains AG-UI `Interrupt` objects with `id`, `reason`, `message`, `tool_call_id`, `response_schema`, `expires_at`, and `metadata` fields. LangGraph-specific data (raw interrupt value, `ns`, `resumable`, `when`) is preserved under `metadata["langgraph"]`.
+When the structured outcome is enabled (`emit_interrupt_outcome=True`, opt-in — see the callout below), `RunFinishedEvent.outcome.type == "interrupt"` is the canonical signal that a run has paused for human input. The `outcome.interrupts` list contains AG-UI `Interrupt` objects with `id`, `reason`, `message`, `tool_call_id`, `response_schema`, `expires_at`, and `metadata` fields. LangGraph-specific data (raw interrupt value, `ns`, `resumable`, `when`) is preserved under `metadata["langgraph"]`.
 
 ```python
 # New: read interrupts from outcome
@@ -64,6 +64,20 @@ if event.type == EventType.RUN_FINISHED and getattr(event, "outcome", None) and 
     for interrupt in event.outcome.interrupts:
         print(interrupt.id, interrupt.reason, interrupt.message)
 ```
+
+> **Opt-in (`emit_interrupt_outcome`, default `False`).** The structured
+> `outcome` is only emitted when you enable it. Released clients that resume
+> through the legacy `forwarded_props["command"]["resume"]` channel (e.g.
+> CopilotKit's `useLangGraphInterrupt`, as of v1.60.x) **stop sending a resume
+> directive once they observe the structured outcome**, which strands the run —
+> so it stays opt-in until those clients adopt `RunAgentInput.resume[]`. With the
+> default, interrupted runs end with a plain `RUN_FINISHED` plus the legacy
+> `on_interrupt` event, exactly as before. Enable the canonical outcome once your
+> client reads `RunAgentInput.resume[]`:
+>
+> ```python
+> agent = LangGraphAgent(name="my-agent", graph=graph, emit_interrupt_outcome=True)
+> ```
 
 ### Resuming a run
 
@@ -93,7 +107,7 @@ If both `input.resume` and `forwarded_props["command"]["resume"]` are provided, 
 
 ### Legacy `on_interrupt` custom event
 
-By default the integration still emits `CustomEvent(name="on_interrupt")` alongside the new `RunFinishedEvent.outcome` for backward compatibility. To suppress the legacy event:
+By default the integration emits `CustomEvent(name="on_interrupt")` for backward compatibility (and, when `emit_interrupt_outcome` is enabled, alongside the new `RunFinishedEvent.outcome`). To suppress the legacy event:
 
 ```python
 agent = LangGraphAgent(
@@ -102,6 +116,8 @@ agent = LangGraphAgent(
     enable_legacy_on_interrupt_event=False,
 )
 ```
+
+Disabling the legacy event forces `emit_interrupt_outcome` on (even if left `False`): with both off, an interrupt would be surfaced by neither channel, so the structured outcome is emitted to avoid silently stranding the run.
 
 Consumers should migrate to reading `outcome` from `RunFinishedEvent` rather than listening for `CustomEvent(name="on_interrupt")`.
 

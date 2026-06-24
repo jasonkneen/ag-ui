@@ -155,7 +155,7 @@ class TestSubclassFanOut(unittest.TestCase):
         self.assertEqual(result[2].id, "int-2")
 
     def test_emit_interrupt_finish_with_fan_out(self):
-        agent = FanOutAgent(name="test", graph=MagicMock(), enable_legacy_on_interrupt_event=False)
+        agent = FanOutAgent(name="test", graph=MagicMock(), enable_legacy_on_interrupt_event=False, emit_interrupt_outcome=True)
         agent.active_run = {"id": "run-1", "thread_id": "t1"}
 
         lg_interrupts = [
@@ -179,7 +179,7 @@ class TestSubclassFanOut(unittest.TestCase):
         self.assertEqual(len(finished.outcome.interrupts), 2)
 
     def test_emit_interrupt_finish_with_fan_out_and_legacy(self):
-        agent = FanOutAgent(name="test", graph=MagicMock(), enable_legacy_on_interrupt_event=True)
+        agent = FanOutAgent(name="test", graph=MagicMock(), enable_legacy_on_interrupt_event=True, emit_interrupt_outcome=True)
         agent.active_run = {"id": "run-1", "thread_id": "t1"}
 
         lg_interrupts = [

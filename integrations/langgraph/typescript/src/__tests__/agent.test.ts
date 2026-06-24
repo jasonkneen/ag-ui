@@ -633,8 +633,8 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
     vi.restoreAllMocks();
   });
 
-  it("emits RUN_FINISHED with outcome.type=interrupt when interrupts exist", () => {
-    const { agent, events } = buildMockedAgent();
+  it("emits RUN_FINISHED with outcome.type=interrupt when emitInterruptOutcome is enabled", () => {
+    const { agent, events } = buildMockedAgent({ emitInterruptOutcome: true });
 
     (agent as any).dispatchInterruptFinish({
       threadId: "t1",
@@ -650,6 +650,25 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
     expect(finished.outcome.interrupts).toHaveLength(1);
     expect(finished.outcome.interrupts[0].id).toBe("int-1");
     expect(finished.outcome.interrupts[0].reason).toBe("confirm");
+  });
+
+  it("by default emits a plain RUN_FINISHED with NO outcome (legacy-client safe)", () => {
+    const { agent, events } = buildMockedAgent();
+
+    (agent as any).dispatchInterruptFinish({
+      threadId: "t1",
+      runId: "run-1",
+      lgInterrupts: [{ value: { reason: "confirm" }, id: "int-1" }],
+    });
+
+    const finished = events.find((e: any) => e.type === "RUN_FINISHED");
+    expect(finished).toBeDefined();
+    expect(finished.outcome).toBeUndefined();
+    // The interrupt is still surfaced via the legacy on_interrupt event.
+    const customEvents = events.filter(
+      (e: any) => e.type === "CUSTOM" && e.name === "on_interrupt",
+    );
+    expect(customEvents).toHaveLength(1);
   });
 
   it("emits legacy CustomEvent(on_interrupt) by default", () => {
@@ -670,6 +689,7 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
   it("suppresses CustomEvent(on_interrupt) when enableLegacyOnInterruptEvent=false", () => {
     const { agent, events } = buildMockedAgent({
       enableLegacyOnInterruptEvent: false,
+      emitInterruptOutcome: true,
     });
 
     (agent as any).dispatchInterruptFinish({
@@ -692,6 +712,7 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
   it("still emits RUN_FINISHED(outcome=interrupt) even with legacy off", () => {
     const { agent, events } = buildMockedAgent({
       enableLegacyOnInterruptEvent: false,
+      emitInterruptOutcome: true,
     });
 
     (agent as any).dispatchInterruptFinish({
@@ -704,6 +725,31 @@ describe("dispatchInterruptFinish produces correct AG-UI protocol events", () =>
       (e: any) => e.type === "RUN_FINISHED",
     );
     expect(finished.outcome.type).toBe("interrupt");
+    expect(finished.outcome.interrupts).toHaveLength(1);
+  });
+
+  it("forces the outcome when legacy is off even if emitInterruptOutcome is false (no silent swallow)", () => {
+    // Both signals off would otherwise drop the interrupt entirely: no
+    // on_interrupt, no outcome. The outcome must be forced on so the interrupt
+    // is still surfaced.
+    const { agent, events } = buildMockedAgent({
+      enableLegacyOnInterruptEvent: false,
+      // emitInterruptOutcome defaults false
+    });
+
+    (agent as any).dispatchInterruptFinish({
+      threadId: "t1",
+      runId: "run-1",
+      lgInterrupts: [{ value: { reason: "r" }, id: "int-1" }],
+    });
+
+    const customEvents = events.filter(
+      (e: any) => e.type === "CUSTOM" && e.name === "on_interrupt",
+    );
+    expect(customEvents).toHaveLength(0);
+
+    const finished = events.find((e: any) => e.type === "RUN_FINISHED");
+    expect(finished.outcome?.type).toBe("interrupt");
     expect(finished.outcome.interrupts).toHaveLength(1);
   });
 });
@@ -856,7 +902,7 @@ describe("prepareStream input.resume protocol", () => {
   });
 
   it("interrupt short-circuit with hasResume=false dispatches RUN_FINISHED(outcome=interrupt)", async () => {
-    const { agent, events } = buildMockedAgent();
+    const { agent, events } = buildMockedAgent({ emitInterruptOutcome: true });
 
     const input = {
       runId: "run-1",

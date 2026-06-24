@@ -605,6 +605,7 @@ class TestInterruptShortCircuitOutcomeLegacyOff(unittest.IsolatedAsyncioTestCase
             name="test",
             graph=MagicMock(),
             enable_legacy_on_interrupt_event=False,
+            emit_interrupt_outcome=True,
         )
         agent.active_run = {"id": "run-1", "mode": "start"}
 
@@ -643,7 +644,7 @@ class TestInterruptShortCircuitOutcomeLegacyOff(unittest.IsolatedAsyncioTestCase
         self.assertEqual(finished_events[0].outcome.type, "interrupt")
 
     async def test_no_resume_short_circuit_with_legacy_on(self):
-        agent = make_agent()
+        agent = make_agent(emit_interrupt_outcome=True)
         agent.active_run = {"id": "run-1", "mode": "start"}
 
         checkpoint_messages = [
@@ -675,6 +676,87 @@ class TestInterruptShortCircuitOutcomeLegacyOff(unittest.IsolatedAsyncioTestCase
         self.assertIn(EventType.RUN_FINISHED, types)
 
         finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
+        self.assertEqual(finished_events[0].outcome.type, "interrupt")
+
+
+class TestInterruptShortCircuitDefault(unittest.IsolatedAsyncioTestCase):
+    """Default config (emit_interrupt_outcome=False) must short-circuit with a
+    plain RUN_FINISHED (no structured outcome) plus the legacy on_interrupt event
+    — released clients that resume via command.resume break when they see the
+    structured outcome. This lives in a unittest.TestCase so CI's
+    `unittest discover` actually collects it (test_interrupt_handling.py's
+    pytest-style classes are not collected by that runner)."""
+
+    async def test_default_short_circuit_emits_plain_run_finished(self):
+        agent = make_agent()  # emit_interrupt_outcome defaults False
+        agent.active_run = {"id": "run-1", "mode": "start"}
+
+        checkpoint_messages = [
+            HumanMessage(id="h1", content="do something"),
+            AIMessage(
+                id="ai1",
+                content="",
+                tool_calls=[{"id": "tc-1", "name": "approval", "args": {}}],
+            ),
+        ]
+        state = _make_state(
+            messages=checkpoint_messages,
+            tasks=[FakeTask(interrupts=[FakeInterrupt(value="confirm?")])],
+        )
+
+        frontend_messages = [UserMessage(id="h1", role="user", content="do something")]
+        inp = _make_input(messages=frontend_messages, forwarded_props={})
+
+        agent.prepare_regenerate_stream = AsyncMock()
+        config = {"configurable": {"thread_id": "t1"}}
+
+        result = await agent.prepare_stream(inp, state, config)
+
+        events = result.get("events_to_dispatch", [])
+        types = [getattr(e, "type", None) for e in events]
+        # Legacy on_interrupt still surfaces the interrupt by default.
+        self.assertIn(EventType.CUSTOM, types)
+        self.assertIn(EventType.RUN_FINISHED, types)
+
+        finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
+        self.assertEqual(len(finished_events), 1)
+        self.assertIsNone(getattr(finished_events[0], "outcome", None))
+
+    async def test_legacy_off_forces_outcome_even_when_emit_off(self):
+        """With BOTH the legacy on_interrupt event and emit_interrupt_outcome
+        off, the interrupt would be surfaced by neither channel — so the outcome
+        is forced on to avoid a silent swallow."""
+        from ag_ui_langgraph.agent import LangGraphAgent
+
+        agent = LangGraphAgent(
+            name="test",
+            graph=MagicMock(),
+            enable_legacy_on_interrupt_event=False,
+            # emit_interrupt_outcome defaults False
+        )
+        agent.active_run = {"id": "run-1", "mode": "start"}
+
+        state = _make_state(
+            messages=[
+                HumanMessage(id="h1", content="do something"),
+                AIMessage(id="ai1", content="", tool_calls=[{"id": "tc-1", "name": "approval", "args": {}}]),
+            ],
+            tasks=[FakeTask(interrupts=[FakeInterrupt(value="confirm?")])],
+        )
+        inp = _make_input(
+            messages=[UserMessage(id="h1", role="user", content="do something")],
+            forwarded_props={},
+        )
+        agent.prepare_regenerate_stream = AsyncMock()
+
+        result = await agent.prepare_stream(inp, state, {"configurable": {"thread_id": "t1"}})
+
+        events = result.get("events_to_dispatch", [])
+        types = [getattr(e, "type", None) for e in events]
+        self.assertNotIn(EventType.CUSTOM, types)
+        finished_events = [e for e in events if getattr(e, "type", None) == EventType.RUN_FINISHED]
+        self.assertEqual(len(finished_events), 1)
+        self.assertIsNotNone(getattr(finished_events[0], "outcome", None))
         self.assertEqual(finished_events[0].outcome.type, "interrupt")
 
 

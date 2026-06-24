@@ -62,7 +62,7 @@ The LangGraph integration now supports the AG-UI standard interrupt protocol. Ke
 
 ### Detecting a paused run
 
-`RunFinishedEvent.outcome.type === "interrupt"` is the canonical signal that a run has paused for human input. The `outcome.interrupts` array contains AG-UI `Interrupt` objects with `id`, `reason`, `message`, `toolCallId`, `responseSchema`, `expiresAt`, and `metadata` fields. LangGraph-specific data (raw interrupt value, `ns`, `resumable`, `when`) is preserved under `metadata.langgraph`.
+When the structured outcome is enabled (`emitInterruptOutcome: true`, opt-in — see the callout below), `RunFinishedEvent.outcome.type === "interrupt"` is the canonical signal that a run has paused for human input. The `outcome.interrupts` array contains AG-UI `Interrupt` objects with `id`, `reason`, `message`, `toolCallId`, `responseSchema`, `expiresAt`, and `metadata` fields. LangGraph-specific data (raw interrupt value, `ns`, `resumable`, `when`) is preserved under `metadata.langgraph`.
 
 ```ts
 // New: read interrupts from outcome
@@ -72,6 +72,24 @@ if (event.type === "RUN_FINISHED" && event.outcome?.type === "interrupt") {
   }
 }
 ```
+
+> **Opt-in (`emitInterruptOutcome`, default `false`).** The structured
+> `outcome` is only emitted when you enable it. Released clients that resume
+> through the legacy `forwardedProps.command.resume` channel (e.g. CopilotKit's
+> `useLangGraphInterrupt`, as of v1.60.x) **stop sending a resume directive once
+> they observe the structured outcome**, which strands the run — so it stays
+> opt-in until those clients adopt `RunAgentInput.resume[]`. With the default,
+> interrupted runs end with a plain `RUN_FINISHED` plus the legacy
+> `on_interrupt` event, exactly as before. Enable the canonical outcome once
+> your client reads `RunAgentInput.resume[]`:
+>
+> ```ts
+> const agent = new LangGraphAgent({
+>   graphId: "my-graph",
+>   deploymentUrl: "https://your-langgraph-deployment.com",
+>   emitInterruptOutcome: true,
+> });
+> ```
 
 ### Resuming a run
 
@@ -101,7 +119,7 @@ If both `input.resume` and `forwardedProps.command.resume` are provided, `input.
 
 ### Legacy `on_interrupt` custom event
 
-By default the integration still emits `CustomEvent(name="on_interrupt")` alongside the new `RunFinishedEvent.outcome` for backward compatibility. To suppress the legacy event:
+By default the integration emits `CustomEvent(name="on_interrupt")` for backward compatibility (and, when `emitInterruptOutcome` is enabled, alongside the new `RunFinishedEvent.outcome`). To suppress the legacy event:
 
 ```ts
 const agent = new LangGraphAgent({
@@ -111,6 +129,8 @@ const agent = new LangGraphAgent({
   enableLegacyOnInterruptEvent: false,
 });
 ```
+
+Disabling the legacy event forces `emitInterruptOutcome` on (even if left `false`): with both off, an interrupt would be surfaced by neither channel, so the structured outcome is emitted to avoid silently stranding the run.
 
 Consumers should migrate to reading `outcome` from `RunFinishedEvent` rather than listening for `CustomEvent(name="on_interrupt")`.
 

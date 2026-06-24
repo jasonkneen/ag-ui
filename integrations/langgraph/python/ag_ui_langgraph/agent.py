@@ -124,12 +124,18 @@ class PreparedStream(TypedDict):
     events_to_dispatch: NotRequired[Optional[List[ProcessedEvents]]]
 
 class LangGraphAgent:
-    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None, enable_legacy_on_interrupt_event: bool = True):
+    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None, enable_legacy_on_interrupt_event: bool = True, emit_interrupt_outcome: bool = False):
         self.name = name
         self.description = description
         self.graph = graph
         self.config = config or {}
         self.enable_legacy_on_interrupt_event = enable_legacy_on_interrupt_event
+        # Opt-in: terminate interrupted runs with the AG-UI structured outcome
+        # RunFinishedEvent(outcome={"type": "interrupt", ...}). Default False so
+        # released clients that resume via forwardedProps.command.resume keep
+        # working until they adopt RunAgentInput.resume[] (the structured outcome
+        # makes them stop sending a resume directive). See _emit_interrupt_finish.
+        self.emit_interrupt_outcome = emit_interrupt_outcome
         self.messages_in_process: MessagesInProgressRecord = {}
         self.active_run: Optional[RunMetadata] = None
         self.constant_schema_keys = ['messages', 'tools']
@@ -156,6 +162,7 @@ class LangGraphAgent:
                 description=self.description,
                 config=dict(self.config) if self.config else None,
                 enable_legacy_on_interrupt_event=self.enable_legacy_on_interrupt_event,
+                emit_interrupt_outcome=self.emit_interrupt_outcome,
             )
         except TypeError as exc:
             raise TypeError(
@@ -232,7 +239,10 @@ class LangGraphAgent:
                     "RunAgentInput.resume[] (thread_id=%r, run_id=%r)",
                     thread_id, self.active_run.get("id"),
                 )
-            has_resume_input = agui_resume is not None or legacy_has_resume
+            # Truthiness, not `is not None`: an empty resume list means "no
+            # resume" (consistent with treating an absent resume as no-resume),
+            # so it must not suppress the regenerate / interrupt paths.
+            has_resume_input = bool(agui_resume) or legacy_has_resume
             # active_run was just reset to INITIAL_ACTIVE_RUN above, so
             # active_run["node_name"] is always None here — the else branch
             # was dead code. Resolve to None directly to make the intent
@@ -519,7 +529,10 @@ class LangGraphAgent:
             and legacy_command_resume is not None
         )
 
-        has_resume_input = agui_resume is not None or legacy_has_resume
+        # Truthiness, not `is not None`: an empty resume list means "no resume"
+        # (consistent with treating an absent resume as no-resume), so it must
+        # not suppress the regenerate / interrupt paths.
+        has_resume_input = bool(agui_resume) or legacy_has_resume
 
         self.active_run["schema_keys"] = self.get_schema_keys(config)
 
@@ -1083,9 +1096,21 @@ class LangGraphAgent:
     ) -> List[ProcessedEvents]:
         """Build the tail-events for an interrupt-terminated run.
 
-        Returns either:
-          [RunFinishedEvent(outcome=Interrupt)]                                   # default
-          [CustomEvent(on_interrupt) * N, RunFinishedEvent(outcome=Interrupt)]    # legacy compat ON
+        Default (``emit_interrupt_outcome=False``, ``enable_legacy_on_interrupt_event=True``):
+          [CustomEvent(on_interrupt) * N, RunFinishedEvent]            # plain finish, no outcome
+        Opt-in (``emit_interrupt_outcome=True``):
+          [CustomEvent(on_interrupt) * N, RunFinishedEvent(outcome=Interrupt)]
+
+        ``emit_interrupt_outcome`` defaults to False: released clients that
+        resume via the legacy ``forwardedProps.command.resume`` channel stop
+        sending a resume directive once they observe the structured outcome,
+        which strands the run. It stays opt-in until those clients adopt
+        ``RunAgentInput.resume[]``.
+
+        The structured outcome is, however, emitted whenever the legacy
+        on_interrupt event is disabled (``enable_legacy_on_interrupt_event=False``),
+        even if ``emit_interrupt_outcome`` is False — otherwise the interrupt
+        would be surfaced by neither channel and silently swallowed.
 
         Caller is responsible for any preceding STATE_SNAPSHOT / MESSAGES_SNAPSHOT.
         """
@@ -1101,15 +1126,23 @@ class LangGraphAgent:
                         raw_event=raw,
                     )
                 )
+        # Emit the structured outcome when opted in, OR whenever the legacy
+        # on_interrupt event is disabled — otherwise the interrupt would be
+        # surfaced by neither channel and silently swallowed.
+        include_outcome = (
+            self.emit_interrupt_outcome or not self.enable_legacy_on_interrupt_event
+        )
+        outcome = (
+            RunFinishedInterruptOutcome(type="interrupt", interrupts=agui_interrupts)
+            if include_outcome
+            else None
+        )
         events.append(
             RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id,
-                outcome=RunFinishedInterruptOutcome(
-                    type="interrupt",
-                    interrupts=agui_interrupts,
-                ),
+                outcome=outcome,
             )
         )
         return events

@@ -239,7 +239,7 @@ class TestLegacyResumeStillWorks(unittest.IsolatedAsyncioTestCase):
 
 class TestActiveInterruptsNoResumeEmitsOutcome(unittest.IsolatedAsyncioTestCase):
     async def test_active_interrupts_no_resume_emits_outcome(self):
-        agent = make_agent()
+        agent = make_agent(emit_interrupt_outcome=True)
         agent.active_run = {"id": "run-1", "mode": "start"}
 
         checkpoint_messages = [
@@ -286,7 +286,7 @@ class TestActiveInterruptsNoResumeEmitsOutcome(unittest.IsolatedAsyncioTestCase)
 
 class TestEmptyResumeArrayTreatedAsAbsent(unittest.IsolatedAsyncioTestCase):
     async def test_empty_resume_array_treated_as_absent(self):
-        agent = make_agent()
+        agent = make_agent(emit_interrupt_outcome=True)
         agent.active_run = {"id": "run-1", "mode": "start"}
 
         checkpoint_messages = [
