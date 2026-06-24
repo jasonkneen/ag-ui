@@ -14,7 +14,7 @@ import { EventType } from "@ag-ui/client";
 function createAgent() {
   const agent = new LangGraphAgent({
     graphId: "test-graph",
-    url: "http://localhost:8000",
+    deploymentUrl: "http://localhost:8000",
   });
 
   // Wire up a mock subscriber and activeRun so dispatchEvent works
