@@ -334,7 +334,7 @@ class TestRunEmitsLegacyWarningOnce(unittest.IsolatedAsyncioTestCase):
         # real graph work by stubbing prepare_stream to return an
         # events_to_dispatch payload — that triggers the early ``return`` at
         # the top of ``_handle_stream_events``.
-        # ``run`` does ``input.copy(update={...})``; on a MagicMock that
+        # ``run`` does ``input.model_copy(update={...})``; on a MagicMock that
         # returns a fresh mock with stringified attributes, so route the
         # copy back through the configured fixture to preserve thread_id
         # and forwarded_props.
