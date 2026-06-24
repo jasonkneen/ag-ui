@@ -1245,3 +1245,130 @@ async def test_stream_update_intent_finds_same_run_surface(monkeypatch):
     text = str(events[-1])
     assert "updateComponents" in text
     assert "createSurface" not in text
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the REAL Strands agent loop completes the dynamic-A2UI flow
+# (run-level regression for the hang — generate_a2ui returns + RUN_FINISHED).
+# ---------------------------------------------------------------------------
+
+from strands import Agent as StrandsAgentCore
+from strands.models.model import Model as StrandsModel
+
+
+def _tool_use_chunks(name, tool_use_id, args_json):
+    return [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockStart": {"start": {"toolUse": {"name": name, "toolUseId": tool_use_id}}}},
+        {"contentBlockDelta": {"delta": {"toolUse": {"input": args_json}}}},
+        {"contentBlockStop": {}},
+        {"messageStop": {"stopReason": "tool_use"}},
+    ]
+
+
+def _text_chunks(text):
+    return [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"text": text}}},
+        {"contentBlockStop": {}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+
+class _DynamicA2UIFakeModel(StrandsModel):
+    """Scripts the full dynamic-A2UI conversation across the OUTER Strands agent
+    loop AND the inner forced render turn, so an end-to-end run exercises the
+    real event loop (not a stubbed stream_async). The forced render turn (the
+    sub-agent) is identified by its tool_choice; the outer turn calls
+    generate_a2ui first, then narrates once its result is in history."""
+
+    def __init__(self):
+        self.render_calls = 0
+        self.outer_calls = 0
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(self, output_model, prompt=None, system_prompt=None, **kwargs):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(
+        self, messages, tool_specs=None, system_prompt=None, *, tool_choice=None, **kwargs
+    ):
+        # Inner forced render turn (the generate_a2ui sub-agent).
+        if tool_choice == {"tool": {"name": RENDER_A2UI_TOOL_NAME}}:
+            self.render_calls += 1
+            for ch in _tool_use_chunks(
+                RENDER_A2UI_TOOL_NAME,
+                "render-1",
+                '{"surfaceId": "s1", "components": [{"id": "root", "component": "Row"}], "data": {}}',
+            ):
+                yield ch
+            return
+
+        # Outer agent turn. Narrate once generate_a2ui already ran (its toolUse
+        # is in history); else call generate_a2ui. The outer_calls guard keeps
+        # the loop terminating even if detection drifts.
+        self.outer_calls += 1
+        already_generated = any(
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and any(
+                isinstance(b, dict)
+                and (b.get("toolUse") or {}).get("name") == GENERATE_A2UI_TOOL_NAME
+                for b in (m.get("content") or [])
+            )
+            for m in messages
+        )
+        if already_generated or self.outer_calls >= 2:
+            for ch in _text_chunks("Here is your sales dashboard."):
+                yield ch
+        else:
+            for ch in _tool_use_chunks(GENERATE_A2UI_TOOL_NAME, "gen-1", '{"intent": "create"}'):
+                yield ch
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_dynamic_a2ui_run_emits_run_finished():
+    """End-to-end through the REAL Strands agent loop: an auto-injected
+    generate_a2ui call paints an A2UI surface (render_a2ui streams), its
+    envelope returns to the outer loop as a TOOL_CALL_RESULT, the agent
+    narrates, and the run emits RUN_FINISHED — instead of hanging on a
+    still-Running generate_a2ui. Run-level regression for the dynamic-A2UI hang."""
+    model = _DynamicA2UIFakeModel()
+    core = StrandsAgentCore(model=model, system_prompt="You render UIs.", tools=[])
+    agent = StrandsAgent(core, name="strands-e2e", config=StrandsAgentConfig())
+
+    inp = _msg_input(
+        forwarded_props={"injectA2UITool": True},
+        tools=[RENDER_TOOL_INPUT],
+        messages=[UserMessage(id="u1", role="user", content="Show my sales dashboard")],
+    )
+    events = await _collect(agent, inp)
+    types = [e.type for e in events]
+
+    # generate_a2ui was auto-injected, called, and its result returned to the loop.
+    assert any(
+        e.type == EventType.TOOL_CALL_START
+        and getattr(e, "tool_call_name", None) == GENERATE_A2UI_TOOL_NAME
+        for e in events
+    )
+    assert EventType.TOOL_CALL_RESULT in types
+    # The A2UI surface painted (inner render_a2ui streamed as synthetic events).
+    assert any(
+        e.type == EventType.TOOL_CALL_START
+        and getattr(e, "tool_call_name", None) == RENDER_A2UI_TOOL_NAME
+        for e in events
+    )
+    # The agent narrated and the run COMPLETED (no hang, no error).
+    assert EventType.TEXT_MESSAGE_CONTENT in types
+    assert EventType.RUN_FINISHED in types
+    assert EventType.RUN_ERROR not in types
+    # Exactly one forced render turn — no agentic continuation in the sub-agent.
+    assert model.render_calls == 1
+    # Outer loop: one generate call + one narration.
+    assert model.outer_calls == 2
