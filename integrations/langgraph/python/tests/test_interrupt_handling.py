@@ -287,6 +287,21 @@ class TestInterruptMappingHardening:
         result = lg_interrupt_to_agui(FakeInterrupt(value="x", id="lg-real-42"))
         assert result.id == "lg-real-42"
 
+    def test_empty_string_reason_is_preserved(self):
+        """An explicit reason="" must be kept (matching the TS `??`), not
+        replaced by the "langgraph:interrupt" default that `or` would force."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value={"reason": ""}, id="int-1"))
+        assert result.reason == ""
+
+    def test_missing_reason_falls_back_to_default(self):
+        """When reason is absent (None), the default still applies."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value={"message": "hi"}, id="int-1"))
+        assert result.reason == "langgraph:interrupt"
+
     def test_empty_string_tool_call_id_is_preserved(self):
         """`or` would drop "" → fallback; `??`-equivalent keeps it."""
         from ag_ui_langgraph.interrupts import lg_interrupt_to_agui

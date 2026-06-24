@@ -23,7 +23,11 @@ def lg_interrupt_to_agui(lg: LangGraphInterrupt) -> AGUIInterrupt:
             "Upgrade to langgraph>=0.4 (which always populates Interrupt.id)."
         )
 
-    reason = (raw.get("reason") if is_dict else None) or "langgraph:interrupt"
+    # Default only when reason is absent (None), not when it is a falsy-but-real
+    # value: an explicit reason="" must be preserved, matching the TS side's
+    # `?? "langgraph:interrupt"`. Using `or` here would drop "".
+    _reason = raw.get("reason") if is_dict else None
+    reason = _reason if _reason is not None else "langgraph:interrupt"
 
     message = (
         raw if isinstance(raw, str)
