@@ -5,6 +5,8 @@ Issue #1317: multiple TEXT_MESSAGE_IDs were generated per agent run when
 using LangChain/LangGraph, causing CopilotKit to split one assistant
 response into multiple message bubbles.
 """
+import unittest
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -17,9 +19,11 @@ def _fresh_active_run(run_id: str = "run-1") -> dict:
     return {
         "id": run_id,
         "thread_id": "t1",
+        "mode": "start",
         "reasoning_process": None,
         "node_name": "agent",
         "has_function_streaming": False,
+        "streamed_tool_call_ids": set(),
         "model_made_tool_call": False,
         "state_reliable": True,
         "manually_emitted_state": None,
@@ -103,7 +107,7 @@ def _make_model_end_event():
     }
 
 
-class TestStableMessageId:
+class TestStableMessageId(unittest.IsolatedAsyncioTestCase):
     """The same TEXT_MESSAGE_ID must be reused across a text → tool → text
     sequence within a single agent run."""
 

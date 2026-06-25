@@ -343,7 +343,15 @@ class TestRunEmitsLegacyWarningOnce(unittest.IsolatedAsyncioTestCase):
                 for k, v in update.items():
                     setattr(inp, k, v)
             return inp
+        # ``run`` forwards via ``input.model_copy(update={...})``; route it
+        # through the fixture so forwarded_props survive onto the same mock.
         inp.copy = _identity_copy
+        inp.model_copy = _identity_copy
+
+        # ``run`` awaits ``graph.aget_state`` before the warning block; the
+        # bare ``make_agent`` graph leaves it a sync MagicMock, so awaiting it
+        # raises and ``run`` bails before any warning fires. Stub it async.
+        agent.graph.aget_state = AsyncMock(return_value=_make_state(messages=[]))
 
         sentinel = MagicMock()
         agent.prepare_stream = AsyncMock(return_value={
