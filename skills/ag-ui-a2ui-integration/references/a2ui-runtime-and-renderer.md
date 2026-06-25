@@ -23,7 +23,15 @@ agent.use(
 );
 ```
 
-Or let CopilotRuntime v2 apply it to selected agents:
+When hosting behind CopilotRuntime v2, prefer the client-driven path: forward a
+catalog to the provider (`<CopilotKit a2ui={{ catalog }}>`, see "Client Side").
+With CopilotKit >= 1.61.2 this auto-enables A2UI, defaults tool injection on,
+and auto-derives `defaultCatalogId` from the forwarded catalog's `catalogId`, so
+no runtime `a2ui` block is required.
+
+Use an explicit runtime `a2ui` block only to override that default — for
+example, to scope injection to specific agents or pin a catalog id when the
+client does not forward one:
 
 ```ts
 import { CopilotRuntime, InMemoryAgentRunner } from "@copilotkit/runtime/v2";
@@ -31,6 +39,7 @@ import { CopilotRuntime, InMemoryAgentRunner } from "@copilotkit/runtime/v2";
 const runtime = new CopilotRuntime({
   agents,
   runner: new InMemoryAgentRunner(),
+  // Optional override; omit when the provider forwards a catalog.
   a2ui: {
     agents: ["a2ui_dynamic_schema"],
     injectA2UITool: true,
@@ -82,8 +91,9 @@ string result that the middleware can scan.
 Use dynamic schema mode when the model must compose a surface from the available
 catalog. Current AG-UI adapters share this shape:
 
-- The host asks for injection with runtime `a2ui.injectA2UITool` or per-agent
-  `new A2UIMiddleware({ injectA2UITool: true })`.
+- Injection is enabled by forwarding a catalog from the client provider
+  (`a2ui={{ catalog }}`, CopilotKit >= 1.61.2), or explicitly via runtime
+  `a2ui.injectA2UITool` or per-agent `new A2UIMiddleware({ injectA2UITool: true })`.
 - The framework adapter injects a planner-facing `generate_a2ui` tool when it
   sees the `injectA2UITool` flag.
 - `generate_a2ui` runs a sub-agent that is forced to call `render_a2ui`.
@@ -139,9 +149,11 @@ export function AppShell() {
 ```
 
 The catalog registered here must match the `catalogId` stamped into
-`createSurface`. For dynamic schema, set middleware/adapter `defaultCatalogId`
-to that same id so streamed `createSurface` operations resolve before the final
-tool result arrives.
+`createSurface`. With CopilotKit >= 1.61.2 the forwarded catalog supplies its
+own `catalogId`, which the middleware uses to auto-derive `defaultCatalogId`, so
+streamed `createSurface` operations resolve without any manual pin. Set
+middleware/adapter `defaultCatalogId` explicitly only when you are not
+forwarding a catalog from the provider.
 
 ## Component Catalog Pattern
 

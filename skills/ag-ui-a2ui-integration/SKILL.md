@@ -52,9 +52,11 @@ agents and used against a real app or repo, not published as a docs page.
    `references/a2ui-runtime-and-renderer.md`. Avoid double-applying
    `A2UIMiddleware`; use either runtime-level A2UI config or per-agent
    `agent.use(new A2UIMiddleware(...))` for a given agent.
-5. Register a catalog on the client. For dynamic schema, ensure the middleware
-   or adapter uses the same `defaultCatalogId` as the renderer-registered
-   catalog.
+5. Register a catalog on the client. With CopilotKit >= 1.61.2, forwarding it to
+   the provider (`a2ui={{ catalog }}`) auto-enables A2UI and auto-derives
+   `defaultCatalogId` from the catalog's id. Only when you are not forwarding a
+   catalog, ensure the middleware or adapter sets a `defaultCatalogId` matching
+   the renderer-registered catalog.
 6. Verify the streaming path with `references/verification.md`: AG-UI stream,
    `a2ui-surface` activity snapshots or `a2ui_operations`, rendered A2UI
    surface, and a user interaction flowing back through AG-UI.
@@ -106,8 +108,10 @@ instead of guessing a scaffold command.
   rather than asking the model to invent component trees.
 - Emit `createSurface` once per `surfaceId`; use update operations for later
   changes.
-- Do not let the model invent catalog ids. The host/middleware/adapter should
-  stamp a `defaultCatalogId` that matches the client-registered catalog.
+- Do not let the model invent catalog ids. When the client forwards a catalog to
+  the provider (CopilotKit >= 1.61.2), its `catalogId` is derived automatically;
+  otherwise the host/middleware/adapter should stamp a `defaultCatalogId` that
+  matches the client-registered catalog.
 - Preserve AG-UI run boundaries and error events. Do not swallow server or
   stream errors.
 - Verify with a real browser or client run when possible. A static typecheck is
