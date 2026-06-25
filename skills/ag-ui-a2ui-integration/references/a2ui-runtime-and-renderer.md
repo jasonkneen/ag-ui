@@ -1,121 +1,174 @@
 # A2UI Runtime and Renderer Wiring
 
-A2UI needs a server-side runtime path that tells the agent how to emit UI and
-a client-side renderer path that turns emitted A2UI operations into a visible
-surface.
+A2UI needs three pieces to line up: a server-side AG-UI bridge, an A2UI
+operation source, and a client renderer with the matching catalog.
 
-## Runtime Side
+## Server Bridge
 
-Enable A2UI on the runtime. For dynamic schema flows, inject the A2UI tool so
-the agent can create and update surfaces.
+AG-UI now provides `@ag-ui/a2ui-middleware`. It injects schema context, can
+inject the `render_a2ui` tool, detects `a2ui_operations` tool results, emits
+`ACTIVITY_SNAPSHOT` events with `activityType: "a2ui-surface"`, and forwards
+user actions back to the agent as synthetic `log_a2ui_event` tool messages.
 
-```ts
-import { CopilotRuntime } from "@copilotkit/runtime";
-
-const runtime = new CopilotRuntime({
-  agents: {
-    default: myAgUiAgent,
-  },
-  a2ui: { injectA2UITool: true },
-});
-```
-
-For static UI generation or apps that already expose the necessary A2UI tool
-contract, `a2ui: true` or `a2ui: {}` can be enough. Scope to specific agents
-when needed:
+Apply it directly to one agent:
 
 ```ts
-const runtime = new CopilotRuntime({
-  agents: {
-    booking: bookingAgent,
-    support: supportAgent,
-  },
-  a2ui: {
+import { A2UIMiddleware } from "@ag-ui/a2ui-middleware";
+
+agent.use(
+  new A2UIMiddleware({
     injectA2UITool: true,
-    agents: ["booking"],
+    defaultCatalogId: "https://example.com/catalogs/product-catalog.json",
+  }),
+);
+```
+
+Or let CopilotRuntime v2 apply it to selected agents:
+
+```ts
+import { CopilotRuntime, InMemoryAgentRunner } from "@copilotkit/runtime/v2";
+
+const runtime = new CopilotRuntime({
+  agents,
+  runner: new InMemoryAgentRunner(),
+  a2ui: {
+    agents: ["a2ui_dynamic_schema"],
+    injectA2UITool: true,
+    defaultCatalogId: "https://example.com/catalogs/product-catalog.json",
   },
 });
 ```
+
+Do not apply the middleware twice to the same agent. If an integration needs
+per-agent middleware because only some agents should get `injectA2UITool`,
+exclude those agents from runtime-level A2UI config.
+
+## Fixed Schema Mode
+
+Use fixed schema mode when the app already knows the component tree. Backend
+tools return an `a2ui_operations` envelope, and only the data changes per tool
+call.
+
+```ts
+import {
+  A2UI_OPERATIONS_KEY,
+  createSurface,
+  updateComponents,
+  updateDataModel,
+} from "@ag-ui/a2ui-toolkit";
+
+const CATALOG_ID = "https://example.com/catalogs/travel.json";
+const SURFACE_ID = "flight-search-results";
+
+function searchFlights(flights: Array<Record<string, unknown>>) {
+  return {
+    [A2UI_OPERATIONS_KEY]: [
+      createSurface(SURFACE_ID, CATALOG_ID),
+      updateComponents(SURFACE_ID, FLIGHT_SCHEMA),
+      updateDataModel(SURFACE_ID, { flights }),
+    ],
+  };
+}
+```
+
+For Python adapters, use the equivalent helpers from `ag_ui_a2ui_toolkit`:
+`A2UI_OPERATIONS_KEY`, `create_surface`, `update_components`, and
+`update_data_model`. Return a dict/object envelope when the framework preserves
+structured tool results. Only stringify when that specific adapter expects a
+string result that the middleware can scan.
+
+## Dynamic Schema Mode
+
+Use dynamic schema mode when the model must compose a surface from the available
+catalog. Current AG-UI adapters share this shape:
+
+- The host asks for injection with runtime `a2ui.injectA2UITool` or per-agent
+  `new A2UIMiddleware({ injectA2UITool: true })`.
+- The framework adapter injects a planner-facing `generate_a2ui` tool when it
+  sees the `injectA2UITool` flag.
+- `generate_a2ui` runs a sub-agent that is forced to call `render_a2ui`.
+- The sub-agent streams `render_a2ui` arguments (`surfaceId`, `components`,
+  `data`) so `A2UIMiddleware` can show building/retry states and progressively
+  paint.
+- The adapter/toolkit validates and retries before committing the final
+  `a2ui_operations` envelope.
+
+For adapters that expose an explicit tool factory, use that rather than
+hand-rolling prompts:
+
+```ts
+import { getA2UITools } from "@ag-ui/langgraph";
+
+const a2uiTool = getA2UITools({
+  model: subagentModel,
+  defaultCatalogId: "https://example.com/catalogs/product-catalog.json",
+  guidelines: {
+    compositionGuide: "Use ProductCard for product comparisons.",
+  },
+});
+```
+
+Frameworks with auto-injection, such as ADK and Strands, can infer the model
+and create `generate_a2ui` when the runtime/middleware forwards
+`injectA2UITool`. Prefer explicit tool wiring only when the adapter cannot infer
+the model, the developer has already wired a custom `generate_a2ui`, or the app
+is not hosted behind CopilotRuntime.
 
 ## Client Side
 
-Enable A2UI on the app shell that owns the AG-UI conversation.
+Register the renderer and catalog on the app shell that owns the AG-UI
+conversation.
 
 ```tsx
-import { CopilotKitProvider } from "@copilotkit/react-core/v2";
+import { CopilotKit } from "@copilotkit/react-core";
+import { CopilotChat } from "@copilotkit/react-core/v2";
 import "@copilotkit/react-core/v2/styles.css";
+import { productCatalog } from "./a2ui-catalog";
 
 export function AppShell() {
   return (
-    <CopilotKitProvider runtimeUrl="/api/copilotkit" a2ui>
-      <App />
-    </CopilotKitProvider>
+    <CopilotKit
+      runtimeUrl="/api/copilotkit/my-integration"
+      agent="a2ui_dynamic_schema"
+      a2ui={{ catalog: productCatalog }}
+    >
+      <CopilotChat agentId="a2ui_dynamic_schema" />
+    </CopilotKit>
   );
 }
 ```
 
-Pass a theme or catalog through the `a2ui` prop when the app needs custom
-rendering:
-
-```tsx
-<CopilotKitProvider
-  runtimeUrl="/api/copilotkit"
-  a2ui={{ catalog: myCatalog, theme: myTheme }}
->
-  <App />
-</CopilotKitProvider>
-```
+The catalog registered here must match the `catalogId` stamped into
+`createSurface`. For dynamic schema, set middleware/adapter `defaultCatalogId`
+to that same id so streamed `createSurface` operations resolve before the final
+tool result arrives.
 
 ## Component Catalog Pattern
 
 Use a catalog when the agent needs app-specific components beyond the built-in
-A2UI catalog. Define runtime schemas and matching renderers.
+A2UI catalog. On the client, current AG-UI/CopilotKit examples register a
+runtime `Catalog` instance that carries the catalog id, renderer
+implementations, and component schemas.
 
-```tsx
-import {
-  createCatalog,
-  type CatalogRenderers,
-} from "@copilotkit/a2ui-renderer";
-import { z } from "zod";
+```ts
+import { Catalog } from "@copilotkit/a2ui-renderer";
+import type { ReactComponentImplementation } from "@copilotkit/a2ui-renderer";
+import { ProductCard, Row } from "./a2ui-renderers";
 
-const definitions = {
-  ProductCard: {
-    description: "A product card with title, price, and availability.",
-    props: z.object({
-      title: z.string(),
-      price: z.number(),
-      inStock: z.boolean(),
-    }),
-  },
-};
-
-const renderers = {
-  ProductCard: ({ props }) => (
-    <article>
-      <h3>{props.title}</h3>
-      <p>${props.price}</p>
-      <button disabled={!props.inStock}>Add to cart</button>
-    </article>
-  ),
-} satisfies CatalogRenderers<typeof definitions>;
-
-export const myCatalog = createCatalog(definitions, renderers, {
-  includeBasicCatalog: true,
-});
+export const productCatalog = new Catalog<ReactComponentImplementation>(
+  "https://example.com/catalogs/product-catalog.json",
+  [Row, ProductCard],
+  [],
+);
 ```
 
-Keep the schema value available at runtime. TypeScript types alone disappear
-at runtime and cannot teach the agent what it may render.
+Each renderer implementation should expose a runtime schema, usually from Zod
+schemas that include the same component names and prop names the agent is
+allowed to generate. TypeScript types alone are not enough; the middleware and
+adapter need runtime schema data to instruct and validate generated components.
 
-## Agent Instructions
-
-Tell the agent when to emit A2UI and what interaction should flow back:
-
-```text
-When the user asks to compare products, create one A2UI surface named
-"product-comparison". Use ProductCard components for each item. When the user
-clicks Add to cart, continue the AG-UI run with the selected product id.
-```
-
-Prefer concrete UI goals and component names over broad instructions like
-"render a nice interface".
+Server-side inline catalogs are still useful when the host owns validation
+directly. When passing an inline catalog to `A2UIMiddleware.schema` or an
+adapter's `a2ui.catalog`, use the v0.9 inline catalog shape:
+`{ catalogId, components }`. The `catalogId` must match the client
+`Catalog` id.

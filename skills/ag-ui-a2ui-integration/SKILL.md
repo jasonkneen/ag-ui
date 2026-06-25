@@ -1,7 +1,7 @@
 ---
 name: ag-ui-a2ui-integration
-description: "Use when adding A2UI rendering to any AG-UI-supported framework or custom AG-UI application, scaffolding an AG-UI app that should render A2UI, adapting an AG-UI integration to emit A2UI surfaces, or wiring CopilotKit's A2UI runtime and renderer around an AG-UI agent."
-version: 1.0.0
+description: "Use when adding A2UI rendering to any AG-UI-supported framework or custom AG-UI application, scaffolding an AG-UI app that should render A2UI, adapting an AG-UI integration to emit A2UI surfaces, or wiring the AG-UI A2UI middleware/toolkit with a compatible renderer."
+version: 1.1.0
 ---
 
 # AG-UI + A2UI Integration Skill
@@ -9,8 +9,9 @@ version: 1.0.0
 ## Overview
 
 Use this skill to add A2UI rendering to an AG-UI application. Treat AG-UI as
-the transport and agent integration layer, and A2UI as the UI payload format
-that the agent emits and the client renders.
+the transport and agent integration layer, `@ag-ui/a2ui-middleware` as the
+server-side bridge that detects and paints A2UI operations, and A2UI as the UI
+payload format that the client renderer displays.
 
 This is a developer-facing skill artifact. It is meant to be loaded by coding
 agents and used against a real app or repo, not published as a docs page.
@@ -36,30 +37,38 @@ agents and used against a real app or repo, not published as a docs page.
 
 ## Workflow
 
-1. Inspect the app shape: framework, package manager, AG-UI endpoint, frontend
-   shell, and any existing A2UI renderer or catalog.
-2. If starting from a blank app, inspect the current AG-UI CLI and integration
-   docs. Use a CLI flag when the target framework is scaffoldable; otherwise
-   start from the framework's AG-UI package or example.
-3. Select the framework adapter from
+1. Inspect the app shape: framework adapter, AG-UI agent endpoint, runtime
+   host, frontend shell, and any existing A2UI renderer/catalog.
+2. Decide the A2UI mode before editing code:
+   - Fixed schema: backend tools return an `a2ui_operations` envelope with
+     `createSurface`, `updateComponents`, and `updateDataModel`.
+   - Dynamic schema: a framework A2UI tool (`generate_a2ui`) delegates to a
+     sub-agent that streams `render_a2ui` args through `A2UIMiddleware`.
+3. Select framework-specific wiring from
    `references/framework-adapters.md`, or use that reference to find the
    closest AG-UI integration pattern. Preserve the app's existing agent
    architecture.
-4. Wire the A2UI runtime and renderer using
-   `references/a2ui-runtime-and-renderer.md`.
-5. Add or extend the component catalog only when the built-in A2UI catalog is
-   not enough for the requested UI.
-6. Verify the streaming path with `references/verification.md`: agent stream,
-   rendered A2UI surface, and a user interaction flowing back through AG-UI.
+4. Wire server middleware/runtime and client renderer using
+   `references/a2ui-runtime-and-renderer.md`. Avoid double-applying
+   `A2UIMiddleware`; use either runtime-level A2UI config or per-agent
+   `agent.use(new A2UIMiddleware(...))` for a given agent.
+5. Register a catalog on the client. For dynamic schema, ensure the middleware
+   or adapter uses the same `defaultCatalogId` as the renderer-registered
+   catalog.
+6. Verify the streaming path with `references/verification.md`: AG-UI stream,
+   `a2ui-surface` activity snapshots or `a2ui_operations`, rendered A2UI
+   surface, and a user interaction flowing back through AG-UI.
 
 ## AG-UI Framework Support
 
 This skill is not limited to the framework examples below. For any target
 framework, first check the AG-UI repository's `integrations/` directory, the
-AG-UI docs, and the current CLI source. If AG-UI supports the framework, use
-that integration's documented package, endpoint helper, or scaffold path. If
-there is no framework adapter, implement the custom AG-UI agent path and keep
-the A2UI runtime/client wiring the same.
+AG-UI docs, the framework adapter's A2UI files, and the current CLI source. If
+AG-UI supports the framework, use that integration's documented package,
+endpoint helper, A2UI tool factory, or scaffold path. If there is no framework
+A2UI adapter, implement the custom AG-UI agent path, return `a2ui_operations`
+from backend tools for fixed layouts, and keep the middleware/client wiring the
+same.
 
 ## Common AG-UI CLI Flags
 
@@ -86,14 +95,19 @@ instead of guessing a scaffold command.
 ## Key Rules
 
 - Keep the integration AG-UI-first for every supported framework. CopilotKit is
-  the common runtime and renderer path for A2UI in web apps, but do not
-  describe AG-UI as merely a CopilotKit implementation detail.
-- Enable A2UI on both sides: runtime support on the server and renderer
-  support on the client.
-- If dynamic component schemas are needed, inject the A2UI tool on the runtime
-  and pass a real runtime schema value. Type-only definitions are not enough.
+  a common runtime/renderer path for web apps, but AG-UI owns the middleware,
+  framework adapters, and wire events.
+- Enable A2UI on both sides: `A2UIMiddleware` or runtime A2UI config on the
+  server, and an A2UI-capable renderer/catalog on the client.
+- For dynamic schema, prefer the framework adapter's A2UI tool factory or
+  auto-injection path. The model should call `generate_a2ui`; the sub-agent
+  should stream `render_a2ui` args so the middleware can progressively paint.
+- For fixed schema, return an `a2ui_operations` envelope from backend tools
+  rather than asking the model to invent component trees.
 - Emit `createSurface` once per `surfaceId`; use update operations for later
   changes.
+- Do not let the model invent catalog ids. The host/middleware/adapter should
+  stamp a `defaultCatalogId` that matches the client-registered catalog.
 - Preserve AG-UI run boundaries and error events. Do not swallow server or
   stream errors.
 - Verify with a real browser or client run when possible. A static typecheck is
