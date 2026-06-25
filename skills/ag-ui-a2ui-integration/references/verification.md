@@ -28,16 +28,16 @@ Use this checklist before calling an AG-UI + A2UI integration complete.
 
 ## Common Failure Modes
 
-| Symptom                               | Likely cause                                                         | Fix                                                                              |
-| ------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| No A2UI surface appears               | A2UI is enabled only on the client or only on the runtime            | Enable renderer/catalog plus `A2UIMiddleware` or runtime A2UI config             |
-| Agent describes UI in prose           | Agent lacks `generate_a2ui` or fixed-schema backend tools            | Use the framework A2UI tool factory/auto-injection or return `a2ui_operations`   |
-| Custom component never renders        | Catalog id or component keys differ between server and client        | Register the catalog and align `defaultCatalogId`, `catalogId`, and names        |
-| Dynamic surface appears only at end   | Nested `render_a2ui` args are not streaming to the AG-UI wire        | Use the adapter's streaming A2UI tool path, not a non-streaming sub-agent invoke |
-| Action clicks do nothing              | The action bridge is not reaching `forwardedProps.a2uiAction`        | Verify the client action is forwarded and middleware emits `log_a2ui_event`      |
-| Skeletons duplicate or flicker        | Middleware is applied twice or catalog/tool names are misconfigured  | Use either runtime-level or per-agent middleware for each agent, not both        |
-| `Catalog not found` in the renderer   | Model or server stamped a catalog id the client did not register     | Set `defaultCatalogId` to the renderer catalog id; do not let the model pick it  |
-| Invalid component tree keeps retrying | Components fail toolkit validation against the inline/client catalog | Fix required props, child refs, root layout, and component names                 |
+| Symptom                               | Likely cause                                                         | Fix                                                                                                                                                                     |
+| ------------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No A2UI surface appears               | A2UI is enabled only on the client or only on the runtime            | Enable renderer/catalog plus `A2UIMiddleware` or runtime A2UI config                                                                                                    |
+| Agent describes UI in prose           | Agent lacks `generate_a2ui` or fixed-schema backend tools            | Use the framework A2UI tool factory/auto-injection or return `a2ui_operations`                                                                                          |
+| Custom component never renders        | Catalog id or component keys differ between server and client        | Register the catalog and align `defaultCatalogId`, `catalogId`, and names                                                                                               |
+| Dynamic surface appears only at end   | Nested `render_a2ui` args are not streaming to the AG-UI wire        | Use the adapter's streaming A2UI tool path, not a non-streaming sub-agent invoke                                                                                        |
+| Action clicks do nothing              | The action bridge is not reaching `forwardedProps.a2uiAction`        | Verify the client action is forwarded and middleware emits `log_a2ui_event`                                                                                             |
+| Skeletons duplicate or flicker        | Middleware is applied twice or catalog/tool names are misconfigured  | Use either runtime-level or per-agent middleware for each agent, not both                                                                                               |
+| `Catalog not found` in the renderer   | Model or server stamped a catalog id the client did not register     | Forward the catalog to the provider (`a2ui={{ catalog }}`, CopilotKit >= 1.61.2) so its id is auto-derived; otherwise set `defaultCatalogId` to the renderer catalog id |
+| Invalid component tree keeps retrying | Components fail toolkit validation against the inline/client catalog | Fix required props, child refs, root layout, and component names                                                                                                        |
 
 A runtime smoke test should show the AG-UI stream in logs or devtools, an
 `a2ui-surface` activity or `a2ui_operations` result, a rendered A2UI surface in
