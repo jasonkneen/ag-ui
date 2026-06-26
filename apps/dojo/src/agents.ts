@@ -321,9 +321,14 @@ export const agentsIntegrations = {
       (path) => new AgnoAgent({ url: `${envVars.agnoUrl}/${path}/agui` }),
       {
         agentic_chat: "agentic_chat",
-        tool_based_generative_ui: "tool_based_generative_ui",
+        agentic_chat_reasoning: "agentic_chat_reasoning",
+        agentic_chat_multimodal: "agentic_chat_multimodal",
+        agentic_generative_ui: "agentic_generative_ui",
         backend_tool_rendering: "backend_tool_rendering",
         human_in_the_loop: "human_in_the_loop",
+        predictive_state_updates: "predictive_state_updates",
+        shared_state: "shared_state",
+        tool_based_generative_ui: "tool_based_generative_ui",
       },
     ),
 
@@ -436,7 +441,23 @@ export const agentsIntegrations = {
         shared_state: "shared_state",
         tool_based_generative_ui: "tool_based_generative_ui",
         predictive_state_updates: "predictive_state_updates",
-      },
+    subgraphs: "subgraphs",
+      }
+    ),
+
+  "ag-ui-dotnet": async () =>
+    mapAgents(
+      (path) => new HttpAgent({ url: `${envVars.aguiDotnetUrl}/${path}` }),
+      {
+        agentic_chat: "agentic_chat",
+        v1_agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        agentic_generative_ui: "agentic_generative_ui",
+        shared_state: "shared_state",
+        tool_based_generative_ui: "tool_based_generative_ui",
+        predictive_state_updates: "predictive_state_updates",
+      }
     ),
 
   a2a: async () => {
