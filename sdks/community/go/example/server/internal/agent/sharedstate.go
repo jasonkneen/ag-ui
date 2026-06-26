@@ -57,6 +57,11 @@ func (s SharedState) Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAg
 	if maxIter <= 0 {
 		maxIter = config.DefaultMaxIterations
 	}
+	if maxIter > config.MaxIterationsCeiling {
+		s.Deps.Logger.Warn("clamping MaxIterations to ceiling",
+			"requested", maxIter, "ceiling", config.MaxIterationsCeiling)
+		maxIter = config.MaxIterationsCeiling
+	}
 	for iter := 0; iter < maxIter; iter++ {
 		if emit.Err() != nil || ctx.Err() != nil {
 			return

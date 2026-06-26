@@ -110,7 +110,7 @@ func newApp(shutdownCtx context.Context, cfg config.Config, deps *agent.Deps, lo
 		app.Use(cors.New(cors.Config{
 			AllowOrigins: []string{"*"},
 			AllowMethods: []string{"GET", "POST", "OPTIONS"},
-			AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Cache-Control"},
+			AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Cache-Control", "X-AG-Approval"},
 		}))
 	}
 

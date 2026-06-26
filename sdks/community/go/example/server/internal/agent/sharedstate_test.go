@@ -13,10 +13,15 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"github.com/cloudwego/eino/schema"
 
+	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/example/server/internal/config"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/example/server/internal/runstore"
 )
 
 func runSharedState(t *testing.T, cm *scriptedModel, in *aguitypes.RunAgentInput) string {
+	return runSharedStateWithMaxIterations(t, cm, in, 8)
+}
+
+func runSharedStateWithMaxIterations(t *testing.T, cm *scriptedModel, in *aguitypes.RunAgentInput, maxIterations int) string {
 	t.Helper()
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
@@ -27,7 +32,7 @@ func runSharedState(t *testing.T, cm *scriptedModel, in *aguitypes.RunAgentInput
 	}
 	deps := &Deps{
 		Model: cm, BaseModel: cm, Tools: tools,
-		Store: runstore.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MaxIterations: 8,
+		Store: runstore.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MaxIterations: maxIterations,
 	}
 	SharedState{Deps: deps}.Run(context.Background(), emit, in, in.ThreadID, in.RunID)
 	_ = w.Flush()
@@ -116,5 +121,25 @@ func TestSharedState_RemoveIngredient(t *testing.T) {
 	out := runSharedState(t, m, in)
 	if !strings.Contains(out, `"op":"remove"`) || !strings.Contains(out, `"path":"/recipe/ingredients/0"`) {
 		t.Errorf("expected a remove delta:\n%s", out)
+	}
+}
+
+func TestSharedState_MaxIterationsClampedToCeiling(t *testing.T) {
+	turns := make([][]*schema.Message, 70)
+	for i := range turns {
+		turns[i] = []*schema.Message{toolCallChunk("c", "apply_recipe_changes", `{"servings":4}`)}
+	}
+	m := &scriptedModel{turns: turns}
+	in := &aguitypes.RunAgentInput{
+		ThreadID: "t", RunID: "r",
+		Messages: []aguitypes.Message{{ID: "u1", Role: aguitypes.RoleUser, Content: "Keep editing."}},
+		State:    seededRecipeState(),
+	}
+	out := runSharedStateWithMaxIterations(t, m, in, config.MaxIterationsCeiling+100)
+	if !strings.Contains(out, `"type":"RUN_ERROR"`) {
+		t.Fatalf("expected non-convergence RUN_ERROR:\n%s", out)
+	}
+	if !strings.Contains(out, "agent did not converge within 64 iterations") {
+		t.Fatalf("expected max-iteration ceiling in error:\n%s", out)
 	}
 }

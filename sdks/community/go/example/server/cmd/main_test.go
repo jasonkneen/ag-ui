@@ -75,6 +75,26 @@ func TestAppRouteRegistrationMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestAppCORSAllowsApprovalHeader(t *testing.T) {
+	req := newRequest(t, http.MethodOptions, "/human_in_the_loop", "")
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set("Access-Control-Request-Headers", "X-AG-Approval")
+
+	resp, err := testApp().Test(req)
+	if err != nil {
+		t.Fatalf("OPTIONS /human_in_the_loop: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("preflight status = %d, body = %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(got), "x-ag-approval") {
+		t.Fatalf("Access-Control-Allow-Headers = %q, want X-AG-Approval", got)
+	}
+}
+
 func TestAppValidSSELifecycleNoCredentials(t *testing.T) {
 	body := `{"threadId":"t","runId":"r","messages":[{"id":"u1","role":"user","content":"Plan dinner"}],"tools":[],"context":[],"forwardedProps":{},"state":{}}`
 	resp, err := testApp().Test(newRequest(t, http.MethodPost, "/agentic_generative_ui", body))
