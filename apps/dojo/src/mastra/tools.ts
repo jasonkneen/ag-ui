@@ -45,17 +45,18 @@ export const scheduleMeetingTool = createTool({
     chosen_label: z.string().optional(),
     cancelled: z.boolean().optional(),
   }),
-  execute: async (inputData, context): Promise<string> => {
+  execute: async (inputData, context) => {
     const { resumeData, suspend } = context?.agent ?? {};
 
-    // First execution: pause and ask the user to pick a time. `suspend()`
-    // unwinds execution; the return value of this pass is discarded by Mastra.
+    // First execution: pause and ask the user to pick a time. Return the
+    // `suspend()` call directly — it keeps the tool suspended so Mastra pauses
+    // the run at `tool-call-suspended`. Do NOT `await` then return a value:
+    // that completes the tool and the agent continues without the user.
     if (!resumeData) {
-      await suspend?.({
+      return suspend?.({
         topic: inputData.topic,
         attendee: inputData.attendee,
       });
-      return "Awaiting the user's time selection…";
     }
 
     // Resumed: the user has responded.
