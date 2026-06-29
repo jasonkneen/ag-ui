@@ -128,6 +128,7 @@ export const menuIntegrations = [
       "interrupt",
       "shared_state",
       "tool_based_generative_ui",
+      "background_agents",
     ],
   },
   {

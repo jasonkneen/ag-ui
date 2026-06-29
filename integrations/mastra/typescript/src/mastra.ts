@@ -1,4 +1,6 @@
 import type {
+  ActivityDeltaEvent,
+  ActivitySnapshotEvent,
   AgentConfig,
   BaseEvent,
   CustomEvent,
@@ -39,10 +41,63 @@ import {
 
 type RemoteMastraAgent = ReturnType<MastraClient["getAgent"]>;
 
+/**
+ * AG-UI `activityType` used for Mastra Background Tasks. Background work
+ * (a tool with `background: { enabled: true }`) runs out-of-band while the
+ * agent conversation continues; the bridge surfaces its lifecycle as AG-UI
+ * ACTIVITY_SNAPSHOT / ACTIVITY_DELTA events so the UI can render it distinctly
+ * from normal streamed responses. Renderers register against this string via
+ * CopilotKit's `renderActivityMessages` prop.
+ *
+ * The activity `content` shape (one activity per Mastra task; `messageId` is
+ * the Mastra `taskId`):
+ *
+ *   {
+ *     taskId: string;        // Mastra background task id (== activity messageId)
+ *     toolName: string;      // the backgrounded tool
+ *     toolCallId: string;    // originating tool call
+ *     status: "started" | "running" | "suspended" | "resumed"
+ *           | "completed" | "failed" | "cancelled";
+ *     args?: Record<string, unknown>;  // tool args, once running
+ *     outputs: unknown[];    // streamed tool-output chunks, appended in order
+ *     elapsedMs?: number;    // wall-clock since dispatch, ticked by progress
+ *     result?: unknown;      // final result on completion
+ *     error?: string;        // message on failure
+ *     suspendPayload?: unknown; // data passed to suspend(), when suspended
+ *     startedAt?: string;    // ISO timestamp
+ *     completedAt?: string;  // ISO timestamp
+ *   }
+ *
+ * This shape is a sensible default proposed by the AG-UI bridge; it is intended
+ * to be co-designed with Mastra (see OSS-93) and may evolve.
+ */
+export const MASTRA_BACKGROUND_TASK_ACTIVITY_TYPE = "mastra-background-task";
+
 export interface MastraAgentConfig extends AgentConfig {
   agent: LocalMastraAgent | RemoteMastraAgent;
   resourceId?: string;
   requestContext?: RequestContext;
+  /**
+   * Opt into Mastra's `untilIdle` run mode (local agents only). When set, the
+   * bridge passes `untilIdle` to `agent.stream(...)`, which subscribes to the
+   * background-task manager for the run's memory scope and pipes the task
+   * lifecycle chunks (`background-task-running` / `-output` / `-completed` /
+   * `-failed` / …) into the SAME `fullStream`, re-entering the agentic loop so
+   * the model reacts to the result in the same run. Without it, only
+   * `background-task-started` reaches the run stream and completion is
+   * delivered out of band. Requires a configured storage backend + a memory
+   * scope (Mastra falls through to the default stream otherwise). `true` uses
+   * Mastra's default idle timeout; pass `{ maxIdleMs }` to override.
+   *
+   * CAVEAT (verified against @mastra/core 1.47.0): in practice only
+   * `background-task-started` + `-running` reach the piped stream;
+   * `background-task-completed` does NOT arrive, so the run idles out without a
+   * completion and the activity stays "running". Treat this as the forward-
+   * looking hook for when Mastra delivers terminal lifecycle on the stream;
+   * leave it OFF until then (its only effect today is an idle hold with no
+   * completion payload).
+   */
+  untilIdle?: boolean | { maxIdleMs?: number };
 }
 
 interface MastraAgentStreamOptions {
@@ -81,20 +136,41 @@ interface MastraAgentStreamOptions {
     // bridge can fall back to the AG-UI runId when a chunk omits it.
     runId?: string;
   }) => void;
+  /**
+   * Emit an ACTIVITY_SNAPSHOT for a background task (full initial content).
+   * Called once per task, when the task starts.
+   */
+  onActivitySnapshot?: (snapshot: {
+    messageId: string;
+    activityType: string;
+    content: Record<string, any>;
+  }) => void;
+  /**
+   * Emit an ACTIVITY_DELTA for a background task (RFC 6902 JSON patch against
+   * the prior snapshot/delta content). Called on each subsequent lifecycle
+   * chunk (running, output, progress, completed, failed, cancelled, …).
+   */
+  onActivityDelta?: (delta: {
+    messageId: string;
+    activityType: string;
+    patch: Array<Record<string, any>>;
+  }) => void;
 }
 
 export class MastraAgent extends AbstractAgent {
   agent: LocalMastraAgent | RemoteMastraAgent;
   resourceId?: string;
   requestContext?: RequestContext;
+  untilIdle?: boolean | { maxIdleMs?: number };
   public headers?: Record<string, string>;
 
   constructor(private config: MastraAgentConfig) {
-    const { agent, resourceId, requestContext, ...rest } = config;
+    const { agent, resourceId, requestContext, untilIdle, ...rest } = config;
     super(rest);
     this.agent = agent;
     this.resourceId = resourceId;
     this.requestContext = requestContext ?? new RequestContext();
+    this.untilIdle = untilIdle;
   }
 
   public clone() {
@@ -548,6 +624,22 @@ export class MastraAgent extends AbstractAgent {
         closeReasoning();
         setMessageId(randomUUID());
       },
+      onActivitySnapshot: ({ messageId, activityType, content }) => {
+        subscriber.next({
+          type: EventType.ACTIVITY_SNAPSHOT,
+          messageId,
+          activityType,
+          content,
+        } as ActivitySnapshotEvent);
+      },
+      onActivityDelta: ({ messageId, activityType, patch }) => {
+        subscriber.next({
+          type: EventType.ACTIVITY_DELTA,
+          messageId,
+          activityType,
+          patch,
+        } as ActivityDeltaEvent);
+      },
     };
   }
 
@@ -578,6 +670,62 @@ export class MastraAgent extends AbstractAgent {
         callbacks.onToolCallPart?.(pendingToolCall);
         pendingToolCall = null;
       }
+    };
+
+    // taskIds for which an ACTIVITY_SNAPSHOT has already been emitted. Guards
+    // against emitting a delta before its snapshot and bounds progress ticks to
+    // tasks the client knows about.
+    const knownTasks = new Set<string>();
+
+    // Maps an in-flight background tool call (by toolCallId) to its task, so we
+    // can correlate the loop's inline `tool-result` / `tool-error` back to the
+    // activity. When a backgrounded tool finishes within the agent loop's wait
+    // window, Mastra surfaces only `background-task-started` on the main stream
+    // and delivers the outcome as an ordinary `tool-result` — there is no
+    // `background-task-completed` here (that lives on the manager's own stream).
+    const backgroundToolCalls = new Map<
+      string,
+      { taskId: string; toolName?: string }
+    >();
+
+    const toISO = (value: unknown): unknown =>
+      value instanceof Date ? value.toISOString() : value;
+
+    // Seed an activity for a task if we haven't already (defensive: a running /
+    // output chunk should always follow a started chunk, but a delta with no
+    // prior snapshot would be unrenderable).
+    const ensureTaskSnapshot = (payload: any) => {
+      const { taskId, toolName, toolCallId, args } = payload ?? {};
+      if (!taskId || knownTasks.has(taskId)) return;
+      knownTasks.add(taskId);
+      const content: Record<string, any> = {
+        taskId,
+        toolName,
+        toolCallId,
+        // The task is dispatched and executing out of band; surface it as
+        // "running" so the UI reads as active immediately (the inline path
+        // never emits a separate running delta).
+        status: "running",
+        outputs: [],
+      };
+      if (args !== undefined) content.args = args;
+      callbacks.onActivitySnapshot?.({
+        messageId: taskId,
+        activityType: MASTRA_BACKGROUND_TASK_ACTIVITY_TYPE,
+        content,
+      });
+    };
+
+    const emitTaskDelta = (
+      taskId: string,
+      patch: Array<Record<string, any>>,
+    ) => {
+      if (!taskId || patch.length === 0) return;
+      callbacks.onActivityDelta?.({
+        messageId: taskId,
+        activityType: MASTRA_BACKGROUND_TASK_ACTIVITY_TYPE,
+        patch,
+      });
     };
 
     const handleChunk = (chunk: any): boolean => {
@@ -620,11 +768,44 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "tool-result": {
+          // For a backgrounded call, the agent loop's inline tool-result is a
+          // placeholder ack ("…running in the background; you will be notified
+          // when it completes"), NOT the real outcome — the task is detached
+          // and its true result is delivered out of band (a later turn / the
+          // manager's own stream). So suppress it: don't render a TOOL_CALL_
+          // RESULT for a tool call we never rendered, and leave the activity in
+          // its "running" state. Real completion arrives via the
+          // background-task-completed / -failed chunks handled below.
+          if (backgroundToolCalls.has(chunk.payload.toolCallId)) {
+            backgroundToolCalls.delete(chunk.payload.toolCallId);
+            break;
+          }
           flush();
           callbacks.onToolResultPart?.({
             toolCallId: chunk.payload.toolCallId,
             result: chunk.payload.result,
           });
+          break;
+        }
+        case "tool-error": {
+          // An inline error on a backgrounded call means dispatch itself failed
+          // -> mark the activity failed. Non-background tool errors fall through
+          // to the stream's `error` handling elsewhere, so just swallow here.
+          const bgError = backgroundToolCalls.get(chunk.payload?.toolCallId);
+          if (bgError) {
+            backgroundToolCalls.delete(chunk.payload.toolCallId);
+            knownTasks.delete(bgError.taskId);
+            emitTaskDelta(bgError.taskId, [
+              { op: "add", path: "/status", value: "failed" },
+              {
+                op: "add",
+                path: "/error",
+                value:
+                  chunk.payload?.error?.message ??
+                  String(chunk.payload?.error ?? "Unknown error"),
+              },
+            ]);
+          }
           break;
         }
         case "error": {
@@ -678,6 +859,135 @@ export class MastraAgent extends AbstractAgent {
           if (chunk.payload?.messageId) {
             callbacks.onMessageId?.(chunk.payload.messageId);
           }
+          break;
+        }
+        // --- Background Tasks (@mastra/core >= 1.29) ---------------------
+        // Mastra runs a tool flagged `background: { enabled: true }` out of
+        // band; its lifecycle surfaces on fullStream as background-task-*
+        // chunks. Map start -> ACTIVITY_SNAPSHOT (full content) and every
+        // subsequent lifecycle chunk -> ACTIVITY_DELTA (JSON patch). The task
+        // id round-trips as the activity messageId so all events for one task
+        // address the same activity message. JSON-patch `add` to an existing
+        // object member replaces it (RFC 6902 §4.1), so it is safe for both
+        // first-write and updates.
+        case "background-task-started": {
+          const { taskId, toolName, toolCallId } = chunk.payload;
+          // The agent loop emits `tool-call` immediately before this; the
+          // bridge has it buffered in pendingToolCall. Suppress that normal
+          // tool render (the work is now an activity) but reuse its args for
+          // the snapshot. Mirrors the tool-call-suspended suppression.
+          const args =
+            pendingToolCall && pendingToolCall.toolCallId === toolCallId
+              ? pendingToolCall.args
+              : undefined;
+          pendingToolCall = null;
+          if (taskId && toolCallId) {
+            backgroundToolCalls.set(toolCallId, { taskId, toolName });
+          }
+          ensureTaskSnapshot({ taskId, toolName, toolCallId, args });
+          break;
+        }
+        case "background-task-running":
+        case "background-task-resumed": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          const status =
+            chunk.type === "background-task-resumed" ? "resumed" : "running";
+          const patch: Array<Record<string, any>> = [
+            { op: "add", path: "/status", value: status },
+          ];
+          if (p.args !== undefined)
+            patch.push({ op: "add", path: "/args", value: p.args });
+          if (p.startedAt !== undefined)
+            patch.push({
+              op: "add",
+              path: "/startedAt",
+              value: toISO(p.startedAt),
+            });
+          emitTaskDelta(p.taskId, patch);
+          break;
+        }
+        case "background-task-output": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          // p.payload is a `tool-output` chunk; surface its inner payload (the
+          // actual streamed output) and fall back to the whole chunk.
+          const output = p.payload?.payload ?? p.payload;
+          emitTaskDelta(p.taskId, [
+            { op: "add", path: "/status", value: "running" },
+            { op: "add", path: "/outputs/-", value: output },
+          ]);
+          break;
+        }
+        case "background-task-progress": {
+          // Aggregate heartbeat across all running tasks (no per-task id).
+          // Tick the elapsed time on each task the client already knows about.
+          const p = chunk.payload;
+          const taskIds: string[] = Array.isArray(p.taskIds) ? p.taskIds : [];
+          for (const taskId of taskIds) {
+            if (!knownTasks.has(taskId)) continue;
+            emitTaskDelta(taskId, [
+              { op: "add", path: "/elapsedMs", value: p.elapsedMs },
+            ]);
+          }
+          break;
+        }
+        case "background-task-suspended": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          const patch: Array<Record<string, any>> = [
+            { op: "add", path: "/status", value: "suspended" },
+          ];
+          if (p.suspendPayload !== undefined)
+            patch.push({
+              op: "add",
+              path: "/suspendPayload",
+              value: p.suspendPayload,
+            });
+          emitTaskDelta(p.taskId, patch);
+          break;
+        }
+        case "background-task-completed": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          knownTasks.delete(p.taskId);
+          backgroundToolCalls.delete(p.toolCallId);
+          emitTaskDelta(p.taskId, [
+            {
+              op: "add",
+              path: "/status",
+              value: p.isError ? "failed" : "completed",
+            },
+            { op: "add", path: "/result", value: p.result },
+            { op: "add", path: "/completedAt", value: toISO(p.completedAt) },
+          ]);
+          break;
+        }
+        case "background-task-failed": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          knownTasks.delete(p.taskId);
+          backgroundToolCalls.delete(p.toolCallId);
+          emitTaskDelta(p.taskId, [
+            { op: "add", path: "/status", value: "failed" },
+            {
+              op: "add",
+              path: "/error",
+              value: p.error?.message ?? String(p.error ?? "Unknown error"),
+            },
+            { op: "add", path: "/completedAt", value: toISO(p.completedAt) },
+          ]);
+          break;
+        }
+        case "background-task-cancelled": {
+          const p = chunk.payload;
+          ensureTaskSnapshot(p);
+          knownTasks.delete(p.taskId);
+          backgroundToolCalls.delete(p.toolCallId);
+          emitTaskDelta(p.taskId, [
+            { op: "add", path: "/status", value: "cancelled" },
+            { op: "add", path: "/completedAt", value: toISO(p.completedAt) },
+          ]);
           break;
         }
         default: {
@@ -799,6 +1109,8 @@ export class MastraAgent extends AbstractAgent {
       onToolCallPart,
       onToolResultPart,
       onToolSuspended,
+      onActivitySnapshot,
+      onActivityDelta,
       onError,
       onRunFinished,
     }: MastraAgentStreamOptions,
@@ -851,6 +1163,13 @@ export class MastraAgent extends AbstractAgent {
           clientTools,
           requestContext,
         };
+        // Pipe the background-task lifecycle into this run's fullStream (and
+        // re-enter the loop on completion) when opted in. Only meaningful for
+        // local agents with storage + a memory scope; Mastra falls through to
+        // the default stream otherwise.
+        if (this.untilIdle) {
+          streamOptions.untilIdle = this.untilIdle;
+        }
         if (this.headers && Object.keys(this.headers).length > 0) {
           streamOptions.modelSettings = {
             ...((streamOptions.modelSettings as
@@ -875,6 +1194,8 @@ export class MastraAgent extends AbstractAgent {
             onToolCallPart,
             onToolResultPart,
             onToolSuspended,
+            onActivitySnapshot,
+            onActivityDelta,
             onError,
           });
 
@@ -923,6 +1244,8 @@ export class MastraAgent extends AbstractAgent {
             onToolCallPart,
             onToolResultPart,
             onToolSuspended,
+            onActivitySnapshot,
+            onActivityDelta,
             onError,
           });
 
