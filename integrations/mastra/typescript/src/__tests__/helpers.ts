@@ -29,6 +29,8 @@ export class FakeMemory {
 export class FakeLocalAgent {
   memory: FakeMemory;
   streamChunks: any[];
+  /** Messages passed to the most recent stream() call (post-diff-filter). */
+  lastStreamMessages: any[] | null = null;
 
   constructor(opts: { memory?: FakeMemory; streamChunks?: any[] } = {}) {
     this.memory = opts.memory ?? new FakeMemory();
@@ -39,7 +41,8 @@ export class FakeLocalAgent {
     return this.memory;
   }
 
-  async stream(_messages: any, _opts?: any) {
+  async stream(messages: any, _opts?: any) {
+    this.lastStreamMessages = messages;
     const chunks = this.streamChunks;
     return {
       fullStream: (async function* () {
@@ -53,12 +56,14 @@ export class FakeLocalAgent {
 
 export class FakeRemoteAgent {
   streamChunks: any[];
+  lastStreamMessages: any[] | null = null;
 
   constructor(opts: { streamChunks?: any[] } = {}) {
     this.streamChunks = opts.streamChunks ?? [];
   }
 
-  async stream(_messages: any, _opts?: any) {
+  async stream(messages: any, _opts?: any) {
+    this.lastStreamMessages = messages;
     const chunks = this.streamChunks;
     return {
       processDataStream: async ({
