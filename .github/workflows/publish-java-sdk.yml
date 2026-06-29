@@ -1,9 +1,18 @@
 name: Release
 
-# Publish to Maven Central whenever a GitHub release is published.
+# Publish to Maven Central when a GitHub release is published, or manually via
+# workflow_dispatch — optionally as a dry-run that builds and signs the release
+# artifacts without uploading.
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run in dry-run mode (build and sign without uploading)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,9 +47,37 @@ jobs:
       - name: Run tests
         run: mvn -B verify
 
+      # Dry-run: build the release artifacts (sources, javadoc) and GPG-sign them
+      # via the release profile, stopping at `verify` so nothing is uploaded.
+      - name: Publish to Maven Central (dry-run)
+        if: inputs.dry_run == true
+        run: |
+          echo "🔍 Dry-run: building and signing release artifacts without uploading..."
+          mvn -B -Prelease verify -DskipTests
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+
       - name: Publish to Maven Central
-        run: mvn -B -Prelease deploy -DskipTests
+        if: inputs.dry_run != true
+        run: |
+          echo "🚀 Publishing to Maven Central..."
+          mvn -B -Prelease deploy -DskipTests
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+
+      - name: Dry-run summary
+        if: success() && inputs.dry_run == true
+        run: |
+          echo "## ✅ Dry-run complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release artifacts were built and GPG-signed; nothing was uploaded." >> "$GITHUB_STEP_SUMMARY"
+          echo "Re-run without the dry-run flag to publish to Maven Central." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish summary
+        if: success() && inputs.dry_run != true
+        run: |
+          echo "## ✅ Published to Maven Central" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check deployment status: https://central.sonatype.com/publishing" >> "$GITHUB_STEP_SUMMARY"
