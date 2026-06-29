@@ -66,6 +66,12 @@ interface MastraAgentStreamOptions {
     suspendPayload: any;
     args: Record<string, any>;
     resumeSchema: string;
+    // The runId Mastra associated with the suspended run, taken from the
+    // suspend chunk. Mastra keys the suspended workflow snapshot by this id —
+    // which is NOT necessarily the AG-UI RunAgentInput.runId — so resume must
+    // round-trip THIS value back to `resumeStream({ runId })`. Optional so the
+    // bridge can fall back to the AG-UI runId when a chunk omits it.
+    runId?: string;
   }) => void;
 }
 
@@ -593,7 +599,10 @@ export class MastraAgent extends AbstractAgent {
             suspendPayload: payload.suspendPayload,
             args: payload.args,
             resumeSchema: payload.resumeSchema,
-            runId,
+            // Prefer the runId Mastra reported on the suspend chunk (the id its
+            // snapshot is keyed by); fall back to the AG-UI run's id when the
+            // chunk omits one. The resume path round-trips this exact value.
+            runId: payload.runId ?? runId,
           }),
         } as CustomEvent);
       },
@@ -705,6 +714,11 @@ export class MastraAgent extends AbstractAgent {
             suspendPayload: chunk.payload.suspendPayload,
             args: chunk.payload.args,
             resumeSchema: chunk.payload.resumeSchema,
+            // Mastra keys the suspended snapshot by the run's id, surfaced on
+            // the chunk (`payload.runId`, else the chunk-level `runId`). This
+            // can differ from the AG-UI RunAgentInput.runId, so it must be the
+            // id resume sends back to `resumeStream`. See the resume path.
+            runId: chunk.payload.runId ?? chunk.runId,
           });
           break;
         }
