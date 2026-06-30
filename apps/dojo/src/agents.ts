@@ -147,6 +147,7 @@ export const agentsIntegrations = {
         | "agentic_chat_multimodal"
         | "backend_tool_rendering"
         | "human_in_the_loop"
+        | "interrupt"
         | "tool_based_generative_ui",
         AbstractAgent
       >

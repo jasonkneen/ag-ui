@@ -57,14 +57,36 @@ export class FakeLocalAgent {
 export class FakeRemoteAgent {
   streamChunks: any[];
   lastStreamMessages: any[] | null = null;
+  // Chunks replayed by resumeStream's processDataStream. When undefined, the
+  // remote agent has no resume capability (mirrors older @mastra/client-js).
+  resumeChunks: any[] | undefined;
+  // Records every resumeStream(resumeData, opts) call for assertions.
+  resumeCalls: Array<{ resumeData: any; opts: any }> = [];
 
-  constructor(opts: { streamChunks?: any[] } = {}) {
+  constructor(opts: { streamChunks?: any[]; resumeChunks?: any[] } = {}) {
     this.streamChunks = opts.streamChunks ?? [];
+    this.resumeChunks = opts.resumeChunks;
   }
 
   async stream(messages: any, _opts?: any) {
     this.lastStreamMessages = messages;
     const chunks = this.streamChunks;
+    return {
+      processDataStream: async ({
+        onChunk,
+      }: {
+        onChunk: (chunk: any) => Promise<void>;
+      }) => {
+        for (const chunk of chunks) {
+          await onChunk(chunk);
+        }
+      },
+    };
+  }
+
+  async resumeStream(resumeData: any, opts: any) {
+    this.resumeCalls.push({ resumeData, opts });
+    const chunks = this.resumeChunks ?? [];
     return {
       processDataStream: async ({
         onChunk,
@@ -133,7 +155,11 @@ export function makeLocalMastraAgent(
 }
 
 export function makeRemoteMastraAgent(
-  opts: { streamChunks?: any[]; emitInterruptOutcome?: boolean } = {},
+  opts: {
+    streamChunks?: any[];
+    resumeChunks?: any[];
+    emitInterruptOutcome?: boolean;
+  } = {},
 ) {
   return new MastraAgent({
     agentId: "test-agent",

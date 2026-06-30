@@ -75,6 +75,26 @@ type RemoteMastraAgent = ReturnType<MastraClient["getAgent"]>;
  */
 export const MASTRA_BACKGROUND_TASK_ACTIVITY_TYPE = "mastra-background-task";
 
+// Shape of a remote resume response. Newer @mastra/client-js (>= the release
+// that added agent suspend/resume) exposes `resumeStream` on the remote Agent
+// resource; it returns a Response augmented with `processDataStream` — the same
+// callback-based stream the remote `.stream()` path consumes. We type it
+// structurally (not against the installed client-js) so the bridge compiles
+// against older client-js builds that predate `resumeStream`; the capability is
+// probed at runtime via `hasRemoteResume` before use.
+type RemoteResumeResponse = {
+  processDataStream?: (args: {
+    onChunk: (chunk: any) => void | Promise<void>;
+  }) => Promise<void>;
+};
+
+interface RemoteResumableAgent {
+  resumeStream(
+    resumeData: unknown,
+    options: Record<string, unknown>,
+  ): Promise<RemoteResumeResponse | null | undefined>;
+}
+
 export interface MastraAgentConfig extends AgentConfig {
   agent: LocalMastraAgent | RemoteMastraAgent;
   resourceId?: string;
@@ -105,17 +125,26 @@ export interface MastraAgentConfig extends AgentConfig {
    * `RUN_FINISHED.outcome={ type: "interrupt", interrupts: [...] }`, mapping each
    * Mastra tool suspend to an `Interrupt`.
    *
-   * Default **false**. Opt-in for the same reason as LangGraph's
-   * `emitInterruptOutcome`: released clients that drive resume through the
-   * legacy `forwardedProps.command.resume` channel (e.g. CopilotKit's runtime as
-   * of v1.60.1) stop sending a resume directive once they observe the structured
-   * outcome, which silently strands the run. Until those clients adopt the
-   * canonical resume protocol, emitting the outcome by default would break them.
+   * Default **true** (opt-out). The structured outcome is the canonical AG-UI
+   * interrupt path; clients on the canonical resume protocol drive resume via
+   * `RunAgentInput.resume`, which the bridge consumes here.
+   *
+   * REQUIRES a CopilotKit client **>= 1.61.2** (the release that reads
+   * `outcome:"interrupt"` and resumes via `RunAgentInput.resume`). On older
+   * clients (<= 1.61.1, incl. 1.60.1/1.61.0) the client records the structured
+   * interrupt but never addresses it on resume, stranding the run with
+   * `Thread has N pending interrupt(s) not addressed by resume`. **If you target
+   * a client below 1.61.2, set this to `false`** to fall back to the legacy
+   * `on_interrupt`-only path. (The bridge can't detect the client version — the
+   * CopilotKit client is the consumer app's dependency, not this package's —
+   * so the floor is a documented requirement, not an enforced one.)
    *
    * Independent of the legacy `CUSTOM(name="on_interrupt")` event, which is
-   * always emitted (backward compat). When this flag is on, BOTH the legacy
-   * event and the structured outcome are emitted; when off, only the legacy
-   * event plus a plain `RUN_FINISHED` — exactly as before this flag existed.
+   * always emitted (backward compat). When on, BOTH the legacy event and the
+   * structured outcome are emitted; when off, only the legacy event plus a plain
+   * `RUN_FINISHED` — exactly as before this flag existed. Resume itself consumes
+   * BOTH the legacy `forwardedProps.command.resume` and the standard
+   * `RunAgentInput.resume` channels regardless of this flag.
    */
   emitInterruptOutcome?: boolean;
 }
@@ -183,7 +212,7 @@ export class MastraAgent extends AbstractAgent {
   requestContext?: RequestContext;
   untilIdle?: boolean | { maxIdleMs?: number };
   public headers?: Record<string, string>;
-  /** See MastraAgentConfig.emitInterruptOutcome. Default false. */
+  /** See MastraAgentConfig.emitInterruptOutcome. Default true. */
   emitInterruptOutcome: boolean;
 
   constructor(private config: MastraAgentConfig) {
@@ -196,7 +225,7 @@ export class MastraAgent extends AbstractAgent {
       ...rest
     } = config;
     super(rest);
-    this.emitInterruptOutcome = emitInterruptOutcome ?? false;
+    this.emitInterruptOutcome = emitInterruptOutcome ?? true;
     this.agent = agent;
     this.resourceId = resourceId;
     this.requestContext = requestContext ?? new RequestContext();
@@ -239,7 +268,36 @@ export class MastraAgent extends AbstractAgent {
         // CopilotKit passes resume data via forwardedProps.command (convention
         // shared with LangGraph's interrupt bridge). forwardedProps is untyped
         // (any) — the caller is responsible for shape validation.
-        const forwardedCommand = input.forwardedProps?.command;
+        let forwardedCommand = input.forwardedProps?.command;
+
+        // Standard AG-UI resume channel: clients on the canonical interrupt path
+        // (CopilotKit >= 1.61.2) drive resume through `RunAgentInput.resume`
+        // (an array of { interruptId, status, payload }) instead of the legacy
+        // `forwardedProps.command`. Mastra fully overrides run(), so the base
+        // AbstractAgent reconcile of `input.resume` is bypassed — we consume it
+        // here. We normalize the first entry into the same internal command shape
+        // the legacy path uses, so a single resume block serves both channels.
+        //
+        // The Mastra snapshot runId (the resumeStream key) is NOT carried by a
+        // ResumeEntry — only `interruptId` round-trips. So we encode the runId
+        // into the emitted Interrupt id as `${runId}::${toolCallId}` (see
+        // suspendToInterrupt) and decode it back here.
+        if (!forwardedCommand?.interruptEvent && Array.isArray(input.resume)) {
+          const entry = input.resume.find(
+            (r) => r?.status === "resolved" || r?.status === "cancelled",
+          );
+          if (entry?.interruptId) {
+            const sep = entry.interruptId.indexOf("::");
+            const runId =
+              sep >= 0 ? entry.interruptId.slice(0, sep) : input.runId;
+            const toolCallId =
+              sep >= 0 ? entry.interruptId.slice(sep + 2) : entry.interruptId;
+            forwardedCommand = {
+              resume: entry.status === "cancelled" ? false : entry.payload,
+              interruptEvent: { toolCallId, runId },
+            };
+          }
+        }
 
         // resume: false means the user explicitly declined the tool call.
         // Close the run cleanly without calling resumeStream.
@@ -285,79 +343,146 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
-          // Remote agent resume is not yet supported — error, don't fake success
-          if (!this.isLocalMastraAgent(this.agent)) {
-            subscriber.error(
-              new Error(
-                "Resume from interrupt is not yet supported for remote Mastra agents",
-              ),
-            );
-            return;
+          // Resume options are shared verbatim by the local and remote paths.
+          // Mastra keys the suspended snapshot by the runId surfaced on the
+          // suspend chunk (round-tripped here as interruptEvent.runId), NOT the
+          // AG-UI RunAgentInput.runId — passing the latter fails remote resume
+          // with "No snapshot found for this workflow run". The remote instance
+          // loads that snapshot from configured storage, so `memory` must point
+          // at the same thread/resource the suspended run used.
+          const resumeOptions: Record<string, unknown> = {
+            toolCallId: interruptEvent.toolCallId,
+            runId: interruptEvent.runId,
+            memory: {
+              thread: input.threadId,
+              resource: this.resourceId ?? input.threadId,
+            },
+            requestContext: this.requestContext,
+          };
+          if (this.headers && Object.keys(this.headers).length > 0) {
+            resumeOptions.modelSettings = {
+              ...((resumeOptions.modelSettings as
+                | Record<string, unknown>
+                | undefined) ?? {}),
+              headers: this.headers,
+            };
           }
 
+          const callbacks = this.makeStreamCallbacks(
+            subscriber,
+            () => messageId,
+            (id) => {
+              messageId = id;
+            },
+            input.runId,
+            pendingInterrupts,
+          );
+
+          // Shared completion: emit a best-effort working-memory snapshot
+          // (no-op for remote agents, which have no local memory) then
+          // RUN_FINISHED. makeRunFinishedEvent attaches the structured
+          // interrupt outcome when emitInterruptOutcome is on (e.g. a chained
+          // interrupt in the resumed stream), so the resumed-run tail is
+          // identical for local and remote.
+          const finishResume = async () => {
+            await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
+            subscriber.next(
+              this.makeRunFinishedEvent(
+                input.threadId,
+                input.runId,
+                pendingInterrupts,
+              ),
+            );
+            subscriber.complete();
+          };
+
           try {
-            const resumeOptions: Record<string, unknown> = {
-              toolCallId: interruptEvent.toolCallId,
-              runId: interruptEvent.runId,
-              memory: {
-                thread: input.threadId,
-                resource: this.resourceId ?? input.threadId,
-              },
-              requestContext: this.requestContext,
-            };
-            if (this.headers && Object.keys(this.headers).length > 0) {
-              resumeOptions.modelSettings = {
-                ...((resumeOptions.modelSettings as
-                  | Record<string, unknown>
-                  | undefined) ?? {}),
-                headers: this.headers,
-              };
-            }
-            const response = await this.agent.resumeStream(
-              forwardedCommand.resume,
-              resumeOptions,
-            );
-
-            // Null/invalid response from resumeStream is an error
-            if (
-              !response ||
-              typeof response !== "object" ||
-              !response.fullStream
-            ) {
-              subscriber.error(
-                new Error(
-                  "resumeStream returned no valid response (missing fullStream)",
-                ),
+            if (this.isLocalMastraAgent(this.agent)) {
+              const response = await this.agent.resumeStream(
+                forwardedCommand.resume,
+                resumeOptions,
               );
-              return;
-            }
 
-            const callbacks = this.makeStreamCallbacks(
-              subscriber,
-              () => messageId,
-              (id) => {
-                messageId = id;
-              },
-              input.runId,
-              pendingInterrupts,
-            );
-            const hadError = await this.processFullStream(response.fullStream, {
-              ...callbacks,
-              onError: (error) => {
-                subscriber.error(error);
-              },
-            });
+              // Null/invalid response from resumeStream is an error
+              if (
+                !response ||
+                typeof response !== "object" ||
+                !response.fullStream
+              ) {
+                subscriber.error(
+                  new Error(
+                    "resumeStream returned no valid response (missing fullStream)",
+                  ),
+                );
+                return;
+              }
 
-            if (!hadError) {
-              await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
-              subscriber.next(
-                this.makeRunFinishedEvent(
-                  input.threadId,
-                  input.runId,
-                  pendingInterrupts,
-                ),
+              const hadError = await this.processFullStream(
+                response.fullStream,
+                {
+                  ...callbacks,
+                  onError: (error) => {
+                    subscriber.error(error);
+                  },
+                },
               );
-              subscriber.complete();
+
+              if (!hadError) {
+                await finishResume();
+              }
+            } else {
+              // Remote resume round-trips the suspend state + resume command
+              // over @mastra/client-js. The remote Agent's resumeStream returns
+              // a processDataStream response (callback-based), so we drive it
+              // through the same createChunkProcessor used by the remote
+              // .stream() path — single source of truth for chunk handling.
+              const remoteAgent = this
+                .agent as unknown as Partial<RemoteResumableAgent>;
+              if (typeof remoteAgent.resumeStream !== "function") {
+                subscriber.error(
+                  new Error(
+                    "Resume from interrupt requires a @mastra/client-js version that supports agent.resumeStream(); please upgrade @mastra/client-js",
+                  ),
+                );
+                return;
+              }
+
+              const response = await remoteAgent.resumeStream(
+                forwardedCommand.resume,
+                resumeOptions,
+              );
+
+              if (
+                !response ||
+                typeof response.processDataStream !== "function"
+              ) {
+                subscriber.error(
+                  new Error(
+                    "resumeStream returned no valid response (missing processDataStream)",
+                  ),
+                );
+                return;
+              }
+
+              let stopped = false;
+              const { handleChunk, flush } = this.createChunkProcessor({
+                ...callbacks,
+                onError: (error) => {
+                  subscriber.error(error);
+                },
+              });
+
+              await response.processDataStream({
+                onChunk: async (chunk: any) => {
+                  if (stopped) return;
+                  if (handleChunk(chunk)) stopped = true;
+                },
+              });
+
+              if (!stopped) {
+                flush();
+                await finishResume();
+              }
             }
           } catch (error) {
             subscriber.error(error);
@@ -530,8 +655,14 @@ export class MastraAgent extends AbstractAgent {
       responseSchema = rawSchema as Record<string, any>;
     }
 
+    // Encode the snapshot runId into the interrupt id as `${runId}::${toolCallId}`.
+    // A standard-path client (CopilotKit >= 1.61.2) only round-trips `interruptId`
+    // in its ResumeEntry — not metadata — so the id is the one channel that can
+    // carry the runId resume needs (see the input.resume consumer in run()).
+    // `toolCallId` stays its own field for the legacy path and for renderers.
+    const snapshotRunId = payload.runId ?? runId;
     return {
-      id: payload.toolCallId,
+      id: `${snapshotRunId}::${payload.toolCallId}`,
       reason: "mastra:tool_suspend",
       toolCallId: payload.toolCallId,
       ...(responseSchema ? { responseSchema } : {}),
@@ -543,7 +674,7 @@ export class MastraAgent extends AbstractAgent {
           args: payload.args,
           resumeSchema: payload.resumeSchema,
           // The id Mastra keys the suspended snapshot by (see onToolSuspended).
-          runId: payload.runId ?? runId,
+          runId: snapshotRunId,
         },
       },
     };
