@@ -25,10 +25,14 @@ test.describe("Interrupt (Suspend/Resume) Feature", () => {
     );
     await CopilotSelectors.sendButton(page).click();
 
-    // The interrupt picker renders, populated from the tool's suspend payload.
+    // The interrupt picker renders from the tool's suspend payload, with the
+    // generated time slots. The picker only mounts on a real suspend (driven by
+    // the on_interrupt event), so its presence + selectable slots is the
+    // deterministic interrupt signal. We don't assert the topic text: it comes
+    // from the model's tool-call args (`topic`), which the model doesn't fill
+    // deterministically (it often falls back to the generic "a call" label).
     const picker = page.getByTestId("interrupt-picker");
     await expect(picker).toBeVisible({ timeout: 30_000 });
-    await expect(picker).toContainText("sales team");
     await expect(picker.getByRole("button").first()).toBeVisible();
   });
 
