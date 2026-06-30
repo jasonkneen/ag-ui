@@ -118,21 +118,27 @@ export function collectError(
 // --- Agent factories (centralizes the `as any` cast) ---
 
 export function makeLocalMastraAgent(
-  opts: { memory?: FakeMemory; streamChunks?: any[] } = {},
+  opts: {
+    memory?: FakeMemory;
+    streamChunks?: any[];
+    emitInterruptOutcome?: boolean;
+  } = {},
 ) {
   return new MastraAgent({
     agentId: "test-agent",
     agent: new FakeLocalAgent(opts) as any,
     resourceId: "resource-1",
+    emitInterruptOutcome: opts.emitInterruptOutcome,
   });
 }
 
 export function makeRemoteMastraAgent(
-  opts: { streamChunks?: any[] } = {},
+  opts: { streamChunks?: any[]; emitInterruptOutcome?: boolean } = {},
 ) {
   return new MastraAgent({
     agentId: "test-agent",
     agent: new FakeRemoteAgent(opts) as any,
     resourceId: "resource-1",
+    emitInterruptOutcome: opts.emitInterruptOutcome,
   });
 }

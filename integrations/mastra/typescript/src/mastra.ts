@@ -4,6 +4,7 @@ import type {
   AgentConfig,
   BaseEvent,
   CustomEvent,
+  Interrupt,
   Message,
   ReasoningStartEvent,
   ReasoningMessageStartEvent,
@@ -12,6 +13,7 @@ import type {
   ReasoningEndEvent,
   RunAgentInput,
   RunFinishedEvent,
+  RunFinishedInterruptOutcome,
   RunStartedEvent,
   StateSnapshotEvent,
   TextMessageChunkEvent,
@@ -98,6 +100,24 @@ export interface MastraAgentConfig extends AgentConfig {
    * completion payload).
    */
   untilIdle?: boolean | { maxIdleMs?: number };
+  /**
+   * Terminate interrupted runs with the AG-UI structured outcome
+   * `RUN_FINISHED.outcome={ type: "interrupt", interrupts: [...] }`, mapping each
+   * Mastra tool suspend to an `Interrupt`.
+   *
+   * Default **false**. Opt-in for the same reason as LangGraph's
+   * `emitInterruptOutcome`: released clients that drive resume through the
+   * legacy `forwardedProps.command.resume` channel (e.g. CopilotKit's runtime as
+   * of v1.60.1) stop sending a resume directive once they observe the structured
+   * outcome, which silently strands the run. Until those clients adopt the
+   * canonical resume protocol, emitting the outcome by default would break them.
+   *
+   * Independent of the legacy `CUSTOM(name="on_interrupt")` event, which is
+   * always emitted (backward compat). When this flag is on, BOTH the legacy
+   * event and the structured outcome are emitted; when off, only the legacy
+   * event plus a plain `RUN_FINISHED` — exactly as before this flag existed.
+   */
+  emitInterruptOutcome?: boolean;
 }
 
 interface MastraAgentStreamOptions {
@@ -163,10 +183,20 @@ export class MastraAgent extends AbstractAgent {
   requestContext?: RequestContext;
   untilIdle?: boolean | { maxIdleMs?: number };
   public headers?: Record<string, string>;
+  /** See MastraAgentConfig.emitInterruptOutcome. Default false. */
+  emitInterruptOutcome: boolean;
 
   constructor(private config: MastraAgentConfig) {
-    const { agent, resourceId, requestContext, untilIdle, ...rest } = config;
+    const {
+      agent,
+      resourceId,
+      requestContext,
+      untilIdle,
+      emitInterruptOutcome,
+      ...rest
+    } = config;
     super(rest);
+    this.emitInterruptOutcome = emitInterruptOutcome ?? false;
     this.agent = agent;
     this.resourceId = resourceId;
     this.requestContext = requestContext ?? new RequestContext();
@@ -188,6 +218,13 @@ export class MastraAgent extends AbstractAgent {
     // dedupes instead of duplicating. Remote agents / older Mastra streams that
     // omit the start messageId keep using this fallback (and the rotation below).
     let messageId = randomUUID();
+
+    // Tool suspends collected this run, mapped to AG-UI Interrupts. Only
+    // populated when emitInterruptOutcome is on; the terminating RUN_FINISHED
+    // carries them as a structured `outcome` (see makeRunFinishedEvent). The
+    // legacy CUSTOM(on_interrupt) event is emitted regardless (see
+    // onToolSuspended).
+    const pendingInterrupts: Interrupt[] = [];
 
     return new Observable<BaseEvent>((subscriber) => {
       const run = async () => {
@@ -302,6 +339,7 @@ export class MastraAgent extends AbstractAgent {
                 messageId = id;
               },
               input.runId,
+              pendingInterrupts,
             );
             const hadError = await this.processFullStream(response.fullStream, {
               ...callbacks,
@@ -312,11 +350,13 @@ export class MastraAgent extends AbstractAgent {
 
             if (!hadError) {
               await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
-              subscriber.next({
-                type: EventType.RUN_FINISHED,
-                threadId: input.threadId,
-                runId: input.runId,
-              } as RunFinishedEvent);
+              subscriber.next(
+                this.makeRunFinishedEvent(
+                  input.threadId,
+                  input.runId,
+                  pendingInterrupts,
+                ),
+              );
               subscriber.complete();
             }
           } catch (error) {
@@ -408,6 +448,7 @@ export class MastraAgent extends AbstractAgent {
               messageId = id;
             },
             input.runId,
+            pendingInterrupts,
           );
 
           await this.streamMastraAgent(input, {
@@ -417,11 +458,13 @@ export class MastraAgent extends AbstractAgent {
             },
             onRunFinished: async () => {
               await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
-              subscriber.next({
-                type: EventType.RUN_FINISHED,
-                threadId: input.threadId,
-                runId: input.runId,
-              } as RunFinishedEvent);
+              subscriber.next(
+                this.makeRunFinishedEvent(
+                  input.threadId,
+                  input.runId,
+                  pendingInterrupts,
+                ),
+              );
               subscriber.complete();
             },
           });
@@ -443,6 +486,95 @@ export class MastraAgent extends AbstractAgent {
     agent: LocalMastraAgent | RemoteMastraAgent,
   ): agent is LocalMastraAgent {
     return "getMemory" in agent;
+  }
+
+  /**
+   * Maps a Mastra tool suspend to an AG-UI {@link Interrupt}.
+   *
+   * `id` is the suspended tool call id — the correlation key resume sends back
+   * (alongside `runId`) via `resumeStream`. `responseSchema` is the parsed
+   * `resumeSchema` (Mastra hands it over as a JSON string). Everything the
+   * resume round-trip needs that has no first-class Interrupt field
+   * (`toolName`, `suspendPayload`, `args`, the snapshot-keying `runId`) is
+   * preserved under `metadata.mastra`, shaped like the legacy on_interrupt
+   * value so a standard-path client can reconstruct the resume directive.
+   */
+  private suspendToInterrupt(
+    payload: {
+      toolCallId: string;
+      toolName: string;
+      suspendPayload: any;
+      args: Record<string, any>;
+      resumeSchema: string;
+      runId?: string;
+    },
+    runId: string,
+  ): Interrupt {
+    let responseSchema: Record<string, any> | undefined;
+    const rawSchema = payload.resumeSchema as unknown;
+    if (typeof rawSchema === "string" && rawSchema.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(rawSchema);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          responseSchema = parsed;
+        }
+      } catch {
+        // resumeSchema is not valid JSON — omit responseSchema; the raw value
+        // is still carried in metadata.mastra below.
+      }
+    } else if (
+      rawSchema &&
+      typeof rawSchema === "object" &&
+      !Array.isArray(rawSchema)
+    ) {
+      responseSchema = rawSchema as Record<string, any>;
+    }
+
+    return {
+      id: payload.toolCallId,
+      reason: "mastra:tool_suspend",
+      toolCallId: payload.toolCallId,
+      ...(responseSchema ? { responseSchema } : {}),
+      metadata: {
+        mastra: {
+          type: "mastra_suspend",
+          toolName: payload.toolName,
+          suspendPayload: payload.suspendPayload,
+          args: payload.args,
+          resumeSchema: payload.resumeSchema,
+          // The id Mastra keys the suspended snapshot by (see onToolSuspended).
+          runId: payload.runId ?? runId,
+        },
+      },
+    };
+  }
+
+  /**
+   * Builds the terminating RUN_FINISHED for a run. When emitInterruptOutcome is
+   * on AND the run suspended at least one tool, attaches the structured
+   * `outcome: { type: "interrupt", interrupts }`. Otherwise emits a plain
+   * RUN_FINISHED — the legacy/default behavior. Mirrors LangGraph's
+   * `dispatchInterruptFinish`.
+   */
+  private makeRunFinishedEvent(
+    threadId: string,
+    runId: string,
+    interrupts: Interrupt[],
+  ): RunFinishedEvent {
+    const includeOutcome = this.emitInterruptOutcome && interrupts.length > 0;
+    return {
+      type: EventType.RUN_FINISHED,
+      threadId,
+      runId,
+      ...(includeOutcome
+        ? {
+            outcome: {
+              type: "interrupt",
+              interrupts,
+            } satisfies RunFinishedInterruptOutcome,
+          }
+        : {}),
+    } as RunFinishedEvent;
   }
 
   /**
@@ -513,6 +645,7 @@ export class MastraAgent extends AbstractAgent {
     getMessageId: () => string,
     setMessageId: (id: string) => void,
     runId: string,
+    pendingInterrupts: Interrupt[],
   ): Omit<MastraAgentStreamOptions, "onError" | "onRunFinished"> {
     let reasoningMessageId: string | null = null;
     let isReasoning = false;
@@ -603,6 +736,8 @@ export class MastraAgent extends AbstractAgent {
         } as ToolCallResultEvent);
       },
       onToolSuspended: (payload) => {
+        // Legacy path: always emitted (backward compat, owner decision). The
+        // wrapper stays even when emitInterruptOutcome is on.
         subscriber.next({
           type: EventType.CUSTOM,
           name: "on_interrupt",
@@ -619,6 +754,13 @@ export class MastraAgent extends AbstractAgent {
             runId: payload.runId ?? runId,
           }),
         } as CustomEvent);
+
+        // Standard path (opt-in): accumulate the suspend as an AG-UI Interrupt
+        // so the terminating RUN_FINISHED carries the structured outcome. Kept
+        // separate from the legacy event above — both fire when the flag is on.
+        if (this.emitInterruptOutcome) {
+          pendingInterrupts.push(this.suspendToInterrupt(payload, runId));
+        }
       },
       onFinishMessagePart: () => {
         closeReasoning();
