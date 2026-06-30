@@ -241,23 +241,10 @@ export class MastraAgent extends AbstractAgent {
   }
 
   /**
-   * Forwards the AG-UI `RunAgentInput.context` onto Mastra's `RequestContext`
-   * under the reserved `"ag-ui"` key, shaped `{ context }`. This is the channel
-   * a Mastra tool reads it back from — `execute(input, { requestContext })`
-   * receives the same RequestContext we pass to `agent.stream()` /
-   * `agent.resumeStream()`, so a tool does:
-   *
-   *   const { context } = requestContext.get("ag-ui") ?? {};
-   *
-   * It is also visible to dynamic `instructions`/option functions, which Mastra
-   * invokes with `{ requestContext }`. This is the idiomatic peer of LangGraph's
-   * graph-state context channel (`state["ag-ui"].context`).
-   *
-   * Called on EVERY entry path — initial stream, local resume, AND remote
-   * resume — because a resumed run carries a *fresh* `input.context` that must
-   * replace whatever was set on the prior turn. The resume paths previously
-   * reused `this.requestContext` verbatim and silently dropped the new context
-   * (OSS-392); routing every path through here closes that drop.
+   * Forwards `input.context` onto the Mastra RequestContext under "ag-ui", so a
+   * tool reads it via `requestContext.get("ag-ui").context`. Called on every
+   * entry path (initial stream + both resume paths) so a resumed run forwards
+   * its own context instead of reusing the prior turn's.
    */
   private applyInputContext(context: RunAgentInput["context"]): RequestContext {
     this.requestContext ??= new RequestContext();
@@ -368,10 +355,7 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
-          // Forward THIS run's context onto the RequestContext before resuming.
-          // The resume request carries a fresh `input.context`; without re-setting
-          // it here the resumed stream (local or remote) would reuse the prior
-          // turn's value and drop the new context (OSS-392).
+          // Re-set this run's context so resume forwards it, not the prior turn's.
           const resumeRequestContext = this.applyInputContext(input.context);
 
           // Resume options are shared verbatim by the local and remote paths.

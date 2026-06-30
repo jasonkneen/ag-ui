@@ -8,16 +8,10 @@ import {
   collectEvents,
 } from "./helpers";
 
-// ---------------------------------------------------------------------------
-// OSS-392: input.context must be forwarded onto Mastra's RequestContext under
-// the "ag-ui" key, reachable by tools via `execute(input, { requestContext })`,
-// on the initial run AND after resume on BOTH the local and remote paths.
-//
-// These tests read the context BACK through the exact RequestContext.get()
-// channel a Mastra tool uses — not merely asserting the option is present — so
-// they prove reachability, not plumbing. (A real-LLM run with a tool that calls
-// requestContext.get("ag-ui") covers the live Mastra runtime end-to-end.)
-// ---------------------------------------------------------------------------
+// input.context must be forwarded onto the RequestContext under "ag-ui",
+// reachable by tools, on the initial run and after resume (local + remote).
+// These read the context back through the same requestContext.get("ag-ui")
+// channel a tool uses, so they prove reachability rather than plumbing.
 
 const CONTEXT_A: Context[] = [{ description: "tier", value: "premium" }];
 const CONTEXT_B: Context[] = [{ description: "tier", value: "enterprise" }];
@@ -80,7 +74,7 @@ function standardResumeInput(context: Context[]) {
   } as any);
 }
 
-describe("context forwarding (OSS-392): initial run", () => {
+describe("context forwarding: initial run", () => {
   it("forwards input.context onto requestContext for a local agent", async () => {
     const { agent, fake } = makeLocal({
       streamChunks: [{ type: "text-delta", payload: { text: "hi" } }],
@@ -112,7 +106,7 @@ describe("context forwarding (OSS-392): initial run", () => {
   });
 });
 
-describe("context forwarding (OSS-392): resume re-sets context", () => {
+describe("context forwarding: resume re-sets context", () => {
   it("forwards the resume request's context on a local legacy-channel resume", async () => {
     const { agent, fake } = makeLocal({
       resumeChunks: [{ type: "text-delta", payload: { text: "approved" } }],
@@ -145,12 +139,9 @@ describe("context forwarding (OSS-392): resume re-sets context", () => {
   });
 });
 
-describe("context forwarding (OSS-392): resume does not reuse a stale context", () => {
-  // The bug this guards: the resume path reused the constructor/initial-run
-  // requestContext verbatim and never re-set input.context, so a resume request
-  // carrying a NEW context silently saw the prior turn's value. We reuse a
-  // single agent instance (shared this.requestContext) across an initial run
-  // then a resume, and assert the resume sees the fresh context, not the stale.
+describe("context forwarding: resume does not reuse a stale context", () => {
+  // Reuse one agent instance (shared requestContext) across an initial run then
+  // a resume, asserting the resume sees the fresh context, not the prior turn's.
 
   it("local resume overwrites the prior run's context (does not drop the new one)", async () => {
     const fake = new FakeLocalAgent({
