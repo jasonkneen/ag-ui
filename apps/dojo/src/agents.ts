@@ -146,6 +146,9 @@ export const agentsIntegrations = {
       // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
       mastraClient: mastraClient as any,
       resourceId: "mastra-agent-remote",
+      // Surface Observational Memory background work as AG-UI activity events
+      // for the `observational_memory` demo only (default OFF for all others).
+      observationalMemory: ["observational_memory"],
     }) as Promise<
       Record<
         | "agentic_chat"
@@ -158,7 +161,8 @@ export const agentsIntegrations = {
         | "tool_based_generative_ui"
         | "a2ui_dynamic_schema"
         | "a2ui_recovery"
-        | "a2ui_fixed_schema",
+        | "a2ui_fixed_schema"
+        | "observational_memory",
         AbstractAgent
       >
     >;
@@ -170,6 +174,9 @@ export const agentsIntegrations = {
       // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
       mastra: mastra as any,
       resourceId: "mastra-agent-local",
+      // Surface Observational Memory background work as AG-UI activity events
+      // for the `observational_memory` demo only (default OFF for all others).
+      observationalMemory: ["observational_memory"],
     });
     // Override the A2UI agents with wrappers carrying the a2ui auto-inject
     // config. The underlying agents wire NO tool — the bridge auto-injects
@@ -204,7 +211,8 @@ export const agentsIntegrations = {
       | "background_agents"
       | "a2ui_dynamic_schema"
       | "a2ui_recovery"
-      | "a2ui_fixed_schema",
+      | "a2ui_fixed_schema"
+      | "observational_memory",
       AbstractAgent
     >;
   },

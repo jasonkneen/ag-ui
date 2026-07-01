@@ -190,13 +190,28 @@ export function convertAGUIMessagesToMastra(
 export interface GetRemoteAgentsOptions {
   mastraClient: MastraClient;
   resourceId: string;
+  /**
+   * Surface Mastra Observational Memory (OM) background work as AG-UI activity
+   * events (activityType `mastra-observational-memory`). `true` enables it for
+   * every agent; pass an array of agent ids to enable it only for those.
+   * Default OFF. The remote agent must have OM enabled on its Memory server-side
+   * — this only controls whether the bridge surfaces the `data-om-*` chunks it
+   * streams. See `MastraAgentConfig.observationalMemory`.
+   */
+  observationalMemory?: boolean | string[];
 }
 
 export async function getRemoteAgents({
   mastraClient,
   resourceId,
+  observationalMemory,
 }: GetRemoteAgentsOptions): Promise<Record<string, AbstractAgent>> {
   const agents = await mastraClient.listAgents();
+
+  const wantsObservationalMemory = (agentId: string): boolean =>
+    observationalMemory === true ||
+    (Array.isArray(observationalMemory) &&
+      observationalMemory.includes(agentId));
 
   return Object.entries(agents).reduce(
     (acc, [agentId]) => {
@@ -209,6 +224,9 @@ export async function getRemoteAgents({
         // Enables syncing input.state into the remote server's working memory
         // (client -> agent shared state), mirroring the local path.
         remoteClient: mastraClient,
+        observationalMemory: wantsObservationalMemory(agentId)
+          ? true
+          : undefined,
       });
 
       return acc;
@@ -227,6 +245,13 @@ export interface GetLocalAgentsOptions {
    * agent ids to enable it only for those. See `MastraAgentConfig.untilIdle`.
    */
   untilIdle?: boolean | string[];
+  /**
+   * Surface Mastra Observational Memory (OM) background work as AG-UI activity
+   * events (activityType `mastra-observational-memory`). `true` enables it for
+   * every agent; pass an array of agent ids to enable it only for those.
+   * Default OFF. See `MastraAgentConfig.observationalMemory`.
+   */
+  observationalMemory?: boolean | string[];
 }
 
 export function getLocalAgents({
@@ -234,12 +259,18 @@ export function getLocalAgents({
   resourceId,
   requestContext,
   untilIdle,
+  observationalMemory,
 }: GetLocalAgentsOptions): Record<string, AbstractAgent> {
   const agents = mastra.listAgents() || {};
 
   const wantsUntilIdle = (agentId: string): boolean =>
     untilIdle === true ||
     (Array.isArray(untilIdle) && untilIdle.includes(agentId));
+
+  const wantsObservationalMemory = (agentId: string): boolean =>
+    observationalMemory === true ||
+    (Array.isArray(observationalMemory) &&
+      observationalMemory.includes(agentId));
 
   const agentAGUI = Object.entries(agents).reduce(
     (acc, [agentId, agent]) => {
@@ -249,6 +280,9 @@ export function getLocalAgents({
         resourceId,
         requestContext,
         untilIdle: wantsUntilIdle(agentId) ? true : undefined,
+        observationalMemory: wantsObservationalMemory(agentId)
+          ? true
+          : undefined,
       });
       return acc;
     },
