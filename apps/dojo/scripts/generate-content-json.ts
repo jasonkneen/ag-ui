@@ -207,6 +207,13 @@ const agentFilesMapper: Record<
         `/mastra/typescript/examples/src/mastra/agents/a2ui.ts`,
       ),
     ],
+    a2ui_fixed_schema: [
+      path.join(
+        __dirname,
+        integrationsFolderPath,
+        `/mastra/typescript/examples/src/mastra/agents/a2ui-fixed.ts`,
+      ),
+    ],
   }),
 
   "mastra-agent-local": () => ({
@@ -234,6 +241,9 @@ const agentFilesMapper: Record<
     ],
     a2ui_recovery: [
       path.join(__dirname, "../src/mastra/agents/a2ui.ts"),
+    ],
+    a2ui_fixed_schema: [
+      path.join(__dirname, "../src/mastra/agents/a2ui-fixed.ts"),
     ],
   }),
 

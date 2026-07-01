@@ -328,4 +328,14 @@ describe("planA2UIInjection (Mastra auto-inject)", () => {
     });
     expect(plan).toBeNull();
   });
+
+  it("explicit backend injectA2UITool:false opts out even when forwarded true (fixed-schema owns its tool)", () => {
+    const plan = planA2UIInjection({
+      model: "openai/gpt-4.1",
+      input: makeInput({ injectA2UITool: true }),
+      existingToolNames: ["search_hotels", "search_flights"],
+      config: { injectA2UITool: false },
+    });
+    expect(plan).toBeNull();
+  });
 });

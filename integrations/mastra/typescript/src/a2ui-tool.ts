@@ -533,6 +533,12 @@ export function planA2UIInjection<TModel = A2UISubagentModel>(
   const { input, existingToolNames, config } = args;
   const log = args.log ?? console;
 
+  // Explicit backend opt-out wins even over a forwarded `true`: an agent that
+  // OWNS a fixed-schema A2UI tool sets `a2ui.injectA2UITool:false` so the bridge
+  // never auto-injects `generate_a2ui` alongside its own direct tool, even when
+  // the runtime blanket-forwards the flag to every A2UI agent.
+  if (config?.injectA2UITool === false) return null;
+
   const forwarded = input.forwardedProps as
     | { injectA2UITool?: boolean | string }
     | undefined;

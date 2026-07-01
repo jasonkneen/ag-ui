@@ -10,6 +10,7 @@ import { backendToolRenderingAgent } from "./agents/backend-tool-rendering";
 import { humanInTheLoopAgent } from "./agents/human-in-the-loop";
 import { interruptAgent } from "./agents/interrupt";
 import { a2uiDynamicSchemaAgent, a2uiRecoveryAgent } from "./agents/a2ui";
+import { a2uiFixedSchemaAgent } from "./agents/a2ui-fixed";
 
 export const mastra = new Mastra({
   server: {
@@ -26,6 +27,7 @@ export const mastra = new Mastra({
     interrupt: interruptAgent,
     a2ui_dynamic_schema: a2uiDynamicSchemaAgent,
     a2ui_recovery: a2uiRecoveryAgent,
+    a2ui_fixed_schema: a2uiFixedSchemaAgent,
   },
   // File-backed (not ":memory:"): suspend/resume persists the agentic-loop
   // workflow snapshot to instance storage and loads it on resumeStream. An

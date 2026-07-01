@@ -21,6 +21,7 @@ import {
   a2uiRecoveryAgent,
   a2uiInjectConfig,
 } from "./mastra/agents/a2ui";
+import { a2uiFixedSchemaAgent } from "./mastra/agents/a2ui-fixed";
 import { PydanticAIAgent } from "@ag-ui/pydantic-ai";
 import { ADKAgent } from "@ag-ui/adk";
 import { SpringAiAgent } from "@ag-ui/spring-ai";
@@ -155,7 +156,8 @@ export const agentsIntegrations = {
         | "interrupt"
         | "tool_based_generative_ui"
         | "a2ui_dynamic_schema"
-        | "a2ui_recovery",
+        | "a2ui_recovery"
+        | "a2ui_fixed_schema",
         AbstractAgent
       >
     >;
@@ -178,10 +180,19 @@ export const agentsIntegrations = {
         resourceId: "mastra-agent-local",
         a2ui: a2uiInjectConfig,
       }) as unknown as AbstractAgent;
+    // Fixed-schema owns its own direct tools — opt OUT of auto-injection so the
+    // bridge never adds generate_a2ui alongside search_flights/search_hotels.
+    const wrapA2UIFixed = (agent: unknown): AbstractAgent =>
+      new MastraAgent({
+        agent: agent as any,
+        resourceId: "mastra-agent-local",
+        a2ui: { injectA2UITool: false },
+      }) as unknown as AbstractAgent;
     return {
       ...base,
       a2ui_dynamic_schema: wrapA2UI(a2uiDynamicSchemaAgent),
       a2ui_recovery: wrapA2UI(a2uiRecoveryAgent),
+      a2ui_fixed_schema: wrapA2UIFixed(a2uiFixedSchemaAgent),
     } as Record<
       | "agentic_chat"
       | "backend_tool_rendering"
@@ -191,7 +202,8 @@ export const agentsIntegrations = {
       | "tool_based_generative_ui"
       | "background_agents"
       | "a2ui_dynamic_schema"
-      | "a2ui_recovery",
+      | "a2ui_recovery"
+      | "a2ui_fixed_schema",
       AbstractAgent
     >;
   },
