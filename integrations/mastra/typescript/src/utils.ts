@@ -7,6 +7,15 @@ import { Agent as LocalMastraAgent } from "@mastra/core/agent";
 import { RequestContext } from "@mastra/core/request-context";
 import { MastraAgent } from "./mastra";
 
+/**
+ * CoreMessage extended with an optional `id` field.
+ * Mastra's `inputToMastraDBMessage` checks `"id" in message` at runtime
+ * and preserves it when present, but the upstream AI SDK type doesn't
+ * declare the field. This type makes the pass-through explicit.
+ * Ref: https://github.com/mastra-ai/mastra/blob/13f46064564fc4aee14aa11878f9352d79f4efc4/packages/core/src/agent/message-list/conversion/input-converter.ts#L79
+ */
+type CoreMessageWithId = CoreMessage & { id?: string };
+
 function mediaSourceToUrl(source: InputContentDataSource | InputContentUrlSource): string {
   if (source.type === "data") {
     return `data:${source.mimeType};base64,${source.value}`;
@@ -92,8 +101,23 @@ const toMastraContent = (content: Message["content"]): string | any[] => {
   return parts;
 };
 
-export function convertAGUIMessagesToMastra(messages: Message[]): CoreMessage[] {
-  const result: CoreMessage[] = [];
+export function convertAGUIMessagesToMastra(
+  messages: Message[],
+  // Messages to resolve a tool message's toolName against. Defaults to
+  // `messages`, but callers that send only a diff (the new turn) must pass the
+  // full incoming history here: a tool-result's matching assistant tool-call
+  // may have been filtered out of `messages`, and resolving toolName to
+  // "unknown" makes Mastra store a broken tool result (the model then re-calls).
+  lookupMessages: Message[] = messages,
+): CoreMessageWithId[] {
+  // Preserve AG-UI message IDs on the CoreMessage objects (see CoreMessageWithId).
+  // Mastra's AIV4Adapter.fromCoreMessage reads `id` when present, which enables
+  // Mastra's MessageHistory processor to deduplicate re-sent history:
+  //   - processInput filters historical messages whose IDs match the input IDs
+  //   - storage.saveMessages upserts by ID, so re-sent history won't duplicate
+  // The `id` key is omitted when undefined so it doesn't defeat Mastra's
+  // `"id" in message` check.
+  const result: CoreMessageWithId[] = [];
 
   for (const message of messages) {
     if (message.role === "assistant") {
@@ -111,18 +135,20 @@ export function convertAGUIMessagesToMastra(messages: Message[]): CoreMessage[] 
         });
       }
       result.push({
+        ...(message.id !== undefined ? { id: message.id } : {}),
         role: "assistant",
         content: parts,
-      });
+      } as CoreMessage);
     } else if (message.role === "user") {
       const userContent = toMastraContent(message.content);
       result.push({
+        ...(message.id !== undefined ? { id: message.id } : {}),
         role: "user",
         content: userContent,
-      });
+      } as CoreMessage);
     } else if (message.role === "tool") {
       let toolName = "unknown";
-      for (const msg of messages) {
+      for (const msg of lookupMessages) {
         if (msg.role === "assistant") {
           for (const toolCall of msg.toolCalls ?? []) {
             if (toolCall.id === message.toolCallId) {
@@ -133,6 +159,7 @@ export function convertAGUIMessagesToMastra(messages: Message[]): CoreMessage[] 
         }
       }
       result.push({
+        ...(message.id !== undefined ? { id: message.id } : {}),
         role: "tool",
         content: [
           {
@@ -142,7 +169,7 @@ export function convertAGUIMessagesToMastra(messages: Message[]): CoreMessage[] 
             result: message.content,
           },
         ],
-      });
+      } as CoreMessage);
     }
   }
 
@@ -180,14 +207,25 @@ export interface GetLocalAgentsOptions {
   mastra: Mastra;
   resourceId: string;
   requestContext?: RequestContext;
+  /**
+   * Enable Mastra's `untilIdle` run mode (background-task lifecycle piped into
+   * the run's fullStream). `true` enables it for every agent; pass an array of
+   * agent ids to enable it only for those. See `MastraAgentConfig.untilIdle`.
+   */
+  untilIdle?: boolean | string[];
 }
 
 export function getLocalAgents({
   mastra,
   resourceId,
   requestContext,
+  untilIdle,
 }: GetLocalAgentsOptions): Record<string, AbstractAgent> {
   const agents = mastra.listAgents() || {};
+
+  const wantsUntilIdle = (agentId: string): boolean =>
+    untilIdle === true ||
+    (Array.isArray(untilIdle) && untilIdle.includes(agentId));
 
   const agentAGUI = Object.entries(agents).reduce(
     (acc, [agentId, agent]) => {
@@ -196,6 +234,7 @@ export function getLocalAgents({
         agent,
         resourceId,
         requestContext,
+        untilIdle: wantsUntilIdle(agentId) ? true : undefined,
       });
       return acc;
     },

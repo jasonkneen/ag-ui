@@ -16,11 +16,13 @@ type envVars = {
   agentFrameworkPythonUrl: string;
   a2aUrl: string;
   agentFrameworkDotnetUrl: string;
+  aguiDotnetUrl: string;
   a2aMiddlewareBuildingsManagementUrl: string;
   a2aMiddlewareFinanceUrl: string;
   a2aMiddlewareItUrl: string;
   a2aMiddlewareOrchestratorUrl: string;
   awsStrandsUrl: string;
+  awsStrandsTypescriptUrl: string;
   claudeAgentSdkPythonUrl: string;
   claudeAgentSdkTypescriptUrl: string;
   langroidUrl: string;
@@ -63,6 +65,7 @@ export default function getEnvVars(): envVars {
       process.env.AGENT_FRAMEWORK_PYTHON_URL || "http://localhost:8015",
     agentFrameworkDotnetUrl:
       process.env.AGENT_FRAMEWORK_DOTNET_URL || "http://localhost:8016",
+    aguiDotnetUrl: process.env.AGUI_DOTNET_URL || "http://localhost:8023",
     springAiUrl: process.env.SPRING_AI_URL || "http://localhost:8080",
     a2aUrl: process.env.A2A_URL || "http://localhost:10002",
     a2aMiddlewareBuildingsManagementUrl:
@@ -75,6 +78,8 @@ export default function getEnvVars(): envVars {
     a2aMiddlewareOrchestratorUrl:
       process.env.A2A_MIDDLEWARE_ORCHESTRATOR_URL || "http://localhost:9000",
     awsStrandsUrl: process.env.AWS_STRANDS_URL || "http://localhost:8000",
+    awsStrandsTypescriptUrl:
+      process.env.AWS_STRANDS_TYPESCRIPT_URL || "http://localhost:8022",
     claudeAgentSdkPythonUrl:
       process.env.CLAUDE_AGENT_SDK_PYTHON_URL || "http://localhost:8019",
     claudeAgentSdkTypescriptUrl:
