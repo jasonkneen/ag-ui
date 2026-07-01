@@ -193,6 +193,20 @@ const agentFilesMapper: Record<
         `/mastra/typescript/examples/src/mastra/agents/tool-based-generative-ui.ts`,
       ),
     ],
+    a2ui_dynamic_schema: [
+      path.join(
+        __dirname,
+        integrationsFolderPath,
+        `/mastra/typescript/examples/src/mastra/agents/a2ui.ts`,
+      ),
+    ],
+    a2ui_recovery: [
+      path.join(
+        __dirname,
+        integrationsFolderPath,
+        `/mastra/typescript/examples/src/mastra/agents/a2ui.ts`,
+      ),
+    ],
   }),
 
   "mastra-agent-local": () => ({
@@ -214,6 +228,12 @@ const agentFilesMapper: Record<
     ],
     tool_based_generative_ui: [
       path.join(__dirname, "../src/mastra/agents/tool-based-generative-ui.ts"),
+    ],
+    a2ui_dynamic_schema: [
+      path.join(__dirname, "../src/mastra/agents/a2ui.ts"),
+    ],
+    a2ui_recovery: [
+      path.join(__dirname, "../src/mastra/agents/a2ui.ts"),
     ],
   }),
 

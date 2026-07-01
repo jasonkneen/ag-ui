@@ -9,6 +9,7 @@ import { toolBasedGenerativeUIAgent } from "./agents/tool-based-generative-ui";
 import { backendToolRenderingAgent } from "./agents/backend-tool-rendering";
 import { humanInTheLoopAgent } from "./agents/human-in-the-loop";
 import { interruptAgent } from "./agents/interrupt";
+import { a2uiDynamicSchemaAgent, a2uiRecoveryAgent } from "./agents/a2ui";
 
 export const mastra = new Mastra({
   server: {
@@ -23,6 +24,8 @@ export const mastra = new Mastra({
     backend_tool_rendering: backendToolRenderingAgent,
     human_in_the_loop: humanInTheLoopAgent,
     interrupt: interruptAgent,
+    a2ui_dynamic_schema: a2uiDynamicSchemaAgent,
+    a2ui_recovery: a2uiRecoveryAgent,
   },
   // File-backed (not ":memory:"): suspend/resume persists the agentic-loop
   // workflow snapshot to instance storage and loads it on resumeStream. An
@@ -30,7 +33,7 @@ export const mastra = new Mastra({
   // snapshot can't be found on resume ("No snapshot found for this workflow
   // run"). Powers the `interrupt` demo's remote resume (OSS-380).
   storage: new LibSQLStore({
-    id: 'mastra-storage',
+    id: "mastra-storage",
     url: "file:../mastra.db",
   }),
   logger: new PinoLogger({

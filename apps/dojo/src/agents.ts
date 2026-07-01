@@ -16,6 +16,11 @@ import { LlamaIndexAgent } from "@ag-ui/llamaindex";
 import { CrewAIAgent } from "@ag-ui/crewai";
 import getEnvVars from "./env";
 import { mastra } from "./mastra";
+import {
+  a2uiDynamicSchemaAgent,
+  a2uiRecoveryAgent,
+  a2uiInjectConfig,
+} from "./mastra/agents/a2ui";
 import { PydanticAIAgent } from "@ag-ui/pydantic-ai";
 import { ADKAgent } from "@ag-ui/adk";
 import { SpringAiAgent } from "@ag-ui/spring-ai";
@@ -148,26 +153,45 @@ export const agentsIntegrations = {
         | "backend_tool_rendering"
         | "human_in_the_loop"
         | "interrupt"
-        | "tool_based_generative_ui",
+        | "tool_based_generative_ui"
+        | "a2ui_dynamic_schema"
+        | "a2ui_recovery",
         AbstractAgent
       >
     >;
   },
 
   "mastra-agent-local": async () => {
-    return MastraAgent.getLocalAgents({
+    const base = MastraAgent.getLocalAgents({
       // Cast needed: pnpm may resolve separate @mastra/core installations
       // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
       mastra: mastra as any,
       resourceId: "mastra-agent-local",
-    }) as Record<
+    });
+    // Override the A2UI agents with wrappers carrying the a2ui auto-inject
+    // config. The underlying agents wire NO tool — the bridge auto-injects
+    // `generate_a2ui` per run (pillar 1). Config MUST go through the constructor
+    // so the runtime's per-request `clone()` preserves it.
+    const wrapA2UI = (agent: unknown): AbstractAgent =>
+      new MastraAgent({
+        agent: agent as any,
+        resourceId: "mastra-agent-local",
+        a2ui: a2uiInjectConfig,
+      }) as unknown as AbstractAgent;
+    return {
+      ...base,
+      a2ui_dynamic_schema: wrapA2UI(a2uiDynamicSchemaAgent),
+      a2ui_recovery: wrapA2UI(a2uiRecoveryAgent),
+    } as Record<
       | "agentic_chat"
       | "backend_tool_rendering"
       | "human_in_the_loop"
       | "interrupt"
       | "shared_state"
       | "tool_based_generative_ui"
-      | "background_agents",
+      | "background_agents"
+      | "a2ui_dynamic_schema"
+      | "a2ui_recovery",
       AbstractAgent
     >;
   },
