@@ -1254,6 +1254,14 @@ export class MastraAgent extends AbstractAgent {
           };
           if (!p.toolCallId) break;
           if (p.phase === "start") {
+            // Flush the buffered OUTER `generate_a2ui` tool-call onto the wire
+            // FIRST, so the A2UIMiddleware has registered it as the active outer
+            // call before this inner `render_a2ui` starts. That keys the streamed
+            // surface to the outer call, so the final generate_a2ui result
+            // envelope lands on the SAME activity id and REPLACES the streamed
+            // surface (single paint) instead of duplicating it — and lets the
+            // envelope be intercepted (no residual generate_a2ui tool card).
+            flush();
             callbacks.onToolCallStart?.({
               toolCallId: p.toolCallId,
               toolName: p.toolName ?? "render_a2ui",
@@ -1645,7 +1653,8 @@ export class MastraAgent extends AbstractAgent {
             ...clientToolNames,
           ];
           const plan = planA2UIInjection({
-            model: this.a2ui?.model ?? (this.agent as { model?: unknown }).model,
+            model:
+              this.a2ui?.model ?? (this.agent as { model?: unknown }).model,
             input: {
               forwardedProps,
               context: inputContext,

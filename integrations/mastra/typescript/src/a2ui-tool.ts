@@ -412,8 +412,7 @@ export function getA2UITools<TModel = A2UISubagentModel>(
       // middleware gate uses the same validator); exhaustion returns a
       // structured ``a2ui_recovery_exhausted`` envelope so the conversation
       // stays usable.
-      const streamed = ctx.writer?.custom != null;
-      const { envelope, ok } = await runA2UIGenerationWithRecovery({
+      const { envelope } = await runA2UIGenerationWithRecovery({
         basePrompt: prep.prompt,
         catalog,
         config: recovery,
@@ -436,16 +435,14 @@ export function getA2UITools<TModel = A2UISubagentModel>(
             defaultCatalogId,
           }),
       });
-      // When we streamed the render (pillar 2) AND it succeeded, the surface was
-      // already painted progressively from the inner render_a2ui deltas. Returning
-      // the a2ui_operations envelope again would DOUBLE-paint (the runtime keys the
-      // streamed surface and the final tool-result envelope under different
-      // activity ids). Return a non-painting sentinel so the streamed surface
-      // stands. On failure (recovery exhausted) nothing valid was streamed — return
-      // the structured envelope so the failure UI renders.
-      if (streamed && ok) {
-        return { status: "a2ui_streamed" };
-      }
+      // Always return the real a2ui_operations envelope. The progressive render
+      // (streamed via writer.custom) is keyed to THIS generate_a2ui call — the
+      // bridge flushes the outer call onto the wire before the inner render
+      // deltas — so the runtime paints the streamed surface and this final
+      // envelope under the SAME activity id: the envelope replaces (not
+      // duplicates) the streamed surface, and being an a2ui result it is
+      // intercepted (no residual generate_a2ui tool card). On exhaustion the
+      // envelope carries the a2ui_recovery_exhausted failure instead.
       return parseEnvelope(envelope);
     },
   });
