@@ -29,21 +29,42 @@ export class FakeMemory {
 export class FakeLocalAgent {
   memory: FakeMemory;
   streamChunks: any[];
+  resumeChunks: any[] | undefined;
   /** Messages passed to the most recent stream() call (post-diff-filter). */
   lastStreamMessages: any[] | null = null;
+  /** Options passed to the most recent stream() call. */
+  lastStreamOpts: any = null;
+  /** Options passed to the most recent resumeStream() call. */
+  lastResumeOpts: any = null;
 
-  constructor(opts: { memory?: FakeMemory; streamChunks?: any[] } = {}) {
+  constructor(
+    opts: { memory?: FakeMemory; streamChunks?: any[]; resumeChunks?: any[] } = {},
+  ) {
     this.memory = opts.memory ?? new FakeMemory();
     this.streamChunks = opts.streamChunks ?? [];
+    this.resumeChunks = opts.resumeChunks;
   }
 
   async getMemory(_opts?: any) {
     return this.memory;
   }
 
-  async stream(messages: any, _opts?: any) {
+  async stream(messages: any, opts?: any) {
     this.lastStreamMessages = messages;
+    this.lastStreamOpts = opts;
     const chunks = this.streamChunks;
+    return {
+      fullStream: (async function* () {
+        for (const chunk of chunks) {
+          yield chunk;
+        }
+      })(),
+    };
+  }
+
+  async resumeStream(_resumeData: any, opts?: any) {
+    this.lastResumeOpts = opts;
+    const chunks = this.resumeChunks ?? [];
     return {
       fullStream: (async function* () {
         for (const chunk of chunks) {
@@ -68,8 +89,12 @@ export class FakeRemoteAgent {
     this.resumeChunks = opts.resumeChunks;
   }
 
-  async stream(messages: any, _opts?: any) {
+  /** Options passed to the most recent stream() call. */
+  lastStreamOpts: any = null;
+
+  async stream(messages: any, opts?: any) {
     this.lastStreamMessages = messages;
+    this.lastStreamOpts = opts;
     const chunks = this.streamChunks;
     return {
       processDataStream: async ({
@@ -143,6 +168,7 @@ export function makeLocalMastraAgent(
   opts: {
     memory?: FakeMemory;
     streamChunks?: any[];
+    resumeChunks?: any[];
     emitInterruptOutcome?: boolean;
   } = {},
 ) {

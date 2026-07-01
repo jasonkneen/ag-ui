@@ -240,6 +240,18 @@ export class MastraAgent extends AbstractAgent {
     return cloned;
   }
 
+  /**
+   * Forwards `input.context` onto the Mastra RequestContext under "ag-ui", so a
+   * tool reads it via `requestContext.get("ag-ui").context`. Called on every
+   * entry path (initial stream + both resume paths) so a resumed run forwards
+   * its own context instead of reusing the prior turn's.
+   */
+  private applyInputContext(context: RunAgentInput["context"]): RequestContext {
+    this.requestContext ??= new RequestContext();
+    this.requestContext.set("ag-ui", { context });
+    return this.requestContext;
+  }
+
   run(input: RunAgentInput): Observable<BaseEvent> {
     // Fallback id used only until Mastra announces the persisted message id on
     // the start / step-start chunk (see onMessageId). Adopting Mastra's id
@@ -343,6 +355,9 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
+          // Re-set this run's context so resume forwards it, not the prior turn's.
+          const resumeRequestContext = this.applyInputContext(input.context);
+
           // Resume options are shared verbatim by the local and remote paths.
           // Mastra keys the suspended snapshot by the runId surfaced on the
           // suspend chunk (round-tripped here as interruptEvent.runId), NOT the
@@ -357,7 +372,7 @@ export class MastraAgent extends AbstractAgent {
               thread: input.threadId,
               resource: this.resourceId ?? input.threadId,
             },
-            requestContext: this.requestContext,
+            requestContext: resumeRequestContext,
           };
           if (this.headers && Object.keys(this.headers).length > 0) {
             resumeOptions.modelSettings = {
@@ -1422,8 +1437,7 @@ export class MastraAgent extends AbstractAgent {
       messagesToSend,
       messages,
     );
-    this.requestContext?.set("ag-ui", { context: inputContext });
-    const requestContext = this.requestContext;
+    const requestContext = this.applyInputContext(inputContext);
 
     if (this.isLocalMastraAgent(this.agent)) {
       try {
