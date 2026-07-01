@@ -164,11 +164,23 @@ interface MastraAgentStreamOptions {
   onReasoningPart?: (text: string) => void;
   onReasoningEnd?: () => void;
   onFinishMessagePart?: () => void;
-  onToolCallPart?: (streamPart: {
+  /** Emit TOOL_CALL_START. Fired once per tool call, before any args. */
+  onToolCallStart?: (streamPart: {
     toolCallId: string;
     toolName: string;
-    args: any;
   }) => void;
+  /**
+   * Emit a TOOL_CALL_ARGS delta. The bridge streams these incrementally as
+   * Mastra emits `tool-call-delta` chunks (raw JSON-text fragments), or emits
+   * a single full-args delta on the fall-back path (older @mastra/core that
+   * only emits the final `tool-call` chunk).
+   */
+  onToolCallArgs?: (streamPart: {
+    toolCallId: string;
+    argsTextDelta: string;
+  }) => void;
+  /** Emit TOOL_CALL_END. Fired once per tool call, after all args. */
+  onToolCallEnd?: (streamPart: { toolCallId: string }) => void;
   onToolResultPart?: (streamPart: { toolCallId: string; result: any }) => void;
   onError: (error: Error) => void;
   onRunFinished?: () => Promise<void>;
@@ -854,7 +866,7 @@ export class MastraAgent extends AbstractAgent {
           delta: text,
         } as TextMessageChunkEvent);
       },
-      onToolCallPart: (streamPart) => {
+      onToolCallStart: (streamPart) => {
         closeReasoning();
         subscriber.next({
           type: EventType.TOOL_CALL_START,
@@ -862,11 +874,15 @@ export class MastraAgent extends AbstractAgent {
           toolCallId: streamPart.toolCallId,
           toolCallName: streamPart.toolName,
         } as ToolCallStartEvent);
+      },
+      onToolCallArgs: (streamPart) => {
         subscriber.next({
           type: EventType.TOOL_CALL_ARGS,
           toolCallId: streamPart.toolCallId,
-          delta: JSON.stringify(streamPart.args),
+          delta: streamPart.argsTextDelta,
         } as ToolCallArgsEvent);
+      },
+      onToolCallEnd: (streamPart) => {
         subscriber.next({
           type: EventType.TOOL_CALL_END,
           toolCallId: streamPart.toolCallId,
@@ -933,10 +949,27 @@ export class MastraAgent extends AbstractAgent {
 
   /**
    * Creates a stateful chunk processor that maps Mastra stream chunks to
-   * AG-UI events via callbacks. Buffers tool-call chunks: if followed by
+   * AG-UI events via callbacks.
+   *
+   * Tool-call args are streamed incrementally: Mastra emits
+   * `tool-call-input-streaming-start` → one or more `tool-call-delta` (each a
+   * raw JSON-text fragment) → `tool-call-input-streaming-end` → a final
+   * `tool-call` (with the assembled args) as the model produces the call.
+   * When those delta chunks are present we emit TOOL_CALL_START on the start
+   * chunk, a TOOL_CALL_ARGS per delta, and TOOL_CALL_END on the end chunk —
+   * so the client renders args as they arrive. The trailing `tool-call` for an
+   * already-streamed id is a no-op (args were already emitted).
+   *
+   * Fall-back (backwards compatibility): older @mastra/core in the supported
+   * 1.0.x floor may emit only the final `tool-call` with no delta chunks. In
+   * that case we buffer the `tool-call` and emit a single START + full-args
+   * ARGS + END when it flushes. This buffered path also preserves the
+   * suspend protocol: if a buffered tool-call is followed by
    * tool-call-suspended, the TOOL_CALL_* events are suppressed (the tool
    * hasn't executed yet — emitting them confuses CopilotKit's orchestration
-   * which expects a TOOL_CALL_RESULT to follow).
+   * which expects a TOOL_CALL_RESULT to follow). Suspendable tools are
+   * server-side and travel the buffered path; client/generative tools (which
+   * never suspend) are the ones whose args stream incrementally.
    *
    * Used by both the local agent path (async iterable) and the remote agent
    * path (processDataStream callback) — single source of truth for chunk
@@ -946,17 +979,62 @@ export class MastraAgent extends AbstractAgent {
    *   - `handleChunk`: processes a single chunk; returns `true` if processing should stop (error or malformed chunk).
    *   - `flush`: emits any buffered tool-call (call at end of stream).
    */
-  private createChunkProcessor(callbacks: MastraAgentStreamOptions) {
+  private createChunkProcessor(
+    callbacks: MastraAgentStreamOptions,
+    clientToolNames: Set<string> = new Set(),
+  ) {
+    // Only CLIENT (frontend) tools stream their args live — they are the
+    // generative-UI tools that benefit from progressive rendering, and they
+    // never suspend or background. SERVER tools take the buffered path below so
+    // a following `tool-call-suspended` / `background-task-started` can still
+    // suppress the normal render (you cannot retract an already-emitted live
+    // arg stream). The bridge knows which tools are client tools because they
+    // arrive in `RunAgentInput.tools` (→ `clientTools`); server tools live on
+    // the Mastra agent and are absent from that set.
+    const isClientTool = (toolName?: string) =>
+      !!toolName && clientToolNames.has(toolName);
+
+    // Floor / fall-back path: a final `tool-call` with no preceding client
+    // delta stream is buffered here so a following tool-call-suspended /
+    // background-task-started can suppress it (and reuse its args). Tool calls
+    // that streamed deltas live are NOT buffered.
     let pendingToolCall: {
       toolCallId: string;
       toolName: string;
       args: any;
     } | null = null;
+    // Tool calls for which we have emitted TOOL_CALL_START via the streaming
+    // (delta) path, and (separately) for which we have emitted TOOL_CALL_END.
+    const streamedStarted = new Set<string>();
+    const streamedEnded = new Set<string>();
+
+    const startStreamedToolCall = (toolCallId: string, toolName: string) => {
+      if (!streamedStarted.has(toolCallId)) {
+        streamedStarted.add(toolCallId);
+        callbacks.onToolCallStart?.({ toolCallId, toolName });
+      }
+    };
+
+    const endStreamedToolCall = (toolCallId: string) => {
+      if (streamedStarted.has(toolCallId) && !streamedEnded.has(toolCallId)) {
+        streamedEnded.add(toolCallId);
+        callbacks.onToolCallEnd?.({ toolCallId });
+      }
+    };
 
     const flush = () => {
       if (pendingToolCall) {
-        callbacks.onToolCallPart?.(pendingToolCall);
+        const { toolCallId, toolName, args } = pendingToolCall;
         pendingToolCall = null;
+        callbacks.onToolCallStart?.({ toolCallId, toolName });
+        callbacks.onToolCallArgs?.({
+          toolCallId,
+          // The buffered path has the assembled args object — serialize the
+          // whole thing as a single delta (the streaming path emits the raw
+          // JSON-text fragments instead).
+          argsTextDelta: JSON.stringify(args ?? {}),
+        });
+        callbacks.onToolCallEnd?.({ toolCallId });
       }
     };
 
@@ -1046,13 +1124,58 @@ export class MastraAgent extends AbstractAgent {
           callbacks.onTextPart?.(chunk.payload.text);
           break;
         }
-        case "tool-call": {
+        // Tool-call args stream incrementally: start → delta(s) → end → the
+        // final `tool-call`. For CLIENT tools we emit these live (progressive
+        // render). For SERVER tools we ignore the delta chunks and buffer the
+        // final `tool-call` (below) so it stays suppressible.
+        case "tool-call-input-streaming-start": {
+          // A new tool call begins — flush any prior buffered (floor-path) call.
           flush();
-          pendingToolCall = {
-            toolCallId: chunk.payload.toolCallId,
-            toolName: chunk.payload.toolName,
-            args: chunk.payload.args,
-          };
+          if (
+            chunk.payload.toolCallId &&
+            isClientTool(chunk.payload.toolName)
+          ) {
+            startStreamedToolCall(
+              chunk.payload.toolCallId,
+              chunk.payload.toolName,
+            );
+          }
+          break;
+        }
+        case "tool-call-delta": {
+          const { toolCallId, argsTextDelta } = chunk.payload;
+          // Only forward deltas for a call we opened as a live (client) stream.
+          // Server-tool deltas are ignored; their args ride the final
+          // `tool-call` chunk into the buffered path.
+          if (
+            toolCallId &&
+            streamedStarted.has(toolCallId) &&
+            argsTextDelta != null
+          ) {
+            callbacks.onToolCallArgs?.({ toolCallId, argsTextDelta });
+          }
+          break;
+        }
+        case "tool-call-input-streaming-end": {
+          if (chunk.payload.toolCallId) {
+            endStreamedToolCall(chunk.payload.toolCallId);
+          }
+          break;
+        }
+        case "tool-call": {
+          const { toolCallId, toolName, args } = chunk.payload;
+          if (toolCallId && streamedStarted.has(toolCallId)) {
+            // Client tool: args were already streamed live via deltas — close
+            // the call (the streaming-end chunk may have been absent) and don't
+            // re-emit.
+            endStreamedToolCall(toolCallId);
+            break;
+          }
+          // Server tool (or a client tool that emitted no deltas): buffer so a
+          // following tool-call-suspended / background-task-started can suppress
+          // it and reuse its args, matching the pre-streaming behavior.
+          flush();
+          pendingToolCall = { toolCallId, toolName, args };
           break;
         }
         case "tool-result": {
@@ -1298,8 +1421,12 @@ export class MastraAgent extends AbstractAgent {
   private async processFullStream(
     stream: AsyncIterable<any>,
     callbacks: MastraAgentStreamOptions,
+    clientToolNames: Set<string> = new Set(),
   ): Promise<boolean> {
-    const { handleChunk, flush } = this.createChunkProcessor(callbacks);
+    const { handleChunk, flush } = this.createChunkProcessor(
+      callbacks,
+      clientToolNames,
+    );
     for await (const chunk of stream) {
       if (handleChunk(chunk)) return true;
     }
@@ -1394,7 +1521,9 @@ export class MastraAgent extends AbstractAgent {
       onReasoningPart,
       onReasoningEnd,
       onFinishMessagePart,
-      onToolCallPart,
+      onToolCallStart,
+      onToolCallArgs,
+      onToolCallEnd,
       onToolResultPart,
       onToolSuspended,
       onActivitySnapshot,
@@ -1413,6 +1542,11 @@ export class MastraAgent extends AbstractAgent {
         return acc;
       },
       {} as Record<string, any>,
+    );
+    // Names of the frontend tools — only these stream their args live (see
+    // createChunkProcessor). Server tools (on the Mastra agent) are absent here.
+    const clientToolNames = new Set<string>(
+      tools.map((tool) => tool.name as string),
     );
     const resourceId = this.resourceId ?? threadId;
 
@@ -1471,20 +1605,26 @@ export class MastraAgent extends AbstractAgent {
         );
 
         if (response && typeof response === "object") {
-          const hadError = await this.processFullStream(response.fullStream, {
-            onMessageId,
-            onTextPart,
-            onReasoningStart,
-            onReasoningPart,
-            onReasoningEnd,
-            onFinishMessagePart,
-            onToolCallPart,
-            onToolResultPart,
-            onToolSuspended,
-            onActivitySnapshot,
-            onActivityDelta,
-            onError,
-          });
+          const hadError = await this.processFullStream(
+            response.fullStream,
+            {
+              onMessageId,
+              onTextPart,
+              onReasoningStart,
+              onReasoningPart,
+              onReasoningEnd,
+              onFinishMessagePart,
+              onToolCallStart,
+              onToolCallArgs,
+              onToolCallEnd,
+              onToolResultPart,
+              onToolSuspended,
+              onActivitySnapshot,
+              onActivityDelta,
+              onError,
+            },
+            clientToolNames,
+          );
 
           if (!hadError) await onRunFinished?.();
         } else {
@@ -1521,20 +1661,25 @@ export class MastraAgent extends AbstractAgent {
         // Remote agents use processDataStream (callback-based) — share
         // chunk handling logic via createChunkProcessor.
         if (response && typeof response.processDataStream === "function") {
-          const { handleChunk, flush } = this.createChunkProcessor({
-            onMessageId,
-            onTextPart,
-            onReasoningStart,
-            onReasoningPart,
-            onReasoningEnd,
-            onFinishMessagePart,
-            onToolCallPart,
-            onToolResultPart,
-            onToolSuspended,
-            onActivitySnapshot,
-            onActivityDelta,
-            onError,
-          });
+          const { handleChunk, flush } = this.createChunkProcessor(
+            {
+              onMessageId,
+              onTextPart,
+              onReasoningStart,
+              onReasoningPart,
+              onReasoningEnd,
+              onFinishMessagePart,
+              onToolCallStart,
+              onToolCallArgs,
+              onToolCallEnd,
+              onToolResultPart,
+              onToolSuspended,
+              onActivitySnapshot,
+              onActivityDelta,
+              onError,
+            },
+            clientToolNames,
+          );
 
           await response.processDataStream({
             onChunk: async (chunk: any) => {
