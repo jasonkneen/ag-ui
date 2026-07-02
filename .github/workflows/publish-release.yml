@@ -1246,7 +1246,6 @@ jobs:
           dotnet build src/AGUI.Protobuf/AGUI.Protobuf.csproj -c Release --no-incremental
           dotnet build src/AGUI.Client/AGUI.Client.csproj -c Release --no-incremental
           dotnet build src/AGUI.Server/AGUI.Server.csproj -c Release --no-incremental
-          dotnet build src/AGUI/AGUI.csproj -c Release --no-incremental
 
       - name: Pack NuGet packages
         shell: bash
