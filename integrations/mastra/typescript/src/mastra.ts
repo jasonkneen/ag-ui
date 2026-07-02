@@ -317,10 +317,46 @@ function extractLastAssistantText(uiMessages: unknown): string | undefined {
 export const MASTRA_OBSERVATIONAL_MEMORY_ACTIVITY_TYPE =
   "mastra-observational-memory";
 
+/**
+ * Mastra tracing options threaded into the underlying `agent.stream(...)` /
+ * `agent.resumeStream(...)` call. Typed structurally (not against
+ * `@mastra/core`) so the bridge compiles on any supported core in the peer
+ * range — cores predating observability v-next simply ignore an unknown
+ * `tracingOptions` key. Mirrors Mastra's `TracingOptions`:
+ *   - `traceId`: a caller-chosen trace id to anchor the run under (lets a client
+ *     self-assign a trace it already knows, e.g. to attach feedback later).
+ *   - `metadata`: arbitrary key/values attached to the run's root trace span.
+ */
+export interface MastraTracingOptions {
+  traceId?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface MastraAgentConfig extends AgentConfig {
   agent: LocalMastraAgent | RemoteMastraAgent;
   resourceId?: string;
   requestContext?: RequestContext;
+  /**
+   * Forward Mastra tracing options into the run's `agent.stream(...)` (and the
+   * resume path). Chiefly lets a caller inject a self-chosen `traceId` so the
+   * Mastra execution trace is anchored to an id the client already knows,
+   * enabling trace-centric feedback/scores (`createFeedback({ traceId })`).
+   *
+   * NOT per-run: this config (and any `traceId` in it) is stored once on the
+   * agent instance and reused verbatim for EVERY run of that instance. So a
+   * config-level `tracingOptions.traceId` is applied to every run, not to a
+   * single run, meaning a caller who sets a fixed `traceId` here and reuses one
+   * `MastraAgent` across many runs collapses all those runs onto a single trace.
+   * Callers who want a distinct traceId per run should construct a fresh agent
+   * per run (the `registerCopilotKit` / `getLocalAgents` path already does this,
+   * since agents are constructed inside the per-request route handler).
+   *
+   * The OUTBOUND execution traceId surfaced on `RUN_FINISHED.result` IS per-run:
+   * when no inbound `traceId` is set, Mastra generates one for that run, which
+   * the bridge surfaces back to the client (see {@link makeRunFinishedEvent}).
+   * Inert on cores that predate Mastra observability v-next.
+   */
+  tracingOptions?: MastraTracingOptions;
   /**
    * Opt into Mastra's `untilIdle` run mode (local agents only). When set, the
    * bridge passes `untilIdle` to `agent.stream(...)`, which subscribes to the
@@ -463,7 +499,13 @@ interface MastraAgentStreamOptions {
   onToolCallEnd?: (streamPart: { toolCallId: string }) => void;
   onToolResultPart?: (streamPart: { toolCallId: string; result: any }) => void;
   onError: (error: Error) => void;
-  onRunFinished?: () => Promise<void>;
+  /**
+   * Terminate the run with RUN_FINISHED. Receives the Mastra execution traceId
+   * (Mastra observability v-next) when the consumed stream exposed one, so the
+   * bridge can surface it on `RUN_FINISHED.result` (see makeRunFinishedEvent).
+   * traceId is undefined on cores/streams that don't expose one.
+   */
+  onRunFinished?: (traceId?: string) => Promise<void>;
   onToolSuspended: (payload: {
     toolCallId: string;
     toolName: string;
@@ -520,6 +562,7 @@ export class MastraAgent extends AbstractAgent {
   requestContext?: RequestContext;
   untilIdle?: boolean | { maxIdleMs?: number };
   observationalMemory?: boolean;
+  tracingOptions?: MastraTracingOptions;
   public headers?: Record<string, string>;
   /** See MastraAgentConfig.emitInterruptOutcome. Default true. */
   emitInterruptOutcome: boolean;
@@ -555,6 +598,7 @@ export class MastraAgent extends AbstractAgent {
       resourceId,
       requestContext,
       untilIdle,
+      tracingOptions,
       emitInterruptOutcome,
       a2ui,
       remoteClient,
@@ -572,6 +616,7 @@ export class MastraAgent extends AbstractAgent {
     this.remoteClient = remoteClient;
     this.useProcessedFinalText = useProcessedFinalText ?? false;
     this.observationalMemory = observationalMemory;
+    this.tracingOptions = tracingOptions;
   }
 
   public clone() {
@@ -716,6 +761,9 @@ export class MastraAgent extends AbstractAgent {
             },
             requestContext: resumeRequestContext,
           };
+          if (this.tracingOptions) {
+            resumeOptions.tracingOptions = this.tracingOptions;
+          }
           if (this.headers && Object.keys(this.headers).length > 0) {
             resumeOptions.modelSettings = {
               ...((resumeOptions.modelSettings as
@@ -741,13 +789,14 @@ export class MastraAgent extends AbstractAgent {
           // interrupt outcome when emitInterruptOutcome is on (e.g. a chained
           // interrupt in the resumed stream), so the resumed-run tail is
           // identical for local and remote.
-          const finishResume = async () => {
+          const finishResume = async (traceId?: string) => {
             await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
             subscriber.next(
               this.makeRunFinishedEvent(
                 input.threadId,
                 input.runId,
                 pendingInterrupts,
+                traceId,
               ),
             );
             subscriber.complete();
@@ -785,7 +834,7 @@ export class MastraAgent extends AbstractAgent {
               );
 
               if (!hadError) {
-                await finishResume();
+                await finishResume(await this.resolveTraceId(response));
               }
             } else {
               // Remote resume round-trips the suspend state + resume command
@@ -838,7 +887,7 @@ export class MastraAgent extends AbstractAgent {
 
               if (!stopped) {
                 flush();
-                await finishResume();
+                await finishResume(await this.resolveTraceId(response));
               }
             }
           } catch (error) {
@@ -875,13 +924,14 @@ export class MastraAgent extends AbstractAgent {
             onError: (error) => {
               subscriber.error(error);
             },
-            onRunFinished: async () => {
+            onRunFinished: async (traceId) => {
               await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
               subscriber.next(
                 this.makeRunFinishedEvent(
                   input.threadId,
                   input.runId,
                   pendingInterrupts,
+                  traceId,
                 ),
               );
               subscriber.complete();
@@ -980,17 +1030,25 @@ export class MastraAgent extends AbstractAgent {
    * `outcome: { type: "interrupt", interrupts }`. Otherwise emits a plain
    * RUN_FINISHED — the legacy/default behavior. Mirrors LangGraph's
    * `dispatchInterruptFinish`.
+   *
+   * When the run exposed a Mastra execution traceId (Mastra observability
+   * v-next), it is surfaced on `RUN_FINISHED.result` as `{ traceId }` so the
+   * client/runtime can correlate the produced assistant message with its trace
+   * (e.g. to anchor trace-centric feedback/scores). `result` is left unset
+   * otherwise, preserving the prior event shape.
    */
   private makeRunFinishedEvent(
     threadId: string,
     runId: string,
     interrupts: Interrupt[],
+    traceId?: string,
   ): RunFinishedEvent {
     const includeOutcome = this.emitInterruptOutcome && interrupts.length > 0;
     return {
       type: EventType.RUN_FINISHED,
       threadId,
       runId,
+      ...(traceId ? { result: { traceId } } : {}),
       ...(includeOutcome
         ? {
             outcome: {
@@ -2490,6 +2548,33 @@ export class MastraAgent extends AbstractAgent {
   }
 
   /**
+   * Reads the Mastra execution traceId off a consumed stream response, if any.
+   *
+   * `traceId` is exposed by Mastra observability v-next on the stream response
+   * (`MastraModelOutput.traceId`); it may be a plain string or a Promise that
+   * resolves after the stream is consumed, so we await a thenable. Probed
+   * structurally so the bridge stays compatible with cores / remote clients
+   * that don't expose it (they simply yield undefined). Best-effort: a read
+   * that throws is swallowed so it never blocks RUN_FINISHED.
+   */
+  private async resolveTraceId(response: unknown): Promise<string | undefined> {
+    if (!response || typeof response !== "object") return undefined;
+    try {
+      const raw = (response as { traceId?: unknown }).traceId;
+      const traceId =
+        raw && typeof (raw as PromiseLike<unknown>).then === "function"
+          ? await (raw as PromiseLike<unknown>)
+          : raw;
+      return typeof traceId === "string" && traceId.length > 0
+        ? traceId
+        : undefined;
+    } catch (error) {
+      console.warn("[MastraAgent] Failed to read execution traceId:", error);
+      return undefined;
+    }
+  }
+
+  /**
    * Streams a local or remote Mastra agent, emitting AG-UI events via callbacks.
    * For local agents, iterates fullStream with processFullStream.
    * For remote agents, uses processDataStream with createChunkProcessor.
@@ -2631,6 +2716,9 @@ export class MastraAgent extends AbstractAgent {
         if (this.untilIdle) {
           streamOptions.untilIdle = this.untilIdle;
         }
+        if (this.tracingOptions) {
+          streamOptions.tracingOptions = this.tracingOptions;
+        }
         if (this.headers && Object.keys(this.headers).length > 0) {
           streamOptions.modelSettings = {
             ...((streamOptions.modelSettings as
@@ -2669,7 +2757,10 @@ export class MastraAgent extends AbstractAgent {
             initialState,
           );
 
-          if (!hadError) await onRunFinished?.();
+          if (!hadError) {
+            const traceId = await this.resolveTraceId(response);
+            await onRunFinished?.(traceId);
+          }
         } else {
           throw new Error("Invalid response from local agent");
         }
@@ -2688,6 +2779,9 @@ export class MastraAgent extends AbstractAgent {
           clientTools,
           requestContext,
         };
+        if (this.tracingOptions) {
+          streamOptions.tracingOptions = this.tracingOptions;
+        }
         if (this.headers && Object.keys(this.headers).length > 0) {
           streamOptions.modelSettings = {
             ...((streamOptions.modelSettings as
@@ -2734,7 +2828,10 @@ export class MastraAgent extends AbstractAgent {
             },
           });
           if (!stopped) flush();
-          if (!stopped) await onRunFinished?.();
+          if (!stopped) {
+            const traceId = await this.resolveTraceId(response);
+            await onRunFinished?.(traceId);
+          }
         } else {
           throw new Error("Invalid response from remote agent");
         }
