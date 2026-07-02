@@ -67,7 +67,7 @@ PY
 
   PACKAGE_ID=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')
   RESPONSE=$(mktemp)
-  STATUS=$(curl -sS --max-time 30 \
+  STATUS=$(curl --compressed -sS --max-time 30 \
     -w '%{http_code}' \
     -o "$RESPONSE" \
     "https://api.nuget.org/v3/registration5-gz-semver2/${PACKAGE_ID}/index.json" || true)
