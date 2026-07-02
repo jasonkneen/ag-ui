@@ -1241,12 +1241,12 @@ jobs:
         working-directory: sdks/dotnet
         run: |
           set -euo pipefail
-          dotnet build src/AGUI.Abstractions/AGUI.Abstractions.csproj -c Release
-          dotnet build src/AGUI.Formatting/AGUI.Formatting.csproj -c Release
-          dotnet build src/AGUI.Protobuf/AGUI.Protobuf.csproj -c Release
-          dotnet build src/AGUI.Client/AGUI.Client.csproj -c Release
-          dotnet build src/AGUI.Server/AGUI.Server.csproj -c Release
-          dotnet build src/AGUI/AGUI.csproj -c Release
+          dotnet build src/AGUI.Abstractions/AGUI.Abstractions.csproj -c Release --no-incremental
+          dotnet build src/AGUI.Formatting/AGUI.Formatting.csproj -c Release --no-incremental
+          dotnet build src/AGUI.Protobuf/AGUI.Protobuf.csproj -c Release --no-incremental
+          dotnet build src/AGUI.Client/AGUI.Client.csproj -c Release --no-incremental
+          dotnet build src/AGUI.Server/AGUI.Server.csproj -c Release --no-incremental
+          dotnet build src/AGUI/AGUI.csproj -c Release --no-incremental
 
       - name: Pack NuGet packages
         shell: bash
