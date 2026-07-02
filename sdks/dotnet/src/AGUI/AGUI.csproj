@@ -8,6 +8,7 @@
     <Description>Umbrella package for the AG-UI .NET SDK, including client, server, formatting, protobuf, and protocol abstractions.</Description>
     <PackageTags>$(PackageTags);sdk;umbrella</PackageTags>
     <IncludeBuildOutput>false</IncludeBuildOutput>
+    <IncludeSymbols>false</IncludeSymbols>
   </PropertyGroup>
 
   <ItemGroup>
