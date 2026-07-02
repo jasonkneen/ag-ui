@@ -51,7 +51,7 @@
   <ItemGroup Condition="'$(IsPackable)' == 'true'">
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
     <None Include="$(MSBuildThisFileDirectory)PACKAGE.md" Pack="true" PackagePath="\README.md" />
-    <None Include="$(MSBuildThisFileDirectory)..\..\docs\logo\AG-UI logo_light.png" Pack="true" PackagePath="\icon.png" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\docs\logo\AG-UI logo_dark.png" Pack="true" PackagePath="\icon.png" />
   </ItemGroup>
 
   <PropertyGroup Condition=" '$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == 'net472' ">
