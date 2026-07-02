@@ -217,6 +217,49 @@ interface RemoteResumableAgent {
   ): Promise<RemoteResumeResponse | null | undefined>;
 }
 
+/**
+ * Walks `finish.payload.response.uiMessages` to pull the final assistant text
+ * after Mastra's output processors have run.
+ *
+ * Returns `undefined` when:
+ *   - `uiMessages` is absent (older Mastra, or a non-finish chunk),
+ *   - no assistant message is present,
+ *   - the assistant message contains no text parts (tool-only response),
+ * so callers can fall back to the buffered raw text.
+ *
+ * Accepts both string content and array-of-parts content shapes (Mastra's
+ * UIMessage tolerates either depending on how the agent assembled its
+ * response).
+ */
+function extractLastAssistantText(uiMessages: unknown): string | undefined {
+  if (!Array.isArray(uiMessages)) return undefined;
+  for (let i = uiMessages.length - 1; i >= 0; i--) {
+    const message = uiMessages[i];
+    if (!message || (message as { role?: string }).role !== "assistant") {
+      continue;
+    }
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") {
+      return content.length > 0 ? content : undefined;
+    }
+    if (Array.isArray(content)) {
+      const text = content
+        .filter(
+          (part: any): part is { type: "text"; text: string } =>
+            part?.type === "text" && typeof part.text === "string",
+        )
+        .map((part) => part.text)
+        .join("");
+      return text.length > 0 ? text : undefined;
+    }
+    // Some UIMessage shapes expose pre-joined text via a `text` field.
+    const text = (message as { text?: unknown }).text;
+    if (typeof text === "string" && text.length > 0) return text;
+    return undefined;
+  }
+  return undefined;
+}
+
 export interface MastraAgentConfig extends AgentConfig {
   agent: LocalMastraAgent | RemoteMastraAgent;
   resourceId?: string;
@@ -287,6 +330,31 @@ export interface MastraAgentConfig extends AgentConfig {
    * own `Memory` instance).
    */
   remoteClient?: MastraClient;
+  /**
+   * When the configured agent uses `outputProcessors` that rewrite assistant
+   * text (e.g. character-voice transforms, redaction, format normalization),
+   * the processor-modified text is available only on the `finish` /
+   * `step-finish` chunk's `payload.response.uiMessages` — surfaced upstream in
+   * https://github.com/mastra-ai/mastra/pull/11549 to expose processor output
+   * through streaming.
+   *
+   * Set to `true` to buffer intermediate `text-delta` chunks and emit only the
+   * processor-modified text extracted from that boundary's `uiMessages`. When a
+   * boundary has no usable `uiMessages` (older Mastra, or processors that did
+   * not modify text), the buffered raw text is emitted on the terminal `finish`
+   * as a fallback so no text is ever dropped.
+   *
+   * Default: `false` (current behavior — text-delta chunks stream to the client
+   * in real time, processor rewrites are not surfaced).
+   *
+   * Trade-off: enabling this loses real-time text streaming — the final
+   * assistant text appears at once after the agent's last step. Required when
+   * downstream consumers (e.g. CopilotKit chat UI) must render the
+   * post-processor text rather than the raw LLM output.
+   *
+   * Tracking: https://github.com/ag-ui-protocol/ag-ui/issues/1726
+   */
+  useProcessedFinalText?: boolean;
 }
 
 interface MastraAgentStreamOptions {
@@ -386,6 +454,8 @@ export class MastraAgent extends AbstractAgent {
   a2ui?: A2UIInjectConfig;
   /** See MastraAgentConfig.remoteClient. Set for remote agents only. */
   remoteClient?: MastraClient;
+  /** See MastraAgentConfig.useProcessedFinalText. Default false. */
+  useProcessedFinalText: boolean;
 
   /**
    * Suffix appended to a turn's base (Mastra-stored) messageId to key the
@@ -415,6 +485,7 @@ export class MastraAgent extends AbstractAgent {
       emitInterruptOutcome,
       a2ui,
       remoteClient,
+      useProcessedFinalText,
       ...rest
     } = config;
     super(rest);
@@ -425,6 +496,7 @@ export class MastraAgent extends AbstractAgent {
     this.untilIdle = untilIdle;
     this.a2ui = a2ui;
     this.remoteClient = remoteClient;
+    this.useProcessedFinalText = useProcessedFinalText ?? false;
   }
 
   public clone() {
@@ -1256,6 +1328,62 @@ export class MastraAgent extends AbstractAgent {
       }
     };
 
+    // --- useProcessedFinalText buffering ------------------------------------
+    // When the flag is on, `text-delta` chunks are accumulated here instead of
+    // streamed, and the assistant text is emitted once per boundary from the
+    // processor-modified `finish.payload.response.uiMessages` (falling back to
+    // this raw buffer on the terminal `finish`). All of this is inert when the
+    // flag is off — bufferedText stays "" and the release helpers early-return.
+    let bufferedText = "";
+    // The last text we emitted within the current message window. Mastra ends a
+    // response with a `step-finish` immediately followed by a terminal `finish`,
+    // and BOTH can carry the same `response.uiMessages`; without this guard the
+    // second boundary would re-emit the identical text as a duplicate bubble
+    // (under the already-rotated messageId). Reset on each start / step-start so
+    // dedup is scoped to one message and never suppresses distinct per-step text.
+    let lastEmittedText: string | undefined;
+
+    // Emit `text` as one assistant TEXT_MESSAGE_CHUNK, skipping an exact repeat
+    // of what we just emitted for this message (see lastEmittedText).
+    const emitProcessedText = (text: string) => {
+      if (text === lastEmittedText) return;
+      callbacks.onTextPart?.(text);
+      lastEmittedText = text;
+    };
+
+    // Release buffered/processed assistant text at a finish boundary. Prefers
+    // the processor-modified text from `uiMessages`; on the terminal `finish`
+    // falls back to the raw buffer so nothing is dropped. On a non-terminal
+    // `step-finish` with no `uiMessages`, keeps buffering (the text may still be
+    // rewritten and surfaced on a later boundary — emitting raw now then
+    // processed later would double-render).
+    const releaseBufferedText = (chunkPayload: any, isTerminal: boolean) => {
+      if (!this.useProcessedFinalText) return;
+      const processedText = extractLastAssistantText(
+        chunkPayload?.response?.uiMessages,
+      );
+      if (processedText !== undefined) {
+        bufferedText = "";
+        emitProcessedText(processedText);
+        return;
+      }
+      if (isTerminal && bufferedText) {
+        const raw = bufferedText;
+        bufferedText = "";
+        emitProcessedText(raw);
+      }
+    };
+
+    // Flush the raw buffer as-is (used when a turn ends without a `finish`, e.g.
+    // a tool suspend/interrupt) so text streamed before the interrupt is not
+    // lost. No-op when the flag is off or nothing is buffered.
+    const flushBufferedTextRaw = () => {
+      if (!this.useProcessedFinalText || !bufferedText) return;
+      const raw = bufferedText;
+      bufferedText = "";
+      emitProcessedText(raw);
+    };
+
     // taskIds for which an ACTIVITY_SNAPSHOT has already been emitted. Guards
     // against emitting a delta before its snapshot and bounds progress ticks to
     // tasks the client knows about.
@@ -1339,7 +1467,13 @@ export class MastraAgent extends AbstractAgent {
           break;
         case "text-delta": {
           flush();
-          callbacks.onTextPart?.(chunk.payload.text);
+          if (this.useProcessedFinalText) {
+            // Hold deltas until a finish boundary — the processor-modified text
+            // arrives via finish.payload.response.uiMessages.
+            bufferedText += chunk.payload.text;
+          } else {
+            callbacks.onTextPart?.(chunk.payload.text);
+          }
           break;
         }
         // Tool-call args stream incrementally: start → delta(s) → end → the
@@ -1561,6 +1695,10 @@ export class MastraAgent extends AbstractAgent {
             );
             return true;
           }
+          // The turn interrupts here — no `finish` will release the buffer, so
+          // emit any assistant text streamed before the suspend (raw; a suspend
+          // carries no processor uiMessages) ahead of the interrupt event.
+          flushBufferedTextRaw();
           callbacks.onToolSuspended({
             toolCallId: chunk.payload.toolCallId,
             toolName: chunk.payload.toolName,
@@ -1579,9 +1717,20 @@ export class MastraAgent extends AbstractAgent {
         // the messageId so the next step's text gets a fresh ID. When a stream
         // ends with step-finish followed by finish, onFinishMessagePart fires
         // twice — the second rotation produces an unused messageId, which is harmless.
-        case "finish":
+        //
+        // For useProcessedFinalText, both release buffered/processed text BEFORE
+        // rotating the id (so the emitted text inherits the finishing step's
+        // messageId), but only the terminal `finish` may fall back to the raw
+        // buffer — see releaseBufferedText.
         case "step-finish": {
           flush();
+          releaseBufferedText(chunk.payload, false);
+          callbacks.onFinishMessagePart?.();
+          break;
+        }
+        case "finish": {
+          flush();
+          releaseBufferedText(chunk.payload, true);
           callbacks.onFinishMessagePart?.();
           break;
         }
@@ -1590,6 +1739,9 @@ export class MastraAgent extends AbstractAgent {
         // the streamed assistant id equals the stored id (see onMessageId).
         case "start":
         case "step-start": {
+          // A fresh message window begins: reset the dedup guard so distinct
+          // per-step text is never suppressed (see lastEmittedText).
+          lastEmittedText = undefined;
           if (chunk.payload?.messageId) {
             callbacks.onMessageId?.(chunk.payload.messageId);
           }
