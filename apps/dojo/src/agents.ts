@@ -154,6 +154,7 @@ export const agentsIntegrations = {
         | "backend_tool_rendering"
         | "human_in_the_loop"
         | "interrupt"
+        | "shared_state"
         | "tool_based_generative_ui"
         | "a2ui_dynamic_schema"
         | "a2ui_recovery"
