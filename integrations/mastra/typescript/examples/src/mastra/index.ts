@@ -12,6 +12,7 @@ import { interruptAgent } from "./agents/interrupt";
 import { a2uiDynamicSchemaAgent, a2uiRecoveryAgent } from "./agents/a2ui";
 import { a2uiFixedSchemaAgent } from "./agents/a2ui-fixed";
 import { sharedStateAgent } from "./agents/shared-state";
+import { observationalMemoryAgent } from "./agents/observational-memory";
 
 export const mastra = new Mastra({
   server: {
@@ -30,6 +31,7 @@ export const mastra = new Mastra({
     a2ui_recovery: a2uiRecoveryAgent,
     a2ui_fixed_schema: a2uiFixedSchemaAgent,
     shared_state: sharedStateAgent,
+    observational_memory: observationalMemoryAgent,
   },
   // File-backed (not ":memory:"): suspend/resume persists the agentic-loop
   // workflow snapshot to instance storage and loads it on resumeStream. An
