@@ -603,4 +603,110 @@ describe("event emission details (fake-only)", () => {
     // Step 1 and Step 3 text must have distinct messageIds
     expect(textChunks[0].messageId).not.toBe(textChunks[1].messageId);
   });
+
+  describe("custom-data / missing-payload chunks (#1635)", () => {
+    it("skips a custom-data chunk lacking a payload instead of aborting the stream", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const agent = makeLocalMastraAgent({
+        streamChunks: [
+          { type: "text-delta", payload: { text: "Hello" } },
+          // Mastra 1.31 custom-data chunk: carries `data`, no `payload`.
+          {
+            type: "data-workspace-metadata",
+            data: { workspaceId: "ws-1", title: "My Workspace" },
+          },
+          { type: "text-delta", payload: { text: " world" } },
+          { type: "finish", payload: { finishReason: "stop" } },
+        ],
+      });
+
+      const events = await collectEvents(agent, makeInput());
+
+      // The stream must NOT abort: RUN_FINISHED is still emitted.
+      expect(events.some((e) => e.type === EventType.RUN_FINISHED)).toBe(true);
+
+      // Both text deltas (before and after the custom-data chunk) flow through.
+      const joinedText = events
+        .filter(
+          (e): e is TextMessageChunkEvent =>
+            e.type === EventType.TEXT_MESSAGE_CHUNK,
+        )
+        .map((e) => e.delta ?? "")
+        .join("");
+      expect(joinedText).toContain("Hello");
+      expect(joinedText).toContain("world");
+
+      warnSpy.mockRestore();
+    });
+
+    it("recognizes text-start / text-end / tool-output without warning (#1635, #836)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const agent = makeLocalMastraAgent({
+        streamChunks: [
+          { type: "text-start", payload: { id: "t1" } },
+          { type: "text-delta", payload: { text: "Hi" } },
+          { type: "text-end", payload: { id: "t1" } },
+          { type: "tool-output", payload: { output: "interim" } },
+          { type: "finish", payload: { finishReason: "stop" } },
+        ],
+      });
+
+      const events = await collectEvents(agent, makeInput());
+
+      // Text still flows and the run completes.
+      expect(events.some((e) => e.type === EventType.RUN_FINISHED)).toBe(true);
+      const joinedText = events
+        .filter(
+          (e): e is TextMessageChunkEvent =>
+            e.type === EventType.TEXT_MESSAGE_CHUNK,
+        )
+        .map((e) => e.delta ?? "")
+        .join("");
+      expect(joinedText).toContain("Hi");
+
+      // None of these recognized types hit the `default:` warn flood.
+      const warnedTypes = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(
+        warnedTypes.some(
+          (m) =>
+            m.includes("Unrecognized stream chunk type") &&
+            (m.includes("text-start") ||
+              m.includes("text-end") ||
+              m.includes("tool-output")),
+        ),
+      ).toBe(false);
+
+      warnSpy.mockRestore();
+    });
+
+    it("warns at most once per payload-less chunk type (no log flood)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const agent = makeLocalMastraAgent({
+        streamChunks: [
+          { type: "data-workspace-metadata", data: { n: 1 } },
+          { type: "data-workspace-metadata", data: { n: 2 } },
+          { type: "data-workspace-metadata", data: { n: 3 } },
+          { type: "finish", payload: { finishReason: "stop" } },
+        ],
+      });
+
+      const events = await collectEvents(agent, makeInput());
+
+      expect(events.some((e) => e.type === EventType.RUN_FINISHED)).toBe(true);
+
+      const skipWarns = warnSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter(
+          (m) =>
+            m.includes("Skipping stream chunk without payload") &&
+            m.includes("data-workspace-metadata"),
+        );
+      expect(skipWarns).toHaveLength(1);
+
+      warnSpy.mockRestore();
+    });
+  });
 });
