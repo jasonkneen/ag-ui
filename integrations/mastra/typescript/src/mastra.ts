@@ -1226,6 +1226,19 @@ export class MastraAgent extends AbstractAgent {
     const streamedStarted = new Set<string>();
     const streamedEnded = new Set<string>();
 
+    // Skipped / unrecognized chunk types warn at most once each. Mastra 1.31+
+    // custom-data streams (e.g. `data-*` via context.writer.custom) can emit
+    // the same payload-less type at high frequency; a per-chunk warn would
+    // flood the log (#1635). Dedupe by type so integrators still see the
+    // message without the spam.
+    const warnedChunkTypes = new Set<string>();
+    const warnOnce = (type: string | undefined, message: string) => {
+      const key = type ?? "undefined";
+      if (warnedChunkTypes.has(key)) return;
+      warnedChunkTypes.add(key);
+      console.warn(`[MastraAgent] ${message}: type=${key}`);
+    };
+
     const startStreamedToolCall = (toolCallId: string, toolName: string) => {
       if (!streamedStarted.has(toolCallId)) {
         streamedStarted.add(toolCallId);
@@ -1320,9 +1333,7 @@ export class MastraAgent extends AbstractAgent {
       // return false) so the rest of the stream — including RUN_FINISHED —
       // still flows, rather than aborting the run.
       if (!chunk || !chunk.payload) {
-        console.warn(
-          `[MastraAgent] Skipping stream chunk without payload: type=${chunk?.type ?? "undefined"}`,
-        );
+        warnOnce(chunk?.type, "Skipping stream chunk without payload");
         return false;
       }
       switch (chunk.type) {
@@ -1340,6 +1351,21 @@ export class MastraAgent extends AbstractAgent {
         }
         case "reasoning-signature":
         case "redacted-reasoning":
+          break;
+        // Mastra 1.31+ text lifecycle markers bracket the `text-delta` chunks.
+        // AG-UI streams text via TEXT_MESSAGE_CHUNK and derives message
+        // boundaries from start/finish + messageId rotation, so these markers
+        // need no action — recognize them so they don't hit the `default:`
+        // warning flood (#1635, #836).
+        case "text-start":
+        case "text-end":
+          break;
+        // A standalone (non-background) `tool-output` streams intermediate tool
+        // output. The bridge surfaces completed tool results via `tool-result`;
+        // there is no AG-UI mapping for interim output, so ignore it. (Task
+        // output under a backgrounded tool is consumed inside
+        // `background-task-output`, not here.) Recognized to avoid the warn.
+        case "tool-output":
           break;
         case "text-delta": {
           flush();
@@ -1729,9 +1755,7 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         default: {
-          console.warn(
-            `[MastraAgent] Unrecognized stream chunk type: ${chunk.type}`,
-          );
+          warnOnce(chunk.type, "Unrecognized stream chunk type");
           break;
         }
       }

@@ -639,5 +639,74 @@ describe("event emission details (fake-only)", () => {
 
       warnSpy.mockRestore();
     });
+
+    it("recognizes text-start / text-end / tool-output without warning (#1635, #836)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const agent = makeLocalMastraAgent({
+        streamChunks: [
+          { type: "text-start", payload: { id: "t1" } },
+          { type: "text-delta", payload: { text: "Hi" } },
+          { type: "text-end", payload: { id: "t1" } },
+          { type: "tool-output", payload: { output: "interim" } },
+          { type: "finish", payload: { finishReason: "stop" } },
+        ],
+      });
+
+      const events = await collectEvents(agent, makeInput());
+
+      // Text still flows and the run completes.
+      expect(events.some((e) => e.type === EventType.RUN_FINISHED)).toBe(true);
+      const joinedText = events
+        .filter(
+          (e): e is TextMessageChunkEvent =>
+            e.type === EventType.TEXT_MESSAGE_CHUNK,
+        )
+        .map((e) => e.delta ?? "")
+        .join("");
+      expect(joinedText).toContain("Hi");
+
+      // None of these recognized types hit the `default:` warn flood.
+      const warnedTypes = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(
+        warnedTypes.some(
+          (m) =>
+            m.includes("Unrecognized stream chunk type") &&
+            (m.includes("text-start") ||
+              m.includes("text-end") ||
+              m.includes("tool-output")),
+        ),
+      ).toBe(false);
+
+      warnSpy.mockRestore();
+    });
+
+    it("warns at most once per payload-less chunk type (no log flood)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const agent = makeLocalMastraAgent({
+        streamChunks: [
+          { type: "data-workspace-metadata", data: { n: 1 } },
+          { type: "data-workspace-metadata", data: { n: 2 } },
+          { type: "data-workspace-metadata", data: { n: 3 } },
+          { type: "finish", payload: { finishReason: "stop" } },
+        ],
+      });
+
+      const events = await collectEvents(agent, makeInput());
+
+      expect(events.some((e) => e.type === EventType.RUN_FINISHED)).toBe(true);
+
+      const skipWarns = warnSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter(
+          (m) =>
+            m.includes("Skipping stream chunk without payload") &&
+            m.includes("data-workspace-metadata"),
+        );
+      expect(skipWarns).toHaveLength(1);
+
+      warnSpy.mockRestore();
+    });
   });
 });
