@@ -1194,6 +1194,9 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.build.outputs.mode == 'prerelease' && github.ref || 'main' }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Step08_Multimodal integration test reads ag-ui-logo.png, which is
+          # stored via Git LFS. Without the real bytes the snapshot diff fails.
+          lfs: true
           persist-credentials: false
 
       - name: Set up .NET
