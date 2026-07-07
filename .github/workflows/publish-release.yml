@@ -1187,6 +1187,10 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      # actions: read lets the SignPath connector download the packed .nupkg
+      # artifact from this workflow run (see the "Sign packages" seam below).
+      # Harmless for the Azure Artifact Signing path, which signs in place.
+      actions: read
     steps:
       - name: Checkout release ref
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -1277,6 +1281,86 @@ jobs:
             fi
           done < <(jq -c '.[]' dotnet-packages.json)
           ls -la artifacts/nuget
+
+      # ── Author signing (pack → SIGN → push) ────────────────────────────────
+      # Author-signs the packed *.nupkg in place so nuget.org marks the
+      # packages as signed. The provider is selected by the SIGNING_PROVIDER
+      # repo/environment variable (set it on the `nuget` environment):
+      #   unset / 'none'      → no signing (today's behavior; safe default)
+      #   'signpath'          → SignPath   (cert subject: "SignPath Foundation")
+      #   'artifact-signing'  → Azure Artifact Signing (cert subject: your org)
+      # Both providers sign the same artifacts/nuget/*.nupkg, so the Push step
+      # below is unchanged. nuget.org's *repository* signature is applied
+      # automatically on push and is independent of this. Symbol packages
+      # (*.snupkg) are intentionally not author-signed.
+      # Required vars/secrets per provider: see sdks/dotnet/docs/signing.md.
+      # NOTE: This seam is inert until SIGNING_PROVIDER is set — safe to merge
+      # ahead of the certificate/account being provisioned.
+
+      # --- SignPath: upload the packed artifact, sign remotely, download back ---
+      - name: Upload packages for SignPath signing
+        if: vars.SIGNING_PROVIDER == 'signpath'
+        id: signpath-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: nuget-unsigned
+          path: artifacts/nuget/*.nupkg
+          if-no-files-found: error
+
+      - name: Sign packages (SignPath)
+        if: vars.SIGNING_PROVIDER == 'signpath'
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd  # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.signpath-upload.outputs.artifact-id }}
+          wait-for-completion: true
+          # Extracts the signed *.nupkg back over the unsigned ones.
+          output-artifact-directory: artifacts/nuget
+
+      # --- Azure Artifact Signing: OIDC login, then sign in place ---
+      # Reuses the job's existing `id-token: write` — no client secret needed.
+      - name: Azure login (OIDC)
+        if: vars.SIGNING_PROVIDER == 'artifact-signing'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        with:
+          # These IDs are non-secret but already exist as secrets on the `nuget`
+          # environment (provisioned 2026-07-01), so read them from secrets.
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign packages (Azure Artifact Signing)
+        if: vars.SIGNING_PROVIDER == 'artifact-signing'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}/artifacts/nuget
+          files-folder-filter: nupkg
+          files-folder-recurse: false
+
+      # Fail the release before publishing if signing was requested but didn't
+      # actually apply (verifies the author signature chains to a trusted root).
+      - name: Verify packages are signed
+        if: vars.SIGNING_PROVIDER != '' && vars.SIGNING_PROVIDER != 'none'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(artifacts/nuget/*.nupkg)
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "::error::No .nupkg found to verify after signing"
+            exit 1
+          fi
+          for pkg in "${pkgs[@]}"; do
+            echo "Verifying signature: ${pkg}"
+            dotnet nuget verify "${pkg}" --all
+          done
 
       - name: NuGet login
         id: nuget-login
