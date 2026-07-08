@@ -105,3 +105,37 @@ packages you must publish a **new version**:
    (e.g. `0.0.3` → `0.0.4`). One bump re-releases all five packages, signed.
 3. (Optional) Unlist the old unsigned version on nuget.org so consumers move to
    the signed one.
+
+## Provisioning checklist (Azure — primary path)
+
+Ordered work to go from "seam merged" to "signed release." Ownership split:
+Azure/infra owner does 1–3, a repo admin does 4, then anyone triggers 5.
+
+1. **Signing account** — create a `Microsoft.CodeSigning/codeSigningAccounts`
+   resource. ([Quickstart](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart))
+2. **Identity validation** — complete org validation (the multi-day gate); this
+   is what stamps "CopilotKit" onto the certificate.
+3. **Certificate profile** — create a **Public Trust** profile, and assign the
+   **Trusted Signing Certificate Profile Signer** role to the existing App
+   Registration (client `AZURE_CLIENT_ID`) so the OIDC login may sign.
+   ([Roles tutorial](https://learn.microsoft.com/en-us/azure/trusted-signing/tutorial-assign-roles))
+4. **Set the `nuget` environment variables** with the values from steps 1 & 3
+   (the `AZURE_*` secrets already exist):
+   ```bash
+   R=ag-ui-protocol/ag-ui
+   gh variable set ARTIFACT_SIGNING_ENDPOINT     --env nuget --repo $R --body "https://<region>.codesigning.azure.net"
+   gh variable set ARTIFACT_SIGNING_ACCOUNT      --env nuget --repo $R --body "<signing-account-name>"
+   gh variable set ARTIFACT_SIGNING_CERT_PROFILE --env nuget --repo $R --body "<certificate-profile-name>"
+   gh variable set SIGNING_PROVIDER              --env nuget --repo $R --body "artifact-signing"
+   ```
+   > The `Preflight — validate signing configuration` step fails the run with an
+   > explicit list if any of these are still missing, so a partial setup can't
+   > publish a broken package.
+5. **Trial + ship** — run `canary / publish` (scope `sdk-dotnet`,
+   `dry_run=false`) → confirm signed on nuget.org → bump `VersionPrefix` for the
+   stable signed release.
+
+### SignPath (backup path)
+
+If Azure stalls, set `SIGNING_PROVIDER=signpath` and the `SIGNPATH_*`
+vars/secrets from the SignPath section above instead. Nothing else changes.

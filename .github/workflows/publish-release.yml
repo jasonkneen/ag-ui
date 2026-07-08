@@ -1297,6 +1297,58 @@ jobs:
       # NOTE: This seam is inert until SIGNING_PROVIDER is set — safe to merge
       # ahead of the certificate/account being provisioned.
 
+      # Fail fast with an explicit list if signing is enabled but the selected
+      # provider's configuration is incomplete — so a half-provisioned setup
+      # errors here with actionable output instead of deep inside a signing
+      # action. Lists exactly which vars/secrets the `nuget` environment still
+      # needs. See sdks/dotnet/docs/signing.md.
+      - name: Preflight — validate signing configuration
+        if: vars.SIGNING_PROVIDER != '' && vars.SIGNING_PROVIDER != 'none'
+        shell: bash
+        env:
+          PROVIDER: ${{ vars.SIGNING_PROVIDER }}
+          # SignPath (backup provider)
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          # Azure Artifact Signing (primary provider). AZURE_* already exist as
+          # secrets on the `nuget` env (2026-07-01); ARTIFACT_SIGNING_* are the
+          # vars still pending the signing account + certificate profile.
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_CERT_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERT_PROFILE }}
+        run: |
+          set -euo pipefail
+          missing=()
+          case "$PROVIDER" in
+            signpath)
+              required="SIGNPATH_API_TOKEN SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_SIGNING_POLICY_SLUG SIGNPATH_ARTIFACT_CONFIGURATION_SLUG"
+              ;;
+            artifact-signing)
+              required="AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ARTIFACT_SIGNING_ENDPOINT ARTIFACT_SIGNING_ACCOUNT ARTIFACT_SIGNING_CERT_PROFILE"
+              ;;
+            *)
+              echo "::error::Unknown SIGNING_PROVIDER '${PROVIDER}' (expected 'none', 'signpath', or 'artifact-signing')"
+              exit 1
+              ;;
+          esac
+          for name in $required; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::SIGNING_PROVIDER='${PROVIDER}' but the 'nuget' environment is missing: ${missing[*]}"
+            echo "Provision these (see sdks/dotnet/docs/signing.md) before enabling signing."
+            exit 1
+          fi
+          echo "Signing configuration for '${PROVIDER}' is complete."
+
       # --- SignPath: upload the packed artifact, sign remotely, download back ---
       - name: Upload packages for SignPath signing
         if: vars.SIGNING_PROVIDER == 'signpath'
