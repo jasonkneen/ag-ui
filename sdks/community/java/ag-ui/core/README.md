@@ -12,15 +12,15 @@ dependencies** — streaming is expressed with the JDK's
 
 | Package | Contents |
 |---------|----------|
-| [`agent`](src/main/java/io/github/agui4j/core/agent) | The `Agent` functional interface, plus `RunAgentInput` and `Context` describing a single run. |
-| [`event`](src/main/java/io/github/agui4j/core/event) | The `Event` model — a `sealed interface` with one record per event variant, discriminated by `EventType`. |
-| [`message`](src/main/java/io/github/agui4j/core/message) | Conversation messages: `UserMessage`, `AssistantMessage`, `SystemMessage`, `DeveloperMessage`, `ToolMessage`, plus `Role`, `ToolCall`, and `FunctionCall`. |
-| [`tool`](src/main/java/io/github/agui4j/core/tool) | `Tool` and `ToolParameters` describing tools available to an agent. |
-| [`serialization`](src/main/java/io/github/agui4j/core/serialization) | The `Serializer` interface (and `SerializationException`) — the JSON binding seam. The core ships no concrete implementation. |
+| [`agent`](src/main/java/com/agui/community/core/agent) | The `Agent` functional interface, plus `RunAgentInput` and `Context` describing a single run. |
+| [`event`](src/main/java/com/agui/community/core/event) | The `Event` model — a `sealed interface` with one record per event variant, discriminated by `EventType`. |
+| [`message`](src/main/java/com/agui/community/core/message) | Conversation messages: `UserMessage`, `AssistantMessage`, `SystemMessage`, `DeveloperMessage`, `ToolMessage`, plus `Role`, `ToolCall`, and `FunctionCall`. |
+| [`tool`](src/main/java/com/agui/community/core/tool) | `Tool` and `ToolParameters` describing tools available to an agent. |
+| [`serialization`](src/main/java/com/agui/community/core/serialization) | The `Serializer` interface (and `SerializationException`) — the JSON binding seam. The core ships no concrete implementation. |
 
 ## The event model
 
-`Event` is a [sealed interface](src/main/java/io/github/agui4j/core/event/Event.java);
+`Event` is a [sealed interface](src/main/java/com/agui/community/core/event/Event.java);
 every event is one of a fixed set of records, so you can handle them
 exhaustively with a `switch`:
 
@@ -37,7 +37,7 @@ String describe(Event event) {
 ```
 
 Every event carries the common `type()`, `timestamp()`, and `rawEvent()`
-fields. See [`EventType`](src/main/java/io/github/agui4j/core/event/EventType.java)
+fields. See [`EventType`](src/main/java/com/agui/community/core/event/EventType.java)
 for the full set of variants (lifecycle, text messages, tool calls, reasoning,
 state, activity, and the `RAW` / `CUSTOM` / `META_EVENT` specials).
 
@@ -63,8 +63,8 @@ Jackson, Gson, or another library; client and server modules accept a
 
 ```xml
 <dependency>
-    <groupId>io.github.ag-ui-4j</groupId>
-    <artifactId>core</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-core</artifactId>
     <version>0.2.0</version>
 </dependency>
 ```

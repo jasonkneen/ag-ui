@@ -4,7 +4,7 @@
 
 Server-side support for the [AG-UI protocol](https://docs.ag-ui.com).
 
-This module exposes an [`Agent`](../core/src/main/java/io/github/agui4j/core/agent/Agent.java)
+This module exposes an [`Agent`](../core/src/main/java/com/agui/community/core/agent/Agent.java)
 over the protocol: it reads a `RunAgentInput`, runs the agent, and streams the
 resulting `Event`s back to the client as Server-Sent Events. It is the
 server-side mirror of the [`client`](../client) module's `HttpAgent`.
@@ -17,30 +17,30 @@ third-party dependencies.
 
 ## What's inside
 
-### Transport-neutral core (`io.github.agui4j.server`)
+### Transport-neutral core (`com.agui.community.server`)
 
 | Type | Purpose |
 |------|---------|
-| [`AgentRunHandler`](src/main/java/io/github/agui4j/server/AgentRunHandler.java) | Parses a request body into a `RunAgentInput`, runs the `Agent`, and relays its events to an `EventSink`, framing each through an `EventEncoder`. Knows nothing about HTTP or the wire protocol. |
-| [`AgentRegistry`](src/main/java/io/github/agui4j/server/AgentRegistry.java) | A lookup from agent id to `Agent`, so a transport can route `/agent/{id}` to one of several agents. `single()` exposes the sole agent when exactly one is registered. |
-| [`EventEncoder`](src/main/java/io/github/agui4j/server/EventEncoder.java) | Frames an `Event` for a particular protocol — the single point of variation between SSE and a future transport such as WebSocket. |
-| [`EventSink`](src/main/java/io/github/agui4j/server/EventSink.java) | A transport-neutral destination for already-encoded frames; an adapter implements it over its response. |
-| [`SseEventEncoder`](src/main/java/io/github/agui4j/server/SseEventEncoder.java) | The SSE `EventEncoder`: encodes an `Event` as a `data:` frame using the injected `Serializer`. |
-| [`EventRelaySubscriber`](src/main/java/io/github/agui4j/server/EventRelaySubscriber.java) | A `Flow.Subscriber<Event>` that writes encoded frames to the sink, requesting one event at a time for backpressure, and surfaces failures in band as a terminal `RUN_ERROR` frame. |
-| [`OutputStreamEventSink`](src/main/java/io/github/agui4j/server/OutputStreamEventSink.java) | An `EventSink` over a blocking `OutputStream` (flushes per frame). |
+| [`AgentRunHandler`](src/main/java/com/agui/community/server/AgentRunHandler.java) | Parses a request body into a `RunAgentInput`, runs the `Agent`, and relays its events to an `EventSink`, framing each through an `EventEncoder`. Knows nothing about HTTP or the wire protocol. |
+| [`AgentRegistry`](src/main/java/com/agui/community/server/AgentRegistry.java) | A lookup from agent id to `Agent`, so a transport can route `/agent/{id}` to one of several agents. `single()` exposes the sole agent when exactly one is registered. |
+| [`EventEncoder`](src/main/java/com/agui/community/server/EventEncoder.java) | Frames an `Event` for a particular protocol — the single point of variation between SSE and a future transport such as WebSocket. |
+| [`EventSink`](src/main/java/com/agui/community/server/EventSink.java) | A transport-neutral destination for already-encoded frames; an adapter implements it over its response. |
+| [`SseEventEncoder`](src/main/java/com/agui/community/server/SseEventEncoder.java) | The SSE `EventEncoder`: encodes an `Event` as a `data:` frame using the injected `Serializer`. |
+| [`EventRelaySubscriber`](src/main/java/com/agui/community/server/EventRelaySubscriber.java) | A `Flow.Subscriber<Event>` that writes encoded frames to the sink, requesting one event at a time for backpressure, and surfaces failures in band as a terminal `RUN_ERROR` frame. |
+| [`OutputStreamEventSink`](src/main/java/com/agui/community/server/OutputStreamEventSink.java) | An `EventSink` over a blocking `OutputStream` (flushes per frame). |
 
-### JDK transport (`io.github.agui4j.server.jdk`)
+### JDK transport (`com.agui.community.server.jdk`)
 
 | Type | Purpose |
 |------|---------|
-| [`JdkAgentHttpHandler`](src/main/java/io/github/agui4j/server/jdk/JdkAgentHttpHandler.java) | An `HttpHandler` for the JDK's built-in `com.sun.net.httpserver`. Routes `/agent/{id}` to an agent from an `AgentRegistry` (single-agent alias on the base path), streams events as `text/event-stream`, and rejects unknown ids with `404`, malformed input with `400`, and non-`POST` with `405`. No third-party dependencies. |
+| [`JdkAgentHttpHandler`](src/main/java/com/agui/community/server/jdk/JdkAgentHttpHandler.java) | An `HttpHandler` for the JDK's built-in `com.sun.net.httpserver`. Routes `/agent/{id}` to an agent from an `AgentRegistry` (single-agent alias on the base path), streams events as `text/event-stream`, and rejects unknown ids with `404`, malformed input with `400`, and non-`POST` with `405`. No third-party dependencies. |
 
 ## Usage
 
 ```java
 import com.sun.net.httpserver.HttpServer;
-import io.github.agui4j.core.agent.Agent;
-import io.github.agui4j.server.jdk.JdkAgentHttpHandler;
+import com.agui.community.core.agent.Agent;
+import com.agui.community.server.jdk.JdkAgentHttpHandler;
 
 import java.net.InetSocketAddress;
 
@@ -57,7 +57,7 @@ drive it.
 
 ### Multiple agents
 
-Pass an [`AgentRegistry`](src/main/java/io/github/agui4j/server/AgentRegistry.java)
+Pass an [`AgentRegistry`](src/main/java/com/agui/community/server/AgentRegistry.java)
 to address several agents by the id in the path (`/agent/{id}`). An unknown id
 returns `404`:
 
@@ -103,8 +103,8 @@ AgentRunHandler handler = new AgentRunHandler(agent, serializer, encoder);
 
 ```xml
 <dependency>
-    <groupId>io.github.ag-ui-4j</groupId>
-    <artifactId>server</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-server</artifactId>
     <version>0.2.0</version>
 </dependency>
 ```

@@ -3,7 +3,7 @@
 Client implementation for the [AG-UI protocol](https://docs.ag-ui.com).
 
 This module lets you talk to a remote AG-UI endpoint as an
-[`Agent`](../core/src/main/java/io/github/agui4j/core/agent/Agent.java). It is
+[`Agent`](../core/src/main/java/com/agui/community/core/agent/Agent.java). It is
 built only on the JDK's `HttpClient` and an injected `Serializer`, so it stays
 agnostic to the concrete JSON library you use.
 
@@ -11,17 +11,17 @@ agnostic to the concrete JSON library you use.
 
 | Type | Purpose |
 |------|---------|
-| [`HttpAgent`](src/main/java/io/github/agui4j/client/HttpAgent.java) | An `Agent` that serializes a `RunAgentInput` to JSON, POSTs it to a remote endpoint, and decodes the Server-Sent Events response into a `Flow.Publisher<Event>`. |
-| [`SseEventParser`](src/main/java/io/github/agui4j/client/SseEventParser.java) | Parses a Server-Sent Events byte/line stream into AG-UI events. |
-| [`HttpAgentException`](src/main/java/io/github/agui4j/client/HttpAgentException.java) | Raised (via `onError`) when a request fails or returns an error status. |
+| [`HttpAgent`](src/main/java/com/agui/community/client/HttpAgent.java) | An `Agent` that serializes a `RunAgentInput` to JSON, POSTs it to a remote endpoint, and decodes the Server-Sent Events response into a `Flow.Publisher<Event>`. |
+| [`SseEventParser`](src/main/java/com/agui/community/client/SseEventParser.java) | Parses a Server-Sent Events byte/line stream into AG-UI events. |
+| [`HttpAgentException`](src/main/java/com/agui/community/client/HttpAgentException.java) | Raised (via `onError`) when a request fails or returns an error status. |
 
 ## Usage
 
 ```java
-import io.github.agui4j.client.HttpAgent;
-import io.github.agui4j.core.agent.Agent;
-import io.github.agui4j.core.agent.RunAgentInput;
-import io.github.agui4j.core.event.Event;
+import com.agui.community.client.HttpAgent;
+import com.agui.community.core.agent.Agent;
+import com.agui.community.core.agent.RunAgentInput;
+import com.agui.community.core.event.Event;
 
 import java.net.URI;
 import java.util.concurrent.Flow;
@@ -63,8 +63,8 @@ Agent agent = new HttpAgent(
 
 ```xml
 <dependency>
-    <groupId>io.github.ag-ui-4j</groupId>
-    <artifactId>client</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-client</artifactId>
     <version>0.2.0</version>
 </dependency>
 ```

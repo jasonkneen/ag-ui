@@ -1,5 +1,6 @@
 package com.agui.community.core.agent;
 
+import com.agui.community.core.interrupt.Resume;
 import com.agui.community.core.message.Message;
 import com.agui.community.core.tool.Tool;
 import java.util.List;
@@ -22,10 +23,15 @@ import java.util.Objects;
  *                       (copied to an unmodifiable list)
  * @param forwardedProps free-form properties forwarded to the agent, or
  *                       {@code null} (optional)
+ * @param resume         responses to interrupts raised by the previous run,
+ *                       resuming a human-in-the-loop pause; never {@code null}
+ *                       (copied to an unmodifiable list)
  * @see <a href="https://docs.ag-ui.com/concepts/agents">AG-UI Agents</a>
+ * @see <a href="https://docs.ag-ui.com/concepts/interrupts">AG-UI Interrupts</a>
  */
 public record RunAgentInput(String threadId, String runId, Object state, List<Message> messages,
-                            List<Tool> tools, List<Context> context, Object forwardedProps) {
+                            List<Tool> tools, List<Context> context, Object forwardedProps,
+                            List<Resume> resume) {
 
     public RunAgentInput {
         Objects.requireNonNull(threadId, "threadId must not be null");
@@ -33,6 +39,23 @@ public record RunAgentInput(String threadId, String runId, Object state, List<Me
         messages = Objects.isNull(messages) ? List.of() : List.copyOf(messages);
         tools = Objects.isNull(tools) ? List.of() : List.copyOf(tools);
         context = Objects.isNull(context) ? List.of() : List.copyOf(context);
+        resume = Objects.isNull(resume) ? List.of() : List.copyOf(resume);
+    }
+
+    /**
+     * Creates a run input without any human-in-the-loop {@code resume} entries.
+     *
+     * @param threadId       the conversation thread id
+     * @param runId          the agent run id
+     * @param state          the current agent state, or {@code null}
+     * @param messages       the conversation messages
+     * @param tools          the tools available to the agent
+     * @param context        additional context entries
+     * @param forwardedProps forwarded properties, or {@code null}
+     */
+    public RunAgentInput(String threadId, String runId, Object state, List<Message> messages,
+                         List<Tool> tools, List<Context> context, Object forwardedProps) {
+        this(threadId, runId, state, messages, tools, context, forwardedProps, List.of());
     }
 
     /**
@@ -45,6 +68,6 @@ public record RunAgentInput(String threadId, String runId, Object state, List<Me
      * @param tools    the tools available to the agent
      */
     public RunAgentInput(String threadId, String runId, List<Message> messages, List<Tool> tools) {
-        this(threadId, runId, null, messages, tools, List.of(), null);
+        this(threadId, runId, null, messages, tools, List.of(), null, List.of());
     }
 }

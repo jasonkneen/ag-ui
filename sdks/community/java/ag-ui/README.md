@@ -9,7 +9,7 @@ A modular Java library for the [**AG-UI protocol**](https://docs.ag-ui.com) — 
 open, event-based protocol for connecting AI agents to user-facing applications.
 
 It models the protocol as a stream of typed **events** (text, tool calls,
-reasoning, state deltas, lifecycle) that an [`Agent`](core/src/main/java/io/github/agui4j/core/agent/Agent.java)
+reasoning, state deltas, lifecycle) that an [`Agent`](core/src/main/java/com/agui/community/core/agent/Agent.java)
 emits in response to a `RunAgentInput`. The streaming type is the JDK's built-in
 `java.util.concurrent.Flow.Publisher`, so the core has **no third-party runtime
 dependencies**.
@@ -48,10 +48,10 @@ Server-Sent Events response as a `Flow.Publisher<Event>`. You supply a
 `Serializer` (the library is agnostic to the concrete JSON implementation).
 
 ```java
-import io.github.agui4j.client.HttpAgent;
-import io.github.agui4j.core.agent.Agent;
-import io.github.agui4j.core.agent.RunAgentInput;
-import io.github.agui4j.core.event.Event;
+import com.agui.community.client.HttpAgent;
+import com.agui.community.core.agent.Agent;
+import com.agui.community.core.agent.RunAgentInput;
+import com.agui.community.core.event.Event;
 
 import java.net.URI;
 import java.util.concurrent.Flow;
@@ -89,13 +89,13 @@ Agent agent = input -> {
 
 ## Using as a dependency
 
-Artifacts are published under the `io.github.ag-ui-4j` group id. Add the modules
+Artifacts are published under the `com.ag-ui.community` group id. Add the modules
 you need:
 
 ```xml
 <dependency>
-    <groupId>io.github.ag-ui-4j</groupId>
-    <artifactId>client</artifactId>
+    <groupId>com.ag-ui.community</groupId>
+    <artifactId>java-client</artifactId>
     <version>0.2.0</version>
 </dependency>
 ```
