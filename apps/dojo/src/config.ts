@@ -122,6 +122,20 @@ export const featureConfig: FeatureConfig[] = [
     tags: ["A2UI", "Advanced", "Progress", "Action Handlers"],
   }),
   createFeatureConfig({
+    id: "background_agents",
+    name: "Background Agents",
+    description:
+      "Dispatch long-running work as a Mastra background task and watch its progress render as a distinct activity.",
+    tags: ["Background Tasks", "Activity", "Long running task"],
+  }),
+  createFeatureConfig({
+    id: "observational_memory",
+    name: "Observational Memory",
+    description:
+      "Watch Mastra Observational Memory observe and compress the conversation in the background, surfaced as a distinct activity.",
+    tags: ["Observational Memory", "Activity", "Memory"],
+  }),
+  createFeatureConfig({
     id: "a2ui_recovery",
     name: "A2UI Error Recovery",
     description:
