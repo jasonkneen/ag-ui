@@ -636,7 +636,8 @@ class ClaudeAgentAdapter:
         in_reasoning_block: bool = False
         reasoning_message_id: Optional[str] = None
         has_streamed_text: bool = False
-        
+        unstreamed_fallback_ids: set[str] = set()
+
         # Tool call streaming state
         current_tool_call_id: Optional[str] = None
         current_tool_call_name: Optional[str] = None
@@ -979,6 +980,8 @@ class ClaudeAgentAdapter:
             if isinstance(message, (AssistantMessage, UserMessage)):
                 if isinstance(message, AssistantMessage):
                     msg_id = current_message_id or str(uuid.uuid4())
+                    if current_message_id is None:
+                        unstreamed_fallback_ids.add(msg_id)
                     agui_msg = build_agui_assistant_message(message, msg_id)
                     if agui_msg:
                         upsert_message(agui_msg)
@@ -1051,9 +1054,10 @@ class ClaudeAgentAdapter:
                     "total_cost_usd": getattr(message, 'total_cost_usd', None),
                     "usage": getattr(message, 'usage', None),
                     "structured_output": getattr(message, 'structured_output', None),
+                    "api_error_status": getattr(message, 'api_error_status', None),
                 }
-                
-                if not has_streamed_text and result_text:
+
+                if not has_streamed_text and result_text and not is_error:
                     result_msg_id = str(uuid.uuid4())
                     yield TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, thread_id=thread_id, run_id=run_id, message_id=result_msg_id, role="assistant")
                     yield TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, thread_id=thread_id, run_id=run_id, message_id=result_msg_id, delta=result_text)
@@ -1103,6 +1107,10 @@ class ClaudeAgentAdapter:
 
         flush_pending_msg()
 
+        run_result = self._per_run_result.get((thread_id, run_id), {}) or {}
+        if run_result.get("is_error") and unstreamed_fallback_ids:
+            run_messages[:] = [m for m in run_messages if _get_msg_id(m) not in unstreamed_fallback_ids]
+
         # Emit MESSAGES_SNAPSHOT with input messages + new messages from this run
         if run_messages:
             all_messages = list(input_data.messages or []) + run_messages
@@ -1112,5 +1120,15 @@ class ClaudeAgentAdapter:
             yield MessagesSnapshotEvent(
                 type=EventType.MESSAGES_SNAPSHOT,
                 messages=all_messages,
+            )
+
+        if run_result.get("is_error"):
+            api_error_status = run_result.get("api_error_status")
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                thread_id=thread_id,
+                run_id=run_id,
+                message=result_text or "The run ended with an API error.",
+                code=str(api_error_status) if api_error_status is not None else None,
             )
 

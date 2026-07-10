@@ -78,6 +78,93 @@ class TestStreamTextMessage:
         assert any(getattr(m, "content", None) == "Hi" for m in snapshots[0].messages)
 
 
+class TestResultMessageErrorHandling:
+    """Regression tests for ag-ui-protocol/ag-ui#2145.
+
+    An errored turn used to fold its failure text into MESSAGES_SNAPSHOT
+    twice (once via the streamed text, once via the non-streaming
+    AssistantMessage fallback minting a fresh, never-streamed id) with no
+    RUN_ERROR signal at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_errored_turn_emits_one_assistant_message_and_run_error(self, make_input):
+        from claude_agent_sdk import AssistantMessage, ResultMessage
+        from claude_agent_sdk.types import TextBlock
+
+        adapter = ClaudeAgentAdapter(name="t")
+        error_text = "API Error: 400 You have reached your specified API usage limits."
+        stream = [
+            # Streamed text: gets a real message id, upserted at message_stop.
+            stream_event({"type": "message_start"}),
+            stream_event(
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": error_text}}
+            ),
+            stream_event({"type": "message_stop"}),
+            # SDK redelivers the same content as a complete AssistantMessage
+            # AFTER message_stop reset current_message_id to None — this used
+            # to mint a second, never-streamed id for identical text.
+            AssistantMessage(content=[TextBlock(text=error_text)], model="claude-x"),
+            ResultMessage(
+                subtype="error_during_execution",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=1,
+                session_id="thread-1",
+                result=error_text,
+            ),
+        ]
+        events = await _drive(adapter, stream, make_input)
+
+        snapshots = [e for e in events if e.type == EventType.MESSAGES_SNAPSHOT]
+        assert len(snapshots) == 1
+        assistant_msgs = [
+            m for m in snapshots[0].messages if getattr(m, "role", None) == "assistant"
+        ]
+        assert len(assistant_msgs) == 1, (
+            f"expected exactly 1 assistant message on an errored turn, got "
+            f"{len(assistant_msgs)}"
+        )
+
+        run_errors = [e for e in events if e.type == EventType.RUN_ERROR]
+        assert len(run_errors) == 1
+        assert run_errors[0].message == error_text
+
+    @pytest.mark.asyncio
+    async def test_successful_turn_unaffected(self, make_input):
+        """The is_error gating must not touch normal, non-errored turns."""
+        from claude_agent_sdk import ResultMessage
+
+        adapter = ClaudeAgentAdapter(name="t")
+        stream = [
+            stream_event({"type": "message_start"}),
+            stream_event(
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi there"}}
+            ),
+            stream_event({"type": "message_stop"}),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="thread-1",
+                result="Hi there",
+            ),
+        ]
+        events = await _drive(adapter, stream, make_input)
+
+        snapshots = [e for e in events if e.type == EventType.MESSAGES_SNAPSHOT]
+        assert len(snapshots) == 1
+        assistant_msgs = [
+            m for m in snapshots[0].messages if getattr(m, "role", None) == "assistant"
+        ]
+        assert len(assistant_msgs) == 1
+        assert assistant_msgs[0].content == "Hi there"
+        assert not any(e.type == EventType.RUN_ERROR for e in events)
+
+
 class TestStreamToolCall:
     @pytest.mark.asyncio
     async def test_backend_tool_call_sequence(self, make_input):
