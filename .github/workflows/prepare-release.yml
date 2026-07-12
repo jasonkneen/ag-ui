@@ -199,6 +199,12 @@ jobs:
         with:
           app-id: "3877599"
           private-key: ${{ secrets.DEVOPS_BOT_PRIVATE_KEY }}
+          # Scope the app token to only what this workflow uses, instead of
+          # inheriting the app installation's blanket permissions (zizmor
+          # github-app). contents:write pushes the release/next branch;
+          # pull-requests:write creates/updates the release PR.
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Configure git credentials for push
         if: inputs.dry_run != true && steps.bump.outputs.changed_count != '0'
