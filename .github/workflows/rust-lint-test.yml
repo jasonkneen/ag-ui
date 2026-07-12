@@ -4,11 +4,11 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "crates/**"
-      - ".github/workflows/rust.yml"
-      - "tests/**"
-      - "Cargo.toml"
-      - ".cargo/**"
+      - "sdks/community/rust/crates/**"
+      - "sdks/community/rust/**/tests/**"
+      - "sdks/community/rust/Cargo.toml"
+      - "sdks/community/rust/.cargo/**"
+      - ".github/workflows/rust-lint-test.yml"
   pull_request:
     branches: [ "main" ]
     paths:
@@ -20,7 +20,7 @@ on:
 
 defaults:
   run:
-    working-directory: ./rust
+    working-directory: ./sdks/community/rust
 
 permissions:
   contents: read
