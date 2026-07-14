@@ -595,8 +595,17 @@ export const defaultApplyEvents = (
             // snapshot.
             const snapshotMap = new Map(newMessages.map((m) => [m.id, m]));
 
-            // `activity` messages are always client-only — backends never include
-            // them in MESSAGES_SNAPSHOT — so they are always preserved.
+            // `activity` messages are usually client-only — most backends leave
+            // them out of MESSAGES_SNAPSHOT, so a local activity the snapshot
+            // does not mention is preserved. But a backend may include them (the
+            // message type is part of the snapshot payload in every SDK), and an
+            // id it carries is the same message the client already holds, since
+            // activity ids come from ACTIVITY_* events rather than being minted
+            // by the snapshot. So when the snapshot names an activity message,
+            // it is the source of truth for it and normal replace semantics
+            // apply — otherwise the snapshot copy would be silently dropped for
+            // activities the client already has while still being appended for
+            // ones it does not, which is inconsistent.
             //
             // `reasoning` messages are only sometimes client-only. Most backends
             // never include reasoning in the snapshot (it exists purely as
@@ -611,7 +620,8 @@ export const defaultApplyEvents = (
             // reasoning messages too and apply the normal replace semantics.
             const snapshotHasReasoning = newMessages.some((m) => m.role === "reasoning");
             const isPreservedClientOnly = (m: Message) =>
-              m.role === "activity" || (m.role === "reasoning" && !snapshotHasReasoning);
+              (m.role === "activity" && !snapshotMap.has(m.id)) ||
+              (m.role === "reasoning" && !snapshotHasReasoning);
 
             // Step 1 + 2: Keep preserved client-only messages as-is, keep
             // messages present in the snapshot (replaced with snapshot version),

@@ -1,12 +1,7 @@
 import { Subject } from "rxjs";
 import { toArray } from "rxjs/operators";
 import { firstValueFrom } from "rxjs";
-import {
-  BaseEvent,
-  EventType,
-  Message,
-  RunAgentInput,
-} from "@ag-ui/core";
+import { BaseEvent, EventType, Message, RunAgentInput } from "@ag-ui/core";
 import { defaultApplyEvents } from "../default";
 import { AbstractAgent } from "@/agent";
 import { AgentStateMutation } from "@/agent/subscriber";
@@ -110,7 +105,10 @@ describe("defaultApplyEvents with activity events", () => {
     expect(updates.length).toBe(3);
     expect(updates[0]?.messages?.[0]?.content).toEqual({ operations: [] });
     expect(updates[1]?.messages?.[0]?.content?.operations).toEqual([firstOperation]);
-    expect(updates[2]?.messages?.[0]?.content?.operations).toEqual([firstOperation, secondOperation]);
+    expect(updates[2]?.messages?.[0]?.content?.operations).toEqual([
+      firstOperation,
+      secondOperation,
+    ]);
   });
 
   it("does not replace existing activity message when replace is false", async () => {
@@ -150,7 +148,12 @@ describe("defaultApplyEvents with activity events", () => {
 
   it("replaces existing activity message when replace is true", async () => {
     const initial = [
-      { id: "activity-1", role: "activity" as const, activityType: "PLAN", content: { tasks: ["initial"] } },
+      {
+        id: "activity-1",
+        role: "activity" as const,
+        activityType: "PLAN",
+        content: { tasks: ["initial"] },
+      },
     ] as Message[];
 
     const updates = await emitAndCollect(initial, (events$) => {
@@ -422,7 +425,12 @@ describe("MESSAGES_SNAPSHOT preserves client-only messages", () => {
         { id: "m1", role: "user", content: "create a dashboard" },
         { id: "asst-1", role: "assistant", content: "I'll create that for you" },
         { id: "tool-stream", role: "tool", content: '{"a2ui": true}' },
-        { id: "act-1", role: "activity", activityType: "A2UI_SURFACE", content: { surface: "dashboard" } },
+        {
+          id: "act-1",
+          role: "activity",
+          activityType: "A2UI_SURFACE",
+          content: { surface: "dashboard" },
+        },
         { id: "asst-2", role: "assistant", content: "Here's your dashboard" },
       ] as Message[],
       [
@@ -433,9 +441,7 @@ describe("MESSAGES_SNAPSHOT preserves client-only messages", () => {
       ],
     );
 
-    expect(msgs.map((m) => m.id)).toEqual([
-      "m1", "asst-1", "act-1", "asst-2", "tool-canon",
-    ]);
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "asst-1", "act-1", "asst-2", "tool-canon"]);
   });
 });
 
@@ -544,5 +550,67 @@ describe("MESSAGES_SNAPSHOT with snapshot-supplied reasoning", () => {
     expect(msgs.filter((m) => m.role === "reasoning").length).toBe(1);
     const reasoning = msgs.find((m) => m.id === "r1")! as { encryptedValue?: string };
     expect(reasoning.encryptedValue).toBe("enc-1");
+  });
+});
+
+describe("MESSAGES_SNAPSHOT with snapshot-supplied activity", () => {
+  // A backend may include activity messages in the snapshot. Activity ids are
+  // minted by ACTIVITY_* events rather than by the snapshot, so an id the
+  // snapshot carries is the same message the client already holds: the snapshot
+  // is the source of truth for it and normal replace semantics apply. Activity
+  // messages the snapshot does not mention stay untouched.
+
+  it("replaces an existing activity message with the snapshot version", async () => {
+    const msgs = await applySnapshot(
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["stale"] } },
+        { id: "a1", role: "assistant", content: "hi" },
+      ] as Message[],
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["fresh"] } },
+        { id: "a1", role: "assistant", content: "hi" },
+      ] as Message[],
+    );
+
+    expect(msgs.filter((m) => m.role === "activity").length).toBe(1);
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-1", "a1"]);
+    const activity = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
+    expect(activity.content?.tasks).toEqual(["fresh"]);
+  });
+
+  it("appends an activity message the client does not have yet", async () => {
+    const msgs = await applySnapshot(
+      [{ id: "m1", role: "user", content: "hello" }] as Message[],
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["fresh"] } },
+      ] as Message[],
+    );
+
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-1"]);
+    const activity = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
+    expect(activity.content?.tasks).toEqual(["fresh"]);
+  });
+
+  it("preserves a local activity the snapshot does not mention while replacing one it does", async () => {
+    const msgs = await applySnapshot(
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-local", role: "activity", activityType: "PLAN", content: { tasks: ["local"] } },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["stale"] } },
+      ] as Message[],
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["fresh"] } },
+      ] as Message[],
+    );
+
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-local", "act-1"]);
+    const local = msgs.find((m) => m.id === "act-local")! as { content?: { tasks?: string[] } };
+    const replaced = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
+    expect(local.content?.tasks).toEqual(["local"]);
+    expect(replaced.content?.tasks).toEqual(["fresh"]);
   });
 });
