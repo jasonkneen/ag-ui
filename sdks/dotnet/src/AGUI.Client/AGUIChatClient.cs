@@ -350,6 +350,14 @@ public sealed class AGUIChatClient : DelegatingChatClient
                 {
                     input.ForwardedProperties = providedInput.ForwardedProperties;
                 }
+
+                // A caller-supplied Resume takes precedence; the approval-response
+                // translation below already guards on `input.Resume is null`, so it
+                // yields to this. Interrupt responses still append to it.
+                if (providedInput.Resume is { Count: > 0 })
+                {
+                    input.Resume = providedInput.Resume;
+                }
             }
 
             // Convert M.E.AI tools to AG-UI format

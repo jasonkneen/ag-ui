@@ -182,6 +182,68 @@ public sealed class AGUIChatClientTest
         Assert.Equal("acme", sent.ForwardedProperties.GetProperty("tenant").GetString());
     }
 
+    // A caller-supplied Resume (via RawRepresentationFactory) must be forwarded too,
+    // like the other RunAgentInput fields (#2177 review follow-up).
+    [Fact]
+    public async Task GetStreamingResponse_RawRepresentationFactory_ForwardsResume()
+    {
+        var transport = new CapturingTransport();
+        using var client = new AGUIChatClient(new() { Transport = transport });
+
+        var options = new ChatOptions
+        {
+            RawRepresentationFactory = _ => new RunAgentInput
+            {
+                Resume = new List<AGUIResume>
+                {
+                    new() { InterruptId = "caller-interrupt", Status = ResumeStatus.Resolved },
+                },
+            },
+        };
+
+        var history = new List<ChatMessage> { new(ChatRole.User, "Hello") };
+        await DrainAsync(client.GetStreamingResponseAsync(history, options));
+
+        var resume = transport.LastInput!.Resume;
+        Assert.NotNull(resume);
+        var entry = Assert.Single(resume!);
+        Assert.Equal("caller-interrupt", entry.InterruptId);
+    }
+
+    // A caller-supplied Resume takes precedence over the approval-response
+    // translation (the `input.Resume is null` guard yields to it) (#2177).
+    [Fact]
+    public async Task GetStreamingResponse_CallerResume_TakesPrecedenceOverApprovalResponses()
+    {
+        var transport = new CapturingTransport();
+        using var client = new AGUIChatClient(new() { Transport = transport });
+
+        var options = new ChatOptions
+        {
+            RawRepresentationFactory = _ => new RunAgentInput
+            {
+                Resume = new List<AGUIResume>
+                {
+                    new() { InterruptId = "caller-interrupt", Status = ResumeStatus.Resolved },
+                },
+            },
+        };
+
+        var toolCall = new FunctionCallContent("call-1", "someTool", new Dictionary<string, object?>());
+        var history = new List<ChatMessage>
+        {
+            new(ChatRole.User, [new ToolApprovalResponseContent("req-approval", approved: true, toolCall)]),
+        };
+
+        await DrainAsync(client.GetStreamingResponseAsync(history, options));
+
+        // The caller's Resume wins; the approval response is not translated over it.
+        var resume = transport.LastInput!.Resume;
+        Assert.NotNull(resume);
+        var entry = Assert.Single(resume!);
+        Assert.Equal("caller-interrupt", entry.InterruptId);
+    }
+
     // https://github.com/microsoft/agent-framework/issues/5587
     [Fact]
     public async Task AGUIChatClient_ToolCallResultWithPlainTextContent_DoesNotParseAsJson()
