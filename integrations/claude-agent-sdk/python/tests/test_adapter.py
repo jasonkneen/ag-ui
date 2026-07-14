@@ -88,7 +88,7 @@ class TestResultMessageErrorHandling:
     """
 
     @pytest.mark.asyncio
-    async def test_errored_turn_emits_one_assistant_message_and_run_error(self, make_input):
+    async def test_errored_turn_emits_one_assistant_message(self, make_input):
         from claude_agent_sdk import AssistantMessage, ResultMessage
         from claude_agent_sdk.types import TextBlock
 
@@ -127,9 +127,14 @@ class TestResultMessageErrorHandling:
             f"{len(assistant_msgs)}"
         )
 
-        run_errors = [e for e in events if e.type == EventType.RUN_ERROR]
-        assert len(run_errors) == 1
-        assert run_errors[0].message == error_text
+        # Terminal events are owned by run(): the stream itself must NOT emit
+        # RUN_ERROR (run() emits it in place of RUN_FINISHED).
+        assert not any(e.type == EventType.RUN_ERROR for e in events)
+        # The failure text is threaded to run() via the per-run result slot
+        # (_drive never pops it, unlike run()'s finally).
+        stored = adapter._per_run_result[("thread-1", "run-1")]
+        assert stored["is_error"] is True
+        assert stored["result"] == error_text
 
     @pytest.mark.asyncio
     async def test_successful_turn_unaffected(self, make_input):
@@ -163,6 +168,91 @@ class TestResultMessageErrorHandling:
         assert len(assistant_msgs) == 1
         assert assistant_msgs[0].content == "Hi there"
         assert not any(e.type == EventType.RUN_ERROR for e in events)
+        # The failure-text slot is error-only: a success turn must not grow a
+        # "result" key, or it would leak into RunFinishedEvent.result.
+        assert "result" not in adapter._per_run_result[("thread-1", "run-1")]
+
+    @pytest.mark.asyncio
+    async def test_run_replaces_run_finished_with_run_error_on_api_error(
+        self, make_input, monkeypatch
+    ):
+        """Terminal events are owned by run(): an errored turn must end in
+        exactly one RUN_ERROR *in place of* RUN_FINISHED (verifyEvents rejects
+        anything after RUN_ERROR), mirroring TestRunErrorPath."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage
+        from claude_agent_sdk.types import TextBlock
+
+        error_text = "API Error: 400 You have reached your specified API usage limits."
+        result_msg = ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="thread-1",
+            result=error_text,
+        )
+        # Newer SDKs add api_error_status to ResultMessage; the installed
+        # version predates it, so attach dynamically (plain dataclass, no
+        # slots) to exercise the best-effort code threading.
+        result_msg.api_error_status = 400
+
+        stream = [
+            stream_event({"type": "message_start"}),
+            stream_event(
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": error_text}}
+            ),
+            stream_event({"type": "message_stop"}),
+            AssistantMessage(content=[TextBlock(text=error_text)], model="claude-x"),
+            result_msg,
+        ]
+
+        class _FakeStreamingWorker:
+            """SessionWorker stand-in that streams the canned errored turn."""
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def query(self, prompt, session_id="default"):
+                async def _gen():
+                    for m in stream:
+                        yield m
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        adapter = ClaudeAgentAdapter(name="t")
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _FakeStreamingWorker)
+        inp = make_input(messages=[{"id": "1", "role": "user", "content": "hi"}])
+        events = [e async for e in adapter.run(inp)]
+        types = _types(events)
+
+        assert EventType.RUN_STARTED in types
+        assert types.count(EventType.RUN_ERROR) == 1
+        assert EventType.RUN_FINISHED not in types
+        assert types[-1] == EventType.RUN_ERROR  # nothing may follow RUN_ERROR
+        err = events[-1]
+        assert err.message == error_text
+        assert err.code == "400"
+
+        snapshots = [e for e in events if e.type == EventType.MESSAGES_SNAPSHOT]
+        assert len(snapshots) == 1
+        assistant_msgs = [
+            m for m in snapshots[0].messages if getattr(m, "role", None) == "assistant"
+        ]
+        assert len(assistant_msgs) == 1
+
+        # The stream completed cleanly (unlike the exception paths), so the
+        # healthy worker/session must NOT be evicted.
+        assert "thread-1" in adapter._workers
 
 
 class TestStreamToolCall:
