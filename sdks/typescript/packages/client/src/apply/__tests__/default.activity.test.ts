@@ -554,11 +554,11 @@ describe("MESSAGES_SNAPSHOT with snapshot-supplied reasoning", () => {
 });
 
 describe("MESSAGES_SNAPSHOT with snapshot-supplied activity", () => {
-  // A backend may include activity messages in the snapshot. Activity ids are
-  // minted by ACTIVITY_* events rather than by the snapshot, so an id the
-  // snapshot carries is the same message the client already holds: the snapshot
-  // is the source of truth for it and normal replace semantics apply. Activity
-  // messages the snapshot does not mention stay untouched.
+  // A snapshot is a snapshot of every message, so once it carries any activity
+  // the backend is declaring the complete activity set: entries it repeats are
+  // replaced and ones it leaves out are dropped. A snapshot that carries no
+  // activity says nothing about it, and the client's activity is preserved —
+  // the same all-or-nothing rule `snapshotHasReasoning` applies to reasoning.
 
   it("replaces an existing activity message with the snapshot version", async () => {
     const msgs = await applySnapshot(
@@ -594,11 +594,11 @@ describe("MESSAGES_SNAPSHOT with snapshot-supplied activity", () => {
     expect(activity.content?.tasks).toEqual(["fresh"]);
   });
 
-  it("preserves a local activity the snapshot does not mention while replacing one it does", async () => {
+  it("drops a local activity the snapshot leaves out once the snapshot carries activity", async () => {
     const msgs = await applySnapshot(
       [
         { id: "m1", role: "user", content: "hello" },
-        { id: "act-local", role: "activity", activityType: "PLAN", content: { tasks: ["local"] } },
+        { id: "act-gone", role: "activity", activityType: "PLAN", content: { tasks: ["gone"] } },
         { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["stale"] } },
       ] as Message[],
       [
@@ -607,10 +607,26 @@ describe("MESSAGES_SNAPSHOT with snapshot-supplied activity", () => {
       ] as Message[],
     );
 
-    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-local", "act-1"]);
-    const local = msgs.find((m) => m.id === "act-local")! as { content?: { tasks?: string[] } };
-    const replaced = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
-    expect(local.content?.tasks).toEqual(["local"]);
-    expect(replaced.content?.tasks).toEqual(["fresh"]);
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-1"]);
+    const activity = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
+    expect(activity.content?.tasks).toEqual(["fresh"]);
+  });
+
+  it("keeps client activity when the snapshot carries none", async () => {
+    const msgs = await applySnapshot(
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "act-1", role: "activity", activityType: "PLAN", content: { tasks: ["local"] } },
+        { id: "a1", role: "assistant", content: "hi" },
+      ] as Message[],
+      [
+        { id: "m1", role: "user", content: "hello" },
+        { id: "a1", role: "assistant", content: "hi" },
+      ] as Message[],
+    );
+
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "act-1", "a1"]);
+    const activity = msgs.find((m) => m.id === "act-1")! as { content?: { tasks?: string[] } };
+    expect(activity.content?.tasks).toEqual(["local"]);
   });
 });
