@@ -3,20 +3,26 @@
 The `AGUI.*` NuGet packages are **author-signed** during release so nuget.org
 marks them as signed. Signing happens in the `publish-dotnet` job of
 [`.github/workflows/publish-release.yml`](../../../.github/workflows/publish-release.yml),
-in a provider-agnostic seam between **pack** and **push**:
+in a seam between **pack** and **push**:
 
 ```
 pack  →  SIGN (this seam)  →  verify  →  push
 ```
 
+Signing uses a **DigiCert code-signing certificate** whose private key is stored
+(non-exportable, RSA-HSM) in **Azure Key Vault**, applied with
+[NuGetKeyVaultSignTool](https://github.com/novotnyllc/NuGetKeyVaultSignTool) and
+GitHub OIDC — no long-lived secret is stored. The private key never leaves the
+HSM; signing is a `keys/sign` operation executed inside the vault.
+
 The seam is **inert by default**. Until you set the `SIGNING_PROVIDER` variable
-it does nothing and the release behaves exactly as before, so it is safe to
-merge ahead of a certificate/account being provisioned.
+to `keyvault` it does nothing and the release behaves exactly as before, so it
+is safe to merge ahead of provisioning being complete.
 
 > **Author vs. repository signature.** nuget.org always adds its own
 > *repository* signature on push — that is automatic and unrelated to this.
-> This seam adds the *author* signature, which is the one that carries an
-> identity (see "Whose name shows up" below) and flips the package to "signed".
+> This seam adds the *author* signature, which carries the publisher identity
+> (`CN=Tawkit, Inc.`) and flips the package to "signed".
 >
 > **Not the same as `AGUI.snk`.** The `.snk` / `SignAssembly` machinery is
 > assembly *strong-naming* (identity inside the DLLs). It is unrelated to NuGet
@@ -24,118 +30,90 @@ merge ahead of a certificate/account being provisioned.
 
 ## Turning it on
 
-Set a single variable on the **`nuget` environment** (Settings → Environments →
-`nuget`), plus that provider's inputs:
-
-| `SIGNING_PROVIDER` | Effect |
-| --- | --- |
-| _unset_ or `none` | No signing (default) |
-| `signpath` | Sign via SignPath |
-| `artifact-signing` | Sign via Azure Artifact Signing |
-
-### Option A — SignPath
-
-Free for OSS via the SignPath Foundation. The published signature reads
-**"SignPath Foundation"**, not CopilotKit.
-
-One-time SignPath-side setup (in the SignPath web app): create a **project**, a
-**signing policy** (e.g. `release-signing`), and an **artifact configuration**
-that signs the `*.nupkg` inside the uploaded artifact. Then wire:
+Set `SIGNING_PROVIDER=keyvault` on the **`nuget` environment** (Settings →
+Environments → `nuget`), plus the config below. The
+`Preflight — validate signing configuration` step fails the run with an explicit
+list if any of these are missing, so a half-provisioned setup can't publish a
+broken package.
 
 | Name | Kind | Notes |
 | --- | --- | --- |
-| `SIGNING_PROVIDER` | var | `signpath` |
-| `SIGNPATH_API_TOKEN` | **secret** | SignPath REST API token |
-| `SIGNPATH_ORGANIZATION_ID` | var | SignPath organization ID |
-| `SIGNPATH_PROJECT_SLUG` | var | e.g. `ag-ui-dotnet` |
-| `SIGNPATH_SIGNING_POLICY_SLUG` | var | e.g. `release-signing` |
-| `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` | var | artifact config that signs the nupkgs |
-
-Mechanics: the packed `*.nupkg` are uploaded as a run artifact, SignPath signs
-them remotely, and the signed files are downloaded back over the originals
-(hence the job's `actions: read` permission).
-
-### Option B — Azure Artifact Signing
-
-Microsoft's managed service (formerly "Trusted Signing" / "Azure Code
-Signing"), ~$9.99/mo. The signature reads **your validated org name** (e.g.
-"CopilotKit"). Microsoft issues/rotates the certificate — you never hold a key;
-you complete a one-time organization **identity validation** instead.
-
-One-time Azure-side setup: create an Artifact Signing account + certificate
-profile (Public Trust), complete identity validation, and configure an App
-Registration with a **federated credential** for this repo/environment so the
-job's OIDC token can log in (no client secret required). Then wire:
-
-| Name | Kind | Notes |
-| --- | --- | --- |
-| `SIGNING_PROVIDER` | var | `artifact-signing` |
+| `SIGNING_PROVIDER` | var | `keyvault` |
 | `AZURE_CLIENT_ID` | **secret** | App Registration (client) ID — _already set on the `nuget` env (2026-07-01)_ |
 | `AZURE_TENANT_ID` | **secret** | Directory (tenant) ID — _already set_ |
-| `AZURE_SUBSCRIPTION_ID` | **secret** | Subscription containing the signing account — _already set_ |
-| `ARTIFACT_SIGNING_ENDPOINT` | var | Regional endpoint, e.g. `https://eus.codesigning.azure.net` |
-| `ARTIFACT_SIGNING_ACCOUNT` | var | Signing account name |
-| `ARTIFACT_SIGNING_CERT_PROFILE` | var | Certificate profile name |
+| `AZURE_SUBSCRIPTION_ID` | **secret** | Subscription containing the vault — _already set_ |
+| `AZURE_KEY_VAULT_URL` | **secret** | e.g. `https://cpk-signing-kv.vault.azure.net` |
+| `CODE_SIGNING_CERT_NAME` | **secret** | Certificate name in the vault, e.g. `code-signing` |
 
-The three `AZURE_*` IDs are not really secret, but the OIDC federated identity
-for this repo was pre-provisioned on the `nuget` environment as **secrets**
-(2026-07-01), so the workflow reads them from `secrets`. Auth is federated
-(OIDC) — no long-lived client secret is stored. Only the three
-`ARTIFACT_SIGNING_*` values still need to be added (as vars) once the signing
-account + certificate profile exist.
+The vault URL and cert name are not credentials, but are kept as **secrets** so
+they stay out of the committed workflow and the public CI logs. Auth is
+federated (OIDC) — no client secret is stored.
 
-## Whose name shows up
+## How it works
 
-| | SignPath (free OSS) | Azure Artifact Signing |
-| --- | --- | --- |
-| Signer shown in tooling | SignPath Foundation | your org, e.g. "CopilotKit" |
-| Issuer (CA) | SignPath's CA partner | `Microsoft ID Verified CS …` |
-| Cost | free | ~$9.99/mo |
-| Gate to obtain | built-from-repo check | org identity validation |
+1. `azure/login` exchanges the job's OIDC token (`id-token: write`) for an Azure
+   login — using the App Registration's **environment-scoped federated
+   credential** (subject `repo:ag-ui-protocol/ag-ui:environment:nuget`).
+2. `az account get-access-token --resource https://vault.azure.net` mints a
+   short-lived Key Vault data-plane token, which is masked and passed to the
+   tool via `--azure-key-vault-accesstoken` (the only secret-free auth path —
+   managed-identity / client-secret modes don't apply on GitHub runners).
+3. `NuGetKeyVaultSignTool sign` signs each `*.nupkg` (one per call, hence the
+   loop) with SHA-256 and an RFC 3161 timestamp from `timestamp.digicert.com`.
+   `*.snupkg` symbol packages are intentionally not author-signed.
+4. `dotnet nuget verify --all` gates the push — the release fails if a package
+   isn't signed or the signature doesn't chain to a trusted root.
 
-## Signing already-published versions
+## Provisioning checklist
 
-NuGet.org versions are **immutable** — you cannot re-upload `0.0.3` as a signed
-copy (the push step's `--skip-duplicate` will silently skip it). To ship signed
-packages you must publish a **new version**:
+Ownership split: an Azure/subscription admin does 1–2, a repo admin does 3, a
+nuget.org org admin does 4, then anyone triggers 5.
 
-1. Provision a provider above and set its vars/secrets.
-2. Bump the shared `<VersionPrefix>` in
-   [`sdks/dotnet/Directory.Build.props`](../Directory.Build.props)
-   (e.g. `0.0.3` → `0.0.4`). One bump re-releases all five packages, signed.
-3. (Optional) Unlist the old unsigned version on nuget.org so consumers move to
-   the signed one.
-
-## Provisioning checklist (Azure — primary path)
-
-Ordered work to go from "seam merged" to "signed release." Ownership split:
-Azure/infra owner does 1–3, a repo admin does 4, then anyone triggers 5.
-
-1. **Signing account** — create a `Microsoft.CodeSigning/codeSigningAccounts`
-   resource. ([Quickstart](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart))
-2. **Identity validation** — complete org validation (the multi-day gate); this
-   is what stamps "CopilotKit" onto the certificate.
-3. **Certificate profile** — create a **Public Trust** profile, and assign the
-   **Trusted Signing Certificate Profile Signer** role to the existing App
-   Registration (client `AZURE_CLIENT_ID`) so the OIDC login may sign.
-   ([Roles tutorial](https://learn.microsoft.com/en-us/azure/trusted-signing/tutorial-assign-roles))
-4. **Set the `nuget` environment variables** with the values from steps 1 & 3
-   (the `AZURE_*` secrets already exist):
+1. **Grant the CI identity Key Vault access.** The App Registration (client
+   `AZURE_CLIENT_ID`) needs both roles on the vault — Crypto User to sign,
+   Certificate User to read the cert:
+   ```bash
+   SP_OID=$(az ad sp show --id <AZURE_CLIENT_ID> --query id -o tsv)
+   VID=$(az keyvault show --name cpk-signing-kv --query id -o tsv)
+   az role assignment create --role "Key Vault Crypto User" \
+     --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal --scope "$VID"
+   az role assignment create --role "Key Vault Certificate User" \
+     --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal --scope "$VID"
+   ```
+2. **Environment-scoped federated credential.** Because the job uses
+   `environment: nuget`, the App Registration needs a federated credential with
+   subject exactly `repo:ag-ui-protocol/ag-ui:environment:nuget` (issuer
+   `https://token.actions.githubusercontent.com`, audience
+   `api://AzureADTokenExchange`). A branch/ref-scoped credential will silently
+   fail to log in.
+3. **Set the `nuget` environment secrets/vars** from the table above:
    ```bash
    R=ag-ui-protocol/ag-ui
-   gh variable set ARTIFACT_SIGNING_ENDPOINT     --env nuget --repo $R --body "https://<region>.codesigning.azure.net"
-   gh variable set ARTIFACT_SIGNING_ACCOUNT      --env nuget --repo $R --body "<signing-account-name>"
-   gh variable set ARTIFACT_SIGNING_CERT_PROFILE --env nuget --repo $R --body "<certificate-profile-name>"
-   gh variable set SIGNING_PROVIDER              --env nuget --repo $R --body "artifact-signing"
+   gh secret set   AZURE_KEY_VAULT_URL    --env nuget --repo $R --body "https://cpk-signing-kv.vault.azure.net"
+   gh secret set   CODE_SIGNING_CERT_NAME --env nuget --repo $R --body "code-signing"
+   gh variable set SIGNING_PROVIDER       --env nuget --repo $R --body "keyvault"
    ```
-   > The `Preflight — validate signing configuration` step fails the run with an
-   > explicit list if any of these are still missing, so a partial setup can't
-   > publish a broken package.
-5. **Trial + ship** — run `canary / publish` (scope `sdk-dotnet`,
-   `dry_run=false`) → confirm signed on nuget.org → bump `VersionPrefix` for the
-   stable signed release.
+4. **Register the certificate on nuget.org.** Export the public cert and
+   register it under the **`ag-ui-protocol` org** → Manage → Certificates:
+   ```bash
+   az keyvault certificate download --vault-name cpk-signing-kv --name code-signing \
+     --file agui-codesign.cer --encoding DER
+   ```
+   ⚠️ Enforcement is account-wide and immediate: once any cert is registered to
+   the owner, **every** future push must be author-signed with a registered
+   cert. Land this together with the signing CI (step 3) and the version bump
+   (step 5) — don't register early, or an interim unsigned release will be
+   rejected.
+5. **Version bump + ship.** nuget.org versions are immutable, so signed
+   packages must publish as a new version. Bump the shared `<VersionPrefix>` in
+   [`sdks/dotnet/Directory.Build.props`](../Directory.Build.props) (e.g. `0.0.3`
+   → `0.0.4`) — one bump re-releases all five packages, signed. (Optional:
+   unlist the old unsigned versions so consumers move to the signed ones.)
 
-### SignPath (backup path)
+## Why the DigiCert cert qualifies
 
-If Azure stalls, set `SIGNING_PROVIDER=signpath` and the `SIGNPATH_*`
-vars/secrets from the SignPath section above instead. Nothing else changes.
+nuget.org accepts an author signature whose cert chains to a root in the
+Microsoft Trusted Root Program (DigiCert is a member), has the code-signing EKU,
+RSA ≥ 2048 (this cert is RSA 3072), and carries a valid RFC 3161 timestamp — all
+satisfied by the issued DigiCert code-signing certificate. Adding/removing certs
+on nuget.org requires 2FA.

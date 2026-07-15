@@ -1187,10 +1187,6 @@ jobs:
     permissions:
       contents: write
       id-token: write
-      # actions: read lets the SignPath connector download the packed .nupkg
-      # artifact from this workflow run (see the "Sign packages" seam below).
-      # Harmless for the Azure Artifact Signing path, which signs in place.
-      actions: read
     steps:
       - name: Checkout release ref
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -1283,123 +1279,107 @@ jobs:
           ls -la artifacts/nuget
 
       # ── Author signing (pack → SIGN → push) ────────────────────────────────
-      # Author-signs the packed *.nupkg in place so nuget.org marks the
-      # packages as signed. The provider is selected by the SIGNING_PROVIDER
-      # repo/environment variable (set it on the `nuget` environment):
-      #   unset / 'none'      → no signing (today's behavior; safe default)
-      #   'signpath'          → SignPath   (cert subject: "SignPath Foundation")
-      #   'artifact-signing'  → Azure Artifact Signing (cert subject: your org)
-      # Both providers sign the same artifacts/nuget/*.nupkg, so the Push step
-      # below is unchanged. nuget.org's *repository* signature is applied
-      # automatically on push and is independent of this. Symbol packages
-      # (*.snupkg) are intentionally not author-signed.
-      # Required vars/secrets per provider: see sdks/dotnet/docs/signing.md.
-      # NOTE: This seam is inert until SIGNING_PROVIDER is set — safe to merge
-      # ahead of the certificate/account being provisioned.
+      # Author-signs the packed *.nupkg in place with a DigiCert code-signing
+      # certificate stored (non-exportable, RSA-HSM) in Azure Key Vault, via
+      # NuGetKeyVaultSignTool + GitHub OIDC (no long-lived secret). This is the
+      # *author* signature that flips packages to "signed" on nuget.org;
+      # nuget.org's *repository* signature is applied automatically on push and
+      # is independent of this. Symbol packages (*.snupkg) are intentionally not
+      # author-signed, and assembly strong-naming (AGUI.snk) is a separate,
+      # untouched concern.
+      # Gated on the SIGNING_PROVIDER variable (set on the `nuget` environment):
+      #   unset / 'none'  → no signing (safe default; inert until provisioned)
+      #   'keyvault'      → sign via Azure Key Vault + NuGetKeyVaultSignTool
+      # Required config (see sdks/dotnet/docs/signing.md): the secrets
+      # AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+      # AZURE_KEY_VAULT_URL, CODE_SIGNING_CERT_NAME on the `nuget` environment;
+      # plus the App Registration granted Key Vault "Crypto User" + "Certificate
+      # User" roles on the vault, and the cert registered on the nuget.org owner.
+      # NOTE: inert until SIGNING_PROVIDER=keyvault — safe to merge ahead of
+      # provisioning.
 
-      # Fail fast with an explicit list if signing is enabled but the selected
-      # provider's configuration is incomplete — so a half-provisioned setup
-      # errors here with actionable output instead of deep inside a signing
-      # action. Lists exactly which vars/secrets the `nuget` environment still
-      # needs. See sdks/dotnet/docs/signing.md.
+      # Fail fast with an explicit list if signing is enabled but its
+      # configuration is incomplete — so a half-provisioned setup errors here
+      # with actionable output instead of deep inside the signing tool. Lists
+      # exactly which secrets the `nuget` environment still needs. See
+      # sdks/dotnet/docs/signing.md.
       - name: Preflight — validate signing configuration
         if: vars.SIGNING_PROVIDER != '' && vars.SIGNING_PROVIDER != 'none'
         shell: bash
         env:
           PROVIDER: ${{ vars.SIGNING_PROVIDER }}
-          # SignPath (backup provider)
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-          # Azure Artifact Signing (primary provider). AZURE_* already exist as
-          # secrets on the `nuget` env (2026-07-01); ARTIFACT_SIGNING_* are the
-          # vars still pending the signing account + certificate profile.
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
-          ARTIFACT_SIGNING_CERT_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERT_PROFILE }}
+          AZURE_KEY_VAULT_URL: ${{ secrets.AZURE_KEY_VAULT_URL }}
+          CODE_SIGNING_CERT_NAME: ${{ secrets.CODE_SIGNING_CERT_NAME }}
         run: |
           set -euo pipefail
+          if [ "$PROVIDER" != "keyvault" ]; then
+            echo "::error::Unknown SIGNING_PROVIDER '${PROVIDER}' (expected 'none' or 'keyvault')"
+            exit 1
+          fi
           missing=()
-          case "$PROVIDER" in
-            signpath)
-              required="SIGNPATH_API_TOKEN SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_SIGNING_POLICY_SLUG SIGNPATH_ARTIFACT_CONFIGURATION_SLUG"
-              ;;
-            artifact-signing)
-              required="AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ARTIFACT_SIGNING_ENDPOINT ARTIFACT_SIGNING_ACCOUNT ARTIFACT_SIGNING_CERT_PROFILE"
-              ;;
-            *)
-              echo "::error::Unknown SIGNING_PROVIDER '${PROVIDER}' (expected 'none', 'signpath', or 'artifact-signing')"
-              exit 1
-              ;;
-          esac
-          for name in $required; do
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_KEY_VAULT_URL CODE_SIGNING_CERT_NAME; do
             if [ -z "${!name}" ]; then
               missing+=("$name")
             fi
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::SIGNING_PROVIDER='${PROVIDER}' but the 'nuget' environment is missing: ${missing[*]}"
+            echo "::error::SIGNING_PROVIDER='keyvault' but the 'nuget' environment is missing: ${missing[*]}"
             echo "Provision these (see sdks/dotnet/docs/signing.md) before enabling signing."
             exit 1
           fi
-          echo "Signing configuration for '${PROVIDER}' is complete."
+          echo "Signing configuration for 'keyvault' is complete."
 
-      # --- SignPath: upload the packed artifact, sign remotely, download back ---
-      - name: Upload packages for SignPath signing
-        if: vars.SIGNING_PROVIDER == 'signpath'
-        id: signpath-upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: nuget-unsigned
-          path: artifacts/nuget/*.nupkg
-          if-no-files-found: error
-
-      - name: Sign packages (SignPath)
-        if: vars.SIGNING_PROVIDER == 'signpath'
-        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd  # v2
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-          github-artifact-id: ${{ steps.signpath-upload.outputs.artifact-id }}
-          wait-for-completion: true
-          # Extracts the signed *.nupkg back over the unsigned ones.
-          output-artifact-directory: artifacts/nuget
-
-      # --- Azure Artifact Signing: OIDC login, then sign in place ---
-      # Reuses the job's existing `id-token: write` — no client secret needed.
+      # OIDC login for Key Vault access — reuses the job's id-token: write; no
+      # long-lived client secret is stored.
       - name: Azure login (OIDC)
-        if: vars.SIGNING_PROVIDER == 'artifact-signing'
+        if: vars.SIGNING_PROVIDER == 'keyvault'
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
         with:
-          # These IDs are non-secret but already exist as secrets on the `nuget`
-          # environment (provisioned 2026-07-01), so read them from secrets.
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Sign packages (Azure Artifact Signing)
-        if: vars.SIGNING_PROVIDER == 'artifact-signing'
-        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
-        with:
-          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERT_PROFILE }}
-          files-folder: ${{ github.workspace }}/artifacts/nuget
-          files-folder-filter: nupkg
-          files-folder-recurse: false
+      # Author-sign each *.nupkg with the Key Vault cert. NuGetKeyVaultSignTool
+      # signs one file per call, so we loop; *.snupkg are excluded. The private
+      # key never leaves the HSM — signing is a keys/sign op inside the vault.
+      - name: Author-sign packages (Azure Key Vault)
+        if: vars.SIGNING_PROVIDER == 'keyvault'
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ secrets.AZURE_KEY_VAULT_URL }}
+          CODE_SIGNING_CERT_NAME: ${{ secrets.CODE_SIGNING_CERT_NAME }}
+        run: |
+          dotnet tool install --global NuGetKeyVaultSignTool
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install NuGetKeyVaultSignTool' }
+          $toolsDir = Join-Path $env:USERPROFILE '.dotnet\tools'
+          if ($env:PATH -notlike "*$toolsDir*") { $env:PATH = "$toolsDir;$env:PATH" }
+
+          # Short-lived Key Vault data-plane token from the OIDC login context.
+          $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
+          if (-not $token) { throw 'Failed to obtain Key Vault access token' }
+          Write-Output "::add-mask::$token"
+
+          $pkgs = Get-ChildItem -Path artifacts/nuget -File | Where-Object { $_.Extension -eq '.nupkg' }
+          if ($pkgs.Count -eq 0) { throw 'No .nupkg found to sign' }
+          foreach ($pkg in $pkgs) {
+            Write-Host "Signing $($pkg.Name)"
+            NuGetKeyVaultSignTool sign $pkg.FullName `
+              --file-digest sha256 `
+              --timestamp-rfc3161 http://timestamp.digicert.com `
+              --timestamp-digest sha256 `
+              --azure-key-vault-url $env:AZURE_KEY_VAULT_URL `
+              --azure-key-vault-certificate $env:CODE_SIGNING_CERT_NAME `
+              --azure-key-vault-accesstoken $token
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $($pkg.Name)" }
+          }
 
       # Fail the release before publishing if signing was requested but didn't
       # actually apply (verifies the author signature chains to a trusted root).
       - name: Verify packages are signed
-        if: vars.SIGNING_PROVIDER != '' && vars.SIGNING_PROVIDER != 'none'
+        if: vars.SIGNING_PROVIDER == 'keyvault'
         shell: bash
         run: |
           set -euo pipefail
