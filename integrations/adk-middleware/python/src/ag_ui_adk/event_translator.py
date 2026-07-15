@@ -1360,6 +1360,7 @@ class EventTranslator:
         self._emitted_predict_state_for_tools.clear()
         self._emitted_confirm_for_tools.clear()
         self._predictive_state_tool_call_ids.clear()
+        self._emitted_signature_tool_call_ids.clear()
         self._deferred_confirm_events.clear()
         # Reset reasoning state
         self._is_reasoning = False
