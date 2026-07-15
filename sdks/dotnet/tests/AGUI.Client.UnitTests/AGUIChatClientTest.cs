@@ -211,7 +211,7 @@ public sealed class AGUIChatClientTest
     }
 
     // A caller-supplied Resume takes precedence over the approval-response
-    // translation (the `input.Resume is null` guard yields to it) (#2177).
+    // translation (the callerSuppliedResume guard yields to it) (#2177).
     [Fact]
     public async Task GetStreamingResponse_CallerResume_TakesPrecedenceOverApprovalResponses()
     {
@@ -238,6 +238,40 @@ public sealed class AGUIChatClientTest
         await DrainAsync(client.GetStreamingResponseAsync(history, options));
 
         // The caller's Resume wins; the approval response is not translated over it.
+        var resume = transport.LastInput!.Resume;
+        Assert.NotNull(resume);
+        var entry = Assert.Single(resume!);
+        Assert.Equal("caller-interrupt", entry.InterruptId);
+    }
+
+    // A caller-supplied Resume takes precedence over the interrupt-response translation
+    // too, matching the approval path. Previously the interrupt block appended
+    // unconditionally, so a caller Resume dropped approvals but kept interrupts (#2177).
+    [Fact]
+    public async Task GetStreamingResponse_CallerResume_TakesPrecedenceOverInterruptResponses()
+    {
+        var transport = new CapturingTransport();
+        using var client = new AGUIChatClient(new() { Transport = transport });
+
+        var options = new ChatOptions
+        {
+            RawRepresentationFactory = _ => new RunAgentInput
+            {
+                Resume = new List<AGUIResume>
+                {
+                    new() { InterruptId = "caller-interrupt", Status = ResumeStatus.Resolved },
+                },
+            },
+        };
+
+        var history = new List<ChatMessage>
+        {
+            new(ChatRole.User, [new InterruptResponseContent("req-interrupt")]),
+        };
+
+        await DrainAsync(client.GetStreamingResponseAsync(history, options));
+
+        // The caller's Resume wins; the interrupt response is not appended over it.
         var resume = transport.LastInput!.Resume;
         Assert.NotNull(resume);
         var entry = Assert.Single(resume!);
