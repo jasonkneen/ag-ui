@@ -1001,8 +1001,11 @@ class ClaudeAgentAdapter:
             
             # Handle complete messages
             if isinstance(message, (AssistantMessage, UserMessage)):
+                # msg_id (used below and passed to handle_tool_use_block()) —
+                # not current_message_id, which is only valid inside the
+                # streaming loop and is already None here.
+                msg_id = current_message_id or str(uuid.uuid4())
                 if isinstance(message, AssistantMessage):
-                    msg_id = current_message_id or str(uuid.uuid4())
                     if current_message_id is None:
                         unstreamed_fallback_ids.add(msg_id)
                     agui_msg = build_agui_assistant_message(message, msg_id)
@@ -1017,7 +1020,7 @@ class ClaudeAgentAdapter:
                             continue
                         updated_state, tool_events = await handle_tool_use_block(
                             block, message, thread_id, run_id, self._per_thread_state.get(thread_id),
-                            parent_message_id=current_message_id,
+                            parent_message_id=msg_id,
                         )
                         if tool_id:
                             processed_tool_ids.add(tool_id)
