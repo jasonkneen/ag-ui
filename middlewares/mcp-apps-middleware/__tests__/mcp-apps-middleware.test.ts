@@ -597,6 +597,7 @@ describe("MCPAppsMiddleware", () => {
 
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
+      expect(mockHTTPTransportCalls).toHaveLength(1);
       expect(mockHTTPTransportOpts[0]).toBeUndefined();
     });
 
