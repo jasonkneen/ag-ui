@@ -43,10 +43,18 @@ func (p PredictiveState) Run(ctx context.Context, emit *Emitter, in *aguitypes.R
 	messages := ensureSystemPrompt(toEinoMessages(in.Messages, p.Deps.Provider), predictiveSystemPrompt)
 
 	emit.StepStarted("llm")
-	full, ok := p.streamPredictive(ctx, emit, doc, messages)
+	full, err := p.streamPredictive(ctx, emit, doc, messages)
 	emit.StepFinished("llm")
-	if !ok {
-		return // streamPredictive already emitted RUN_ERROR or the client is gone
+	if err != nil {
+		// The actual run context and emitter state determine whether this was a
+		// shutdown/disconnect. A provider may return context.Canceled or
+		// context.DeadlineExceeded for its own internal operation while the run is
+		// still live; that is a genuine model failure and must reach the client.
+		if ctx.Err() != nil || emit.Err() != nil {
+			return
+		}
+		emit.RunError("the agent failed to generate a response")
+		return
 	}
 
 	// Settle: commit the finalized steps to the real path, then clear the ghost.
@@ -89,34 +97,30 @@ func (p PredictiveState) Run(ctx context.Context, emit *Emitter, in *aguitypes.R
 }
 
 // streamPredictive streams the model turn, emitting the growing draft as predictive
-// STATE_DELTAs under /_predictive/draft. It returns the full generated text and ok
-// = true on success; on a model error it emits RUN_ERROR and returns ok = false.
-func (p PredictiveState) streamPredictive(ctx context.Context, emit *Emitter, doc *DocState, messages []*schema.Message) (string, bool) {
+// STATE_DELTAs under /_predictive/draft. It returns the full generated text on
+// success and leaves error classification and terminal-event emission to Run, so
+// Run can close the active step before emitting RUN_ERROR.
+func (p PredictiveState) streamPredictive(ctx context.Context, emit *Emitter, doc *DocState, messages []*schema.Message) (string, error) {
 	sr, err := p.Deps.BaseModel.Stream(ctx, messages)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || emit.Err() != nil {
-			return "", false
-		}
-		emit.RunError("the agent failed to generate a response")
-		return "", false
+		return "", err
 	}
 	defer sr.Close()
 
 	var b strings.Builder
 	for {
-		if ctx.Err() != nil || emit.Err() != nil {
-			return "", false
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := emit.Err(); err != nil {
+			return "", err
 		}
 		chunk, recvErr := sr.Recv()
 		if errors.Is(recvErr, io.EOF) {
 			break
 		}
 		if recvErr != nil {
-			if errors.Is(recvErr, context.Canceled) || emit.Err() != nil {
-				return "", false
-			}
-			emit.RunError("the agent failed to generate a response")
-			return "", false
+			return "", recvErr
 		}
 		if chunk.Content == "" {
 			continue
@@ -132,7 +136,7 @@ func (p PredictiveState) streamPredictive(ctx context.Context, emit *Emitter, do
 			emit.StateDelta(op)
 		}
 	}
-	return b.String(), true
+	return b.String(), nil
 }
 
 // stepListMarker matches a single leading ordered/unordered list marker ("1.",
