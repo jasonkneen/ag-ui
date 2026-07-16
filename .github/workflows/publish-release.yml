@@ -1200,7 +1200,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1  # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           dotnet-version: |
             8.0.x
@@ -1741,7 +1741,7 @@ jobs:
         # secret is unset until the #engr incoming webhook is provisioned, and a
         # release must not go red merely because alerting isn't wired yet.
         if: steps.build_message.outputs.should_post == 'true' && env.SLACK_WEBHOOK != ''
-        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_ENGR }}
           webhook-type: incoming-webhook
@@ -1769,7 +1769,7 @@ jobs:
            steps.intent.outputs.nuget_intended != 'false') &&
           env.SLACK_WEBHOOK != ''
         continue-on-error: true
-        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_ENGR }}
           webhook-type: incoming-webhook
