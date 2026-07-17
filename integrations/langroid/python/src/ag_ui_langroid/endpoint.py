@@ -41,7 +41,10 @@ def add_langroid_fastapi_endpoint(
             media_type=encoder.get_content_type()
         )
 
-    @app.get(f"{path}/health")
+    # Strip any trailing slash so a root path ("/") yields "/health", not "//health".
+    health_path = f"{path.rstrip('/')}/health"
+
+    @app.get(health_path)
     def health():
         """Health check."""
         return {

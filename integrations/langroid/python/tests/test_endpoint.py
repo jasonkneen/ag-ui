@@ -47,6 +47,18 @@ class TestCreateLangroidApp(unittest.TestCase):
         response = client.get("/chat/health")
         self.assertEqual(response.status_code, 200)
 
+    def test_root_path_health_has_no_double_slash(self):
+        # With the default root path ("/") the health route must be reachable at
+        # "/health" (i.e. not registered as "//health").
+        mock_agent = MagicMock()
+        agent = LangroidAgent(agent=mock_agent, name="test", description="")
+        app = create_langroid_app(agent)  # path defaults to "/"
+        client = TestClient(app)
+
+        self.assertEqual(client.get("/health").status_code, 200)
+        # The route must be registered exactly as "/health".
+        self.assertIn("/health", [r.path for r in app.routes])
+
 
 class TestCreateLangroidAppCors(unittest.TestCase):
     """CORS credentials must never be combined with a wildcard origin."""
