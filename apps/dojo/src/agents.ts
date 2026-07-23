@@ -660,6 +660,48 @@ export const agentsIntegrations = {
       },
     ),
 
+  "claude-managed-agents-dotnet": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsDotnetUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
+  "claude-managed-agents-python": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsPythonUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
+  "claude-managed-agents-typescript": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsTypescriptUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
   langroid: async () =>
     mapAgents(
       (path) =>
