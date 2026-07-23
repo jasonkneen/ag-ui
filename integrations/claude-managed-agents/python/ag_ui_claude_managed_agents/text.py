@@ -6,6 +6,9 @@ from typing import Any
 
 from ._util import get
 
+SEARCH_RESULT_PREVIEW_CHARS = 300
+"""Search result bodies can be long; show only a readable prefix."""
+
 _HEX_ENTITY = re.compile(r"&#x([0-9a-fA-F]+);")
 _DEC_ENTITY = re.compile(r"&#(\d+);")
 
@@ -52,7 +55,7 @@ def describe_tool_result(content: Sequence[Any] | None) -> str:
             source = str(get(block, "source") or "")
             line = f"[search result] {title} — {source}"
             if inner:
-                line += f"\n{decode_entities(inner)[:300]}"
+                line += f"\n{decode_entities(inner)[:SEARCH_RESULT_PREVIEW_CHARS]}"
             lines.append(line)
             continue
         lines.append(f"[{block_type}]")

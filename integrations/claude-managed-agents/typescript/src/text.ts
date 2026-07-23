@@ -1,5 +1,8 @@
 /** Helpers for turning Managed Agents content blocks into display text. */
 
+/** Search result bodies can be long; show only a readable prefix. */
+const SEARCH_RESULT_PREVIEW_CHARS = 300;
+
 /** Any content block; only `type` is required to route it. */
 type ContentBlock = { type: string } & Record<string, any>;
 
@@ -16,7 +19,7 @@ const decodeEntities = (s: string): string =>
     .replace(/&amp;/g, "&");
 
 /** Concatenate the text of every `text` block. */
-export const textOf = (content: ReadonlyArray<ContentBlock> | undefined): string =>
+export const textOf = (content: ReadonlyArray<ContentBlock> | null | undefined): string =>
   (content ?? [])
     .filter((b) => b.type === "text" && typeof b.text === "string")
     .map((b) => b.text as string)
@@ -26,7 +29,7 @@ export const textOf = (content: ReadonlyArray<ContentBlock> | undefined): string
  * Tool results mix block types: text, search results, images, documents.
  * Flatten them into a readable string for the UI.
  */
-export const describeToolResult = (content: ReadonlyArray<ContentBlock> | undefined): string =>
+export const describeToolResult = (content: ReadonlyArray<ContentBlock> | null | undefined): string =>
   (content ?? [])
     .map((block) => {
       if (block.type === "text" && typeof block.text === "string") return decodeEntities(block.text);
@@ -34,7 +37,7 @@ export const describeToolResult = (content: ReadonlyArray<ContentBlock> | undefi
         const inner = Array.isArray(block.content) ? textOf(block.content) : "";
         const title = decodeEntities(String(block.title ?? ""));
         const source = String(block.source ?? "");
-        return `[search result] ${title} — ${source}${inner ? `\n${decodeEntities(inner).slice(0, 300)}` : ""}`;
+        return `[search result] ${title} — ${source}${inner ? `\n${decodeEntities(inner).slice(0, SEARCH_RESULT_PREVIEW_CHARS)}` : ""}`;
       }
       return `[${String(block.type)}]`;
     })

@@ -26,6 +26,9 @@ from ._util import get
 from .text import describe_tool_result, text_of
 from .types import BackendTool, TurnOutcome
 
+TOOL_RESULT_MAX_CHARS = 4000
+"""Tool results can be large; the UI only needs a readable prefix."""
+
 Emit = Callable[[BaseEvent], None]
 
 
@@ -326,13 +329,13 @@ async def _consume(
             elif event_type == "agent.tool_result":
                 emit_tool_result(
                     get(event, "tool_use_id"),
-                    describe_tool_result(get(event, "content"))[:4000],
+                    describe_tool_result(get(event, "content"))[:TOOL_RESULT_MAX_CHARS],
                 )
 
             elif event_type == "agent.mcp_tool_result":
                 emit_tool_result(
                     get(event, "mcp_tool_use_id"),
-                    describe_tool_result(get(event, "content"))[:4000],
+                    describe_tool_result(get(event, "content"))[:TOOL_RESULT_MAX_CHARS],
                 )
 
             elif event_type == "span.model_request_end":

@@ -37,6 +37,14 @@ export type TurnOutcome =
 
 type StreamEvent = BetaManagedAgentsStreamSessionEvents;
 
+/** Tool results can be large; the UI only needs a readable prefix. */
+const TOOL_RESULT_MAX_CHARS = 4000;
+/**
+ * Backoff for re-posting follow-up messages while a session finishes
+ * un-parking; that transition happens asynchronously after a tool result.
+ */
+const PARKED_RETRY_DELAYS_MS = [150, 300, 600, 1000, 1500, 2000];
+
 /**
  * Drive one turn of a managed session: open the event stream, post the
  * outbound events, and translate the session's events into AG-UI events
@@ -69,14 +77,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   // follow-up user message can race ahead of that transition and be rejected
   // as sent-while-parked. Retry it briefly on that specific error.
   const sendFollowUps = async () => {
-    const delaysMs = [150, 300, 600, 1000, 1500, 2000];
     for (let attempt = 0; ; attempt++) {
       try {
         await client.beta.sessions.events.send(sessionId, { events: followUps });
         return;
       } catch (err) {
-        if (attempt >= delaysMs.length || !isSentWhileParked(err)) throw err;
-        await sleep(delaysMs[attempt]!, signal);
+        const delayMs = PARKED_RETRY_DELAYS_MS[attempt];
+        if (delayMs === undefined || !isSentWhileParked(err)) throw err;
+        await sleep(delayMs, signal);
       }
     }
   };
@@ -97,8 +105,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   const clientParks = new Set<string>();
   const askedConfirmations = new Set<string>();
 
+  const emitTextStart = (messageId: string) =>
+    emit({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent);
+  const emitTextContent = (messageId: string, delta: string) =>
+    emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta } as BaseEvent);
+  const emitTextEnd = (messageId: string) => emit({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent);
+
   const closeMessage = (messageId: string) => {
-    emit({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent);
+    emitTextEnd(messageId);
     previews.delete(messageId);
     closedMessages.add(messageId);
   };
@@ -138,28 +152,22 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     return { status: "errored" };
   };
 
+  /** Surface a custom tool result to the UI and answer it in the session. */
+  const answerCustomToolUse = async (toolUseId: string, text: string, isError: boolean) => {
+    emitToolResult(toolUseId, text);
+    await client.beta.sessions.events.send(sessionId, {
+      events: [{ type: "user.custom_tool_result", custom_tool_use_id: toolUseId, content: [{ type: "text", text }], is_error: isError }],
+    });
+    ackedToolUses.add(toolUseId);
+  };
+
   /** Run a backend custom tool and post its result back into the session. */
   const runBackendTool = async (id: string, tool: BackendCustomTool, input: unknown) => {
-    let text: string;
-    let isError = false;
     try {
-      text = await tool.handler(input);
+      await answerCustomToolUse(id, await tool.handler(input), false);
     } catch (err) {
-      isError = true;
-      text = err instanceof Error ? err.message : String(err);
+      await answerCustomToolUse(id, err instanceof Error ? err.message : String(err), true);
     }
-    emitToolResult(id, text);
-    await client.beta.sessions.events.send(sessionId, {
-      events: [
-        {
-          type: "user.custom_tool_result",
-          custom_tool_use_id: id,
-          content: [{ type: "text", text }],
-          is_error: isError,
-        },
-      ],
-    });
-    ackedToolUses.add(id);
   };
 
   const consume = async (): Promise<TurnOutcome> => {
@@ -167,7 +175,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       switch (event.type) {
         case "event_start": {
           if (event.event.type === "agent.message") {
-            emit({ type: EventType.TEXT_MESSAGE_START, messageId: event.event.id, role: "assistant" } as BaseEvent);
+            emitTextStart(event.event.id);
             const seed = accumulateManagedAgentsEvent(undefined, event);
             if (seed) previews.set(event.event.id, seed);
           } else if (event.event.type === "agent.thinking") {
@@ -183,7 +191,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           if (!snapshot) break; // best-effort; the buffered agent.message is canonical
           previews.set(event.event_id, accumulateManagedAgentsEvent(snapshot, event) ?? snapshot);
           if (event.delta.type === "content_delta" && event.delta.content.type === "text") {
-            emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: event.event_id, delta: event.delta.content.text } as BaseEvent);
+            emitTextContent(event.event_id, event.delta.content.text);
           }
           break;
         }
@@ -205,22 +213,22 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           const snapshot = previews.get(event.id);
           const finalText = textOf(event.content);
           if (!snapshot) {
-            emit({ type: EventType.TEXT_MESSAGE_START, messageId: event.id, role: "assistant" } as BaseEvent);
-            if (finalText) emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: event.id, delta: finalText } as BaseEvent);
+            emitTextStart(event.id);
+            if (finalText) emitTextContent(event.id, finalText);
           } else {
             const previewed = textOf(snapshot.content);
             if (finalText.startsWith(previewed)) {
               if (finalText.length > previewed.length) {
-                emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: event.id, delta: finalText.slice(previewed.length) } as BaseEvent);
+                emitTextContent(event.id, finalText.slice(previewed.length));
               }
             } else {
               // Preview diverged from the final text: close it and re-emit the corrected whole.
               closeMessage(event.id);
               if (finalText) {
                 const messageId = `corrected_${event.id}`;
-                emit({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent);
-                emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: finalText } as BaseEvent);
-                emit({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent);
+                emitTextStart(messageId);
+                emitTextContent(messageId, finalText);
+                emitTextEnd(messageId);
               }
               break;
             }
@@ -245,14 +253,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
             break;
           }
           // Nothing can execute this tool. Answer with an error so the agent recovers.
-          const text = `No handler is registered for tool "${event.name}".`;
-          emitToolResult(event.id, text);
-          await client.beta.sessions.events.send(sessionId, {
-            events: [
-              { type: "user.custom_tool_result", custom_tool_use_id: event.id, content: [{ type: "text", text }], is_error: true },
-            ],
-          });
-          ackedToolUses.add(event.id);
+          await answerCustomToolUse(event.id, `No handler is registered for tool "${event.name}".`, true);
           break;
         }
 
@@ -269,12 +270,12 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
         }
 
         case "agent.tool_result": {
-          emitToolResult(event.tool_use_id, describeToolResult(event.content ?? undefined).slice(0, 4000));
+          emitToolResult(event.tool_use_id, describeToolResult(event.content).slice(0, TOOL_RESULT_MAX_CHARS));
           break;
         }
 
         case "agent.mcp_tool_result": {
-          emitToolResult(event.mcp_tool_use_id, describeToolResult(event.content ?? undefined).slice(0, 4000));
+          emitToolResult(event.mcp_tool_use_id, describeToolResult(event.content).slice(0, TOOL_RESULT_MAX_CHARS));
           break;
         }
 

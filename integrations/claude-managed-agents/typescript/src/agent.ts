@@ -23,6 +23,12 @@ const userText = (message: Extract<Message, { role: "user" }>): string => {
     .join("");
 };
 
+/** Whether any user message in the run carries text. */
+const hasUserText = (messages: Message[]): boolean =>
+  messages.some((message) => message.role === "user" && userText(message).trim().length > 0);
+
+const runError = (message: string): BaseEvent => ({ type: EventType.RUN_ERROR, message } as BaseEvent);
+
 /**
  * An AG-UI agent backed by Claude Managed Agents. Each AG-UI thread maps to
  * one managed session; each run drives one turn of that session.
@@ -77,7 +83,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
             : err instanceof Error
               ? err.message
               : "The run failed.";
-          emit({ type: EventType.RUN_ERROR, message } as BaseEvent);
+          emit(runError(message));
         })
         .finally(() => subscriber.complete());
 
@@ -102,20 +108,20 @@ export class ManagedAgentsAgent extends AbstractAgent {
     }
 
     if (ManagedAgentsAgent.busyThreads.has(busyKey)) {
-      emit({ type: EventType.RUN_ERROR, message: "A run is already in progress on this thread." } as BaseEvent);
+      emit(runError("A run is already in progress on this thread."));
       return;
     }
     // Check for something sendable before touching the API, so a malformed
     // run does not create an orphan session.
     if (!this.hasSendableContent(input.messages)) {
-      emit({ type: EventType.RUN_ERROR, message: "There is nothing to send: this run has no user message or tool result." } as BaseEvent);
+      emit(runError("There is nothing to send: this run has no user message or tool result."));
       return;
     }
     ManagedAgentsAgent.busyThreads.add(busyKey);
     try {
       const record = await this.getOrCreateSession(threadId, input, emit);
       if (!record) {
-        emit({ type: EventType.RUN_ERROR, message: "There is nothing to send: a tool result arrived for a thread with no session." } as BaseEvent);
+        emit(runError("There is nothing to send: a tool result arrived for a thread with no session."));
         return;
       }
       onSession(record.sessionId);
@@ -123,7 +129,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
       const outbound = this.outboundEvents(record, input.messages);
       if (outbound.events.length === 0) {
-        emit({ type: EventType.RUN_ERROR, message: "There is nothing new to send: no user message or tool result in this run." } as BaseEvent);
+        emit(runError("There is nothing new to send: no user message or tool result in this run."));
         return;
       }
 
@@ -168,11 +174,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
   /** Whether the run carries a user message with text or a tool result. */
   private hasSendableContent(messages: Message[]): boolean {
-    return messages.some(
-      (message) =>
-        message.role === "tool" ||
-        (message.role === "user" && userText(message).trim().length > 0),
-    );
+    return hasUserText(messages) || messages.some((message) => message.role === "tool");
   }
 
   /** Shared-state key scoped to this managed agent (and scope, if set). */
@@ -257,8 +259,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
     // A tool result only answers a pending call on an existing session;
     // never create a session to receive one.
-    const hasUserText = input.messages.some((m) => m.role === "user" && userText(m).trim().length > 0);
-    if (!hasUserText) return undefined;
+    if (!hasUserText(input.messages)) return undefined;
 
     // The busy-thread gate serializes runs per thread, so creation cannot race.
     const record = await this.createSession(threadId, input.tools ?? []);
@@ -275,14 +276,14 @@ export class ManagedAgentsAgent extends AbstractAgent {
     const { agentId, agentVersion, environmentId } = this.config;
     const customTools = this.customTools(clientTools);
     const title = this.config.sessionTitle?.(threadId) ?? `AG-UI thread ${threadId}`;
+    const agentRef = { id: agentId, ...(agentVersion !== undefined && { version: agentVersion }) };
 
     const agent: SessionCreateParams["agent"] =
       customTools.length === 0
-        ? { type: "agent", id: agentId, ...(agentVersion !== undefined && { version: agentVersion }) }
+        ? { type: "agent", ...agentRef }
         : {
             type: "agent_with_overrides",
-            id: agentId,
-            ...(agentVersion !== undefined && { version: agentVersion }),
+            ...agentRef,
             // Overrides replace the tool list, so keep the agent's own tools.
             tools: [...(await this.baseTools()), ...customTools],
           };
@@ -317,7 +318,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
    * The tool list is a full replacement, so we merge with what the agent has.
    */
   private async syncClientTools(record: SessionRecord, clientTools: Tool[]): Promise<void> {
-    const desired = this.customTools(clientTools ?? []);
+    const desired = this.customTools(clientTools);
     const known = new Set(record.toolNames);
     if (desired.every((tool) => known.has(tool.name))) return;
 

@@ -4,6 +4,9 @@ import re
 from typing import Any
 
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+TOOL_DESCRIPTION_MAX_LENGTH = 1024
+"""Tool descriptions are capped by the API."""
 _INVALID_CHAR = re.compile(r"[^A-Za-z0-9_-]")
 
 
@@ -36,6 +39,6 @@ def custom_tool_from(tool: Any) -> dict[str, Any]:
     return {
         "type": "custom",
         "name": normalize_tool_name(name),
-        "description": (description or f"Tool {name}")[:1024],
+        "description": (description or f"Tool {name}")[:TOOL_DESCRIPTION_MAX_LENGTH],
         "input_schema": _input_schema(getattr(tool, "parameters", None)),
     }
