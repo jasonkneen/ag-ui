@@ -130,13 +130,16 @@ class LangGraphAgent:
         self.graph = graph
         self.config = config or {}
         self.enable_legacy_on_interrupt_event = enable_legacy_on_interrupt_event
-        # Opt-out: when False, the full underlying LangGraph event is not
-        # piggy-backed onto emitted AG-UI events via ``raw_event``. That raw
-        # copy is attached to nearly every event (and re-serialized each time),
-        # so on graphs with large state it dominates payload size — Function
-        # Health saw ~1.5 MB events (OSS-607). Default True preserves the
-        # existing debugging/compat behavior; this flag does not affect the
-        # explicit ``EventType.RAW`` passthrough channel.
+        # Opt-out for emitting the underlying LangGraph event on the wire.
+        # It rides along two ways, both of which this flag controls:
+        #   1. A full ``RawEvent`` (EventType.RAW) re-emitted for every streamed
+        #      event — the dominant payload cost.
+        #   2. The ``raw_event`` copy piggy-backed onto nearly every other
+        #      emitted AG-UI event (re-serialized each time).
+        # On graphs with large state this dominates payload size — Function
+        # Health saw ~1.5 MB events (OSS-607). When False, (1) is not emitted
+        # and (2) is dropped at dispatch. Default True preserves existing
+        # debugging/compat behavior.
         self.emit_raw_events = emit_raw_events
         # Opt-in: terminate interrupted runs with the AG-UI structured outcome
         # RunFinishedEvent(outcome={"type": "interrupt", ...}). Default False so
@@ -456,9 +459,14 @@ class LangGraphAgent:
                             )
                         )
 
-                yield self._dispatch_event(
-                    RawEvent(type=EventType.RAW, event=event)
-                )
+                # The RAW passthrough re-emits the entire underlying LangGraph
+                # event as a first-class event — the dominant payload cost on
+                # large-state graphs. Suppress it entirely when opted out
+                # (emit_raw_events=False); see __init__.
+                if self.emit_raw_events:
+                    yield self._dispatch_event(
+                        RawEvent(type=EventType.RAW, event=event)
+                    )
 
                 async for single_event in self._handle_single_event(event, state):
                     yield single_event

@@ -10,7 +10,7 @@ at the single ``_dispatch_event`` choke point, while leaving the explicit
 import unittest
 from unittest.mock import MagicMock
 
-from ag_ui.core import EventType, RawEvent, TextMessageEndEvent
+from ag_ui.core import EventType, TextMessageEndEvent
 
 from ag_ui_langgraph import LangGraphAgent
 
@@ -40,13 +40,10 @@ class TestEmitRawEventsOptOut(unittest.TestCase):
         out = agent._dispatch_event(ev)
         self.assertIsNone(out.raw_event)
 
-    def test_opt_out_leaves_explicit_raw_event_type_untouched(self):
-        # EventType.RAW is an explicit, opt-in passthrough channel — not the
-        # piggy-backed raw_event — so the opt-out must not empty its payload.
-        agent = _make_agent(emit_raw_events=False)
-        ev = RawEvent(type=EventType.RAW, event={"explicit": "raw"})
-        out = agent._dispatch_event(ev)
-        self.assertEqual(out.event, {"explicit": "raw"})
+    # Note: the RAW passthrough events (EventType.RAW) are suppressed at the
+    # emission layer in _handle_stream_events, not in _dispatch_event — see
+    # test_raw_event_payload_size.py, which asserts zero RAW events (and a
+    # >=90% wire-payload reduction) when opted out over the real pipeline.
 
     def test_clone_preserves_emit_raw_events(self):
         agent = _make_agent(emit_raw_events=False)
