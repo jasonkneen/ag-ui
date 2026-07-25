@@ -16,7 +16,7 @@ Create a managed agent and an environment once (in the Console, or via the SDK),
 import { ManagedAgentsAgent } from "@ag-ui/claude-managed-agents";
 
 const agent = new ManagedAgentsAgent({
-  agentId: "agent_...",
+  managedAgentId: "agent_...",
   environmentId: "env_...",
 });
 
@@ -32,7 +32,7 @@ The Anthropic client reads `ANTHROPIC_API_KEY` from the environment. Pass `clien
 | Managed Agents | AG-UI |
 | --- | --- |
 | `agent.message` (with `event_delta` previews) | `TEXT_MESSAGE_START` / `CONTENT` / `END` |
-| `agent.thinking` | `REASONING_START` / `REASONING_END` |
+| `agent.thinking` | `REASONING_START` / `REASONING_MESSAGE_START` / `REASONING_MESSAGE_END` / `REASONING_END` |
 | `agent.tool_use`, `agent.mcp_tool_use` + results | `TOOL_CALL_*` + `TOOL_CALL_RESULT` (server-executed, display only) |
 | `agent.custom_tool_use` for a frontend tool | `TOOL_CALL_*`, then the run ends so the client can run the tool |
 | `agent.custom_tool_use` for a backend tool | `TOOL_CALL_*` + `TOOL_CALL_RESULT`, and the handler's result is posted back |
@@ -49,7 +49,7 @@ Tools your server executes go in `backendTools`:
 
 ```typescript
 new ManagedAgentsAgent({
-  agentId,
+  managedAgentId,
   environmentId,
   backendTools: [
     {
@@ -68,22 +68,53 @@ The tool call and its result stream to the UI, and the result is returned to the
 
 | Option | Default | |
 | --- | --- | --- |
-| `agentId`, `environmentId` | required | The managed agent and environment behind each session. |
+| `managedAgentId`, `environmentId` | required | The managed agent (`agent_...`) and environment behind each session. |
 | `agentVersion` | latest | Pin an agent version. |
 | `client` | `new Anthropic()` | Bring your own Anthropic client. |
 | `sessionStore` | in-memory | Thread↔session mapping. Provide your own to survive restarts. |
-| `scope` | none | Partitions thread↔session state, for example by authenticated user. |
 | `backendTools` | `[]` | Server-executed custom tools. |
 | `sessionTitle` | `AG-UI thread <id>` | Title for created sessions. |
 | `toolConfirmation` | error | `"allow"`/`"deny"` to answer built-in tools whose permission policy asks. |
 | `turnTimeoutMs` | 300000 | Interrupt turns that run longer. |
 | `streamDeltas` | `true` | Request text/thinking previews for token streaming. |
 
+## Security: authenticate and bind threads to callers
+
+AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by thread ID, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+
+- Put the endpoint behind your own authentication. Never expose it unauthenticated.
+- In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread ID. Do this with a `sessionStore` whose keys include the caller identity derived from your auth layer (never from the request body):
+
+```ts
+class PerCallerStore implements SessionStore {
+  constructor(private ownerId: string, private inner = new Map<string, SessionRecord>()) {}
+  private key = (threadId: string) => `${this.ownerId}:${threadId}`;
+  get = (threadId: string) => this.inner.get(this.key(threadId));
+  set = (threadId: string, record: SessionRecord) => void this.inner.set(this.key(threadId), record);
+  delete = (threadId: string) => void this.inner.delete(this.key(threadId));
+}
+```
+
+  Reuse ONE store instance per caller — construct it once and cache it:
+
+```ts
+const shared = new Map<string, SessionRecord>();
+const stores = new Map<string, PerCallerStore>();
+const storeFor = (ownerId: string): PerCallerStore => {
+  let store = stores.get(ownerId);
+  if (!store) stores.set(ownerId, (store = new PerCallerStore(ownerId, shared)));
+  return store;
+};
+```
+
+  Runs are serialized per thread within a store instance, so a fresh wrapper per request would let a double-submitted thread post into the same session twice. Cache the store (as above) and construct the agent with `storeFor(ownerId)`.
+
 ## Notes
 
-- Thread IDs come from the client. Without `scope`, any caller that knows a thread ID resumes that thread's session, so put the endpoint behind your own authentication and construct one agent (or scope) per caller.
 - The default session store is in-memory: restarting the process starts new sessions. Managed sessions themselves persist server-side.
-- Turns are serial per thread. A second run on a busy thread errors.
+- Turns are serial per thread. A second run on a busy thread errors with code `run_in_progress`.
+- Only the text of a user message is forwarded. A message with image or binary parts and no text errors with code `empty_run` instead of creating a session.
+- When the client disconnects mid-turn (or `abortRun()` is called), the adapter posts `user.interrupt` to stop the session. A turn that exceeds `turnTimeoutMs` is interrupted the same way and errors. A backend tool handler still running at that point is abandoned and answered with an error so the session is not left parked.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter surfaces them for display, so enable them on your agent as usual.
 
 ## Running the examples

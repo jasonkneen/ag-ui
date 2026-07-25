@@ -27,7 +27,7 @@ var app = WebApplication.CreateBuilder(args).Build();
 
 var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
 {
-    AgentId = "agent_...",
+    ManagedAgentId = "agent_...",
     EnvironmentId = "env_...",
 });
 
@@ -35,7 +35,7 @@ app.MapManagedAgentsAgent("/chat", agent);   // POST /chat streams AG-UI events 
 app.Run();
 ```
 
-`MapManagedAgentsAgent` deserializes the posted AG-UI `RunAgentInput`, runs one turn, and writes the events as Server-Sent Events. Pass an `ownerId` selector to scope threads by the authenticated caller: `app.MapManagedAgentsAgent("/chat", agent, ctx => ctx.User.Identity?.Name)`.
+`MapManagedAgentsAgent` deserializes the posted AG-UI `RunAgentInput`, runs one turn, and writes the events as Server-Sent Events.
 
 To drive a run yourself, call `agent.RunAsync(runAgentInput, cancellationToken)`. It returns an `IAsyncEnumerable<BaseEvent>` of AG-UI events you can format however your host needs. The package references the ASP.NET Core shared framework (`Microsoft.AspNetCore.App`) for the endpoint helper, so it targets ASP.NET Core apps.
 
@@ -46,7 +46,8 @@ The Anthropic client reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) from 
 | Managed Agents | AG-UI |
 | --- | --- |
 | `agent.message` (with `event_delta` previews) | `TEXT_MESSAGE_START` / `CONTENT` / `END` |
-| `agent.thinking` | `REASONING_START` / `REASONING_END` |
+| `agent.thinking` (with `event_start` previews) | `REASONING_START` / `REASONING_MESSAGE_START` / `REASONING_MESSAGE_END` / `REASONING_END` |
+| `agent.thinking` (unpreviewed) | `REASONING_START` / `REASONING_END` |
 | `agent.tool_use`, `agent.mcp_tool_use` + results | `TOOL_CALL_*` + `TOOL_CALL_RESULT` (server-executed, display only) |
 | `agent.custom_tool_use` for a frontend tool | `TOOL_CALL_*`, then the run ends so the client can run the tool |
 | `agent.custom_tool_use` for a backend tool | `TOOL_CALL_*` + `TOOL_CALL_RESULT`, and the handler's result is posted back |
@@ -64,7 +65,7 @@ Tools your server executes go in `BackendTools`:
 ```csharp
 var options = new ManagedAgentsAgentOptions
 {
-    AgentId = agentId,
+    ManagedAgentId = agentId,
     EnvironmentId = environmentId,
     BackendTools =
     {
@@ -89,7 +90,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 
 | Option | Default | |
 | --- | --- | --- |
-| `AgentId`, `EnvironmentId` | required | The managed agent and environment behind each session. |
+| `ManagedAgentId`, `EnvironmentId` | required | The managed agent and environment behind each session. |
 | `AgentVersion` | latest | Pin an agent version. |
 | `AnthropicClient` | `new AnthropicClient()` | Bring your own Anthropic SDK client. |
 | `Client` | `AnthropicManagedAgentsClient` | Replace the Managed Agents API surface, for example in tests. |
@@ -100,12 +101,41 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `TurnTimeout` | 5 minutes | Interrupt turns that run longer. |
 | `StreamDeltas` | `true` | Request text and thinking previews for token streaming. |
 
+## Security: authenticate and bind threads to callers
+
+AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by thread ID, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+
+- Put the endpoint behind your own authentication. Never expose it unauthenticated.
+- In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread ID. Do this with an `ISessionStore` whose keys include the caller identity derived from your auth layer (never from the request body):
+
+```csharp
+sealed class PerCallerStore(string ownerId, ConcurrentDictionary<string, ManagedAgentsSessionRecord> inner) : ISessionStore
+{
+    string Key(string threadId) => $"{ownerId}:{threadId}";
+    public ValueTask<ManagedAgentsSessionRecord?> GetAsync(string threadKey, CancellationToken ct)
+        => new(inner.TryGetValue(Key(threadKey), out var record) ? record : null);
+    public ValueTask SetAsync(string threadKey, ManagedAgentsSessionRecord record, CancellationToken ct)
+    { inner[Key(threadKey)] = record; return ValueTask.CompletedTask; }
+    public ValueTask DeleteAsync(string threadKey, CancellationToken ct)
+    { inner.TryRemove(Key(threadKey), out _); return ValueTask.CompletedTask; }
+}
+```
+
+  Reuse ONE store instance per caller — construct it once and cache it:
+
+```csharp
+var shared = new ConcurrentDictionary<string, ManagedAgentsSessionRecord>();
+var stores = new ConcurrentDictionary<string, PerCallerStore>();
+PerCallerStore StoreFor(string ownerId) => stores.GetOrAdd(ownerId, id => new PerCallerStore(id, shared));
+```
+
+  Runs are serialized per thread within a store instance, so a fresh wrapper per request would let a double-submitted thread post into the same session twice. Cache the store (as above) and construct the agent with `StoreFor(ownerId)`.
+
 ## Notes
 
 - The default session store is in-memory: restarting the process starts new sessions. Managed sessions themselves persist server-side.
 - Turns are serial per thread. A second run on a busy thread errors.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter shows them for display, so enable them on your agent as usual.
-- `RunAsync` and `MapManagedAgentsAgent` accept an optional `ownerId`. Pass the host's authenticated caller identity (never a client-supplied value) so thread↔session mappings are scoped per caller, and one caller cannot resume or evict another caller's session by reusing a thread ID.
 
 ## Running the example server
 

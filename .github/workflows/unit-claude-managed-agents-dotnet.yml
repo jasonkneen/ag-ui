@@ -1,4 +1,4 @@
-name: unit / claude-managed-agents-dotnet
+name: unit
 
 on:
   push:
@@ -22,8 +22,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dotnet:
-    name: dotnet / build + unit
+  claude-managed-agents-dotnet:
+    name: claude-managed-agents-dotnet
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 20
     defaults:

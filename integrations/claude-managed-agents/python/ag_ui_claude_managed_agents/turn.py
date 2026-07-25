@@ -22,14 +22,30 @@ from ag_ui.core import (
     ToolCallStartEvent,
 )
 
-from ._util import get
+from ._util import get, maybe_await, observe_task
+from .constants import (
+    BEST_EFFORT_SEND_TIMEOUT_S,
+    PARKED_RETRY_DELAYS_S,
+    TOOL_RESULT_MAX_CHARS,
+)
 from .text import describe_tool_result, text_of
 from .types import BackendTool, TurnOutcome
 
-TOOL_RESULT_MAX_CHARS = 4000
-"""Tool results can be large; the UI only needs a readable prefix."""
+INTERRUPTED_TOOL_RESULT_TEXT = "Tool execution was interrupted."
+"""Posted for a backend tool cut off by a timeout or client disconnect, so
+the session is never left parked on a call nothing will answer."""
 
 Emit = Callable[[BaseEvent], None]
+SentCallback = Callable[[], Awaitable[None] | None]
+
+# Best-effort sends that must outlive a cancelled run (see
+# post_interrupted_result). Strong references only: asyncio keeps weak ones.
+_background_sends: set[asyncio.Future[Any]] = set()
+
+
+def _finish_background_send(task: asyncio.Future[Any]) -> None:
+    _background_sends.discard(task)
+    observe_task(task)
 
 
 async def _close_stream(stream: Any) -> None:
@@ -39,6 +55,11 @@ async def _close_stream(stream: Any) -> None:
     result = close()
     if inspect.isawaitable(result):
         await result
+
+
+async def _run_callback(callback: SentCallback | None) -> None:
+    if callback is not None:
+        await maybe_await(callback())
 
 
 async def run_turn(
@@ -51,7 +72,8 @@ async def run_turn(
     tool_confirmation: str | None,
     stream_deltas: bool,
     emit: Emit,
-    on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    on_results_sent: SentCallback | None = None,
+    on_follow_ups_sent: SentCallback | None = None,
 ) -> TurnOutcome:
     """Open the event stream, post the outbound events, and translate the
     session's events into AG-UI events until the session goes idle.
@@ -59,6 +81,11 @@ async def run_turn(
     `client_tools` maps normalized frontend tool names to their original AG-UI
     names; calls to these park the session. `backend_tools` maps normalized
     names to tools executed on this server.
+
+    `on_results_sent` fires once the tool-result batch is delivered and
+    `on_follow_ups_sent` once the follow-up messages are, so callers persist
+    each delivery independently: the results resume the session even if the
+    follow-ups later fail.
 
     Invariant: no TEXT_MESSAGE or REASONING block is left open when this returns
     or raises. Every exit path closes them.
@@ -75,21 +102,19 @@ async def run_turn(
     # resumes it) and any user messages in a second call: the API validates a
     # whole batch against the session's current state. It also un-parks
     # asynchronously, so retry the follow-ups briefly on that specific error.
-    follow_ups = [e for e in outbound if e.get("type") in ("user.message", "system.message")]
-    results = [e for e in outbound if e.get("type") not in ("user.message", "system.message")]
+    follow_ups = [
+        e for e in outbound if e.get("type") in ("user.message", "system.message")
+    ]
+    results = [
+        e for e in outbound if e.get("type") not in ("user.message", "system.message")
+    ]
     try:
-        try:
-            if results:
-                await client.beta.sessions.events.send(session_id, events=results)
-            if follow_ups:
-                await _send_follow_ups(client, session_id, follow_ups)
-        except BaseException:
-            await _close_stream(stream)
-            raise
-        if on_sent is not None:
-            sent = on_sent()
-            if inspect.isawaitable(sent):
-                await sent
+        if results:
+            await client.beta.sessions.events.send(session_id, events=results)
+            await _run_callback(on_results_sent)
+        if follow_ups:
+            await _send_follow_ups(client, session_id, follow_ups)
+            await _run_callback(on_follow_ups_sent)
 
         return await _consume(
             client=client,
@@ -171,6 +196,16 @@ async def _consume(
     async def send_custom_tool_result(
         tool_use_id: str, text: str, is_error: bool
     ) -> None:
+        # Bounded so a stalled connection cannot hold the thread's run gate
+        # open (the interrupted-result path shields this from cancellation).
+        await asyncio.wait_for(
+            _send_custom_tool_result(tool_use_id, text, is_error),
+            BEST_EFFORT_SEND_TIMEOUT_S,
+        )
+
+    async def _send_custom_tool_result(
+        tool_use_id: str, text: str, is_error: bool
+    ) -> None:
         await client.beta.sessions.events.send(
             session_id,
             events=[
@@ -184,16 +219,43 @@ async def _consume(
         )
         acked_tool_uses.add(tool_use_id)
 
+    async def post_interrupted_result(tool_use_id: str) -> None:
+        """Answer a backend tool call cut off mid-run, so the session is not
+        left parked on it. Best-effort and shielded from the cancellation in
+        flight (a timeout or client disconnect)."""
+        task = asyncio.ensure_future(
+            send_custom_tool_result(tool_use_id, INTERRUPTED_TOOL_RESULT_TEXT, True)
+        )
+        # Keep a strong reference so the loop cannot drop the send mid-flight
+        # once this frame unwinds, and observe its eventual outcome: if the
+        # outer cancellation lands while we are shielded, the send finishes in
+        # the background and its failure must not surface as "exception was
+        # never retrieved".
+        _background_sends.add(task)
+        task.add_done_callback(_finish_background_send)
+        try:
+            await asyncio.shield(task)
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 - the caller re-raises the original cancellation
+            pass
+
     async def run_backend_tool(
         tool_use_id: str, tool: BackendTool, tool_input: Any
     ) -> None:
         """Run a backend custom tool and post its result back into the session."""
         is_error = False
         try:
-            result = tool.handler(tool_input)
-            if inspect.isawaitable(result):
-                result = await result
-            text = str(result)
+            text = str(await _call_backend_handler(tool.handler, tool_input))
+        except asyncio.CancelledError as err:
+            task = asyncio.current_task()
+            if task is None or task.cancelling() > 0:
+                # The run itself is being torn down (timeout or disconnect).
+                await post_interrupted_result(tool_use_id)
+                raise
+            # The handler leaked a CancelledError of its own (e.g. re-raised
+            # from an inner cancelled task) while the run is healthy: the
+            # session is waiting on this call, so report it like any failure.
+            is_error = True
+            text = str(err) or err.__class__.__name__
         except Exception as err:  # noqa: BLE001 - the tool's failure is reported to the agent
             is_error = True
             text = str(err) or err.__class__.__name__
@@ -231,7 +293,10 @@ async def _consume(
                     get(delta, "type") == "content_delta"
                     and get(content, "type") == "text"
                 ):
+                    # Never emit an empty delta; AG-UI requires non-empty content.
                     text = get(content, "text") or ""
+                    if not text:
+                        continue
                     previews[event_id] += text
                     emit(TextMessageContentEvent(message_id=event_id, delta=text))
 
@@ -388,16 +453,21 @@ async def _consume(
                             "policy that does not ask.",
                             "tool_confirmation_required",
                         )
-                    await client.beta.sessions.events.send(
-                        session_id,
-                        events=[
-                            {
-                                "type": "user.tool_confirmation",
-                                "tool_use_id": tool_use_id,
-                                "result": tool_confirmation,
-                            }
-                            for tool_use_id in confirmations
-                        ],
+                    # Bounded like tool-result posts: the session is parked
+                    # waiting on these answers.
+                    await asyncio.wait_for(
+                        client.beta.sessions.events.send(
+                            session_id,
+                            events=[
+                                {
+                                    "type": "user.tool_confirmation",
+                                    "tool_use_id": tool_use_id,
+                                    "result": tool_confirmation,
+                                }
+                                for tool_use_id in confirmations
+                            ],
+                        ),
+                        BEST_EFFORT_SEND_TIMEOUT_S,
                     )
                     acked_tool_uses.update(confirmations)
                     if len(confirmations) == len(blocked_on):
@@ -454,16 +524,28 @@ def _is_sent_while_parked(exc: BaseException) -> bool:
     return status == 400 and "waiting on responses" in str(exc)
 
 
-async def _send_follow_ups(client: Any, session_id: str, events: list[dict[str, Any]]) -> None:
+async def _send_follow_ups(
+    client: Any, session_id: str, events: list[dict[str, Any]]
+) -> None:
     """Post follow-up messages, retrying while the session finishes un-parking."""
-    delays = [0.15, 0.3, 0.6, 1.0, 1.5, 2.0]
-    attempt = 0
-    while True:
+    # One attempt per delay, plus a final attempt that raises on failure.
+    for delay in (*PARKED_RETRY_DELAYS_S, None):
         try:
             await client.beta.sessions.events.send(session_id, events=events)
             return
         except Exception as exc:  # noqa: BLE001 - retry only the parked race
-            if attempt >= len(delays) or not _is_sent_while_parked(exc):
+            if delay is None or not _is_sent_while_parked(exc):
                 raise
-            await asyncio.sleep(delays[attempt])
-            attempt += 1
+            await asyncio.sleep(delay)
+
+
+async def _call_backend_handler(handler: Callable[[Any], Any], tool_input: Any) -> Any:
+    """Run a backend tool handler.
+
+    A plain (blocking) function runs in a worker thread so it never stalls
+    the event loop that other runs share; a coroutine is awaited directly.
+    """
+    if inspect.iscoroutinefunction(handler):
+        return await handler(tool_input)
+    result = await asyncio.to_thread(handler, tool_input)
+    return await maybe_await(result)

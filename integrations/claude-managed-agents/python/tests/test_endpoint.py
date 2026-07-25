@@ -21,7 +21,9 @@ IDLE_END_TURN = {
 
 def make_app(fake: FakeClient) -> FastAPI:
     app = FastAPI()
-    agent = ManagedAgentsAgent(agent_id="agent_1", environment_id="env_1", client=fake)  # type: ignore[arg-type]
+    agent = ManagedAgentsAgent(
+        managed_agent_id="agent_1", environment_id="env_1", client=fake
+    )  # type: ignore[arg-type]
     add_managed_agents_fastapi_endpoint(app=app, agent=agent, path="/agentic_chat")
     return app
 
@@ -50,7 +52,7 @@ async def test_streams_encoded_events_and_serves_health():
     transport = httpx.ASGITransport(app=make_app(fake))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health = await client.get("/agentic_chat/health")
-        assert health.json() == {"status": "ok", "agent": {"agentId": "agent_1"}}
+        assert health.json() == {"status": "ok", "agent": {"managedAgentId": "agent_1"}}
 
         payload = {
             "threadId": "thread_1",
@@ -77,3 +79,16 @@ async def test_streams_encoded_events_and_serves_health():
         "TEXT_MESSAGE_END",
         "RUN_FINISHED",
     ]
+
+
+async def test_health_route_is_well_formed_when_mounted_at_root():
+    app = FastAPI()
+    agent = ManagedAgentsAgent(
+        managed_agent_id="agent_1", environment_id="env_1", client=FakeClient()
+    )  # type: ignore[arg-type]
+    add_managed_agents_fastapi_endpoint(app=app, agent=agent)  # default path "/"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        health = await client.get("/health")
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok", "agent": {"managedAgentId": "agent_1"}}

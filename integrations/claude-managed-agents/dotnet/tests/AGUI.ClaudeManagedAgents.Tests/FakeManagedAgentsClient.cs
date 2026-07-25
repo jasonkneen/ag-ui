@@ -51,7 +51,7 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string agentId, int? agentVersion, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string managedAgentId, int? agentVersion, CancellationToken cancellationToken)
     {
         return Task.FromResult(AgentTools);
     }
@@ -72,8 +72,18 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     /// <summary>Every send call, including the ones scripted to fail.</summary>
     public List<IReadOnlyList<JsonElement>> SendAttempts { get; } = [];
 
+    /// <summary>Every stream opened, as (session, streamDeltas).</summary>
+    public List<(string SessionId, bool StreamDeltas)> StreamRequests { get; } = [];
+
+    /// <summary>Every event that was posted, flattened across send calls.</summary>
+    public IEnumerable<JsonElement> SentEvents => Sent.SelectMany(static batch => batch);
+
+    /// <summary>The <c>type</c> of every posted event, in order.</summary>
+    public IEnumerable<string?> SentTypes => SentEvents.Select(static evt => evt.GetProperty("type").GetString());
+
     public Task<ManagedAgentsEventStream> OpenEventStreamAsync(string sessionId, bool streamDeltas, CancellationToken cancellationToken)
     {
+        StreamRequests.Add((sessionId, streamDeltas));
         var events = _streams.TryDequeue(out var scripted) ? scripted : [];
         return Task.FromResult(new ManagedAgentsEventStream(Enumerate(events, Gate, cancellationToken)));
     }

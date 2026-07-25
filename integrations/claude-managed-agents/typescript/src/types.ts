@@ -41,23 +41,24 @@ export interface SessionStore {
 }
 
 export interface ManagedAgentsAgentConfig extends AgentConfig {
-  /** ID of the managed agent that powers each session. */
-  agentId: string;
+  /**
+   * ID of the Anthropic managed agent (`agent_...`) that powers each session.
+   * Named apart from AG-UI's own `agentId` so the two never collide.
+   */
+  managedAgentId: string;
   /** Pin an agent version; omit to use the latest at session creation. */
   agentVersion?: number;
   /** ID of the environment the agent runs in. */
   environmentId: string;
   /** Anthropic client. Defaults to `new Anthropic()`, which reads `ANTHROPIC_API_KEY`. */
   client?: Anthropic;
-  /** Thread↔session store. Defaults to an in-memory store. */
-  sessionStore?: SessionStore;
   /**
-   * Partitions thread↔session state, e.g. by authenticated user. Thread IDs are
-   * client-supplied, so without a scope any caller that knows a thread ID
-   * resumes that thread's session. Construct one agent (or scope) per caller
-   * behind your own authentication.
+   * Thread↔session store, keyed by AG-UI thread ID. Defaults to an in-memory
+   * store. Thread IDs are client-supplied, so put the endpoint behind your own
+   * authentication and supply a store that partitions by caller if you need
+   * multi-tenant isolation.
    */
-  scope?: string;
+  sessionStore?: SessionStore;
   /** Tools the agent can call that this server executes. */
   backendTools?: BackendCustomTool[];
   /** Title for newly created sessions. Defaults to `AG-UI thread <threadId>`. */

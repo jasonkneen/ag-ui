@@ -17,6 +17,7 @@ from ag_ui.core import (
 from anthropic import AsyncAnthropic
 
 from ._util import maybe_await
+from .constants import DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
 from .tools import custom_tool_from, normalize_tool_name
 from .turn import Emit, run_turn
@@ -26,7 +27,11 @@ _DONE = object()
 
 
 def _user_text(message: Any) -> str:
-    """The text of a user message (string content or multimodal parts)."""
+    """The text of a user message (string content or multimodal parts).
+
+    Non-text parts (images, documents) are dropped: a message carrying only
+    those has no text and errors as an empty run.
+    """
     content = getattr(message, "content", None)
     if isinstance(content, str):
         return content
@@ -48,6 +53,8 @@ class _Outbound:
 @dataclass
 class _RunState:
     session_id: str | None = None
+    busy_key: str | None = None
+    """The busy-thread gate this run holds, released when the run unwinds."""
 
 
 class ManagedAgentsAgent:
@@ -57,13 +64,16 @@ class ManagedAgentsAgent:
     of that session.
     """
 
-    # Keys are scoped to the managed agent so distinct agents never collide.
-    _busy_threads: ClassVar[set[str]] = set()
+    # Keyed by session-store identity: the store is the unit of tenancy, so
+    # agents sharing a store serialize runs per thread (even across instances),
+    # while per-caller stores keep one caller's runs from blocking another's.
+    # Keys within a store's set are scoped to the managed agent.
+    _busy_threads: ClassVar[dict[int, set[str]]] = {}
 
     def __init__(
         self,
         *,
-        agent_id: str,
+        managed_agent_id: str,
         environment_id: str,
         agent_version: int | None = None,
         client: AsyncAnthropic | None = None,
@@ -71,17 +81,18 @@ class ManagedAgentsAgent:
         backend_tools: list[BackendTool] | None = None,
         session_title: Callable[[str], str] | None = None,
         tool_confirmation: Literal["allow", "deny"] | None = None,
-        turn_timeout_s: float = 300.0,
+        turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         stream_deltas: bool = True,
-        scope: str | None = None,
     ) -> None:
-        self.agent_id = agent_id
+        self.managed_agent_id = managed_agent_id
         self.environment_id = environment_id
         self.agent_version = agent_version
         self.client = client if client is not None else AsyncAnthropic()
         self.store: SessionStore = (
             session_store if session_store is not None else InMemorySessionStore()
         )
+        # Keyed by normalized name; on a normalized-name collision (e.g. "search
+        # web" and "search_web") the last tool wins.
         self.backend_tools: dict[str, BackendTool] = {
             normalize_tool_name(tool.name): tool for tool in backend_tools or []
         }
@@ -89,10 +100,6 @@ class ManagedAgentsAgent:
         self.tool_confirmation = tool_confirmation
         self.turn_timeout_s = turn_timeout_s
         self.stream_deltas = stream_deltas
-        # Partitions thread<->session state (e.g. by authenticated user). Thread
-        # ids are client-supplied, so without a scope any caller that knows a
-        # thread id resumes that thread's session.
-        self.scope = scope
         # Strong references to in-flight worker tasks so they are not collected.
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -124,18 +131,35 @@ class ManagedAgentsAgent:
             )
         except asyncio.TimeoutError:
             await self._interrupt(state.session_id)
-            seconds = round(self.turn_timeout_s)
             emit(
                 RunErrorEvent(
-                    message=f"The turn exceeded the {seconds}s limit and was interrupted."
+                    message=(
+                        f"The turn exceeded the {self.turn_timeout_s:g}s limit"
+                        " and was interrupted."
+                    ),
+                    code="turn_timeout",
                 )
             )
         except asyncio.CancelledError:
-            # Client disconnected mid-turn: stop the session; there is nobody left to tell.
+            # Client disconnected mid-turn: stop the session; there is nobody
+            # left to tell. This runs before the busy gate is released (see
+            # `finally`), so a user who resends right away is not interrupted
+            # by this late stop.
             await self._interrupt(state.session_id)
             raise
         except Exception as err:  # noqa: BLE001 - surfaced to the client as RUN_ERROR
-            emit(RunErrorEvent(message=str(err) or "The run failed."))
+            emit(
+                RunErrorEvent(message=str(err) or "The run failed.", code="run_failed")
+            )
+        finally:
+            # Release the per-thread gate only after any interrupt above has
+            # been posted, never before.
+            if state.busy_key is not None:
+                busy = ManagedAgentsAgent._busy_threads.get(id(self.store))
+                if busy is not None:
+                    busy.discard(state.busy_key)
+                    if not busy:
+                        del ManagedAgentsAgent._busy_threads[id(self.store)]
 
     async def _interrupt(self, session_id: str | None) -> None:
         if not session_id:
@@ -156,83 +180,103 @@ class ManagedAgentsAgent:
         if input.state is not None:
             emit(StateSnapshotEvent(snapshot=input.state))
 
-        if busy_key in ManagedAgentsAgent._busy_threads:
-            emit(RunErrorEvent(message="A run is already in progress on this thread."))
+        if busy_key in ManagedAgentsAgent._busy_threads.get(id(self.store), ()):
+            emit(
+                RunErrorEvent(
+                    message="A run is already in progress on this thread.",
+                    code="run_in_progress",
+                )
+            )
             return
         # Check for something sendable before touching the API, so a malformed
         # run does not create an orphan session.
         if not self._has_sendable_content(input.messages):
             emit(
                 RunErrorEvent(
-                    message="There is nothing to send: this run has no user message or tool result."
+                    message="There is nothing to send: this run has no user message or tool result.",
+                    code="empty_run",
                 )
             )
             return
 
-        ManagedAgentsAgent._busy_threads.add(busy_key)
-        try:
-            record = await self._get_or_create_session(thread_id, input, emit)
-            if record is None:
-                emit(
-                    RunErrorEvent(
-                        message="There is nothing to send: a tool result arrived for a thread with no session."
-                    )
-                )
-                return
-            state.session_id = record.session_id
-            await self._sync_client_tools(record, input.tools or [])
+        # Hold the per-thread gate for the rest of the run; `_drive` releases
+        # it after any interrupt has been posted.
+        ManagedAgentsAgent._busy_threads.setdefault(id(self.store), set()).add(busy_key)
+        state.busy_key = busy_key
 
-            outbound = self._outbound_events(record, input.messages)
-            if not outbound.events:
-                emit(
-                    RunErrorEvent(
-                        message="There is nothing new to send: no user message or tool result in this run."
-                    )
+        record = await self._get_or_create_session(thread_id, input, emit)
+        if record is None:
+            emit(
+                RunErrorEvent(
+                    message="There is nothing to send: a tool result arrived for a thread with no session.",
+                    code="tool_result_without_session",
                 )
-                return
-
-            # Some parked tool calls are still unanswered: post what we have and
-            # stay parked instead of waiting on a session that will not resume.
-            if outbound.still_parked:
-                await self.client.beta.sessions.events.send(
-                    record.session_id, events=outbound.events
-                )
-                record.pending_client_tool_use_ids = outbound.still_parked
-                record.last_user_message_id = (
-                    outbound.last_user_message_id or record.last_user_message_id
-                )
-                await maybe_await(self.store.set(self._store_key(thread_id), record))
-                emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
-                return
-
-            # Persist delivery as soon as the events land, so a timeout or
-            # disconnect later in the turn does not re-post them next run.
-            async def on_sent() -> None:
-                record.pending_client_tool_use_ids = []
-                if outbound.last_user_message_id:
-                    record.last_user_message_id = outbound.last_user_message_id
-                await maybe_await(self.store.set(self._store_key(thread_id), record))
-
-            outcome = await run_turn(
-                client=self.client,
-                session_id=record.session_id,
-                outbound=outbound.events,
-                on_sent=on_sent,
-                client_tools={
-                    normalize_tool_name(tool.name): tool.name
-                    for tool in input.tools or []
-                },
-                backend_tools=self.backend_tools,
-                tool_confirmation=self.tool_confirmation,
-                stream_deltas=self.stream_deltas,
-                emit=emit,
             )
+            return
+        state.session_id = record.session_id
+        await self._sync_client_tools(record, input.tools or [])
 
-            await self._record_outcome(thread_id, record, outcome)
-            if outcome.status != "errored":
-                emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
-        finally:
-            ManagedAgentsAgent._busy_threads.discard(busy_key)
+        outbound = self._outbound_events(record, input.messages)
+        if not outbound.events:
+            emit(
+                RunErrorEvent(
+                    message="There is nothing new to send: no user message or tool result in this run.",
+                    code="nothing_to_send",
+                )
+            )
+            return
+
+        store_key = thread_id
+
+        # Some parked tool calls are still unanswered: post what we have and
+        # stay parked instead of waiting on a session that will not resume.
+        if outbound.still_parked:
+            await self.client.beta.sessions.events.send(
+                record.session_id, events=outbound.events
+            )
+            record.pending_client_tool_use_ids = outbound.still_parked
+            record.last_user_message_id = (
+                outbound.last_user_message_id or record.last_user_message_id
+            )
+            await maybe_await(self.store.set(store_key, record))
+            emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            return
+
+        # Persist each delivery as soon as it lands, so a failure or
+        # interruption later in the turn does not re-post it next run: the
+        # tool results resume the session even if the follow-ups then fail.
+        async def on_results_sent() -> None:
+            record.pending_client_tool_use_ids = []
+            await maybe_await(self.store.set(store_key, record))
+
+        async def on_follow_ups_sent() -> None:
+            if outbound.last_user_message_id:
+                record.last_user_message_id = outbound.last_user_message_id
+            await maybe_await(self.store.set(store_key, record))
+
+        outcome = await run_turn(
+            client=self.client,
+            session_id=record.session_id,
+            outbound=outbound.events,
+            on_results_sent=on_results_sent,
+            on_follow_ups_sent=on_follow_ups_sent,
+            client_tools=self._client_tools(input.tools or []),
+            backend_tools=self.backend_tools,
+            tool_confirmation=self.tool_confirmation,
+            stream_deltas=self.stream_deltas,
+            emit=emit,
+        )
+
+        await self._record_outcome(thread_id, record, outcome)
+        if outcome.status != "errored":
+            emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+
+    def _client_tools(self, client_tools: Sequence[Any]) -> dict[str, str]:
+        """Normalized frontend tool name -> its original AG-UI name.
+
+        On a normalized-name collision the last tool wins.
+        """
+        return {normalize_tool_name(tool.name): tool.name for tool in client_tools}
 
     def _has_sendable_content(self, messages: Sequence[Any]) -> bool:
         """Whether the run carries a user message with text or a tool result."""
@@ -245,23 +289,19 @@ class ManagedAgentsAgent:
         return False
 
     def _thread_key(self, thread_id: str) -> str:
-        """Shared-state key scoped to this managed agent (and scope, if set)."""
-        return f"{self.agent_id}:{self._store_key(thread_id)}"
-
-    def _store_key(self, thread_id: str) -> str:
-        """Store key: the thread id, partitioned by scope when configured."""
-        return f"{self.scope}:{thread_id}" if self.scope else thread_id
+        """Shared-state key scoped to this managed agent so distinct agents never collide."""
+        return f"{self.managed_agent_id}:{thread_id}"
 
     async def _record_outcome(
         self, thread_id: str, record: SessionRecord, outcome: TurnOutcome
     ) -> None:
         if outcome.status == "errored" and outcome.session_ended:
-            await maybe_await(self.store.delete(self._store_key(thread_id)))
+            await maybe_await(self.store.delete(thread_id))
             return
         if outcome.status != "parked":
             return
         record.pending_client_tool_use_ids = list(outcome.client_tool_use_ids)
-        await maybe_await(self.store.set(self._store_key(thread_id), record))
+        await maybe_await(self.store.set(thread_id, record))
 
     def _outbound_events(
         self, record: SessionRecord, messages: Sequence[Any]
@@ -279,12 +319,16 @@ class ManagedAgentsAgent:
             tool_call_id = getattr(message, "tool_call_id", None)
             if tool_call_id not in pending:
                 continue
+            error_text = getattr(message, "error", None)
+            result_text = "\n".join(
+                part for part in (message.content or "", error_text or "") if part
+            )
             events.append(
                 {
                     "type": "user.custom_tool_result",
                     "custom_tool_use_id": tool_call_id,
-                    "content": [{"type": "text", "text": message.content or ""}],
-                    "is_error": bool(getattr(message, "error", None)),
+                    "content": [{"type": "text", "text": result_text}],
+                    "is_error": bool(error_text),
                 }
             )
             pending.remove(tool_call_id)
@@ -345,7 +389,7 @@ class ManagedAgentsAgent:
     async def _get_or_create_session(
         self, thread_id: str, input: RunAgentInput, emit: Emit
     ) -> SessionRecord | None:  # noqa: A002
-        existing = await maybe_await(self.store.get(self._store_key(thread_id)))
+        existing = await maybe_await(self.store.get(thread_id))
         if existing is not None:
             return existing
 
@@ -359,7 +403,7 @@ class ManagedAgentsAgent:
 
         # The busy-thread gate serializes runs per thread, so creation cannot race.
         record = await self._create_session(thread_id, input.tools or [])
-        await maybe_await(self.store.set(self._store_key(thread_id), record))
+        await maybe_await(self.store.set(thread_id, record))
         emit(
             CustomEvent(
                 name="managed_agents.session",
@@ -380,11 +424,11 @@ class ManagedAgentsAgent:
 
         agent: dict[str, Any]
         if not custom_tools:
-            agent = {"type": "agent", "id": self.agent_id}
+            agent = {"type": "agent", "id": self.managed_agent_id}
             if self.agent_version is not None:
                 agent["version"] = self.agent_version
         else:
-            agent = {"type": "agent_with_overrides", "id": self.agent_id}
+            agent = {"type": "agent_with_overrides", "id": self.managed_agent_id}
             if self.agent_version is not None:
                 agent["version"] = self.agent_version
             # Overrides replace the tool list, so keep the agent's own tools.
@@ -400,12 +444,13 @@ class ManagedAgentsAgent:
     def _custom_tools(self, client_tools: Sequence[Any]) -> list[dict[str, Any]]:
         """Frontend tools plus configured backend tools, as custom tool definitions.
 
-        Keyed by normalized name; on a collision the frontend tool wins, matching
-        dispatch order in the turn loop.
+        Keyed by normalized name. Distinct names that normalize alike never
+        raise: the last one wins, and a frontend tool beats a backend tool with
+        the same normalized name, matching dispatch order in the turn loop.
         """
         by_name: dict[str, dict[str, Any]] = {}
-        for tool in self.backend_tools.values():
-            by_name[normalize_tool_name(tool.name)] = custom_tool_from(tool)
+        for name, tool in self.backend_tools.items():
+            by_name[name] = custom_tool_from(tool)
         for tool in client_tools:
             custom = custom_tool_from(tool)
             by_name[custom["name"]] = custom
@@ -432,9 +477,9 @@ class ManagedAgentsAgent:
         """The tools defined on the managed agent itself, fetched fresh so console edits apply."""
         if self.agent_version is not None:
             agent = await self.client.beta.agents.retrieve(
-                self.agent_id, version=self.agent_version
+                self.managed_agent_id, version=self.agent_version
             )
         else:
-            agent = await self.client.beta.agents.retrieve(self.agent_id)
+            agent = await self.client.beta.agents.retrieve(self.managed_agent_id)
         # The read shape is structurally compatible with the params shape.
         return list(getattr(agent, "tools", None) or [])

@@ -10,6 +10,19 @@ from types import SimpleNamespace
 from typing import Any
 
 
+class FakeAPIError(Exception):
+    """Shaped like an SDK API error: carries an HTTP status code."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def parked_race_error() -> FakeAPIError:
+    """The 400 the API returns for a user message posted while still parked."""
+    return FakeAPIError(400, "session is waiting on responses to tool calls")
+
+
 class FakeStream:
     """An async-iterable of scripted events. An `asyncio.Event` entry blocks
     the stream until it is set (used to keep a run in flight)."""
@@ -35,12 +48,18 @@ class FakeStream:
 
 
 class FakeClient:
+    """`send_failures` maps a 0-based send attempt index to an exception that
+    attempt raises (failed attempts are not recorded in `sent`). `create_gate`
+    blocks session creation until it is set."""
+
     def __init__(
         self,
         *,
         streams: list[list[Any]] | None = None,
         agent_tools: list[Any] | None = None,
         session_id: str = "sesn_1",
+        send_failures: dict[int, BaseException] | None = None,
+        create_gate: asyncio.Event | None = None,
     ) -> None:
         self._streams = list(streams or [])
         self.agent_tools = (
@@ -51,6 +70,9 @@ class FakeClient:
             ]
         )
         self.session_id = session_id
+        self.send_failures = dict(send_failures or {})
+        self.send_attempts = 0
+        self.create_gate = create_gate
         self.sent: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
         self.update_calls: list[tuple[str, dict[str, Any]]] = []
@@ -74,11 +96,18 @@ class FakeClient:
         return stream
 
     async def _send(self, session_id: str, *, events: list[Any]) -> SimpleNamespace:
+        attempt = self.send_attempts
+        self.send_attempts += 1
+        failure = self.send_failures.get(attempt)
+        if failure is not None:
+            raise failure
         self.sent.append({"session_id": session_id, "events": list(events)})
         return SimpleNamespace(data=[])
 
     async def _create(self, **kwargs: Any) -> SimpleNamespace:
         self.create_calls.append(kwargs)
+        if self.create_gate is not None:
+            await self.create_gate.wait()
         return SimpleNamespace(id=self.session_id)
 
     async def _update(self, session_id: str, **kwargs: Any) -> SimpleNamespace:

@@ -12,7 +12,7 @@ from ag_ui_claude_managed_agents import (
     SessionRecord,
 )
 
-from .fake_client import FakeClient
+from .fake_client import FakeAPIError, FakeClient
 
 IDLE_END_TURN = {
     "type": "session.status_idle",
@@ -47,7 +47,7 @@ def new_agent(
     fake: FakeClient, store: InMemorySessionStore | None = None, **kwargs: Any
 ) -> ManagedAgentsAgent:
     return ManagedAgentsAgent(
-        agent_id="agent_1",
+        managed_agent_id="agent_1",
         environment_id="env_1",
         client=fake,  # type: ignore[arg-type]
         session_store=store,
@@ -331,7 +331,7 @@ async def test_forwards_tool_message_error_flag():
         {
             "type": "user.custom_tool_result",
             "custom_tool_use_id": "ctu_1",
-            "content": [{"type": "text", "text": "boom"}],
+            "content": [{"type": "text", "text": "boom\nfailed"}],
             "is_error": True,
         }
     ]
@@ -401,7 +401,9 @@ async def test_default_session_store_persists_across_runs():
         ]
     )
     # No session_store passed: the default in-memory store must survive between runs.
-    agent = ManagedAgentsAgent(agent_id="agent_1", environment_id="env_1", client=fake)  # type: ignore[arg-type]
+    agent = ManagedAgentsAgent(
+        managed_agent_id="agent_1", environment_id="env_1", client=fake
+    )  # type: ignore[arg-type]
     tools = [
         {
             "name": "show_chart",
@@ -530,7 +532,12 @@ async def test_abandons_parked_tool_calls_when_user_sends_new_message_instead():
         {
             "type": "user.custom_tool_result",
             "custom_tool_use_id": "ctu_1",
-            "content": [{"type": "text", "text": "The user did not provide a result for this tool call."}],
+            "content": [
+                {
+                    "type": "text",
+                    "text": "The user did not provide a result for this tool call.",
+                }
+            ],
             "is_error": True,
         }
     ]
@@ -558,6 +565,7 @@ async def test_errors_when_run_has_nothing_new_to_send():
 
     events = await collect(new_agent(fake, store), base_input())
     assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "nothing_to_send"
     assert fake.sent == []
 
 
@@ -568,6 +576,42 @@ async def test_errors_before_creating_session_when_input_has_nothing_sendable():
         base_input(messages=[{"id": "a1", "role": "assistant", "content": "hi"}]),
     )
     assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "empty_run"
+    assert fake.create_calls == []
+
+
+async def test_whitespace_only_user_message_is_an_empty_run():
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    events = await collect(
+        new_agent(fake),
+        base_input(messages=[{"id": "u1", "role": "user", "content": "   \n\t "}]),
+    )
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "empty_run"
+    assert fake.create_calls == []
+
+
+async def test_image_only_user_message_is_an_empty_run():
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    events = await collect(
+        new_agent(fake),
+        base_input(
+            messages=[
+                {
+                    "id": "u1",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "value": "https://x/y.png"},
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "empty_run"
     assert fake.create_calls == []
 
 
@@ -659,6 +703,47 @@ async def test_rejects_second_concurrent_run_on_same_thread():
     second = await collect(new_agent(fake, store), base_input(run_id="run_2"))
     assert isinstance(second[-1], RunErrorEvent)
     assert second[-1].message == "A run is already in progress on this thread."
+    assert second[-1].code == "run_in_progress"
+
+    gate.set()
+    await task
+    assert types(first_events)[-1] == "RUN_FINISHED"
+
+
+async def test_same_thread_id_does_not_collide_across_different_stores():
+    """The busy gate is keyed by store identity: distinct stores are distinct
+    tenants, so one caller's slow run cannot block another's thread of the
+    same (client-supplied) id."""
+    gate = asyncio.Event()
+    slow_fake = FakeClient(streams=[[gate, IDLE_END_TURN]])
+    other_fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.message",
+                    "id": "msg_1",
+                    "content": [{"type": "text", "text": "b"}],
+                },
+                IDLE_END_TURN,
+            ]
+        ]
+    )
+    first_events: list[Any] = []
+
+    async def first() -> None:
+        async for event in new_agent(slow_fake, InMemorySessionStore()).run(
+            base_input()
+        ):
+            first_events.append(event)
+
+    task = asyncio.create_task(first())
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    second = await collect(
+        new_agent(other_fake, InMemorySessionStore()), base_input(run_id="run_2")
+    )
+    assert types(second)[-1] == "RUN_FINISHED"
 
     gate.set()
     await task
@@ -695,7 +780,10 @@ async def test_interrupts_session_when_turn_times_out():
     events = await collect(agent, base_input())
 
     assert isinstance(events[-1], RunErrorEvent)
-    assert events[-1].message == "The turn exceeded the 0s limit and was interrupted."
+    assert (
+        events[-1].message == "The turn exceeded the 0.05s limit and was interrupted."
+    )
+    assert events[-1].code == "turn_timeout"
     assert {"type": "user.interrupt"} in [
         event for send in fake.sent for event in send["events"]
     ]
@@ -708,30 +796,290 @@ async def test_stops_streaming_deltas_when_disabled():
     assert fake.stream_calls == [("sesn_1", {})]
 
 
-async def test_scope_partitions_sessions_across_identical_thread_ids():
+async def test_session_store_is_keyed_by_thread_id():
     fake = FakeClient(
         streams=[
-            [{"type": "agent.message", "id": "msg_1", "content": [{"type": "text", "text": "a"}]}, IDLE_END_TURN],
-            [{"type": "agent.message", "id": "msg_2", "content": [{"type": "text", "text": "b"}]}, IDLE_END_TURN],
+            [
+                {
+                    "type": "agent.message",
+                    "id": "msg_1",
+                    "content": [{"type": "text", "text": "a"}],
+                },
+                IDLE_END_TURN,
+            ],
         ]
     )
     store = InMemorySessionStore()
 
-    await collect(new_agent(fake, store, scope="alice"), base_input())
-    await collect(new_agent(fake, store, scope="bob"), base_input())
+    await collect(new_agent(fake, store), base_input())
 
-    # Same thread id, different scopes: two sessions and two store entries.
-    assert len(fake.create_calls) == 2
-    assert store.get("alice:thread_1") is not None
-    assert store.get("bob:thread_1") is not None
-    assert store.get("thread_1") is None
+    assert len(fake.create_calls) == 1
+    assert store.get("thread_1") is not None
 
 
 async def test_tool_result_on_unknown_thread_does_not_create_session():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     events = await collect(
         new_agent(fake),
-        base_input(messages=[{"id": "t1", "role": "tool", "tool_call_id": "ctu_ghost", "content": "late"}]),
+        base_input(
+            messages=[
+                {
+                    "id": "t1",
+                    "role": "tool",
+                    "tool_call_id": "ctu_ghost",
+                    "content": "late",
+                }
+            ]
+        ),
     )
     assert fake.create_calls == []
     assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "tool_result_without_session"
+
+
+async def test_interrupt_is_posted_before_busy_gate_is_released():
+    """Regression: on disconnect the interrupt must be sent while the thread
+    is still busy, so a user who resends immediately is not killed by a
+    late interrupt."""
+    gate = asyncio.Event()
+    fake = FakeClient(streams=[[gate]])
+    agent = new_agent(fake)
+    busy_key = agent._thread_key("thread_1")
+    busy_when_interrupted: list[bool] = []
+    original_send = fake._send
+
+    async def send(session_id: str, *, events: list[Any]):
+        if {"type": "user.interrupt"} in events:
+            busy_when_interrupted.append(
+                busy_key in ManagedAgentsAgent._busy_threads.get(id(agent.store), set())
+            )
+        return await original_send(session_id, events=events)
+
+    fake.beta.sessions.events.send = send
+
+    generator = agent.run(base_input())
+    await generator.__anext__()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await generator.aclose()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert busy_when_interrupted == [True]
+    assert busy_key not in ManagedAgentsAgent._busy_threads.get(id(agent.store), set())
+
+
+async def test_timeout_before_session_exists_does_not_interrupt():
+    """A turn can time out while the session is still being created: there is
+    no session id to interrupt, and the run must still error cleanly."""
+    gate = asyncio.Event()
+    fake = FakeClient(streams=[[IDLE_END_TURN]], create_gate=gate)
+    events = await collect(new_agent(fake, turn_timeout_s=0.05), base_input())
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert (
+        events[-1].message == "The turn exceeded the 0.05s limit and was interrupted."
+    )
+    assert events[-1].code == "turn_timeout"
+    assert fake.sent == []  # no session, so no interrupt is possible
+    gate.set()
+
+
+async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
+    """Regression: once the tool results resume the session, they are recorded
+    as delivered even if the follow-up messages then fail, so the next run
+    never re-posts consumed results."""
+    fake = FakeClient(
+        streams=[[IDLE_END_TURN]],
+        # Send 0 (the tool results) succeeds; send 1 (the follow-up) fails
+        # with a non-retryable error.
+        send_failures={1: FakeAPIError(500, "server exploded")},
+    )
+    store = InMemorySessionStore()
+    store.set(
+        "thread_1",
+        SessionRecord(
+            session_id="sesn_1",
+            tool_names=[],
+            pending_client_tool_use_ids=["ctu_1"],
+            last_user_message_id="u1",
+        ),
+    )
+
+    events = await collect(
+        new_agent(fake, store),
+        base_input(
+            messages=[
+                {"id": "u1", "role": "user", "content": "Hello"},
+                {"id": "t1", "role": "tool", "toolCallId": "ctu_1", "content": "done"},
+                {"id": "u2", "role": "user", "content": "and one more thing"},
+            ]
+        ),
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert "server exploded" in events[-1].message
+    record = store.get("thread_1")
+    assert record.pending_client_tool_use_ids == []
+    # The follow-up never landed, so the user message stays undelivered.
+    assert record.last_user_message_id == "u1"
+
+
+async def test_abandons_multiple_pending_calls_in_original_order():
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = InMemorySessionStore()
+    store.set(
+        "thread_1",
+        SessionRecord(
+            session_id="sesn_1",
+            tool_names=[],
+            pending_client_tool_use_ids=["ctu_1", "ctu_2", "ctu_3"],
+            last_user_message_id="u1",
+        ),
+    )
+
+    await collect(
+        new_agent(fake, store),
+        base_input(
+            messages=[
+                {"id": "u1", "role": "user", "content": "old"},
+                {"id": "u2", "role": "user", "content": "never mind"},
+            ]
+        ),
+    )
+
+    abandoned = fake.sent[0]["events"]
+    assert [event["custom_tool_use_id"] for event in abandoned] == [
+        "ctu_1",
+        "ctu_2",
+        "ctu_3",
+    ]
+    assert all(event["is_error"] for event in abandoned)
+    assert fake.sent[1]["events"] == [
+        {"type": "user.message", "content": [{"type": "text", "text": "never mind"}]}
+    ]
+
+
+async def test_frontend_tool_wins_normalized_name_collision_with_backend():
+    fake = FakeClient(streams=[[IDLE_END_TURN]], agent_tools=[])
+    backend = BackendTool(
+        name="search_web",
+        description="Backend search",
+        parameters={},
+        handler=lambda _i: "backend",
+    )
+    await collect(
+        new_agent(fake, backend_tools=[backend]),
+        base_input(
+            tools=[
+                {
+                    "name": "search web",
+                    "description": "Frontend search",
+                    "parameters": {"type": "object"},
+                }
+            ]
+        ),
+    )
+
+    tools = fake.create_calls[0]["agent"]["tools"]
+    assert tools == [
+        {
+            "type": "custom",
+            "name": "search_web",
+            "description": "Frontend search",
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+        }
+    ]
+
+
+async def test_frontend_tools_with_colliding_normalized_names_keep_the_last():
+    fake = FakeClient(streams=[[IDLE_END_TURN]], agent_tools=[])
+    await collect(
+        new_agent(fake),
+        base_input(
+            tools=[
+                {"name": "search web", "description": "First", "parameters": {}},
+                {"name": "search_web", "description": "Second", "parameters": {}},
+            ]
+        ),
+    )
+
+    tools = fake.create_calls[0]["agent"]["tools"]
+    assert [tool["name"] for tool in tools] == ["search_web"]
+    assert tools[0]["description"] == "Second"
+
+
+async def test_does_not_update_session_tools_when_already_registered():
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = InMemorySessionStore()
+    store.set(
+        "thread_1",
+        SessionRecord(
+            session_id="sesn_1",
+            tool_names=["show_chart"],
+            pending_client_tool_use_ids=[],
+            last_user_message_id=None,
+        ),
+    )
+
+    await collect(
+        new_agent(fake, store),
+        base_input(
+            tools=[
+                {
+                    "name": "show_chart",
+                    "description": "Render a chart",
+                    "parameters": {"type": "object"},
+                }
+            ]
+        ),
+    )
+
+    assert fake.update_calls == []
+
+
+async def test_interrupts_backend_tool_and_answers_it_when_client_disconnects():
+    """A disconnect mid backend-tool never leaves the session parked: the call
+    gets an error result and the session is interrupted, both before the
+    busy gate is released."""
+    started = asyncio.Event()
+    release = asyncio.Event()  # never set: the handler would run forever
+
+    async def handler(_input: Any) -> str:
+        started.set()
+        await release.wait()
+        return "never"
+
+    backend = BackendTool(name="slow", description="", parameters={}, handler=handler)
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.custom_tool_use",
+                    "id": "ctu_1",
+                    "name": "slow",
+                    "input": {},
+                }
+            ]
+        ]
+    )
+    agent = new_agent(fake, backend_tools=[backend])
+
+    generator = agent.run(base_input())
+    await generator.__anext__()
+    await started.wait()
+    await generator.aclose()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    sent = [event for send in fake.sent for event in send["events"]]
+    assert {
+        "type": "user.custom_tool_result",
+        "custom_tool_use_id": "ctu_1",
+        "content": [{"type": "text", "text": "Tool execution was interrupted."}],
+        "is_error": True,
+    } in sent
+    assert {"type": "user.interrupt"} in sent
+    assert agent._thread_key("thread_1") not in ManagedAgentsAgent._busy_threads.get(
+        id(agent.store), set()
+    )

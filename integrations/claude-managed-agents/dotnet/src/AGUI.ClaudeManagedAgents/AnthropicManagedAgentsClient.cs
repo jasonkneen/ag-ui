@@ -74,12 +74,12 @@ public sealed class AnthropicManagedAgentsClient : IManagedAgentsClient
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string agentId, int? agentVersion, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string managedAgentId, int? agentVersion, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(agentId);
+        ArgumentNullException.ThrowIfNull(managedAgentId);
 
         AgentRetrieveParams? parameters = agentVersion is null ? null : new AgentRetrieveParams { Version = agentVersion };
-        var agent = await _client.Beta.Agents.Retrieve(agentId, parameters, cancellationToken).ConfigureAwait(false);
+        var agent = await _client.Beta.Agents.Retrieve(managedAgentId, parameters, cancellationToken).ConfigureAwait(false);
 
         // The read shape is structurally compatible with the tool params shape, so its JSON
         // can be sent back as an override entry unchanged.
@@ -143,23 +143,11 @@ public sealed class AnthropicManagedAgentsClient : IManagedAgentsClient
 
     private static JsonElement AgentReference(ManagedAgentSessionRequest request)
     {
-        JsonObject agent;
-        if (request.OverrideTools is null)
+        var agent = new JsonObject
         {
-            agent = new JsonObject
-            {
-                ["type"] = "agent",
-                ["id"] = request.AgentId,
-            };
-        }
-        else
-        {
-            agent = new JsonObject
-            {
-                ["type"] = "agent_with_overrides",
-                ["id"] = request.AgentId,
-            };
-        }
+            ["type"] = request.OverrideTools is null ? "agent" : "agent_with_overrides",
+            ["id"] = request.ManagedAgentId,
+        };
 
         if (request.AgentVersion is int version)
         {

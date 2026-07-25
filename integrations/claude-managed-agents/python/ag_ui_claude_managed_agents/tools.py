@@ -3,18 +3,21 @@
 import re
 from typing import Any
 
-_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+from .constants import TOOL_DESCRIPTION_MAX_LENGTH, TOOL_NAME_MAX_LENGTH
 
-TOOL_DESCRIPTION_MAX_LENGTH = 1024
-"""Tool descriptions are capped by the API."""
+_NAME_PATTERN = re.compile(rf"[A-Za-z0-9_-]{{1,{TOOL_NAME_MAX_LENGTH}}}")
 _INVALID_CHAR = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def normalize_tool_name(name: str) -> str:
-    """Managed Agents tool names allow only [A-Za-z0-9_-], max 128 chars."""
+    """Managed Agents tool names allow only [A-Za-z0-9_-], max 128 chars.
+
+    Distinct names can normalize to the same value (e.g. "search web" and
+    "search_web"); callers key tools by normalized name and let the last one win.
+    """
     if _NAME_PATTERN.fullmatch(name):
         return name
-    return _INVALID_CHAR.sub("_", name)[:128] or "tool"
+    return _INVALID_CHAR.sub("_", name)[:TOOL_NAME_MAX_LENGTH] or "tool"
 
 
 def _input_schema(parameters: Any) -> dict[str, Any]:

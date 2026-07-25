@@ -24,18 +24,11 @@ public static class ManagedAgentsEndpointRouteBuilderExtensions
     /// <param name="endpoints">The endpoint route builder.</param>
     /// <param name="pattern">The route pattern to map.</param>
     /// <param name="agent">The managed-agents agent that serves the route.</param>
-    /// <param name="ownerId">
-    /// Optional selector for the authenticated caller that owns the thread, read from the
-    /// request (for example <c>context.User</c>), never from a client-supplied value. When
-    /// provided, thread↔session mappings are scoped per caller. See
-    /// <see cref="ManagedAgentsAgent.RunAsync(RunAgentInput, string?, CancellationToken)"/>.
-    /// </param>
     /// <returns>An <see cref="IEndpointConventionBuilder"/> for further endpoint configuration.</returns>
     public static IEndpointConventionBuilder MapManagedAgentsAgent(
         this IEndpointRouteBuilder endpoints,
         string pattern,
-        ManagedAgentsAgent agent,
-        Func<HttpContext, string?>? ownerId = null)
+        ManagedAgentsAgent agent)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
         ArgumentNullException.ThrowIfNull(pattern);
@@ -71,7 +64,7 @@ public static class ManagedAgentsEndpointRouteBuilderExtensions
             response.Headers.CacheControl = "no-cache";
             httpContext.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
 
-            var events = agent.RunAsync(input, ownerId?.Invoke(httpContext), cancellationToken);
+            var events = agent.RunAsync(input, cancellationToken);
             await s_formatter.WriteAsync(events, response.Body, cancellationToken).ConfigureAwait(false);
             await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
         });

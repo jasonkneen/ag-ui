@@ -4,6 +4,7 @@ import { lastValueFrom, toArray } from "rxjs";
 import { describe, expect, it } from "vitest";
 import { ManagedAgentsAgent } from "../agent";
 import { InMemorySessionStore } from "../sessions";
+import type { BackendCustomTool, ManagedAgentsAgentConfig } from "../types";
 import { createFakeClient } from "./fake-client";
 
 const idleEndTurn = { type: "session.status_idle", id: "idle_1", stop_reason: { type: "end_turn" } };
@@ -24,13 +25,30 @@ const collect = async (agent: ManagedAgentsAgent, input: RunAgentInput): Promise
 
 const types = (events: BaseEvent[]) => events.map((event) => event.type);
 
-const newAgent = (fake: ReturnType<typeof createFakeClient>, store = new InMemorySessionStore()) =>
+const newAgent = (
+  fake: ReturnType<typeof createFakeClient>,
+  store: InMemorySessionStore = new InMemorySessionStore(),
+  extra: Partial<ManagedAgentsAgentConfig> = {},
+) =>
   new ManagedAgentsAgent({
-    agentId: "agent_1",
+    managedAgentId: "agent_1",
     environmentId: "env_1",
     client: fake.client,
     sessionStore: store,
+    ...extra,
   });
+
+/** A deferred promise, used as a gate to hold a stream (and its run) open. */
+const gate = () => {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { promise, release };
+};
+
+const allSentEvents = (fake: ReturnType<typeof createFakeClient>) => fake.sent.flatMap((send) => send.events);
+
+/** Let a run in flight advance a few microtask/macrotask turns. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 describe("ManagedAgentsAgent", () => {
   it("creates a session for a new thread and streams a reply", async () => {
@@ -55,6 +73,18 @@ describe("ManagedAgentsAgent", () => {
     ]);
     expect(events[2]).toMatchObject({ name: "managed_agents.session", value: { sessionId: "sesn_1", threadId: "thread_1" } });
     expect(fake.sent[0].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "Hello" }] }]);
+  });
+
+  it("pins the agent version and applies a custom title when configured", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    await collect(newAgent(fake, undefined, { agentVersion: 3, sessionTitle: (id) => `Chat ${id}` }), baseInput());
+
+    expect(fake.spies.create).toHaveBeenCalledWith({
+      agent: { type: "agent", id: "agent_1", version: 3 },
+      environment_id: "env_1",
+      title: "Chat thread_1",
+    });
+    expect(fake.spies.retrieve).not.toHaveBeenCalled();
   });
 
   it("reuses the session on the thread's next run and sends only the new message", async () => {
@@ -113,6 +143,57 @@ describe("ManagedAgentsAgent", () => {
     );
   });
 
+  it("registers backend and frontend tools by normalized name with the frontend winning a collision", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]], agentTools: [] });
+    const backend: BackendCustomTool = { name: "lookup docs", description: "Backend lookup", parameters: {}, handler: () => "x" };
+    await collect(
+      newAgent(fake, undefined, { backendTools: [backend] }),
+      baseInput({ tools: [{ name: "lookup docs", description: "Frontend lookup", parameters: { type: "object" } }] }),
+    );
+
+    expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
+      { type: "custom", name: "lookup_docs", description: "Frontend lookup", input_schema: { type: "object", properties: {}, required: [] } },
+    ]);
+  });
+
+  it("keeps the last definition when two frontend tool names collide after normalization", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]], agentTools: [] });
+    const events = await collect(
+      newAgent(fake),
+      baseInput({
+        tools: [
+          { name: "search web", description: "first", parameters: { type: "object" } },
+          { name: "search.web", description: "second", parameters: { type: "object" } },
+        ],
+      }),
+    );
+
+    expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+    expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
+      { type: "custom", name: "search_web", description: "second", input_schema: { type: "object", properties: {}, required: [] } },
+    ]);
+  });
+
+  it("dedupes registered tools against the agent's own custom tools", async () => {
+    const fake = createFakeClient({
+      streams: [[idleEndTurn]],
+      agentTools: [
+        { type: "agent_toolset_20260401", configs: [], default_config: {} },
+        { type: "custom", name: "show_chart", description: "Agent's own copy", input_schema: { type: "object", properties: {} } },
+      ],
+    });
+    await collect(
+      newAgent(fake),
+      baseInput({ tools: [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }] }),
+    );
+
+    // The frontend tool replaces the agent's same-named custom tool rather than duplicating it.
+    expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
+      { type: "agent_toolset_20260401", configs: [], default_config: {} },
+      { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object", properties: {}, required: [] } },
+    ]);
+  });
+
   it("round-trips a frontend tool: park, then resume with the client's result", async () => {
     const fake = createFakeClient({
       streams: [
@@ -158,6 +239,51 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [] });
   });
 
+  it("forwards a tool message's error flag and error text", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new InMemorySessionStore();
+    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+
+    await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "t1", role: "tool", toolCallId: "ctu_1", content: "boom", error: "failed" },
+        ],
+      }),
+    );
+
+    expect(fake.sent[0].events).toEqual([
+      { type: "user.custom_tool_result", custom_tool_use_id: "ctu_1", content: [{ type: "text", text: "boom\nfailed" }], is_error: true },
+    ]);
+  });
+
+  it("stays parked when only some pending tool calls are answered", async () => {
+    const fake = createFakeClient({ streams: [] });
+    const store = new InMemorySessionStore();
+    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1", "ctu_2"], lastUserMessageId: "u1" });
+
+    const events = await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "t1", role: "tool", toolCallId: "ctu_1", content: "done" },
+        ],
+      }),
+    );
+
+    // The answered call is posted, the run finishes without streaming, and
+    // the unanswered call stays pending.
+    expect(fake.sent[0].events).toEqual([
+      { type: "user.custom_tool_result", custom_tool_use_id: "ctu_1", content: [{ type: "text", text: "done" }], is_error: false },
+    ]);
+    expect(fake.spies.stream).not.toHaveBeenCalled();
+    expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_2"] });
+  });
+
   it("shares the session store across clones so a resumed run finds its parked session", async () => {
     const fake = createFakeClient({
       streams: [
@@ -169,7 +295,7 @@ describe("ManagedAgentsAgent", () => {
       ],
     });
     // No sessionStore passed: the default in-memory store must be shared by clones.
-    const parent = new ManagedAgentsAgent({ agentId: "agent_1", environmentId: "env_1", client: fake.client });
+    const parent = new ManagedAgentsAgent({ managedAgentId: "agent_1", environmentId: "env_1", client: fake.client });
     const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
 
     await collect(parent.clone(), baseInput({ tools }));
@@ -214,6 +340,29 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get("thread_1")).toMatchObject({ lastUserMessageId: "u3" });
   });
 
+  it("extracts the text of multimodal user content", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    await collect(
+      newAgent(fake),
+      baseInput({ messages: [{ id: "u1", role: "user", content: [{ type: "text", text: "Look here" }] as never }] }),
+    );
+
+    expect(fake.sent[0].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "Look here" }] }]);
+  });
+
+  it("errors with empty_run for an image-only user message and creates no session", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const events = await collect(
+      newAgent(fake),
+      baseInput({
+        messages: [{ id: "u1", role: "user", content: [{ type: "image", source: { type: "url", value: "https://x/y.png" } }] as never }],
+      }),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "empty_run" });
+    expect(fake.spies.create).not.toHaveBeenCalled();
+  });
+
   it("abandons parked tool calls when the user sends a new message instead", async () => {
     const fake = createFakeClient({
       streams: [[{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "Moving on." }] }, idleEndTurn]],
@@ -247,25 +396,52 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u2" });
   });
 
-  it("partitions sessions by scope so identical thread ids do not collide", async () => {
+  it("abandons multiple parked tool calls in their original order", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new InMemorySessionStore();
+    await store.set("thread_1", {
+      sessionId: "sesn_1",
+      toolNames: [],
+      pendingClientToolUseIds: ["ctu_1", "ctu_2", "ctu_3"],
+      lastUserMessageId: "u1",
+    });
+
+    await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "old" },
+          { id: "u2", role: "user", content: "never mind" },
+        ],
+      }),
+    );
+
+    expect(fake.sent[0].events.map((event) => (event as { custom_tool_use_id: string }).custom_tool_use_id)).toEqual([
+      "ctu_1",
+      "ctu_2",
+      "ctu_3",
+    ]);
+    expect(fake.sent[0].events).toEqual(
+      ["ctu_1", "ctu_2", "ctu_3"].map((id) => ({
+        type: "user.custom_tool_result",
+        custom_tool_use_id: id,
+        content: [{ type: "text", text: "The user did not provide a result for this tool call." }],
+        is_error: true,
+      })),
+    );
+    expect(fake.sent[1].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "never mind" }] }]);
+  });
+
+  it("keys the session store by thread id", async () => {
     const fake = createFakeClient({
-      streams: [
-        [{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "a" }] }, idleEndTurn],
-        [{ type: "agent.message", id: "msg_2", content: [{ type: "text", text: "b" }] }, idleEndTurn],
-      ],
+      streams: [[{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "a" }] }, idleEndTurn]],
     });
     const store = new InMemorySessionStore();
-    const scoped = (scope: string) =>
-      new ManagedAgentsAgent({ agentId: "agent_1", environmentId: "env_1", client: fake.client, sessionStore: store, scope });
 
-    await collect(scoped("alice"), baseInput());
-    await collect(scoped("bob"), baseInput());
+    await collect(newAgent(fake, store), baseInput());
 
-    // Same threadId, different scopes: two sessions and two store entries.
-    expect(fake.spies.create).toHaveBeenCalledTimes(2);
-    expect(await store.get("alice:thread_1")).toBeDefined();
-    expect(await store.get("bob:thread_1")).toBeDefined();
-    expect(await store.get("thread_1")).toBeUndefined();
+    expect(fake.spies.create).toHaveBeenCalledTimes(1);
+    expect(await store.get("thread_1")).toBeDefined();
   });
 
   it("does not create a session for a tool result on an unknown thread", async () => {
@@ -275,16 +451,35 @@ describe("ManagedAgentsAgent", () => {
       baseInput({ messages: [{ id: "t1", role: "tool", toolCallId: "ctu_ghost", content: "late result" }] }),
     );
     expect(fake.spies.create).not.toHaveBeenCalled();
-    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_result_without_session" });
   });
 
-  it("errors when a run has nothing new to send", async () => {
+  it("errors with empty_run before creating a session when nothing is sendable", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const events = await collect(newAgent(fake), baseInput({ messages: [{ id: "a1", role: "assistant", content: "hi" }] }));
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "empty_run" });
+    expect(fake.spies.create).not.toHaveBeenCalled();
+  });
+
+  it("errors with empty_run when the input has no messages or tools fields at all", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const input = baseInput() as Record<string, unknown>;
+    delete input.messages;
+    delete input.tools;
+
+    const events = await collect(newAgent(fake), input as never);
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "empty_run" });
+    expect(fake.spies.create).not.toHaveBeenCalled();
+  });
+
+  it("errors with nothing_to_send when a run has nothing new", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new InMemorySessionStore();
     await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: [], lastUserMessageId: "u1" });
 
     const events = await collect(newAgent(fake, store), baseInput());
-    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "nothing_to_send" });
+    expect(fake.sent).toEqual([]);
   });
 
   it("updates the session's tools when the frontend adds a new one", async () => {
@@ -313,5 +508,203 @@ describe("ManagedAgentsAgent", () => {
         ],
       },
     });
+  });
+
+  it("deletes the thread record when the session ends and starts fresh next run", async () => {
+    const fake = createFakeClient({ streams: [[{ type: "session.status_terminated", id: "term_1" }], [idleEndTurn]] });
+    const store = new InMemorySessionStore();
+
+    const events = await collect(newAgent(fake, store), baseInput());
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
+    expect(await store.get("thread_1")).toBeUndefined();
+
+    // The next run creates a fresh session.
+    await collect(newAgent(fake, store), baseInput({ runId: "run_2" }));
+    expect(fake.spies.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("deletes the thread record when the session is deleted", async () => {
+    const fake = createFakeClient({ streams: [[{ type: "session.deleted", id: "del_1" }]] });
+    const store = new InMemorySessionStore();
+
+    const events = await collect(newAgent(fake, store), baseInput());
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
+    expect(await store.get("thread_1")).toBeUndefined();
+  });
+
+  it("rejects a second concurrent run on the same thread with run_in_progress", async () => {
+    const hold = gate();
+    const fake = createFakeClient({ streams: [[hold.promise, idleEndTurn]] });
+    const store = new InMemorySessionStore();
+
+    const first = collect(newAgent(fake, store), baseInput());
+    await settle(); // let the first run enter the busy section and open its stream
+
+    const second = await collect(newAgent(fake, store), baseInput({ runId: "run_2" }));
+    expect(second.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      message: "A run is already in progress on this thread.",
+      code: "run_in_progress",
+    });
+
+    hold.release();
+    expect((await first).at(-1)?.type).toBe(EventType.RUN_FINISHED);
+  });
+
+  it("does not reject runs on the same thread id when the agents use different stores", async () => {
+    // The busy gate is keyed by store identity: distinct stores are distinct
+    // tenants, so one caller's slow run cannot block another's thread of the
+    // same (client-supplied) id.
+    const hold = gate();
+    const slowFake = createFakeClient({ streams: [[hold.promise, idleEndTurn]] });
+    const otherFake = createFakeClient({
+      streams: [[{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "b" }] }, idleEndTurn]],
+    });
+
+    const first = collect(newAgent(slowFake, new InMemorySessionStore()), baseInput());
+    await settle();
+
+    const second = await collect(newAgent(otherFake, new InMemorySessionStore()), baseInput({ runId: "run_2" }));
+    expect(second.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+
+    hold.release();
+    expect((await first).at(-1)?.type).toBe(EventType.RUN_FINISHED);
+  });
+
+  it("interrupts the session when the client disconnects mid-turn", async () => {
+    const fake = createFakeClient({ streams: [[new Promise<void>(() => {})]] });
+    const received: BaseEvent[] = [];
+
+    const subscription = newAgent(fake).run(baseInput()).subscribe({ next: (event) => received.push(event) });
+    await settle(); // stream open, user message posted
+    expect(fake.sent).toHaveLength(1);
+
+    subscription.unsubscribe();
+    await settle(); // let the background interrupt land
+
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+    // No RUN_ERROR reaches a client that already left, and nothing after the abort.
+    expect(types(received)).not.toContain(EventType.RUN_ERROR);
+    expect(types(received)).toEqual([EventType.RUN_STARTED, EventType.STATE_SNAPSHOT, EventType.CUSTOM]);
+  });
+
+  it("posts the interrupt before releasing the busy gate on disconnect", async () => {
+    // A user who stops and immediately resends must not have the fresh run
+    // killed by the previous run's late interrupt: the interrupt is posted
+    // while the thread still reads busy.
+    const fake = createFakeClient({ streams: [[new Promise<void>(() => {})]] });
+    const store = new InMemorySessionStore();
+    const agent = newAgent(fake, store);
+    const busyWhenInterrupted: boolean[] = [];
+    const originalSend = fake.client.beta.sessions.events.send;
+    fake.client.beta.sessions.events.send = (async (sessionId: string, params: { events: unknown[] }) => {
+      if (params.events.some((event) => (event as { type?: string }).type === "user.interrupt")) {
+        const busy = (ManagedAgentsAgent as unknown as { busyThreadsByStore: WeakMap<object, Set<string>> })
+          .busyThreadsByStore.get(store);
+        busyWhenInterrupted.push(busy?.has("agent_1:thread_1") ?? false);
+      }
+      return originalSend(sessionId, params);
+    }) as typeof originalSend;
+
+    const subscription = agent.run(baseInput()).subscribe({ next: () => {} });
+    await settle();
+    subscription.unsubscribe();
+    await settle();
+
+    expect(busyWhenInterrupted).toEqual([true]);
+    const busyAfter = (ManagedAgentsAgent as unknown as { busyThreadsByStore: WeakMap<object, Set<string>> })
+      .busyThreadsByStore.get(store);
+    expect(busyAfter?.has("agent_1:thread_1") ?? false).toBe(false);
+  });
+
+  it("interrupts the session and errors when the turn times out", async () => {
+    const fake = createFakeClient({ streams: [[new Promise<void>(() => {})]] });
+    const events = await collect(newAgent(fake, undefined, { turnTimeoutMs: 30 }), baseInput());
+
+    expect(events.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      message: "The turn exceeded the 0.03s limit and was interrupted.",
+      code: "turn_timeout",
+    });
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+  });
+
+  it("interrupts a backend tool that runs past the timeout instead of hanging", async () => {
+    const handler = () => new Promise<string>(() => {}); // never resolves
+    const fake = createFakeClient({
+      streams: [[{ type: "agent.custom_tool_use", id: "ctu_1", name: "slow_tool", input: {} }, new Promise<void>(() => {})]],
+    });
+    const store = new InMemorySessionStore();
+    const backendTools: BackendCustomTool[] = [{ name: "slow_tool", description: "", parameters: {}, handler }];
+
+    const events = await collect(newAgent(fake, store, { backendTools, turnTimeoutMs: 30 }), baseInput());
+
+    // The run ends with a timeout error rather than hanging forever...
+    expect(events.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      message: "The turn exceeded the 0.03s limit and was interrupted.",
+      code: "turn_timeout",
+    });
+    // ...the parked tool is answered with an error so the session is not left waiting...
+    expect(allSentEvents(fake)).toContainEqual({
+      type: "user.custom_tool_result",
+      custom_tool_use_id: "ctu_1",
+      content: [{ type: "text", text: "Tool execution was interrupted." }],
+      is_error: true,
+    });
+    // ...the session is interrupted, and the thread is free for the next run.
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+    const next = await collect(
+      newAgent(fake, store),
+      baseInput({
+        runId: "run_2",
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "u2", role: "user", content: "still there?" },
+        ],
+      }),
+    );
+    expect(next.at(-1)).not.toMatchObject({ code: "run_in_progress" });
+  });
+
+  it("interrupts a running backend tool when the client disconnects", async () => {
+    const handler = () => new Promise<string>(() => {});
+    const fake = createFakeClient({
+      streams: [[{ type: "agent.custom_tool_use", id: "ctu_1", name: "slow_tool", input: {} }, new Promise<void>(() => {})]],
+    });
+    const backendTools: BackendCustomTool[] = [{ name: "slow_tool", description: "", parameters: {}, handler }];
+    const received: BaseEvent[] = [];
+
+    const subscription = newAgent(fake, undefined, { backendTools })
+      .run(baseInput())
+      .subscribe({ next: (event) => received.push(event) });
+    await settle(); // reach the hung handler
+    subscription.unsubscribe();
+    await settle();
+
+    expect(allSentEvents(fake)).toContainEqual({
+      type: "user.custom_tool_result",
+      custom_tool_use_id: "ctu_1",
+      content: [{ type: "text", text: "Tool execution was interrupted." }],
+      is_error: true,
+    });
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+    expect(types(received)).not.toContain(EventType.RUN_ERROR);
+  });
+
+  it("requests no previews when streamDeltas is false", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    await collect(newAgent(fake, undefined, { streamDeltas: false }), baseInput());
+    expect(fake.spies.stream.mock.calls[0]![1]).toEqual({});
+
+    const withDeltas = createFakeClient({ streams: [[idleEndTurn]] });
+    await collect(newAgent(withDeltas), baseInput());
+    expect(withDeltas.spies.stream.mock.calls[0]![1]).toEqual({ event_deltas: ["agent.message", "agent.thinking"] });
+  });
+
+  it("surfaces a session-create failure as a run error", async () => {
+    const fake = createFakeClient({ createError: new Error("quota exceeded") });
+    const events = await collect(newAgent(fake), baseInput());
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "quota exceeded" });
   });
 });

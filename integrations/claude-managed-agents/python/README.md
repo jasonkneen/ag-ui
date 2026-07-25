@@ -18,11 +18,11 @@ from ag_ui_claude_managed_agents import ManagedAgentsAgent, add_managed_agents_f
 
 app = FastAPI()
 
-agent = ManagedAgentsAgent(agent_id="agent_...", environment_id="env_...")
+agent = ManagedAgentsAgent(managed_agent_id="agent_...", environment_id="env_...")
 add_managed_agents_fastapi_endpoint(app=app, agent=agent, path="/agent")
 ```
 
-The endpoint helper accepts a POST with a `RunAgentInput` body and streams the encoded AG-UI events. Without FastAPI, iterate the events yourself:
+`managed_agent_id` is the Anthropic managed agent's id (`agent_...`), named apart from AG-UI's own agent id so the two never collide. The endpoint helper accepts a POST with a `RunAgentInput` body and streams the encoded AG-UI events. Without FastAPI, iterate the events yourself:
 
 ```python
 async for event in agent.run(run_input):
@@ -36,7 +36,7 @@ The Anthropic client reads `ANTHROPIC_API_KEY` from the environment. Pass `clien
 | Managed Agents | AG-UI |
 | --- | --- |
 | `agent.message` (with `event_delta` previews) | `TEXT_MESSAGE_START` / `CONTENT` / `END` |
-| `agent.thinking` | `REASONING_START` / `REASONING_END` |
+| `agent.thinking` (with `event_start` previews) | `REASONING_START` / `REASONING_MESSAGE_START` / `REASONING_MESSAGE_END` / `REASONING_END` |
 | `agent.tool_use`, `agent.mcp_tool_use` + results | `TOOL_CALL_*` + `TOOL_CALL_RESULT` (server-executed, display only) |
 | `agent.custom_tool_use` for a frontend tool | `TOOL_CALL_*`, then the run ends so the client can run the tool |
 | `agent.custom_tool_use` for a backend tool | `TOOL_CALL_*` + `TOOL_CALL_RESULT`, and the handler's result is posted back |
@@ -52,10 +52,12 @@ Tools passed in `RunAgentInput.tools` are registered on the session as custom to
 Tools your server executes go in `backend_tools`:
 
 ```python
+import json
+
 from ag_ui_claude_managed_agents import BackendTool, ManagedAgentsAgent
 
 agent = ManagedAgentsAgent(
-    agent_id=agent_id,
+    managed_agent_id=managed_agent_id,
     environment_id=environment_id,
     backend_tools=[
         BackendTool(
@@ -68,28 +70,70 @@ agent = ManagedAgentsAgent(
 )
 ```
 
-The handler may be a plain function or a coroutine. The tool call and its result stream to the UI, and the result is returned to the agent.
+The handler may be a plain function or a coroutine. A plain function runs in a worker thread so a blocking handler never stalls the event loop; a coroutine is awaited on the loop. The tool call and its result stream to the UI, and the result is returned to the agent. If the turn times out or the client disconnects mid-tool, an error result is posted for the call so the session is not left parked.
 
 ## Options
 
 | Option | Default | |
 | --- | --- | --- |
-| `agent_id`, `environment_id` | required | The managed agent and environment behind each session. |
+| `managed_agent_id`, `environment_id` | required | The managed agent and environment behind each session. |
 | `agent_version` | latest | Pin an agent version. |
 | `client` | `AsyncAnthropic()` | Bring your own Anthropic client. |
 | `session_store` | in-memory | Thread to session mapping. Provide your own to survive restarts. |
 | `backend_tools` | `[]` | Server-executed custom tools. |
 | `session_title` | `AG-UI thread <id>` | Callable returning the title for created sessions. |
-| `tool_confirmation` | error | `"allow"`/`"deny"` to answer built-in tools whose permission policy asks. |
+| `tool_confirmation` | `None` | `"allow"`/`"deny"` answers built-in tools whose permission policy asks. With no policy, such a call interrupts the run with a `tool_confirmation_required` error. |
 | `turn_timeout_s` | 300 | Interrupt turns that run longer. |
 | `stream_deltas` | `True` | Request text/thinking previews for token streaming. |
+
+## Security: authenticate and bind threads to callers
+
+AG-UI thread ids are supplied by the client and this agent keys thread↔session state by thread id, so a thread id is effectively a bearer identifier: **any caller who presents a thread id resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+
+- Put the endpoint behind your own authentication. Never expose it unauthenticated.
+- In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread id. Do this with a `session_store` whose keys include the caller identity derived from your auth layer (never from the request body):
+
+```python
+class PerCallerStore:
+    def __init__(self, owner_id: str, inner: dict[str, SessionRecord] | None = None) -> None:
+        self._owner_id = owner_id
+        self._inner: dict[str, SessionRecord] = inner if inner is not None else {}
+
+    def _key(self, thread_id: str) -> str:
+        return f"{self._owner_id}:{thread_id}"
+
+    def get(self, thread_id: str) -> SessionRecord | None:
+        return self._inner.get(self._key(thread_id))
+
+    def set(self, thread_id: str, record: SessionRecord) -> None:
+        self._inner[self._key(thread_id)] = record
+
+    def delete(self, thread_id: str) -> None:
+        self._inner.pop(self._key(thread_id), None)
+```
+
+  Reuse ONE store instance per caller — construct it once and cache it:
+
+```python
+_shared: dict[str, SessionRecord] = {}
+_stores: dict[str, PerCallerStore] = {}
+
+
+def store_for(owner_id: str) -> PerCallerStore:
+    if owner_id not in _stores:
+        _stores[owner_id] = PerCallerStore(owner_id, _shared)
+    return _stores[owner_id]
+```
+
+  Runs are serialized per thread within a store instance, so a fresh wrapper per request would let a double-submitted thread post into the same session twice. Cache the store (as above) and construct the agent with `store_for(owner_id)`.
 
 ## Notes
 
 - The default session store is in-memory: restarting the process starts new sessions. Managed sessions themselves persist server-side.
-- Turns are serial per thread. A second run on a busy thread errors.
+- Turns are serial per thread. A second run on a busy thread errors with `run_in_progress`.
+- Only text parts of a user message are forwarded. A message carrying only images or documents has nothing to send and errors with `empty_run`.
+- A client disconnect or a turn timeout posts `user.interrupt` into the session so the agent stops instead of running unattended.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter surfaces them for display, so enable them on your agent as usual.
-- Sessions are keyed by the AG-UI `thread_id`, which is client-supplied, and whoever supplies a thread id resumes its session. Pass `scope` (for example the authenticated user) to partition thread state per caller. Authenticate the endpoint and scope thread ids to the caller in production (for example with a `session_store` that keys records by user).
 
 ## Running the examples
 

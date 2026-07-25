@@ -9,15 +9,22 @@ public class ManagedAgentsAgentTest
     private const string IdleEndTurn =
         """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"end_turn"}}""";
 
-    private static ManagedAgentsAgent NewAgent(FakeManagedAgentsClient fake, ISessionStore? store = null)
+    private static ManagedAgentsAgent NewAgent(FakeManagedAgentsClient fake, ISessionStore? store = null, Action<ManagedAgentsAgentOptions>? configure = null)
     {
-        return new ManagedAgentsAgent(new ManagedAgentsAgentOptions
+        var options = new ManagedAgentsAgentOptions
         {
-            AgentId = "agent_1",
+            ManagedAgentId = "agent_1",
             EnvironmentId = "env_1",
             Client = fake,
             SessionStore = store,
-        });
+        };
+        configure?.Invoke(options);
+        return new ManagedAgentsAgent(options);
+    }
+
+    private static ManagedAgentsSessionRecord Record(IList<string> pending, string? lastUserMessageId = "u1")
+    {
+        return new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = pending, LastUserMessageId = lastUserMessageId };
     }
 
     private static RunAgentInput BaseInput(Action<RunAgentInput>? configure = null)
@@ -76,7 +83,7 @@ public class ManagedAgentsAgentTest
         var events = await CollectAsync(NewAgent(fake), BaseInput());
 
         var created = Assert.Single(fake.CreatedSessions);
-        Assert.Equal(("agent_1", "env_1", "AG-UI thread thread_1"), (created.AgentId, created.EnvironmentId, created.Title));
+        Assert.Equal(("agent_1", "env_1", "AG-UI thread thread_1"), (created.ManagedAgentId, created.EnvironmentId, created.Title));
         Assert.Null(created.OverrideTools);
 
         Assert.Equal(
@@ -200,7 +207,7 @@ public class ManagedAgentsAgentTest
             ],
             ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"Done."}]}""", IdleEndTurn]);
         // No session store passed: the default in-memory store persists across runs.
-        var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions { AgentId = "agent_1", EnvironmentId = "env_1", Client = fake });
+        var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions { ManagedAgentId = "agent_1", EnvironmentId = "env_1", Client = fake });
         var tools = new List<AGUITool> { Tool("show_chart", "Render a chart", """{"type":"object"}""") };
 
         await CollectAsync(agent, BaseInput(input => input.Tools = tools));
@@ -297,7 +304,7 @@ public class ManagedAgentsAgentTest
 
         var events = await CollectAsync(NewAgent(fake, store), BaseInput());
 
-        Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("nothing_to_send", Assert.IsType<RunErrorEvent>(events[^1]).Code);
         Assert.Empty(fake.Sent);
     }
 
@@ -309,7 +316,23 @@ public class ManagedAgentsAgentTest
         var events = await CollectAsync(NewAgent(fake), BaseInput(input => input.Messages = []));
 
         Assert.Equal([AGUIEventTypes.RunStarted, AGUIEventTypes.StateSnapshot, AGUIEventTypes.RunError], Types(events));
+        Assert.Equal("empty_run", Assert.IsType<RunErrorEvent>(events[^1]).Code);
         Assert.Empty(fake.CreatedSessions);
+    }
+
+    [Fact]
+    public async Task ReleasesTheThreadGateWhenABadInputFailsTheRun()
+    {
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"ok"}]}""", IdleEndTurn]);
+        var agent = NewAgent(fake);
+
+        // A null message list must not leak the busy gate before the run fails.
+        var bad = await CollectAsync(agent, BaseInput(input => input.Messages = null!));
+        Assert.Equal("empty_run", Assert.IsType<RunErrorEvent>(bad[^1]).Code);
+
+        var good = await CollectAsync(agent, BaseInput());
+        Assert.Equal(AGUIEventTypes.RunFinished, good[^1].Type);
     }
 
     [Fact]
@@ -357,9 +380,10 @@ public class ManagedAgentsAgentTest
             input.Messages = [new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "rendered" }]));
 
         Assert.Equal([AGUIEventTypes.RunStarted, AGUIEventTypes.StateSnapshot, AGUIEventTypes.RunError], Types(events));
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
         Assert.Equal(
-            "There is nothing to send: a tool result arrived for a thread with no session.",
-            Assert.IsType<RunErrorEvent>(events[^1]).Message);
+            ("There is nothing to send: a tool result arrived for a thread with no session.", "tool_result_without_session"),
+            (error.Message, error.Code));
         Assert.Empty(fake.CreatedSessions);
         Assert.Empty(fake.Sent);
     }
@@ -413,7 +437,7 @@ public class ManagedAgentsAgentTest
         await Task.Delay(100);
         var second = await CollectAsync(agent, BaseInput(input => input.RunId = "run_2"));
         var error = Assert.IsType<RunErrorEvent>(second[^1]);
-        Assert.Equal("A run is already in progress on this thread.", error.Message);
+        Assert.Equal(("A run is already in progress on this thread.", "run_in_progress"), (error.Message, error.Code));
 
         fake.Gate.SetResult();
         await pending;
@@ -423,25 +447,373 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
-    public async Task ScopesSessionsByOwnerSoThreadIdsDoNotCollideAcrossCallers()
+    public async Task RejectsASecondRunOnTheSameThreadFromAnotherAgentInstance()
+    {
+        // The busy gate is shared across instances, so per-request construction
+        // (e.g. one agent per HTTP request) still serializes runs on a thread.
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"slow"}]}""", IdleEndTurn]);
+        fake.Gate = new TaskCompletionSource();
+        var store = new InMemorySessionStore();
+        var first = NewAgent(fake, store);
+        var second = NewAgent(new FakeManagedAgentsClient([IdleEndTurn]), store);
+
+        await using var slow = first.RunAsync(BaseInput()).GetAsyncEnumerator();
+        Assert.True(await slow.MoveNextAsync());
+        Assert.True(await slow.MoveNextAsync());
+        var pending = slow.MoveNextAsync();
+        await Task.Delay(100);
+
+        var events = await CollectAsync(second, BaseInput(input => input.RunId = "run_2"));
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("run_in_progress", error.Code);
+
+        fake.Gate.SetResult();
+        await pending;
+        while (await slow.MoveNextAsync())
+        {
+        }
+    }
+
+    [Fact]
+    public async Task DoesNotRejectRunsOnTheSameThreadIdAcrossDifferentStores()
+    {
+        // The busy gate is keyed by store identity: distinct stores are distinct
+        // tenants, so one caller's slow run cannot block another's thread of the
+        // same (client-supplied) id.
+        var slowFake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"slow"}]}""", IdleEndTurn]);
+        slowFake.Gate = new TaskCompletionSource();
+        var first = NewAgent(slowFake, new InMemorySessionStore());
+        var second = NewAgent(new FakeManagedAgentsClient([IdleEndTurn]), new InMemorySessionStore());
+
+        await using var slow = first.RunAsync(BaseInput()).GetAsyncEnumerator();
+        Assert.True(await slow.MoveNextAsync());
+        Assert.True(await slow.MoveNextAsync());
+        var pending = slow.MoveNextAsync();
+        await Task.Delay(100);
+
+        var events = await CollectAsync(second, BaseInput(input => input.RunId = "run_2"));
+        Assert.IsType<RunFinishedEvent>(events[^1]);
+
+        slowFake.Gate.SetResult();
+        await pending;
+        while (await slow.MoveNextAsync())
+        {
+        }
+    }
+
+    [Fact]
+    public async Task KeysTheSessionStoreByThreadId()
     {
         var fake = new FakeManagedAgentsClient(
-            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"a"}]}""", IdleEndTurn],
-            ["""{"type":"agent.message","id":"msg_2","content":[{"type":"text","text":"b"}]}""", IdleEndTurn]);
+            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"a"}]}""", IdleEndTurn]);
         var store = new InMemorySessionStore();
         var agent = NewAgent(fake, store);
 
-        await foreach (var _ in agent.RunAsync(BaseInput(), "alice"))
+        await foreach (var _ in agent.RunAsync(BaseInput()))
         {
         }
 
-        await foreach (var _ in agent.RunAsync(BaseInput(input => input.RunId = "run_2"), "bob"))
-        {
-        }
+        Assert.Single(fake.CreatedSessions);
+        Assert.NotNull(await store.GetAsync("thread_1", default));
+    }
 
-        // Each owner gets their own session even for the same thread ID.
+    [Fact]
+    public async Task PinsTheAgentVersionAndUsesTheConfiguredTitle()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+
+        await CollectAsync(
+            NewAgent(fake, configure: options =>
+            {
+                options.AgentVersion = 3;
+                options.SessionTitle = threadId => $"Chat {threadId}";
+            }),
+            BaseInput());
+
+        var created = Assert.Single(fake.CreatedSessions);
+        Assert.Equal((3, "Chat thread_1"), (created.AgentVersion, created.Title));
+    }
+
+    [Fact]
+    public async Task RegistersBackendAndFrontendToolsWithTheFrontendWinningANameCollision()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        fake.AgentTools = [];
+        var agent = NewAgent(fake, configure: options => options.BackendTools.Add(new ManagedAgentsBackendTool
+        {
+            Name = "lookup docs",
+            Description = "Backend lookup",
+            Handler = static _ => Task.FromResult("x"),
+        }));
+
+        await CollectAsync(agent, BaseInput(input =>
+            input.Tools = [Tool("lookup docs", "Frontend lookup", """{"type":"object"}""")]));
+
+        // Both normalize to "lookup_docs"; the frontend definition wins.
+        var tools = Assert.Single(fake.CreatedSessions).OverrideTools!;
+        AssertJson(
+            """{"type":"custom","name":"lookup_docs","description":"Frontend lookup","input_schema":{"type":"object","properties":{},"required":[]}}""",
+            Assert.Single(tools));
+    }
+
+    [Fact]
+    public async Task LetsALaterBackendToolReplaceAnEarlierOneWithTheSameNormalizedName()
+    {
+        var fake = new FakeManagedAgentsClient(
+            [
+                """{"type":"agent.custom_tool_use","id":"ctu_1","name":"search_web","input":{}}""",
+                """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["ctu_1"]}}""",
+                IdleEndTurn,
+            ]);
+        fake.AgentTools = [];
+
+        // "search.web" and "search_web" both normalize to "search_web": constructing the
+        // agent must not throw, and the last registration wins.
+        var agent = NewAgent(fake, configure: options =>
+        {
+            options.BackendTools.Add(new ManagedAgentsBackendTool { Name = "search.web", Handler = static _ => Task.FromResult("first") });
+            options.BackendTools.Add(new ManagedAgentsBackendTool { Name = "search_web", Handler = static _ => Task.FromResult("second") });
+        });
+
+        var events = await CollectAsync(agent, BaseInput());
+
+        Assert.Single(Assert.Single(fake.CreatedSessions).OverrideTools!);
+        var result = Assert.Single(events.OfType<ToolCallResultEvent>());
+        Assert.Equal("second", result.Content);
+    }
+
+    [Fact]
+    public async Task ForwardsAToolMessagesErrorFlagAsAnErrorResult()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new InMemorySessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "boom", Error = "failed" },
+        ]));
+
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"boom\nfailed"}],"is_error":true}""",
+            fake.Sent[0].Single());
+    }
+
+    [Fact]
+    public async Task SendsOnlyTheErrorTextWhenAToolMessageHasNoContent()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new InMemorySessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "", Error = "failed" },
+        ]));
+
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"failed"}],"is_error":true}""",
+            fake.Sent[0].Single());
+    }
+
+    [Fact]
+    public async Task StaysParkedWhenOnlySomePendingToolCallsAreAnswered()
+    {
+        var fake = new FakeManagedAgentsClient();
+        var store = new InMemorySessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1", "ctu_2"]), default);
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "done" },
+        ]));
+
+        // The answered call is posted, the run finishes without streaming, and the unanswered
+        // call stays pending.
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"done"}],"is_error":false}""",
+            Assert.Single(fake.Sent).Single());
+        Assert.Empty(fake.StreamRequests);
+        Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
+        Assert.Equal(["ctu_2"], (await store.GetAsync("thread_1", default))!.PendingClientToolUseIds);
+    }
+
+    [Fact]
+    public async Task DeletesTheThreadRecordWhenTheSessionEndsSoTheNextRunStartsFresh()
+    {
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"session.status_terminated","id":"term_1"}"""],
+            [IdleEndTurn]);
+        var store = new InMemorySessionStore();
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput());
+        Assert.Equal("session_ended", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+        Assert.Null(await store.GetAsync("thread_1", default));
+
+        // The next run creates a fresh session.
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.RunId = "run_2"));
         Assert.Equal(2, fake.CreatedSessions.Count);
-        Assert.NotNull(await store.GetAsync("alice:thread_1", default));
-        Assert.NotNull(await store.GetAsync("bob:thread_1", default));
+    }
+
+    [Fact]
+    public async Task InterruptsTheSessionAndStopsWhenTheClientDisconnects()
+    {
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"unheard"}]}""", IdleEndTurn]);
+        fake.Gate = new TaskCompletionSource();
+        using var client = new CancellationTokenSource();
+        var events = new List<BaseEvent>();
+
+        await using var run = NewAgent(fake).RunAsync(BaseInput(), client.Token).GetAsyncEnumerator();
+
+        // RUN_STARTED, STATE_SNAPSHOT, and the session CUSTOM event arrive before the turn opens.
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.True(await run.MoveNextAsync());
+            events.Add(run.Current);
+        }
+
+        // The next event drives the turn: it posts the user message, then waits on the stream.
+        var pending = run.MoveNextAsync();
+        while (fake.Sent.Count == 0)
+        {
+            await Task.Delay(5);
+        }
+
+        // Disconnect while the turn waits: the run ends with no further events.
+        client.Cancel();
+        Assert.False(await pending);
+
+        // No error or further events reach the departed client, but the session is interrupted.
+        Assert.Equal([AGUIEventTypes.RunStarted, AGUIEventTypes.StateSnapshot, AGUIEventTypes.Custom], Types(events));
+        Assert.Contains("user.interrupt", fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task InterruptsTheSessionAndErrorsWhenTheTurnTimesOut()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        fake.Gate = new TaskCompletionSource(); // never released: the turn stalls
+
+        var events = await CollectAsync(
+            NewAgent(fake, configure: options => options.TurnTimeout = TimeSpan.FromMilliseconds(50)),
+            BaseInput());
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("The turn exceeded the 0.05s limit and was interrupted.", error.Message);
+        Assert.Equal("turn_timeout", error.Code);
+        Assert.Contains("user.interrupt", fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task PostsAnInterruptedResultWhenABackendToolIsStillRunningAtTheTimeout()
+    {
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.custom_tool_use","id":"ctu_1","name":"slow_tool","input":{}}"""]);
+        fake.AgentTools = [];
+        var released = new TaskCompletionSource<string>();
+        var agent = NewAgent(fake, configure: options =>
+        {
+            options.TurnTimeout = TimeSpan.FromMilliseconds(50);
+            options.BackendTools.Add(new ManagedAgentsBackendTool { Name = "slow_tool", Handler = _ => released.Task });
+        });
+
+        var events = await CollectAsync(agent, BaseInput());
+        released.SetResult("too late");
+
+        // The tool ran past the timeout: its call is answered anyway so the session is not left
+        // parked on it, then the turn is interrupted and errors.
+        Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Contains(events.OfType<ToolCallStartEvent>(), start => start.ToolCallId == "ctu_1");
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"Tool execution was interrupted."}],"is_error":true}""",
+            Assert.Single(fake.SentEvents, evt => evt.GetProperty("type").GetString() == "user.custom_tool_result"));
+        Assert.Contains("user.interrupt", fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task PostsABackendToolResultEvenWhenTheClientLeavesRightAfterTheHandlerCompletes()
+    {
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""", IdleEndTurn]);
+        fake.AgentTools = [];
+        using var client = new CancellationTokenSource();
+        var agent = NewAgent(fake, configure: options =>
+            options.BackendTools.Add(new ManagedAgentsBackendTool
+            {
+                Name = "get_time",
+                Handler = _ =>
+                {
+                    client.Cancel(); // the caller disconnects while the tool finishes
+                    return Task.FromResult("noon");
+                },
+            }));
+
+        await foreach (var _ in agent.RunAsync(BaseInput(), client.Token))
+        {
+        }
+
+        // The tool already ran, so its result reaches the session despite the disconnect.
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"noon"}],"is_error":false}""",
+            Assert.Single(fake.SentEvents, evt => evt.GetProperty("type").GetString() == "user.custom_tool_result"));
+    }
+
+    [Fact]
+    public async Task DoesNotRequestPreviewsWhenStreamDeltasIsDisabled()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+
+        await CollectAsync(NewAgent(fake, configure: options => options.StreamDeltas = false), BaseInput());
+
+        Assert.Equal([("sesn_1", false)], fake.StreamRequests);
+    }
+
+    [Fact]
+    public async Task ExtractsTheTextFromMultimodalUserContent()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+
+        await CollectAsync(NewAgent(fake), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage
+            {
+                Id = "u1",
+                Content =
+                [
+                    new AGUITextInputContent { Text = "Look here" },
+                    new AGUIImageInputContent { Source = new AGUIInputContentUrlSource { Value = "https://x/y.png" } },
+                ],
+            },
+        ]));
+
+        AssertJson("""{"type":"user.message","content":[{"type":"text","text":"Look here"}]}""", fake.Sent[0].Single());
+    }
+
+    [Fact]
+    public async Task AbandonsMultiplePendingToolCallsInTheirOriginalOrder()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new InMemorySessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1", "ctu_2"]), default);
+
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "old" },
+            new AGUIUserMessage { Id = "u2", Content = "never mind" },
+        ]));
+
+        // Both abandoned results are batched before the user message, in the order they were parked.
+        var abandoned = fake.Sent[0];
+        Assert.Equal(
+            ["ctu_1", "ctu_2"],
+            abandoned.Select(evt => evt.GetProperty("custom_tool_use_id").GetString()));
+        Assert.All(abandoned, evt => Assert.True(evt.GetProperty("is_error").GetBoolean()));
+        AssertJson("""{"type":"user.message","content":[{"type":"text","text":"never mind"}]}""", fake.Sent[1].Single());
     }
 }

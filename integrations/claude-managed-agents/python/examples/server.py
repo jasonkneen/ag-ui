@@ -79,7 +79,7 @@ def build_agents() -> dict[str, ManagedAgentsAgent]:
             print(f"No agent provisioned for {spec.feature}; skipping. Re-run setup.")
             continue
         agents[spec.feature] = ManagedAgentsAgent(
-            agent_id=agent_id,
+            managed_agent_id=agent_id,
             environment_id=environment_id,
             backend_tools=BACKEND_TOOLS.get(spec.feature),
         )

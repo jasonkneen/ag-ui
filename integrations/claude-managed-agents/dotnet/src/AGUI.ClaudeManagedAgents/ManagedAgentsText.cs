@@ -61,7 +61,9 @@ internal static partial class ManagedAgentsText
                     : string.Empty;
                 var title = DecodeEntities(TryGetString(block, "title", out var t) ? t : string.Empty);
                 var source = TryGetString(block, "source", out var s) ? s : string.Empty;
-                var summary = inner.Length == 0 ? string.Empty : "\n" + Truncate(DecodeEntities(inner), 300);
+                var summary = inner.Length == 0
+                    ? string.Empty
+                    : "\n" + Truncate(DecodeEntities(inner), ManagedAgentsLimits.SearchResultPreviewChars);
                 parts.Add($"[search result] {title} — {source}{summary}");
                 continue;
             }

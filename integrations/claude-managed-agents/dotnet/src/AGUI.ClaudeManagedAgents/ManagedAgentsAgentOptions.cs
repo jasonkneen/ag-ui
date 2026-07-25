@@ -10,7 +10,7 @@ public sealed class ManagedAgentsAgentOptions
     /// <summary>
     /// Gets or sets the ID of the managed agent that powers each session. Required.
     /// </summary>
-    public string AgentId { get; set; } = string.Empty;
+    public string ManagedAgentId { get; set; } = string.Empty;
 
     /// <summary>
     /// Gets or sets a pinned agent version. Leave <see langword="null"/> to use the latest at session creation.
@@ -60,7 +60,7 @@ public sealed class ManagedAgentsAgentOptions
     /// <summary>
     /// Gets or sets the limit after which a turn is interrupted. Defaults to five minutes.
     /// </summary>
-    public TimeSpan TurnTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    public TimeSpan TurnTimeout { get; set; } = ManagedAgentsLimits.DefaultTurnTimeout;
 
     /// <summary>
     /// Gets or sets a value indicating whether to request text and thinking previews so replies

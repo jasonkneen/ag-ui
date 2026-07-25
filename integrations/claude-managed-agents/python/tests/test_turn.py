@@ -1,7 +1,10 @@
 """Ports of the TypeScript `turn.test.ts` assertions."""
 
+import asyncio
+import time
 from typing import Any
 
+import pytest
 from ag_ui.core import (
     ReasoningEndEvent,
     ReasoningMessageEndEvent,
@@ -17,9 +20,15 @@ from ag_ui.core import (
     ToolCallStartEvent,
 )
 
-from ag_ui_claude_managed_agents import BackendTool, TurnOutcome, run_turn
+from ag_ui_claude_managed_agents import (
+    TOOL_RESULT_MAX_CHARS,
+    BackendTool,
+    TurnOutcome,
+    run_turn,
+)
+from ag_ui_claude_managed_agents import turn as turn_module
 
-from .fake_client import FakeClient
+from .fake_client import FakeClient, parked_race_error
 
 IDLE_END_TURN = {
     "type": "session.status_idle",
@@ -346,6 +355,41 @@ async def test_reports_backend_tool_exception_as_error_result():
     ]
 
 
+async def test_handler_leaked_cancelled_error_is_reported_not_treated_as_teardown():
+    """A handler that leaks a CancelledError of its own (e.g. re-raised from
+    an inner cancelled task) while the run is healthy must be reported like
+    any failure: no spurious interrupt, and the turn still finishes."""
+
+    async def handler(_input: Any) -> str:
+        raise asyncio.CancelledError()
+
+    backend = BackendTool(
+        name="get_time", description="", parameters={}, handler=handler
+    )
+    events, outcome, fake = await collect(
+        [
+            {
+                "type": "agent.custom_tool_use",
+                "id": "ctu_1",
+                "name": "get_time",
+                "input": {},
+            },
+            IDLE_END_TURN,
+        ],
+        backend_tools={"get_time": backend},
+    )
+
+    assert outcome.status == "finished"
+    sent = [event for send in fake.sent for event in send["events"]]
+    assert {"type": "user.interrupt"} not in sent
+    assert {
+        "type": "user.custom_tool_result",
+        "custom_tool_use_id": "ctu_1",
+        "content": [{"type": "text", "text": "CancelledError"}],
+        "is_error": True,
+    } in sent
+
+
 async def test_posts_error_result_for_tool_nothing_can_execute():
     _, _, fake = await collect(
         [
@@ -587,3 +631,318 @@ async def test_errors_when_stream_ends_before_turn_completes():
     # The open message is closed before the error.
     assert types(emitted) == ["TEXT_MESSAGE_START", "TEXT_MESSAGE_END", "RUN_ERROR"]
     assert emitted[-1].code == "stream_ended"
+
+
+async def test_does_not_emit_empty_content_delta():
+    emitted, _, _ = await collect(
+        [
+            {"type": "event_start", "event": {"type": "agent.message", "id": "msg_1"}},
+            {
+                "type": "event_delta",
+                "event_id": "msg_1",
+                "delta": {
+                    "type": "content_delta",
+                    "index": 0,
+                    "content": {"type": "text", "text": ""},
+                },
+            },
+            {
+                "type": "agent.message",
+                "id": "msg_1",
+                "content": [{"type": "text", "text": "Hi"}],
+            },
+            IDLE_END_TURN,
+        ]
+    )
+    assert emitted == [
+        TextMessageStartEvent(message_id="msg_1", role="assistant"),
+        TextMessageContentEvent(message_id="msg_1", delta="Hi"),
+        TextMessageEndEvent(message_id="msg_1"),
+    ]
+    assert all(
+        event.delta for event in emitted if isinstance(event, TextMessageContentEvent)
+    )
+
+
+async def test_truncates_long_tool_results():
+    emitted, _, _ = await collect(
+        [
+            {
+                "type": "agent.tool_result",
+                "id": "tr_1",
+                "tool_use_id": "tu_1",
+                "content": [
+                    {"type": "text", "text": "x" * (TOOL_RESULT_MAX_CHARS + 500)}
+                ],
+            },
+            IDLE_END_TURN,
+        ]
+    )
+    assert emitted == [
+        ToolCallResultEvent(
+            message_id="result_tu_1",
+            tool_call_id="tu_1",
+            content="x" * TOOL_RESULT_MAX_CHARS,
+            role="tool",
+        )
+    ]
+
+
+async def test_answers_confirmation_gated_mcp_tool_when_policy_is_configured():
+    emitted, outcome, fake = await collect(
+        [
+            {
+                "type": "agent.mcp_tool_use",
+                "id": "mcp_1",
+                "name": "delete_page",
+                "mcp_server_name": "wiki",
+                "input": {},
+                "evaluated_permission": "ask",
+            },
+            {
+                "type": "session.status_idle",
+                "id": "idle_1",
+                "stop_reason": {"type": "requires_action", "event_ids": ["mcp_1"]},
+            },
+            IDLE_END_TURN,
+        ],
+        tool_confirmation="deny",
+    )
+    assert outcome == TurnOutcome(status="finished")
+    assert emitted[0] == ToolCallStartEvent(
+        tool_call_id="mcp_1", tool_call_name="wiki: delete_page"
+    )
+    assert fake.sent[1]["events"] == [
+        {"type": "user.tool_confirmation", "tool_use_id": "mcp_1", "result": "deny"}
+    ]
+
+
+async def test_requires_action_batch_mixes_confirmation_and_client_park():
+    emitted, outcome, fake = await collect(
+        [
+            {
+                "type": "agent.tool_use",
+                "id": "tu_1",
+                "name": "bash",
+                "input": {},
+                "evaluated_permission": "ask",
+            },
+            {
+                "type": "agent.custom_tool_use",
+                "id": "ctu_1",
+                "name": "show_chart",
+                "input": {},
+            },
+            {
+                "type": "session.status_idle",
+                "id": "idle_1",
+                "stop_reason": {
+                    "type": "requires_action",
+                    "event_ids": ["tu_1", "ctu_1"],
+                },
+            },
+        ],
+        tool_confirmation="allow",
+        client_tools={"show_chart": "show_chart"},
+    )
+    # The built-in tool is confirmed, then the run parks on the frontend tool.
+    assert fake.sent[1]["events"] == [
+        {"type": "user.tool_confirmation", "tool_use_id": "tu_1", "result": "allow"}
+    ]
+    assert outcome == TurnOutcome(status="parked", client_tool_use_ids=["ctu_1"])
+
+
+async def test_frontend_tool_wins_dispatch_when_backend_shares_normalized_name():
+    calls: list[Any] = []
+    backend = BackendTool(
+        name="search_web",
+        description="",
+        parameters={},
+        handler=lambda tool_input: calls.append(tool_input) or "backend",
+    )
+    _, outcome, _ = await collect(
+        [
+            {
+                "type": "agent.custom_tool_use",
+                "id": "ctu_1",
+                "name": "search_web",
+                "input": {},
+            },
+            {
+                "type": "session.status_idle",
+                "id": "idle_1",
+                "stop_reason": {"type": "requires_action", "event_ids": ["ctu_1"]},
+            },
+        ],
+        client_tools={"search_web": "search web"},
+        backend_tools={"search_web": backend},
+    )
+    assert outcome == TurnOutcome(status="parked", client_tool_use_ids=["ctu_1"])
+    assert calls == []  # the frontend tool won; the backend handler never ran
+
+
+async def test_runs_plain_sync_backend_handler():
+    def handler(_input: Any) -> str:
+        return "sync result"
+
+    backend = BackendTool(
+        name="get_time", description="", parameters={}, handler=handler
+    )
+    _, _, fake = await collect(
+        [
+            {
+                "type": "agent.custom_tool_use",
+                "id": "ctu_1",
+                "name": "get_time",
+                "input": {},
+            },
+            IDLE_END_TURN,
+        ],
+        backend_tools={"get_time": backend},
+    )
+    assert fake.sent[1]["events"] == [
+        {
+            "type": "user.custom_tool_result",
+            "custom_tool_use_id": "ctu_1",
+            "content": [{"type": "text", "text": "sync result"}],
+            "is_error": False,
+        }
+    ]
+
+
+async def test_blocking_sync_backend_handler_does_not_stall_the_event_loop():
+    def handler(_input: Any) -> str:
+        time.sleep(0.2)  # a blocking call, e.g. a sync HTTP request
+        return "done"
+
+    backend = BackendTool(name="slow", description="", parameters={}, handler=handler)
+    ticks = 0
+    running = True
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        _, outcome, _ = await collect(
+            [
+                {
+                    "type": "agent.custom_tool_use",
+                    "id": "ctu_1",
+                    "name": "slow",
+                    "input": {},
+                },
+                IDLE_END_TURN,
+            ],
+            backend_tools={"slow": backend},
+        )
+    finally:
+        running = False
+        await ticker_task
+    assert outcome == TurnOutcome(status="finished")
+    # The loop kept ticking while the handler blocked in its worker thread.
+    assert ticks >= 5
+
+
+async def test_posts_interrupted_result_when_backend_tool_is_cancelled():
+    """A backend handler cut off by a timeout or disconnect still answers the
+    call, shielded from the cancellation, so the session is never left parked."""
+    started = asyncio.Event()
+    release = asyncio.Event()  # never set: the handler would run forever
+
+    async def handler(_input: Any) -> str:
+        started.set()
+        await release.wait()
+        return "never"
+
+    backend = BackendTool(name="slow", description="", parameters={}, handler=handler)
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.custom_tool_use",
+                    "id": "ctu_1",
+                    "name": "slow",
+                    "input": {},
+                }
+            ]
+        ]
+    )
+    task = asyncio.create_task(
+        run_turn(
+            client=fake,
+            session_id="sesn_1",
+            outbound=[
+                {"type": "user.message", "content": [{"type": "text", "text": "hi"}]}
+            ],
+            client_tools={},
+            backend_tools={"slow": backend},
+            tool_confirmation=None,
+            stream_deltas=True,
+            emit=lambda _event: None,
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake.sent[-1]["events"] == [
+        {
+            "type": "user.custom_tool_result",
+            "custom_tool_use_id": "ctu_1",
+            "content": [{"type": "text", "text": "Tool execution was interrupted."}],
+            "is_error": True,
+        }
+    ]
+
+
+async def test_retries_follow_ups_while_session_finishes_unparking(monkeypatch):
+    """A user.message posted right after tool results can 400 while the
+    session finishes un-parking; the send is retried on that specific error."""
+    monkeypatch.setattr(turn_module, "PARKED_RETRY_DELAYS_S", (0.0, 0.0))
+    result = {
+        "type": "user.custom_tool_result",
+        "custom_tool_use_id": "ctu_1",
+        "content": [{"type": "text", "text": "done"}],
+        "is_error": False,
+    }
+    message = {"type": "user.message", "content": [{"type": "text", "text": "hi"}]}
+    _, outcome, fake = await collect(
+        [IDLE_END_TURN],
+        # Send 0 is the results batch; sends 1-2 hit the parked race.
+        client_options={
+            "send_failures": {1: parked_race_error(), 2: parked_race_error()}
+        },
+        outbound=[result, message],
+    )
+    assert outcome == TurnOutcome(status="finished")
+    assert fake.send_attempts == 4
+    assert fake.sent[0]["events"] == [result]
+    assert fake.sent[1]["events"] == [message]
+
+
+async def test_follow_ups_give_up_after_the_last_retry(monkeypatch):
+    monkeypatch.setattr(turn_module, "PARKED_RETRY_DELAYS_S", (0.0,))
+    fake = FakeClient(
+        streams=[[IDLE_END_TURN]],
+        send_failures={0: parked_race_error(), 1: parked_race_error()},
+    )
+    with pytest.raises(Exception, match="waiting on responses"):
+        await run_turn(
+            client=fake,
+            session_id="sesn_1",
+            outbound=[
+                {"type": "user.message", "content": [{"type": "text", "text": "hi"}]}
+            ],
+            client_tools={},
+            backend_tools={},
+            tool_confirmation=None,
+            stream_deltas=True,
+            emit=lambda _event: None,
+        )
+    assert fake.send_attempts == 2
+    assert fake.streams_opened[0].closed

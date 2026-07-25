@@ -48,13 +48,13 @@ const buildAgents = (): Record<string, ManagedAgentsAgent> => {
   if (!ids) return agents;
   const { environmentId, agents: agentIds } = ids;
   for (const spec of FEATURE_AGENTS) {
-    const agentId = agentIds[spec.feature];
-    if (!agentId) {
+    const managedAgentId = agentIds[spec.feature];
+    if (!managedAgentId) {
       console.warn(`No agent provisioned for ${spec.feature}; skipping. Re-run setup.`);
       continue;
     }
     agents[spec.feature] = new ManagedAgentsAgent({
-      agentId,
+      managedAgentId,
       environmentId,
       backendTools: BACKEND_TOOLS[spec.feature],
     });

@@ -264,6 +264,9 @@ const ALL_SERVICES = {
         ANTHROPIC_API_KEY:
           process.env.ANTHROPIC_API_KEY ||
           "sk-ant-api03-test-key-for-llmock-000000000000000000000000000000000000000000000000-000000000000AA",
+        ...(!process.env.ANTHROPIC_API_KEY && {
+          ANTHROPIC_BASE_URL: "http://localhost:5555",
+        }),
       },
     },
   ],

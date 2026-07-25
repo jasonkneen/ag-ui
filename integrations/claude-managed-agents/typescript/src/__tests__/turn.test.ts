@@ -1,6 +1,7 @@
 import { EventType } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { describe, expect, it } from "vitest";
+import { TOOL_RESULT_MAX_CHARS } from "../constants";
 import { runTurn } from "../turn";
 import { createFakeClient } from "./fake-client";
 
@@ -30,6 +31,8 @@ const collect = async (
 
 const types = (events: BaseEvent[]) => events.map((event) => event.type);
 
+const parkedError = () => Object.assign(new Error("session is waiting on responses to events"), { status: 400 });
+
 describe("runTurn", () => {
   it("streams a text preview, tops it up from the buffered message, and finishes", async () => {
     const { emitted, outcome, fake } = await collect([
@@ -50,6 +53,14 @@ describe("runTurn", () => {
       { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: " there" },
       { type: EventType.TEXT_MESSAGE_END, messageId: "msg_1" },
     ]);
+  });
+
+  it("requests previews only when streaming deltas", async () => {
+    const on = await collect([idleEndTurn]);
+    expect(on.fake.spies.stream.mock.calls[0]![1]).toEqual({ event_deltas: ["agent.message", "agent.thinking"] });
+
+    const off = await collect([idleEndTurn], { streamDeltas: false });
+    expect(off.fake.spies.stream.mock.calls[0]![1]).toEqual({});
   });
 
   it("emits a whole message when there was no preview", async () => {
@@ -81,6 +92,42 @@ describe("runTurn", () => {
     ]);
   });
 
+  it("does not emit an empty text delta", async () => {
+    const { emitted } = await collect([
+      { type: "event_start", event: { type: "agent.message", id: "msg_1" } },
+      { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 0, content: { type: "text", text: "" } } },
+      { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 0, content: { type: "text", text: "Hi" } } },
+      { type: "agent.message", id: "msg_1", content: [{ type: "text", text: "Hi" }] },
+      // A whole message with no text: start and end only.
+      { type: "agent.message", id: "msg_2", content: [] },
+      idleEndTurn,
+    ]);
+    expect(emitted).toEqual([
+      { type: EventType.TEXT_MESSAGE_START, messageId: "msg_1", role: "assistant" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: "Hi" },
+      { type: EventType.TEXT_MESSAGE_END, messageId: "msg_1" },
+      { type: EventType.TEXT_MESSAGE_START, messageId: "msg_2", role: "assistant" },
+      { type: EventType.TEXT_MESSAGE_END, messageId: "msg_2" },
+    ]);
+  });
+
+  it("falls back to the buffered message when preview accumulation throws", async () => {
+    const { emitted } = await collect([
+      { type: "event_start", event: { type: "agent.message", id: "msg_1" } },
+      { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 0, content: { type: "text", text: "Hel" } } },
+      // A gapped delta (index 5 with only one block) makes the SDK's accumulator throw.
+      { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 5, content: { type: "text", text: "??" } } },
+      { type: "agent.message", id: "msg_1", content: [{ type: "text", text: "Hello world" }] },
+      idleEndTurn,
+    ]);
+    expect(emitted).toEqual([
+      { type: EventType.TEXT_MESSAGE_START, messageId: "msg_1", role: "assistant" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: "Hel" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: "lo world" },
+      { type: EventType.TEXT_MESSAGE_END, messageId: "msg_1" },
+    ]);
+  });
+
   it("maps a thinking stretch to reasoning start and end", async () => {
     const { emitted } = await collect([
       { type: "event_start", event: { type: "agent.thinking", id: "think_1" } },
@@ -93,6 +140,11 @@ describe("runTurn", () => {
       EventType.REASONING_MESSAGE_END,
       EventType.REASONING_END,
     ]);
+  });
+
+  it("maps an unpreviewed thinking event to an empty reasoning pair", async () => {
+    const { emitted } = await collect([{ type: "agent.thinking", id: "think_1" }, idleEndTurn]);
+    expect(types(emitted)).toEqual([EventType.REASONING_START, EventType.REASONING_END]);
   });
 
   it("streams built-in tool calls and their results", async () => {
@@ -109,6 +161,16 @@ describe("runTurn", () => {
     ]);
   });
 
+  it("truncates a very large tool result", async () => {
+    const { emitted } = await collect([
+      { type: "agent.tool_use", id: "tu_1", name: "bash", input: {} },
+      { type: "agent.tool_result", id: "tr_1", tool_use_id: "tu_1", content: [{ type: "text", text: "x".repeat(TOOL_RESULT_MAX_CHARS + 500) }] },
+      idleEndTurn,
+    ]);
+    const result = emitted.at(-1) as unknown as { content: string };
+    expect(result.content).toHaveLength(TOOL_RESULT_MAX_CHARS);
+  });
+
   it("maps MCP tool calls with a server-qualified name", async () => {
     const { emitted } = await collect([
       { type: "agent.mcp_tool_use", id: "mcp_1", name: "search", mcp_server_name: "docs", input: { q: "x" } },
@@ -117,6 +179,30 @@ describe("runTurn", () => {
     ]);
     expect(emitted[0]).toEqual({ type: EventType.TOOL_CALL_START, toolCallId: "mcp_1", toolCallName: "docs: search" });
     expect(emitted[3]).toMatchObject({ type: EventType.TOOL_CALL_RESULT, toolCallId: "mcp_1", content: "found" });
+  });
+
+  it("flattens mixed tool result content into readable text", async () => {
+    const { emitted } = await collect([
+      { type: "agent.tool_use", id: "tu_1", name: "search", input: {} },
+      {
+        type: "agent.tool_result",
+        id: "tr_1",
+        tool_use_id: "tu_1",
+        content: [
+          { type: "text", text: "Caf&eacute; &amp; &#39;more&#39; &lt;b&gt;" },
+          { type: "search_result", title: "Docs &amp; guides", source: "https://example.com", content: [{ type: "text", text: "body text" }] },
+          { type: "image", source: {} },
+        ],
+      },
+      idleEndTurn,
+    ]);
+    expect(emitted.at(-1)).toEqual({
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "result_tu_1",
+      toolCallId: "tu_1",
+      content: "Caf&eacute; & 'more' <b>\n[search result] Docs & guides — https://example.com\nbody text\n[image]",
+      role: "tool",
+    });
   });
 
   it("runs a backend tool and posts its result back into the session", async () => {
@@ -141,16 +227,53 @@ describe("runTurn", () => {
     ]);
   });
 
-  it("posts an error result for a tool nothing can execute", async () => {
-    const { fake } = await collect([
-      { type: "agent.custom_tool_use", id: "ctu_1", name: "mystery", input: {} },
-      idleEndTurn,
+  it("reports a throwing backend handler as one error result", async () => {
+    const backend = {
+      name: "get_time",
+      description: "",
+      parameters: {},
+      handler: () => {
+        throw new Error("clock offline");
+      },
+    };
+    const { emitted, fake } = await collect(
+      [{ type: "agent.custom_tool_use", id: "ctu_1", name: "get_time", input: {} }, idleEndTurn],
+      { backendTools: new Map([["get_time", backend]]) },
+    );
+
+    expect(fake.sent[1].events).toEqual([
+      { type: "user.custom_tool_result", custom_tool_use_id: "ctu_1", content: [{ type: "text", text: "clock offline" }], is_error: true },
     ]);
-    expect(fake.sent[1].events[0]).toMatchObject({
-      type: "user.custom_tool_result",
-      custom_tool_use_id: "ctu_1",
-      is_error: true,
-    });
+    const results = emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT);
+    expect(results).toEqual([
+      { type: EventType.TOOL_CALL_RESULT, messageId: "result_ctu_1", toolCallId: "ctu_1", content: "clock offline", role: "tool" },
+    ]);
+  });
+
+  it("emits a single tool result even when posting it fails", async () => {
+    const backend = { name: "get_time", description: "", parameters: {}, handler: async () => "noon" };
+    const emitted: BaseEvent[] = [];
+    // First send (the user message) succeeds; the result post fails.
+    const run = collect(
+      [{ type: "agent.custom_tool_use", id: "ctu_1", name: "get_time", input: {} }, idleEndTurn],
+      { backendTools: new Map([["get_time", backend]]), emit: (event) => emitted.push(event) },
+      { sendResults: [undefined, new Error("send failed")] },
+    );
+    await expect(run).rejects.toThrow("send failed");
+    // A failed post is not a handler failure: no duplicate result is emitted.
+    expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(1);
+  });
+
+  it("posts an error result for a tool nothing can execute", async () => {
+    const { fake } = await collect([{ type: "agent.custom_tool_use", id: "ctu_1", name: "mystery", input: {} }, idleEndTurn]);
+    expect(fake.sent[1].events).toEqual([
+      {
+        type: "user.custom_tool_result",
+        custom_tool_use_id: "ctu_1",
+        content: [{ type: "text", text: 'No handler is registered for tool "mystery".' }],
+        is_error: true,
+      },
+    ]);
   });
 
   it("parks the turn when the frontend must execute a tool", async () => {
@@ -193,12 +316,22 @@ describe("runTurn", () => {
   });
 
   it("fails the run on a confirmation-gated tool with no policy", async () => {
-    const { emitted, outcome } = await collect([
+    const { emitted, outcome, fake } = await collect([
       { type: "agent.tool_use", id: "tu_1", name: "bash", input: {}, evaluated_permission: "ask" },
       { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["tu_1"] } },
     ]);
     expect(outcome).toEqual({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_confirmation_required" });
+    expect(fake.sent[1].events).toEqual([{ type: "user.interrupt" }]);
+  });
+
+  it("interrupts and errors on a blocking action it cannot answer", async () => {
+    const { emitted, outcome, fake } = await collect([
+      { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["unknown_1"] } },
+    ]);
+    expect(outcome).toEqual({ status: "errored" });
+    expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "unsupported_action" });
+    expect(fake.sent[1].events).toEqual([{ type: "user.interrupt" }]);
   });
 
   it("surfaces a terminal session error with its type as the code", async () => {
@@ -207,6 +340,13 @@ describe("runTurn", () => {
     ]);
     expect(outcome).toEqual({ status: "errored" });
     expect(emitted).toEqual([{ type: EventType.RUN_ERROR, message: "Out of credits", code: "billing_error" }]);
+  });
+
+  it("falls back to a stock message when a session error carries none", async () => {
+    const { emitted } = await collect([
+      { type: "session.error", id: "err_1", error: { type: "unknown_error", message: "", retry_status: { type: "terminal" } } },
+    ]);
+    expect(emitted).toEqual([{ type: EventType.RUN_ERROR, message: "The session reported an error.", code: "unknown_error" }]);
   });
 
   it("ignores a retrying session error and completes", async () => {
@@ -231,7 +371,13 @@ describe("runTurn", () => {
     expect(outcome).toEqual({ status: "errored", sessionEnded: true });
   });
 
-  it("closes a dangling preview when the model request ends without a message", async () => {
+  it("reports a deleted session as ended", async () => {
+    const { emitted, outcome } = await collect([{ type: "session.deleted", id: "del_1" }]);
+    expect(outcome).toEqual({ status: "errored", sessionEnded: true });
+    expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
+  });
+
+  it("closes a dangling preview when the model request errors without a message", async () => {
     const { emitted } = await collect([
       { type: "event_start", event: { type: "agent.message", id: "msg_1" } },
       { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 0, content: { type: "text", text: "partia" } } },
@@ -245,12 +391,49 @@ describe("runTurn", () => {
     ]);
   });
 
-  it("errors when the stream ends before the turn completes", async () => {
-    const { emitted, outcome } = await collect([
+  it("keeps the top-up when a successful model_request_end arrives before the buffered message", async () => {
+    const { emitted } = await collect([
       { type: "event_start", event: { type: "agent.message", id: "msg_1" } },
+      { type: "event_delta", event_id: "msg_1", delta: { type: "content_delta", index: 0, content: { type: "text", text: "Hel" } } },
+      // The span ends (success) before the buffered agent.message lands.
+      { type: "span.model_request_end", id: "span_1", model_request_start_id: "s_1", is_error: false, model_usage: {} },
+      { type: "agent.message", id: "msg_1", content: [{ type: "text", text: "Hello there" }] },
+      idleEndTurn,
     ]);
+    expect(emitted).toEqual([
+      { type: EventType.TEXT_MESSAGE_START, messageId: "msg_1", role: "assistant" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: "Hel" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "msg_1", delta: "lo there" },
+      { type: EventType.TEXT_MESSAGE_END, messageId: "msg_1" },
+    ]);
+  });
+
+  it("errors when the stream ends before the turn completes", async () => {
+    const { emitted, outcome } = await collect([{ type: "event_start", event: { type: "agent.message", id: "msg_1" } }]);
     expect(outcome).toEqual({ status: "errored" });
     // The open message is closed before the error.
     expect(types(emitted)).toEqual([EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_END, EventType.RUN_ERROR]);
+    expect(emitted.at(-1)).toMatchObject({ code: "stream_ended" });
+  });
+
+  it("retries a follow-up rejected while the session finishes un-parking", async () => {
+    const { outcome, fake } = await collect(
+      [{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "ok" }] }, idleEndTurn],
+      {
+        outbound: [
+          { type: "user.custom_tool_result", custom_tool_use_id: "ctu_1", content: [{ type: "text", text: "done" }], is_error: false },
+          { type: "user.message", content: [{ type: "text", text: "and then?" }] },
+        ],
+      },
+      // Results post fine; the follow-up 400s twice before the session un-parks.
+      { sendResults: [undefined, parkedError(), parkedError()] },
+    );
+
+    expect(outcome).toEqual({ status: "finished" });
+    expect(fake.spies.send).toHaveBeenCalledTimes(4);
+    expect(fake.sent.map((send) => send.events)).toEqual([
+      [{ type: "user.custom_tool_result", custom_tool_use_id: "ctu_1", content: [{ type: "text", text: "done" }], is_error: false }],
+      [{ type: "user.message", content: [{ type: "text", text: "and then?" }] }],
+    ]);
   });
 });

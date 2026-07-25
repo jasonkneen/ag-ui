@@ -1,6 +1,8 @@
 """Small internal helpers."""
 
+import asyncio
 import inspect
+
 from typing import Any
 
 
@@ -16,3 +18,10 @@ def get(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def observe_task(task: "asyncio.Task[Any] | asyncio.Future[Any]") -> None:
+    """Consume a background task's outcome so an eventual failure never
+    surfaces as an "exception was never retrieved" warning."""
+    if not task.cancelled():
+        task.exception()

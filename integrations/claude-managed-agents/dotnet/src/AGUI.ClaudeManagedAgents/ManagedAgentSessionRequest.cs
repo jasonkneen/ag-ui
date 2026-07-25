@@ -10,7 +10,7 @@ public sealed class ManagedAgentSessionRequest
     /// <summary>
     /// Gets or sets the ID of the managed agent that powers the session.
     /// </summary>
-    public string AgentId { get; set; } = string.Empty;
+    public string ManagedAgentId { get; set; } = string.Empty;
 
     /// <summary>
     /// Gets or sets the pinned agent version, or <see langword="null"/> for the latest.

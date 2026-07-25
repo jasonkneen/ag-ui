@@ -16,6 +16,8 @@ public sealed class ManagedAgentsAgent
     /// </summary>
     public const string SessionCustomEventName = "managed_agents.session";
 
+    private const string AbandonedToolResult = "The user did not provide a result for this tool call.";
+
     private readonly ManagedAgentsAgentOptions _options;
     private readonly IManagedAgentsClient _client;
     private readonly ISessionStore _store;
@@ -23,7 +25,10 @@ public sealed class ManagedAgentsAgent
 
     // A thread runs one turn at a time. Keys are scoped to this managed agent so distinct
     // agents never collide.
-    private readonly ConcurrentDictionary<string, byte> _busyThreads = new(StringComparer.Ordinal);
+    // Keyed by session-store identity: the store is the unit of tenancy, so agents
+    // sharing a store serialize runs per thread (even across instances), while
+    // per-caller stores keep one caller's runs from blocking another's.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ISessionStore, ConcurrentDictionary<string, byte>> s_busyThreadsByStore = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ManagedAgentsAgent"/> class.
@@ -32,9 +37,9 @@ public sealed class ManagedAgentsAgent
     public ManagedAgentsAgent(ManagedAgentsAgentOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (string.IsNullOrEmpty(options.AgentId))
+        if (string.IsNullOrEmpty(options.ManagedAgentId))
         {
-            throw new ArgumentException("AgentId is required.", nameof(options));
+            throw new ArgumentException("ManagedAgentId is required.", nameof(options));
         }
 
         if (string.IsNullOrEmpty(options.EnvironmentId))
@@ -45,39 +50,28 @@ public sealed class ManagedAgentsAgent
         _options = options;
         _client = options.Client ?? new AnthropicManagedAgentsClient(options.AnthropicClient ?? new Anthropic.AnthropicClient());
         _store = options.SessionStore ?? new InMemorySessionStore();
-        _backendTools = options.BackendTools.ToDictionary(
-            static tool => ManagedAgentsCustomTools.NormalizeToolName(tool.Name),
-            static tool => tool,
-            StringComparer.Ordinal);
+
+        // Normalized names may collide (e.g. "search.web" and "search_web"); last write wins,
+        // matching the frontend-tool map.
+        var backendTools = new Dictionary<string, ManagedAgentsBackendTool>(StringComparer.Ordinal);
+        foreach (var tool in options.BackendTools)
+        {
+            backendTools[ManagedAgentsCustomTools.NormalizeToolName(tool.Name)] = tool;
+        }
+
+        _backendTools = backendTools;
     }
 
     /// <summary>
-    /// Runs one turn for the input's thread and streams the resulting AG-UI events.
+    /// Runs one turn for the input's thread and streams the resulting AG-UI events. Thread↔session
+    /// state is keyed by the AG-UI thread ID; supply a session store that partitions by caller if
+    /// you need multi-tenant isolation.
     /// </summary>
     /// <param name="input">The AG-UI run input.</param>
-    /// <param name="cancellationToken">A token that aborts the run, for example when the client disconnects.</param>
-    /// <returns>The AG-UI event stream for the run.</returns>
-    public IAsyncEnumerable<BaseEvent> RunAsync(RunAgentInput input, CancellationToken cancellationToken = default)
-    {
-        return RunAsync(input, ownerId: null, cancellationToken);
-    }
-
-    /// <summary>
-    /// Runs one turn for the input's thread on behalf of <paramref name="ownerId"/> and streams
-    /// the resulting AG-UI events.
-    /// </summary>
-    /// <param name="input">The AG-UI run input.</param>
-    /// <param name="ownerId">
-    /// The authenticated caller that owns the thread, taken from the host's authenticated principal
-    /// (never from a client-supplied value). When set, the thread↔session mapping is scoped to this
-    /// owner so one caller cannot resume, mutate, or evict another caller's session by guessing a
-    /// thread ID. Leave <see langword="null"/> only for single-user or already-scoped deployments.
-    /// </param>
     /// <param name="cancellationToken">A token that aborts the run, for example when the client disconnects.</param>
     /// <returns>The AG-UI event stream for the run.</returns>
     public async IAsyncEnumerable<BaseEvent> RunAsync(
         RunAgentInput input,
-        string? ownerId,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -90,29 +84,36 @@ public sealed class ManagedAgentsAgent
             yield return new StateSnapshotEvent { Snapshot = state };
         }
 
-        var threadKey = ThreadKey(threadId, ownerId);
-        var busyKey = $"{_options.AgentId}:{threadKey}";
-        if (!_busyThreads.TryAdd(busyKey, 0))
+        var threadKey = threadId;
+        var busyKey = $"{_options.ManagedAgentId}:{threadKey}";
+        var busyThreads = s_busyThreadsByStore.GetOrCreateValue(_store);
+        if (!busyThreads.TryAdd(busyKey, 0))
         {
-            yield return new RunErrorEvent { Message = "A run is already in progress on this thread." };
+            yield return new RunErrorEvent { Message = "A run is already in progress on this thread.", Code = "run_in_progress" };
             yield break;
         }
 
-        // Check for something sendable before touching the API, so a malformed run does not
-        // create an orphan session.
-        if (!HasSendableContent(input.Messages))
-        {
-            _busyThreads.TryRemove(busyKey, out _);
-            yield return new RunErrorEvent { Message = "There is nothing to send: this run has no user message or tool result." };
-            yield break;
-        }
-
-        var run = new RunContext();
-        using var timeout = new CancellationTokenSource(_options.TurnTimeout);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        // The gate is held only inside this try, so it is released however the run ends.
         try
         {
-            var events = RunCoreAsync(input, threadKey, run, linked.Token).GetAsyncEnumerator(CancellationToken.None);
+            // A deserialized input may carry a null message list; treat it as empty. Check for
+            // something sendable before touching the API, so a malformed run does not create an
+            // orphan session.
+            var messages = input.Messages ?? [];
+            if (!HasSendableContent(messages))
+            {
+                yield return new RunErrorEvent
+                {
+                    Message = "There is nothing to send: this run has no user message or tool result.",
+                    Code = "empty_run",
+                };
+                yield break;
+            }
+
+            var run = new RunContext();
+            using var timeout = new CancellationTokenSource(_options.TurnTimeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+            var events = RunCoreAsync(input, messages, threadKey, run, linked.Token).GetAsyncEnumerator(CancellationToken.None);
             await using var eventsScope = events.ConfigureAwait(false);
             BaseEvent? errorEvent = null;
             while (true)
@@ -139,13 +140,18 @@ public sealed class ManagedAgentsAgent
 
                     errorEvent = new RunErrorEvent
                     {
-                        Message = $"The turn exceeded the {(int)Math.Round(_options.TurnTimeout.TotalSeconds)}s limit and was interrupted.",
+                        Message = $"The turn exceeded the {FormatSeconds(_options.TurnTimeout)} limit and was interrupted.",
+                        Code = "turn_timeout",
                     };
                     break;
                 }
                 catch (Exception ex)
                 {
-                    errorEvent = new RunErrorEvent { Message = string.IsNullOrEmpty(ex.Message) ? "The run failed." : ex.Message };
+                    errorEvent = new RunErrorEvent
+                    {
+                        Message = string.IsNullOrEmpty(ex.Message) ? "The run failed." : ex.Message,
+                        Code = "run_failed",
+                    };
                     break;
                 }
 
@@ -168,12 +174,13 @@ public sealed class ManagedAgentsAgent
         }
         finally
         {
-            _busyThreads.TryRemove(busyKey, out _);
+            busyThreads.TryRemove(busyKey, out _);
         }
     }
 
     private async IAsyncEnumerable<BaseEvent> RunCoreAsync(
         RunAgentInput input,
+        IList<AGUIMessage> messages,
         string threadKey,
         RunContext run,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -183,9 +190,13 @@ public sealed class ManagedAgentsAgent
         {
             // A tool result only answers a pending call, so it cannot start a thread: creating
             // a session for it would orphan the session.
-            if (!HasUserText(input.Messages))
+            if (!HasUserText(messages))
             {
-                yield return new RunErrorEvent { Message = "There is nothing to send: a tool result arrived for a thread with no session." };
+                yield return new RunErrorEvent
+                {
+                    Message = "There is nothing to send: a tool result arrived for a thread with no session.",
+                    Code = "tool_result_without_session",
+                };
                 yield break;
             }
 
@@ -202,10 +213,14 @@ public sealed class ManagedAgentsAgent
         run.SessionId = record.SessionId;
         await SyncClientToolsAsync(record, input.Tools, cancellationToken).ConfigureAwait(false);
 
-        var outbound = OutboundEvents(record, input.Messages);
+        var outbound = OutboundEvents(record, messages);
         if (outbound.Events.Count == 0)
         {
-            yield return new RunErrorEvent { Message = "There is nothing new to send: no user message or tool result in this run." };
+            yield return new RunErrorEvent
+            {
+                Message = "There is nothing new to send: no user message or tool result in this run.",
+                Code = "nothing_to_send",
+            };
             yield break;
         }
 
@@ -216,7 +231,7 @@ public sealed class ManagedAgentsAgent
             await _client.SendEventsAsync(record.SessionId, outbound.Events, cancellationToken).ConfigureAwait(false);
             record.PendingClientToolUseIds = outbound.StillParked;
             record.LastUserMessageId = outbound.LastUserMessageId ?? record.LastUserMessageId;
-            await _store.SetAsync(threadKey, record, cancellationToken).ConfigureAwait(false);
+            await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
             yield return new RunFinishedEvent { ThreadId = input.ThreadId, RunId = input.RunId };
             yield break;
         }
@@ -239,7 +254,7 @@ public sealed class ManagedAgentsAgent
             _options.StreamDeltas,
             // Persist delivery as soon as the events land, so a timeout or disconnect later in
             // the turn does not re-post them next run.
-            onSent: async ct =>
+            onSent: () =>
             {
                 record.PendingClientToolUseIds = [];
                 if (outbound.LastUserMessageId is not null)
@@ -247,7 +262,7 @@ public sealed class ManagedAgentsAgent
                     record.LastUserMessageId = outbound.LastUserMessageId;
                 }
 
-                await _store.SetAsync(threadKey, record, ct).ConfigureAwait(false);
+                return PersistDeliveredAsync(threadKey, record);
             });
         run.Turn = turn;
 
@@ -257,22 +272,22 @@ public sealed class ManagedAgentsAgent
         }
 
         var outcome = turn.Outcome;
-        await RecordOutcomeAsync(threadKey, record, outcome, cancellationToken).ConfigureAwait(false);
+        await RecordOutcomeAsync(threadKey, record, outcome).ConfigureAwait(false);
         if (outcome.Status != ManagedAgentsTurnStatus.Errored)
         {
             yield return new RunFinishedEvent { ThreadId = input.ThreadId, RunId = input.RunId };
         }
     }
 
-    private async Task RecordOutcomeAsync(
-        string threadKey,
-        ManagedAgentsSessionRecord record,
-        ManagedAgentsTurnOutcome outcome,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// Records the turn's outcome once the turn has ended. Non-cancellable: what happened in
+    /// the session has already happened, so the record must reflect it even if the client left.
+    /// </summary>
+    private async Task RecordOutcomeAsync(string threadKey, ManagedAgentsSessionRecord record, ManagedAgentsTurnOutcome outcome)
     {
         if (outcome.Status == ManagedAgentsTurnStatus.Errored && outcome.SessionEnded)
         {
-            await _store.DeleteAsync(threadKey, cancellationToken).ConfigureAwait(false);
+            await _store.DeleteAsync(threadKey, CancellationToken.None).ConfigureAwait(false);
             return;
         }
 
@@ -282,7 +297,16 @@ public sealed class ManagedAgentsAgent
         }
 
         record.PendingClientToolUseIds = outcome.ClientToolUseIds;
-        await _store.SetAsync(threadKey, record, cancellationToken).ConfigureAwait(false);
+        await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Stores the record after its events were delivered to the session. Non-cancellable: a
+    /// skipped write would make the next run re-post the same message and stale tool results.
+    /// </summary>
+    private Task PersistDeliveredAsync(string threadKey, ManagedAgentsSessionRecord record)
+    {
+        return _store.SetAsync(threadKey, record, CancellationToken.None).AsTask();
     }
 
     /// <summary>
@@ -292,22 +316,19 @@ public sealed class ManagedAgentsAgent
     private static OutboundEventSet OutboundEvents(ManagedAgentsSessionRecord record, IList<AGUIMessage> messages)
     {
         var events = new List<JsonElement>();
-        var pending = new HashSet<string>(record.PendingClientToolUseIds, StringComparer.Ordinal);
-        var pendingOrder = new List<string>(record.PendingClientToolUseIds);
+        var pending = new List<string>(record.PendingClientToolUseIds);
 
         foreach (var message in messages)
         {
-            if (message is not AGUIToolMessage toolMessage || !pending.Contains(toolMessage.ToolCallId))
+            if (message is not AGUIToolMessage toolMessage || !pending.Remove(toolMessage.ToolCallId))
             {
                 continue;
             }
 
             events.Add(ManagedAgentsSessionEvents.CustomToolResult(
                 toolMessage.ToolCallId,
-                toolMessage.Content,
+                ToolResultText(toolMessage),
                 isError: !string.IsNullOrEmpty(toolMessage.Error)));
-            pending.Remove(toolMessage.ToolCallId);
-            pendingOrder.Remove(toolMessage.ToolCallId);
         }
 
         // User messages after the last delivered one; on first contact, just the newest.
@@ -332,20 +353,16 @@ public sealed class ManagedAgentsAgent
         }
 
         // The user moved on without answering the tools the frontend was asked to run: fail
-        // those calls so the agent can respond to the new message.
+        // those calls (in the order they were parked) so the agent can respond to the new
+        // message. The results go first, then the user message.
         if (lastUserMessageId is not null && pending.Count > 0)
         {
-            // Prepend one at a time, so the last pending call ends up first (matching the
-            // reference implementation's unshift order).
-            events.InsertRange(0, pendingOrder.AsEnumerable().Reverse().Select(static toolUseId => ManagedAgentsSessionEvents.CustomToolResult(
-                toolUseId,
-                "The user did not provide a result for this tool call.",
-                isError: true)));
+            events.InsertRange(0, pending.Select(static toolUseId =>
+                ManagedAgentsSessionEvents.CustomToolResult(toolUseId, AbandonedToolResult, isError: true)));
             pending.Clear();
-            pendingOrder.Clear();
         }
 
-        return new OutboundEventSet(events, pendingOrder, lastUserMessageId);
+        return new OutboundEventSet(events, pending, lastUserMessageId);
     }
 
     private async Task<ManagedAgentsSessionRecord> CreateSessionAsync(RunAgentInput input, CancellationToken cancellationToken)
@@ -353,7 +370,7 @@ public sealed class ManagedAgentsAgent
         var customTools = CustomToolsFor(input.Tools);
         var request = new ManagedAgentSessionRequest
         {
-            AgentId = _options.AgentId,
+            ManagedAgentId = _options.ManagedAgentId,
             AgentVersion = _options.AgentVersion,
             EnvironmentId = _options.EnvironmentId,
             Title = _options.SessionTitle?.Invoke(input.ThreadId) ?? $"AG-UI thread {input.ThreadId}",
@@ -421,7 +438,7 @@ public sealed class ManagedAgentsAgent
     /// </summary>
     private Task<IReadOnlyList<JsonElement>> BaseToolsAsync(CancellationToken cancellationToken)
     {
-        return _client.GetAgentToolsAsync(_options.AgentId, _options.AgentVersion, cancellationToken);
+        return _client.GetAgentToolsAsync(_options.ManagedAgentId, _options.AgentVersion, cancellationToken);
     }
 
     private async Task InterruptAsync(string? sessionId)
@@ -443,6 +460,18 @@ public sealed class ManagedAgentsAgent
         }
     }
 
+    /// <summary>A tool message's payload: its content plus any error text, matching the other ports.</summary>
+    private static string ToolResultText(AGUIToolMessage message)
+    {
+        return string.Join("\n", new[] { message.Content, message.Error }.Where(static part => !string.IsNullOrEmpty(part)));
+    }
+
+    /// <summary>Formats a timeout for the RUN_ERROR message without rounding sub-second values to "0s".</summary>
+    private static string FormatSeconds(TimeSpan timeout)
+    {
+        return $"{timeout.TotalSeconds.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}s";
+    }
+
     /// <summary>
     /// Whether the run carries a user message with text or a tool result.
     /// </summary>
@@ -462,11 +491,6 @@ public sealed class ManagedAgentsAgent
     private static string UserTextOf(AGUIUserMessage message)
     {
         return string.Concat(message.Content.OfType<AGUITextInputContent>().Select(static part => part.Text));
-    }
-
-    private static string ThreadKey(string threadId, string? ownerId)
-    {
-        return ownerId is null ? threadId : $"{ownerId}:{threadId}";
     }
 
     private sealed class RunContext

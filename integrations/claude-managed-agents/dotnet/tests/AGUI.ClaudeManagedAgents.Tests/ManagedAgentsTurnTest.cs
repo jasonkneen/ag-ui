@@ -288,6 +288,17 @@ public class ManagedAgentsTurnTest
     }
 
     [Fact]
+    public async Task UsesADefaultMessageForASessionErrorWithoutOne()
+    {
+        var run = await CollectAsync([
+            """{"type":"session.error","id":"err_1","error":{"type":"unknown_error","message":"","retry_status":{"type":"terminal"}}}""",
+        ]);
+
+        var error = Assert.IsType<RunErrorEvent>(Assert.Single(run.Emitted));
+        Assert.Equal(("The session reported an error.", "unknown_error"), (error.Message, error.Code));
+    }
+
+    [Fact]
     public async Task IgnoresARetryingSessionErrorAndCompletes()
     {
         var run = await CollectAsync([
@@ -333,6 +344,122 @@ public class ManagedAgentsTurnTest
         Assert.Equal(
             [AGUIEventTypes.TextMessageStart, AGUIEventTypes.TextMessageContent, AGUIEventTypes.TextMessageEnd],
             Types(run.Emitted));
+    }
+
+    [Fact]
+    public async Task MapsAnUnpreviewedThinkingStretchToAnEmptyReasoningPair()
+    {
+        var run = await CollectAsync([
+            """{"type":"agent.thinking","id":"think_1"}""",
+            IdleEndTurn,
+        ]);
+
+        Assert.Equal([AGUIEventTypes.ReasoningStart, AGUIEventTypes.ReasoningEnd], Types(run.Emitted));
+    }
+
+    [Fact]
+    public async Task DropsAnEmptyTextDelta()
+    {
+        var run = await CollectAsync([
+            """{"type":"event_start","event":{"type":"agent.message","id":"msg_1"}}""",
+            """{"type":"event_delta","event_id":"msg_1","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":""}}}""",
+            """{"type":"event_delta","event_id":"msg_1","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":"Hi"}}}""",
+            """{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"Hi"}]}""",
+            IdleEndTurn,
+        ]);
+
+        var deltas = run.Emitted.OfType<TextMessageContentEvent>().Select(evt => evt.Delta).ToList();
+        Assert.Equal(["Hi"], deltas);
+    }
+
+    [Fact]
+    public async Task FlattensMixedToolResultContent()
+    {
+        var run = await CollectAsync([
+            """
+            {
+              "type": "agent.tool_result",
+              "id": "tr_1",
+              "tool_use_id": "tu_1",
+              "content": [
+                {"type": "text", "text": "Caf&eacute; &amp; &#39;more&#39; &lt;b&gt;"},
+                {"type": "search_result", "title": "Docs &amp; guides", "source": "https://example.com", "content": [{"type": "text", "text": "body text"}]},
+                {"type": "image", "source": {}}
+              ]
+            }
+            """,
+            IdleEndTurn,
+        ]);
+
+        var result = Assert.IsType<ToolCallResultEvent>(run.Emitted[0]);
+        Assert.Equal("Caf&eacute; & 'more' <b>\n[search result] Docs & guides — https://example.com\nbody text\n[image]", result.Content);
+    }
+
+    [Fact]
+    public async Task AnswersTheCallWhenAHandlerThrowsItsOwnCancellation()
+    {
+        // A handler's own timeout (e.g. an inner HttpClient) throws an
+        // OperationCanceledException while the run's token is NOT cancelled;
+        // the session is still waiting on the call, so it must be answered.
+        var backend = new ManagedAgentsBackendTool
+        {
+            Name = "get_time",
+            Handler = _ => throw new TaskCanceledException("A task was canceled."),
+        };
+        var run = await CollectAsync(
+            [
+                """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+                IdleEndTurn,
+            ],
+            backendTools: new Dictionary<string, ManagedAgentsBackendTool> { ["get_time"] = backend });
+
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"A task was canceled."}],"is_error":true}""",
+            run.Fake.Sent[1].Single());
+    }
+
+    [Fact]
+    public async Task ReportsABackendToolExceptionAsAnErrorResult()
+    {
+        var backend = new ManagedAgentsBackendTool
+        {
+            Name = "get_time",
+            Handler = _ => throw new InvalidOperationException("clock offline"),
+        };
+        var run = await CollectAsync(
+            [
+                """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+                IdleEndTurn,
+            ],
+            backendTools: new Dictionary<string, ManagedAgentsBackendTool> { ["get_time"] = backend });
+
+        AssertJson(
+            """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"clock offline"}],"is_error":true}""",
+            run.Fake.Sent[1].Single());
+        var result = run.Emitted.OfType<ToolCallResultEvent>().Single();
+        Assert.Equal("clock offline", result.Content);
+    }
+
+    [Fact]
+    public async Task InterruptsAndErrorsOnAnUnknownBlockingAction()
+    {
+        var run = await CollectAsync([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["unknown_1"]}}""",
+        ]);
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(run.Emitted[^1]).Code);
+        AssertJson("""{"type":"user.interrupt"}""", run.Fake.Sent[1].Single());
+    }
+
+    [Fact]
+    public async Task ReportsADeletedSessionAsEnded()
+    {
+        var run = await CollectAsync(["""{"type":"session.deleted","id":"del_1"}"""]);
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        Assert.True(run.Outcome.SessionEnded);
+        Assert.Equal("session_ended", Assert.IsType<RunErrorEvent>(run.Emitted[^1]).Code);
     }
 
     [Fact]

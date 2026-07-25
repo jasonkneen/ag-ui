@@ -9,9 +9,6 @@ namespace AGUI.ClaudeManagedAgents;
 /// </summary>
 internal static partial class ManagedAgentsCustomTools
 {
-    private const int MaxNameLength = 128;
-    private const int MaxDescriptionLength = 1024;
-
     /// <summary>
     /// Managed Agents tool names allow only <c>[A-Za-z0-9_-]</c>, at most 128 characters.
     /// </summary>
@@ -22,12 +19,7 @@ internal static partial class ManagedAgentsCustomTools
             return name;
         }
 
-        var normalized = InvalidNameCharacterPattern().Replace(name, "_");
-        if (normalized.Length > MaxNameLength)
-        {
-            normalized = normalized.Substring(0, MaxNameLength);
-        }
-
+        var normalized = ManagedAgentsText.Truncate(InvalidNameCharacterPattern().Replace(name, "_"), ManagedAgentsLimits.ToolNameMaxLength);
         return normalized.Length == 0 ? "tool" : normalized;
     }
 
@@ -41,7 +33,7 @@ internal static partial class ManagedAgentsCustomTools
         {
             ["type"] = "custom",
             ["name"] = NormalizeToolName(name),
-            ["description"] = ManagedAgentsText.Truncate(displayDescription, MaxDescriptionLength),
+            ["description"] = ManagedAgentsText.Truncate(displayDescription, ManagedAgentsLimits.ToolDescriptionMaxLength),
             ["input_schema"] = InputSchemaFrom(parameters),
         };
         return JsonSerializer.SerializeToElement(tool);

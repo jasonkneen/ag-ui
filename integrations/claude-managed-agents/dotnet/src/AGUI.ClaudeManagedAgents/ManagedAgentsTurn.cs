@@ -18,7 +18,7 @@ namespace AGUI.ClaudeManagedAgents;
 /// </remarks>
 internal sealed class ManagedAgentsTurn
 {
-    private const int MaxToolResultLength = 4000;
+    private const string InterruptedToolResult = "Tool execution was interrupted.";
 
     private readonly IManagedAgentsClient _client;
     private readonly string _sessionId;
@@ -27,7 +27,7 @@ internal sealed class ManagedAgentsTurn
     private readonly IReadOnlyDictionary<string, ManagedAgentsBackendTool> _backendTools;
     private readonly string? _toolConfirmation;
     private readonly bool _streamDeltas;
-    private readonly Func<CancellationToken, Task>? _onSent;
+    private readonly Func<Task>? _onSent;
 
     private readonly Queue<BaseEvent> _pending = new();
     private readonly Dictionary<string, StringBuilder> _previews = new(StringComparer.Ordinal);
@@ -58,7 +58,7 @@ internal sealed class ManagedAgentsTurn
         IReadOnlyDictionary<string, ManagedAgentsBackendTool> backendTools,
         string? toolConfirmation,
         bool streamDeltas,
-        Func<CancellationToken, Task>? onSent = null)
+        Func<Task>? onSent = null)
     {
         _client = client;
         _sessionId = sessionId;
@@ -88,7 +88,7 @@ internal sealed class ManagedAgentsTurn
             await SendOutboundAsync(cancellationToken).ConfigureAwait(false);
             if (_onSent is not null)
             {
-                await _onSent(cancellationToken).ConfigureAwait(false);
+                await _onSent().ConfigureAwait(false);
             }
 
             await foreach (var streamEvent in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
@@ -156,22 +156,12 @@ internal sealed class ManagedAgentsTurn
                 await _client.SendEventsAsync(_sessionId, followUps, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (Exception ex) when (attempt < SentWhileParkedRetryDelays.Length && IsSentWhileParked(ex))
+            catch (Exception ex) when (attempt < ManagedAgentsLimits.SentWhileParkedRetryDelays.Length && IsSentWhileParked(ex))
             {
-                await Task.Delay(SentWhileParkedRetryDelays[attempt], cancellationToken).ConfigureAwait(false);
+                await Task.Delay(ManagedAgentsLimits.SentWhileParkedRetryDelays[attempt], cancellationToken).ConfigureAwait(false);
             }
         }
     }
-
-    private static readonly TimeSpan[] SentWhileParkedRetryDelays =
-    [
-        TimeSpan.FromMilliseconds(150),
-        TimeSpan.FromMilliseconds(300),
-        TimeSpan.FromMilliseconds(600),
-        TimeSpan.FromMilliseconds(1000),
-        TimeSpan.FromMilliseconds(1500),
-        TimeSpan.FromMilliseconds(2000),
-    ];
 
     private static bool IsFollowUp(JsonElement evt)
     {
@@ -311,7 +301,7 @@ internal sealed class ManagedAgentsTurn
 
         if (streamEvent.TryPickSessionStatusIdleEvent(out var idle))
         {
-            await HandleIdleAsync(idle.StopReason, cancellationToken).ConfigureAwait(false);
+            await HandleIdleAsync(idle.StopReason).ConfigureAwait(false);
             return;
         }
 
@@ -352,8 +342,9 @@ internal sealed class ManagedAgentsTurn
             return; // best-effort; the buffered agent.message is canonical
         }
 
+        // AG-UI rejects a content event with an empty delta, so skip empty text.
         var text = TextDeltaOf(rawEvent);
-        if (text is null)
+        if (string.IsNullOrEmpty(text))
         {
             return;
         }
@@ -428,14 +419,15 @@ internal sealed class ManagedAgentsTurn
         }
 
         // Nothing can execute this tool. Answer with an error so the agent recovers.
-        var text = $"No handler is registered for tool \"{name}\".";
-        EmitToolResult(toolUseId, text);
-        await _client
-            .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.CustomToolResult(toolUseId, text, isError: true)], cancellationToken)
-            .ConfigureAwait(false);
-        _ackedToolUses.Add(toolUseId);
+        await PostCustomToolResultAsync(toolUseId, $"No handler is registered for tool \"{name}\".", isError: true).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Runs a backend tool and posts its result back into the session. If the run is aborted
+    /// (client disconnect or turn timeout) while the handler is still running, stops waiting for
+    /// it, answers the call with an error so the session is not left parked on it, and rethrows
+    /// the cancellation so the abort proceeds.
+    /// </summary>
     private async Task RunBackendToolAsync(string toolUseId, ManagedAgentsBackendTool tool, string inputJson, CancellationToken cancellationToken)
     {
         string text;
@@ -443,17 +435,64 @@ internal sealed class ManagedAgentsTurn
         try
         {
             using var input = JsonDocument.Parse(inputJson);
-            text = await tool.Handler(input.RootElement.Clone()).ConfigureAwait(false);
+            var handlerTask = tool.Handler(input.RootElement.Clone());
+            try
+            {
+                text = await handlerTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // The handler keeps running after we stop waiting; observe its
+                // eventual fault so it cannot surface as an unobserved task exception.
+                _ = handlerTask.ContinueWith(
+                    static t => _ = t.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                throw;
+            }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // The run is being torn down (timeout or disconnect), whatever the
+                // exception type: answer the call best-effort so the session is not
+                // left parked, then surface the cancellation.
+                try
+                {
+                    await PostCustomToolResultAsync(toolUseId, InterruptedToolResult, isError: true).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // Best-effort: the run is already being torn down.
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
+
+            // Includes an OperationCanceledException the handler threw on its own
+            // (e.g. an inner HTTP timeout): the session is waiting on this call,
+            // so it must still be answered.
             isError = true;
-            text = ex.Message;
+            text = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
         }
 
+        await PostCustomToolResultAsync(toolUseId, text, isError).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reports a custom tool's result to the UI and posts it into the session. The post ignores
+    /// the run's cancellation — the tool already ran (or was answered) and the session is waiting
+    /// on the result — but is bounded by its own timeout so a stalled connection cannot hold the
+    /// thread's run gate open.
+    /// </summary>
+    private async Task PostCustomToolResultAsync(string toolUseId, string text, bool isError)
+    {
         EmitToolResult(toolUseId, text);
+        using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
         await _client
-            .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.CustomToolResult(toolUseId, text, isError)], cancellationToken)
+            .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.CustomToolResult(toolUseId, text, isError)], sendTimeout.Token)
             .ConfigureAwait(false);
         _ackedToolUses.Add(toolUseId);
     }
@@ -468,11 +507,11 @@ internal sealed class ManagedAgentsTurn
             return; // transient; the session recovers on its own
         }
 
-        var message = StringPropertyOf(error, "message") ?? "The session reported an error.";
-        Fail(message, StringPropertyOf(error, "type"));
+        var message = StringPropertyOf(error, "message");
+        Fail(string.IsNullOrEmpty(message) ? "The session reported an error." : message, StringPropertyOf(error, "type"));
     }
 
-    private async Task HandleIdleAsync(StopReason stopReason, CancellationToken cancellationToken)
+    private async Task HandleIdleAsync(StopReason stopReason)
     {
         if (stopReason.TryPickBetaManagedAgentsSessionEndTurn(out _))
         {
@@ -515,7 +554,11 @@ internal sealed class ManagedAgentsTurn
             var events = confirmations
                 .Select(id => ManagedAgentsSessionEvents.ToolConfirmation(id, _toolConfirmation))
                 .ToList();
-            await _client.SendEventsAsync(_sessionId, events, cancellationToken).ConfigureAwait(false);
+
+            // Ignores the run's cancellation (the session is parked waiting on these
+            // answers) but bounded so a stalled connection cannot hang the turn.
+            using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
+            await _client.SendEventsAsync(_sessionId, events, sendTimeout.Token).ConfigureAwait(false);
             foreach (var id in confirmations)
             {
                 _ackedToolUses.Add(id);
@@ -653,7 +696,7 @@ internal sealed class ManagedAgentsTurn
 
     private static string DescribeContent(JsonElement rawEvent)
     {
-        return ManagedAgentsText.Truncate(ManagedAgentsText.DescribeToolResult(ContentBlocksOf(rawEvent)), MaxToolResultLength);
+        return ManagedAgentsText.Truncate(ManagedAgentsText.DescribeToolResult(ContentBlocksOf(rawEvent)), ManagedAgentsLimits.ToolResultMaxChars);
     }
 
     private static string? TextDeltaOf(JsonElement rawEvent)

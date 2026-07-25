@@ -16,7 +16,7 @@ def add_managed_agents_fastapi_endpoint(
 
     POST `path` runs one turn and streams the encoded AG-UI events. Closing
     the response (a client disconnect) cancels the run, which interrupts the
-    managed session. GET `{path}/health` reports the agent id.
+    managed session. GET `{path}/health` reports the managed agent id.
     """
 
     @app.post(path)
@@ -32,7 +32,7 @@ def add_managed_agents_fastapi_endpoint(
             event_generator(), media_type=encoder.get_content_type()
         )
 
-    @app.get(f"{path}/health")
+    @app.get(f"{path.rstrip('/')}/health")
     def health():
         """Health check."""
-        return {"status": "ok", "agent": {"agentId": agent.agent_id}}
+        return {"status": "ok", "agent": {"managedAgentId": agent.managed_agent_id}}

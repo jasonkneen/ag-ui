@@ -25,7 +25,10 @@ public interface IManagedAgentsClient
     /// <summary>
     /// Reads the tools defined on the managed agent itself, as tool definition JSON objects.
     /// </summary>
-    Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string agentId, int? agentVersion, CancellationToken cancellationToken);
+    /// <param name="managedAgentId">The managed agent to read.</param>
+    /// <param name="agentVersion">The agent version to read, or <see langword="null"/> for the latest.</param>
+    /// <param name="cancellationToken">A token to cancel the request.</param>
+    Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string managedAgentId, int? agentVersion, CancellationToken cancellationToken);
 
     /// <summary>
     /// Posts user events into the session.

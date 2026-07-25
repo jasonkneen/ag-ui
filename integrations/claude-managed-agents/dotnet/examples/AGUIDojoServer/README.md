@@ -42,4 +42,4 @@ docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e PORT=8026 -p 8026:8026 agui-c
 
 ## Security
 
-This example is for local development. It binds `0.0.0.0`, has no authentication, and drives managed sessions with the server's own API key. Any client that can reach it can use those sessions, so keep it on `localhost` or behind your own auth. Every request is treated as the same single user: it does not pass an `ownerId` selector to `MapManagedAgentsAgent`, so thread IDs are not scoped per caller.
+This example is for local development. It binds `0.0.0.0`, has no authentication, and drives managed sessions with the server's own API key. Any client that can reach it can use those sessions, so keep it on `localhost` or behind your own auth. Every request is treated as the same single user, and thread IDs are not partitioned per caller.

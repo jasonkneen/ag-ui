@@ -47,7 +47,7 @@ internal static class ExampleAgents
 
             var options = new ManagedAgentsAgentOptions
             {
-                AgentId = agentId,
+                ManagedAgentId = agentId,
                 EnvironmentId = ids.EnvironmentId,
             };
             if (s_backendTools.TryGetValue(spec.Route, out var tools))

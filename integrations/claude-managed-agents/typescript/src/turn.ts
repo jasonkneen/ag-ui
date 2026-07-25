@@ -7,6 +7,7 @@ import { accumulateManagedAgentsEvent } from "@anthropic-ai/sdk/lib/sessions/acc
 import type { AccumulatedEvent } from "@anthropic-ai/sdk/lib/sessions/accumulate";
 import { EventType } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
+import { BEST_EFFORT_SEND_TIMEOUT_MS, PARKED_RETRY_DELAYS_MS, TOOL_RESULT_MAX_CHARS } from "./constants";
 import { describeToolResult, textOf } from "./text";
 import type { BackendCustomTool } from "./types";
 
@@ -37,13 +38,20 @@ export type TurnOutcome =
 
 type StreamEvent = BetaManagedAgentsStreamSessionEvents;
 
-/** Tool results can be large; the UI only needs a readable prefix. */
-const TOOL_RESULT_MAX_CHARS = 4000;
+/** Fallback text when the API reports a session error without a message. */
+const SESSION_ERROR_FALLBACK = "The session reported an error.";
+/** Posted for a backend tool whose handler was cut off by a timeout or disconnect. */
+const INTERRUPTED_TOOL_TEXT = "Tool execution was interrupted.";
+
 /**
- * Backoff for re-posting follow-up messages while a session finishes
- * un-parking; that transition happens asynchronously after a tool result.
+ * A live text preview: the SDK's accumulated snapshot (best-effort, dropped
+ * if it errors) plus the text already emitted to the UI, which the buffered
+ * `agent.message` reconciles against.
  */
-const PARKED_RETRY_DELAYS_MS = [150, 300, 600, 1000, 1500, 2000];
+interface Preview {
+  snapshot: AccumulatedEvent | undefined;
+  emitted: string;
+}
 
 /**
  * Drive one turn of a managed session: open the event stream, post the
@@ -98,7 +106,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   }
   await opts.onSent?.();
 
-  const previews = new Map<string, AccumulatedEvent>();
+  const previews = new Map<string, Preview>();
   const closedMessages = new Set<string>();
   const openReasoning = new Set<string>();
   const ackedToolUses = new Set<string>();
@@ -107,10 +115,18 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
 
   const emitTextStart = (messageId: string) =>
     emit({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent);
-  const emitTextContent = (messageId: string, delta: string) =>
-    emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta } as BaseEvent);
+  // Never emit an empty content delta: it is a no-op the schema rejects.
+  const emitTextContent = (messageId: string, delta: string) => {
+    if (delta) emit({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta } as BaseEvent);
+  };
   const emitTextEnd = (messageId: string) => emit({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent);
 
+  const openMessage = (messageId: string): Preview => {
+    emitTextStart(messageId);
+    const preview: Preview = { snapshot: undefined, emitted: "" };
+    previews.set(messageId, preview);
+    return preview;
+  };
   const closeMessage = (messageId: string) => {
     emitTextEnd(messageId);
     previews.delete(messageId);
@@ -152,22 +168,49 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     return { status: "errored" };
   };
 
-  /** Surface a custom tool result to the UI and answer it in the session. */
-  const answerCustomToolUse = async (toolUseId: string, text: string, isError: boolean) => {
-    emitToolResult(toolUseId, text);
-    await client.beta.sessions.events.send(sessionId, {
-      events: [{ type: "user.custom_tool_result", custom_tool_use_id: toolUseId, content: [{ type: "text", text }], is_error: isError }],
-    });
+  /**
+   * Post a custom tool's result into the session. Deliberately not tied to the
+   * run's abort signal (the session is waiting on the result even when the run
+   * is being torn down) but bounded by its own timeout so a stalled connection
+   * cannot hold the thread's run gate open.
+   */
+  const postCustomToolResult = async (toolUseId: string, text: string, isError: boolean) => {
+    await client.beta.sessions.events.send(
+      sessionId,
+      {
+        events: [{ type: "user.custom_tool_result", custom_tool_use_id: toolUseId, content: [{ type: "text", text }], is_error: isError }],
+      },
+      { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
+    );
     ackedToolUses.add(toolUseId);
   };
 
-  /** Run a backend custom tool and post its result back into the session. */
+  /** Surface a custom tool result to the UI and answer it in the session. */
+  const answerCustomToolUse = async (toolUseId: string, text: string, isError: boolean) => {
+    emitToolResult(toolUseId, text);
+    await postCustomToolResult(toolUseId, text, isError);
+  };
+
+  /**
+   * Run a backend custom tool and post its result back into the session.
+   * The handler races the turn's abort signal: on a timeout or disconnect
+   * the tool is answered with an error (best-effort, non-cancellable) so
+   * the session is never left parked, then the abort proceeds.
+   */
   const runBackendTool = async (id: string, tool: BackendCustomTool, input: unknown) => {
+    let text: string;
+    let isError = false;
     try {
-      await answerCustomToolUse(id, await tool.handler(input), false);
+      text = await raceAbort(() => tool.handler(input), signal);
     } catch (err) {
-      await answerCustomToolUse(id, err instanceof Error ? err.message : String(err), true);
+      if (signal.aborted) {
+        await postCustomToolResult(id, INTERRUPTED_TOOL_TEXT, true).catch(() => {});
+        throw err;
+      }
+      text = err instanceof Error ? err.message : String(err);
+      isError = true;
     }
+    await answerCustomToolUse(id, text, isError);
   };
 
   const consume = async (): Promise<TurnOutcome> => {
@@ -175,9 +218,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       switch (event.type) {
         case "event_start": {
           if (event.event.type === "agent.message") {
-            emitTextStart(event.event.id);
-            const seed = accumulateManagedAgentsEvent(undefined, event);
-            if (seed) previews.set(event.event.id, seed);
+            openMessage(event.event.id).snapshot = accumulateManagedAgentsEvent(undefined, event);
           } else if (event.event.type === "agent.thinking") {
             openReasoning.add(event.event.id);
             emit({ type: EventType.REASONING_START, messageId: event.event.id } as BaseEvent);
@@ -187,10 +228,18 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
         }
 
         case "event_delta": {
-          const snapshot = previews.get(event.event_id);
-          if (!snapshot) break; // best-effort; the buffered agent.message is canonical
-          previews.set(event.event_id, accumulateManagedAgentsEvent(snapshot, event) ?? snapshot);
+          const preview = previews.get(event.event_id);
+          if (!preview) break; // best-effort; the buffered agent.message is canonical
+          try {
+            preview.snapshot = accumulateManagedAgentsEvent(preview.snapshot, event);
+          } catch {
+            // A gapped or out-of-order delta: drop this preview and let the
+            // buffered agent.message reconcile against what was emitted.
+            preview.snapshot = undefined;
+            break;
+          }
           if (event.delta.type === "content_delta" && event.delta.content.type === "text") {
+            preview.emitted += event.delta.content.text;
             emitTextContent(event.event_id, event.delta.content.text);
           }
           break;
@@ -210,30 +259,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
 
         case "agent.message": {
           if (closedMessages.has(event.id)) break;
-          const snapshot = previews.get(event.id);
-          const finalText = textOf(event.content);
-          if (!snapshot) {
-            emitTextStart(event.id);
-            if (finalText) emitTextContent(event.id, finalText);
-          } else {
-            const previewed = textOf(snapshot.content);
-            if (finalText.startsWith(previewed)) {
-              if (finalText.length > previewed.length) {
-                emitTextContent(event.id, finalText.slice(previewed.length));
-              }
-            } else {
-              // Preview diverged from the final text: close it and re-emit the corrected whole.
-              closeMessage(event.id);
-              if (finalText) {
-                const messageId = `corrected_${event.id}`;
-                emitTextStart(messageId);
-                emitTextContent(messageId, finalText);
-                emitTextEnd(messageId);
-              }
-              break;
-            }
-          }
-          closeMessage(event.id);
+          reconcileMessage(event.id, textOf(event.content));
           break;
         }
 
@@ -280,16 +306,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
         }
 
         case "span.model_request_end": {
-          // Closes any preview whose buffered agent.message never arrived
-          // (e.g. an interrupted or errored model request).
-          closeAll();
+          // A failed model request produces no buffered agent.message, so its
+          // dangling preview must be closed here. A successful one is left
+          // to the buffered message, which may arrive after this event.
+          if (event.is_error === true) closeAll();
           break;
         }
 
         case "session.error": {
           const { type, message, retry_status } = event.error;
           if (retry_status.type === "retrying") break; // transient; the session recovers on its own
-          return fail(message, type);
+          return fail(message || SESSION_ERROR_FALLBACK, type);
         }
 
         case "session.status_idle": {
@@ -315,13 +342,18 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
                 "tool_confirmation_required",
               );
             }
-            await client.beta.sessions.events.send(sessionId, {
-              events: confirmations.map((tool_use_id) => ({
-                type: "user.tool_confirmation" as const,
-                tool_use_id,
-                result: opts.toolConfirmation!,
-              })),
-            });
+            // Bounded like tool-result posts: the session is parked on these answers.
+            await client.beta.sessions.events.send(
+              sessionId,
+              {
+                events: confirmations.map((tool_use_id) => ({
+                  type: "user.tool_confirmation" as const,
+                  tool_use_id,
+                  result: opts.toolConfirmation!,
+                })),
+              },
+              { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
+            );
             for (const id of confirmations) ackedToolUses.add(id);
             if (confirmations.length === blockedOn.length) break;
           }
@@ -356,6 +388,28 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     return fail("The session event stream ended before the reply completed.", "stream_ended");
   };
 
+  /** Fold the buffered final `agent.message` into what the preview emitted. */
+  const reconcileMessage = (messageId: string, finalText: string) => {
+    const preview = previews.get(messageId);
+    if (!preview) {
+      emitTextStart(messageId);
+      emitTextContent(messageId, finalText);
+    } else if (finalText.startsWith(preview.emitted)) {
+      emitTextContent(messageId, finalText.slice(preview.emitted.length));
+    } else {
+      // Preview diverged from the final text: close it and re-emit the corrected whole.
+      closeMessage(messageId);
+      if (finalText) {
+        const correctedId = `corrected_${messageId}`;
+        emitTextStart(correctedId);
+        emitTextContent(correctedId, finalText);
+        emitTextEnd(correctedId);
+      }
+      return;
+    }
+    closeMessage(messageId);
+  };
+
   try {
     return await consume();
   } finally {
@@ -370,15 +424,34 @@ const isSentWhileParked = (err: unknown): boolean =>
   (err as { status?: unknown }).status === 400 &&
   String((err as { message?: unknown }).message ?? "").includes("waiting on responses");
 
-const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
-  new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(new Error("turn aborted"));
-      },
-      { once: true },
-    );
+/** Rejects when `signal` aborts, whether it aborts before or during the wait. */
+const abortRejection = <T>(signal: AbortSignal): { promise: Promise<T>; dispose: () => void } => {
+  let onAbort: () => void = () => {};
+  const promise = new Promise<T>((_, reject) => {
+    onAbort = () => reject(new Error("turn aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
   });
+  return { promise, dispose: () => signal.removeEventListener("abort", onAbort) };
+};
+
+/** Await `work`, but give up as soon as `signal` aborts. */
+const raceAbort = async <T>(work: () => T | Promise<T>, signal: AbortSignal): Promise<T> => {
+  const aborted = abortRejection<T>(signal);
+  const working = Promise.resolve().then(work);
+  working.catch(() => {}); // an abandoned handler that rejects later must not go unhandled
+  try {
+    return await Promise.race([working, aborted.promise]);
+  } finally {
+    aborted.dispose();
+  }
+};
+
+const sleep = async (ms: number, signal: AbortSignal): Promise<void> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await raceAbort(() => new Promise<void>((resolve) => (timer = setTimeout(resolve, ms))), signal);
+  } finally {
+    clearTimeout(timer);
+  }
+};

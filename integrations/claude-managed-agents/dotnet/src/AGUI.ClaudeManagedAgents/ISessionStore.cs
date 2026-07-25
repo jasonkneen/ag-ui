@@ -5,8 +5,8 @@ namespace AGUI.ClaudeManagedAgents;
 /// a fresh session is created). Provide your own to survive restarts or run multiple replicas.
 /// </summary>
 /// <remarks>
-/// Records are keyed by the value the agent derives from the run: the thread ID, scoped by the
-/// owner ID when one is supplied to <see cref="ManagedAgentsAgent.RunAsync(AGUI.Abstractions.RunAgentInput, string?, CancellationToken)"/>.
+/// Records are keyed by the AG-UI thread ID. Supply a store that partitions by caller if you
+/// need multi-tenant isolation.
 /// </remarks>
 public interface ISessionStore
 {

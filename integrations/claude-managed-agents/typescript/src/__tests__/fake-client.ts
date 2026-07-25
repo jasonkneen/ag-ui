@@ -1,39 +1,86 @@
 import { vi } from "vitest";
 
+/**
+ * One scripted stream entry. A plain event object is yielded; a Promise
+ * blocks the stream until it settles (a gate to hold a run in flight); an
+ * Error is thrown at that point (mid-stream failure).
+ */
+export type StreamStep = unknown;
+
 /** A scripted stand-in for the Anthropic client's managed-agents surface. */
 export interface FakeClientOptions {
-  /** Events yielded by each successive `events.stream` call. */
-  streams?: unknown[][];
+  /** Steps yielded by each successive `events.stream` call. */
+  streams?: StreamStep[][];
   agentTools?: unknown[];
   sessionId?: string;
+  /**
+   * Scripted results for successive `events.send` calls. An Error entry
+   * makes that call reject; `undefined` (or running out) resolves normally.
+   */
+  sendResults?: (Error | undefined)[];
+  /** Make `sessions.create` / `sessions.update` reject with this error. */
+  createError?: Error;
+  updateError?: Error;
 }
+
+const abortError = () => Object.assign(new Error("Request was aborted."), { name: "AbortError" });
+
+/** Resolve with `promise`, unless `signal` aborts first (then reject). */
+const untilAborted = <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(abortError());
+    const onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+};
 
 export function createFakeClient(options: FakeClientOptions = {}) {
   const streams = [...(options.streams ?? [])];
+  const sendResults = [...(options.sendResults ?? [])];
   const sent: { sessionId: string; events: unknown[] }[] = [];
 
-  const stream = vi.fn(async (_sessionId: string) => {
-    const events = streams.shift() ?? [];
+  const stream = vi.fn(async (_sessionId: string, _params?: unknown, requestOptions?: { signal?: AbortSignal }) => {
+    const steps = streams.shift() ?? [];
+    const signal = requestOptions?.signal;
     const controller = new AbortController();
     return {
       controller,
       async *[Symbol.asyncIterator]() {
-        for (const event of events) {
+        for (const step of steps) {
           if (controller.signal.aborted) return;
-          yield event;
+          if (signal?.aborted) throw abortError();
+          if (step instanceof Promise) {
+            await untilAborted(step, signal); // gate: hold the stream open
+            continue;
+          }
+          if (step instanceof Error) throw step;
+          yield step;
         }
+        if (signal?.aborted) throw abortError();
       },
     };
   });
 
   const send = vi.fn(async (sessionId: string, params: { events: unknown[] }) => {
+    const failure = sendResults.shift();
+    if (failure) throw failure;
     sent.push({ sessionId, events: params.events });
     return { data: params.events.map((event, i) => ({ ...(event as object), id: `sent_${sent.length}_${i}` })) };
   });
 
-  const create = vi.fn(async () => ({ id: options.sessionId ?? "sesn_1" }));
-  const update = vi.fn(async () => ({}));
-  const retrieve = vi.fn(async () => ({ tools: options.agentTools ?? [{ type: "agent_toolset_20260401", configs: [], default_config: {} }] }));
+  const create = vi.fn(async (_params: any) => {
+    if (options.createError) throw options.createError;
+    return { id: options.sessionId ?? "sesn_1" };
+  });
+  const update = vi.fn(async (_sessionId: string, _params: any) => {
+    if (options.updateError) throw options.updateError;
+    return {};
+  });
+  const retrieve = vi.fn(async (_agentId: string, _params?: any) => ({
+    tools: options.agentTools ?? [{ type: "agent_toolset_20260401", configs: [], default_config: {} }],
+  }));
 
   const client = {
     beta: {

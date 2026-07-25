@@ -5,9 +5,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ._util import get
-
-SEARCH_RESULT_PREVIEW_CHARS = 300
-"""Search result bodies can be long; show only a readable prefix."""
+from .constants import SEARCH_RESULT_PREVIEW_CHARS
 
 _HEX_ENTITY = re.compile(r"&#x([0-9a-fA-F]+);")
 _DEC_ENTITY = re.compile(r"&#(\d+);")

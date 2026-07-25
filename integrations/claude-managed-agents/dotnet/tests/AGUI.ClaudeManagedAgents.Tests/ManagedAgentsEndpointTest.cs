@@ -24,7 +24,7 @@ public class ManagedAgentsEndpointTest : IAsyncLifetime
         ]);
         var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
         {
-            AgentId = "agent_1",
+            ManagedAgentId = "agent_endpoint",
             EnvironmentId = "env_1",
             Client = _fake,
         });
@@ -32,7 +32,7 @@ public class ManagedAgentsEndpointTest : IAsyncLifetime
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         _app = builder.Build();
-        _app.MapManagedAgentsAgent("/chat", agent, ownerId: context => context.Request.Headers["X-Test-Owner"]);
+        _app.MapManagedAgentsAgent("/chat", agent);
         await _app.StartAsync();
 
         var address = _app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
@@ -67,31 +67,29 @@ public class ManagedAgentsEndpointTest : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ScopesTheThreadByTheOwnerSelector()
+    public async Task KeysTheSessionStoreByThreadId()
     {
         var store = new InMemorySessionStore();
         var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
         {
-            AgentId = "agent_1",
+            ManagedAgentId = "agent_endpoint",
             EnvironmentId = "env_1",
             Client = new FakeManagedAgentsClient(["""{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"end_turn"}}"""]),
             SessionStore = store,
         });
-        _app.MapManagedAgentsAgent("/scoped", agent, ownerId: context => context.Request.Headers["X-Test-Owner"]);
+        _app.MapManagedAgentsAgent("/threads", agent);
 
-        var request = new HttpRequestMessage(HttpMethod.Post, "/scoped")
+        var request = new HttpRequestMessage(HttpMethod.Post, "/threads")
         {
             Content = new StringContent(
                 """{"threadId":"thread_1","runId":"run_1","messages":[{"id":"u1","role":"user","content":"Hello"}],"tools":[],"state":{}}""",
                 Encoding.UTF8,
                 "application/json"),
         };
-        request.Headers.Add("X-Test-Owner", "alice");
         using var response = await _http.SendAsync(request);
         _ = await response.Content.ReadAsStringAsync();
 
-        Assert.NotNull(await store.GetAsync("alice:thread_1", default));
-        Assert.Null(await store.GetAsync("thread_1", default));
+        Assert.NotNull(await store.GetAsync("thread_1", default));
     }
 
     [Fact]

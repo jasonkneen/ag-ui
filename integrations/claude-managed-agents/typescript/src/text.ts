@@ -1,7 +1,6 @@
 /** Helpers for turning Managed Agents content blocks into display text. */
 
-/** Search result bodies can be long; show only a readable prefix. */
-const SEARCH_RESULT_PREVIEW_CHARS = 300;
+import { SEARCH_RESULT_PREVIEW_CHARS } from "./constants";
 
 /** Any content block; only `type` is required to route it. */
 type ContentBlock = { type: string } & Record<string, any>;
