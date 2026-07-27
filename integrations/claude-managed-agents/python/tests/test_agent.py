@@ -148,6 +148,42 @@ async def test_reuses_session_on_next_run_and_sends_only_new_message():
     ]
 
 
+async def test_dedupes_registered_tools_against_the_agents_own_custom_tools():
+    """A custom tool already defined on the managed agent must not be sent
+    twice when a frontend tool of the same name is registered: the frontend
+    definition wins and the agent's copy is dropped."""
+    fake = FakeClient(
+        streams=[[IDLE_END_TURN]],
+        agent_tools=[
+            {"type": "agent_toolset_20260401", "configs": [], "default_config": {}},
+            {
+                "type": "custom",
+                "name": "show_chart",
+                "description": "Agent's own copy",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ],
+    )
+    await collect(
+        new_agent(fake),
+        base_input(
+            tools=[
+                {
+                    "name": "show_chart",
+                    "description": "Render a chart",
+                    "parameters": {"type": "object"},
+                }
+            ]
+        ),
+    )
+
+    tools = fake.create_calls[0]["agent"]["tools"]
+    assert [tool.get("name") for tool in tools if tool.get("type") == "custom"] == [
+        "show_chart"
+    ]
+    assert tools[-1]["description"] == "Render a chart"
+
+
 async def test_registers_frontend_tools_as_custom_tools_when_creating_session():
     fake = FakeClient(
         streams=[[IDLE_END_TURN]],

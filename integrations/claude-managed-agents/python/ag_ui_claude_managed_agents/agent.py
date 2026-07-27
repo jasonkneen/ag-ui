@@ -16,8 +16,8 @@ from ag_ui.core import (
 )
 from anthropic import AsyncAnthropic
 
-from ._util import maybe_await
-from .constants import DEFAULT_TURN_TIMEOUT_S
+from ._util import get, maybe_await
+from .constants import BEST_EFFORT_SEND_TIMEOUT_S, DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
 from .tools import custom_tool_from, normalize_tool_name
 from .turn import Emit, run_turn
@@ -165,8 +165,13 @@ class ManagedAgentsAgent:
         if not session_id:
             return
         try:
-            await self.client.beta.sessions.events.send(
-                session_id, events=[{"type": "user.interrupt"}]
+            # Bounded: this runs while the busy gate is still held, so a
+            # stalled send must not block the thread's later runs.
+            await asyncio.wait_for(
+                self.client.beta.sessions.events.send(
+                    session_id, events=[{"type": "user.interrupt"}]
+                ),
+                BEST_EFFORT_SEND_TIMEOUT_S,
             )
         except Exception:  # noqa: BLE001 - best-effort interrupt
             pass
@@ -432,7 +437,7 @@ class ManagedAgentsAgent:
             if self.agent_version is not None:
                 agent["version"] = self.agent_version
             # Overrides replace the tool list, so keep the agent's own tools.
-            agent["tools"] = [*(await self._base_tools()), *custom_tools]
+            agent["tools"] = await self._merged_tools(custom_tools)
 
         session = await self.client.beta.sessions.create(
             agent=agent, environment_id=self.environment_id, title=title
@@ -469,9 +474,23 @@ class ManagedAgentsAgent:
             return
         await self.client.beta.sessions.update(
             record.session_id,
-            agent={"tools": [*(await self._base_tools()), *desired]},
+            agent={"tools": await self._merged_tools(desired)},
         )
         record.tool_names = [tool["name"] for tool in desired]
+
+    async def _merged_tools(self, custom_tools: list[dict[str, Any]]) -> list[Any]:
+        """The agent's own tools plus custom tools, without duplicate names.
+
+        Overrides replace the whole list, so the agent's tools are carried
+        along, but a custom tool of the same name wins over the agent's copy.
+        """
+        names = {tool["name"] for tool in custom_tools}
+        base = [
+            tool
+            for tool in await self._base_tools()
+            if get(tool, "type") != "custom" or get(tool, "name") not in names
+        ]
+        return [*base, *custom_tools]
 
     async def _base_tools(self) -> list[Any]:
         """The tools defined on the managed agent itself, fetched fresh so console edits apply."""

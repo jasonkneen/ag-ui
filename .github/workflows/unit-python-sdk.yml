@@ -339,6 +339,7 @@ jobs:
         run: uv run python -m unittest discover tests -v
 
   claude-managed-agents-python:
+    name: claude-managed-agents-python
     runs-on: ubuntu-latest
 
     steps:
@@ -350,14 +351,16 @@ jobs:
       - name: Detect fork PR
         id: fork-check
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" && \
-                "${GITHUB_EVENT_PULL_REQUEST_HEAD_REPO_FULL_NAME}" != "${{ github.repository }}" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request" && \
+                "$HEAD_REPO" != "$BASE_REPO" ]]; then
             echo "prefix=fork-" >> "$GITHUB_OUTPUT"
           else
             echo "prefix=" >> "$GITHUB_OUTPUT"
           fi
         env:
-          GITHUB_EVENT_PULL_REQUEST_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0

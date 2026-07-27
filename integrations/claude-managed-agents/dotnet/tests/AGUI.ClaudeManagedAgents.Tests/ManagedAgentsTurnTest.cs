@@ -347,6 +347,26 @@ public class ManagedAgentsTurnTest
     }
 
     [Fact]
+    public async Task KeepsTheTopUpWhenASuccessfulSpanEndArrivesBeforeTheBufferedMessage()
+    {
+        // A successful model_request_end must not close the preview: the buffered
+        // agent.message arrives after it and still owes the streamed text its top-up.
+        var run = await CollectAsync([
+            """{"type":"event_start","event":{"type":"agent.message","id":"msg_1"}}""",
+            """{"type":"event_delta","event_id":"msg_1","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":"Hel"}}}""",
+            """{"type":"span.model_request_end","id":"span_1","model_request_start_id":"s_1","is_error":false,"model_usage":{}}""",
+            """{"type":"agent.message","id":"msg_1","content":[{"type":"text","text":"Hello there"}]}""",
+            IdleEndTurn,
+        ]);
+
+        Assert.Equal(
+            [AGUIEventTypes.TextMessageStart, AGUIEventTypes.TextMessageContent, AGUIEventTypes.TextMessageContent, AGUIEventTypes.TextMessageEnd],
+            Types(run.Emitted));
+        var deltas = run.Emitted.OfType<TextMessageContentEvent>().Select(static e => e.Delta).ToList();
+        Assert.Equal(["Hel", "lo there"], deltas);
+    }
+
+    [Fact]
     public async Task MapsAnUnpreviewedThinkingStretchToAnEmptyReasoningPair()
     {
         var run = await CollectAsync([

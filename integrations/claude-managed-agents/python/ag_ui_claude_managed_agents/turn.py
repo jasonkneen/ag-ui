@@ -404,9 +404,12 @@ async def _consume(
                 )
 
             elif event_type == "span.model_request_end":
-                # Closes any preview whose buffered agent.message never
-                # arrived (e.g. an interrupted or errored model request).
-                close_all()
+                # A failed model request produces no buffered agent.message,
+                # so its dangling preview must be closed here. A successful
+                # one is left to the buffered message, which may arrive after
+                # this event and still needs to reconcile the streamed text.
+                if get(event, "is_error") is True:
+                    close_all()
 
             elif event_type == "session.error":
                 error = get(event, "error")

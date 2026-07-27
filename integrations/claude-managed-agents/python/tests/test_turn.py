@@ -623,6 +623,44 @@ async def test_closes_dangling_preview_when_model_request_ends_without_message()
     ]
 
 
+async def test_keeps_top_up_when_successful_span_end_arrives_before_buffered_message():
+    """A successful model_request_end must not close the preview: the buffered
+    agent.message arrives after it and still owes the streamed text its top-up."""
+    emitted, _, _ = await collect(
+        [
+            {"type": "event_start", "event": {"type": "agent.message", "id": "msg_1"}},
+            {
+                "type": "event_delta",
+                "event_id": "msg_1",
+                "delta": {
+                    "type": "content_delta",
+                    "index": 0,
+                    "content": {"type": "text", "text": "Hel"},
+                },
+            },
+            {
+                "type": "span.model_request_end",
+                "id": "span_1",
+                "model_request_start_id": "s_1",
+                "is_error": False,
+                "model_usage": {},
+            },
+            {
+                "type": "agent.message",
+                "id": "msg_1",
+                "content": [{"type": "text", "text": "Hello there"}],
+            },
+            IDLE_END_TURN,
+        ]
+    )
+    assert [(event.type.value, getattr(event, "delta", None)) for event in emitted] == [
+        ("TEXT_MESSAGE_START", None),
+        ("TEXT_MESSAGE_CONTENT", "Hel"),
+        ("TEXT_MESSAGE_CONTENT", "lo there"),
+        ("TEXT_MESSAGE_END", None),
+    ]
+
+
 async def test_errors_when_stream_ends_before_turn_completes():
     emitted, outcome, _ = await collect(
         [{"type": "event_start", "event": {"type": "agent.message", "id": "msg_1"}}]

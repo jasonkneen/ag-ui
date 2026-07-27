@@ -129,6 +129,31 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task DedupesRegisteredToolsAgainstTheAgentsOwnCustomTools()
+    {
+        // A custom tool already defined on the managed agent must not be sent
+        // twice when a frontend tool of the same name is registered: the
+        // frontend definition wins and the agent's copy is dropped.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn])
+        {
+            AgentTools =
+            [
+                FakeManagedAgentsClient.Json("""{"type":"agent_toolset_20260401","configs":[],"default_config":{}}"""),
+                FakeManagedAgentsClient.Json("""{"type":"custom","name":"show_chart","description":"Agent's own copy","input_schema":{"type":"object","properties":{}}}"""),
+            ],
+        };
+
+        await CollectAsync(NewAgent(fake), BaseInput(input =>
+            input.Tools = [Tool("show_chart", "Render a chart", """{"type":"object","properties":{}}""")]));
+
+        var created = Assert.Single(fake.CreatedSessions);
+        var tools = Assert.IsAssignableFrom<IList<JsonElement>>(created.OverrideTools);
+        Assert.Equal(2, tools.Count);
+        AssertJson("""{"type":"agent_toolset_20260401","configs":[],"default_config":{}}""", tools[0]);
+        Assert.Equal("Render a chart", tools[1].GetProperty("description").GetString());
+    }
+
+    [Fact]
     public async Task RegistersFrontendToolsAsCustomToolsWhenCreatingTheSession()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

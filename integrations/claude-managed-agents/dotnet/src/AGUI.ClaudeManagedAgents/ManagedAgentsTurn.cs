@@ -285,11 +285,17 @@ internal sealed class ManagedAgentsTurn
             return;
         }
 
-        if (streamEvent.TryPickSpanModelRequestEndEvent(out _))
+        if (streamEvent.TryPickSpanModelRequestEndEvent(out var spanEnd))
         {
-            // Closes any preview whose buffered agent.message never arrived
-            // (e.g. an interrupted or errored model request).
-            CloseAll();
+            // A failed model request produces no buffered agent.message, so its
+            // dangling preview must be closed here. A successful one is left to
+            // the buffered message, which may arrive after this event and still
+            // needs to reconcile the streamed text.
+            if (spanEnd.IsError == true)
+            {
+                CloseAll();
+            }
+
             return;
         }
 

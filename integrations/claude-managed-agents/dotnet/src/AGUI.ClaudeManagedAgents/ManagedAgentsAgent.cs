@@ -379,8 +379,7 @@ public sealed class ManagedAgentsAgent
         if (customTools.Count > 0)
         {
             // Overrides replace the tool list, so keep the agent's own tools.
-            var baseTools = await BaseToolsAsync(cancellationToken).ConfigureAwait(false);
-            request.OverrideTools = baseTools.Concat(customTools.Values).ToList();
+            request.OverrideTools = await MergedToolsAsync(customTools, cancellationToken).ConfigureAwait(false);
         }
 
         var sessionId = await _client.CreateSessionAsync(request, cancellationToken).ConfigureAwait(false);
@@ -427,10 +426,28 @@ public sealed class ManagedAgentsAgent
             return;
         }
 
-        var baseTools = await BaseToolsAsync(cancellationToken).ConfigureAwait(false);
-        var tools = baseTools.Concat(desired.Values).ToList();
+        var tools = await MergedToolsAsync(desired, cancellationToken).ConfigureAwait(false);
         await _client.UpdateSessionToolsAsync(record.SessionId, tools, cancellationToken).ConfigureAwait(false);
         record.ToolNames = desired.Keys.ToList();
+    }
+
+    /// <summary>
+    /// The agent's own tools plus custom tools, without duplicate names. Overrides replace the
+    /// whole list, so the agent's tools are carried along, but a custom tool of the same name
+    /// wins over the agent's copy.
+    /// </summary>
+    private async Task<List<JsonElement>> MergedToolsAsync(OrderedToolMap customTools, CancellationToken cancellationToken)
+    {
+        var names = new HashSet<string>(customTools.Keys, StringComparer.Ordinal);
+        var baseTools = await BaseToolsAsync(cancellationToken).ConfigureAwait(false);
+        return baseTools
+            .Where(tool => !(tool.TryGetProperty("type", out var type)
+                && type.ValueEquals("custom")
+                && tool.TryGetProperty("name", out var name)
+                && name.ValueKind == JsonValueKind.String
+                && names.Contains(name.GetString()!)))
+            .Concat(customTools.Values)
+            .ToList();
     }
 
     /// <summary>
@@ -450,13 +467,16 @@ public sealed class ManagedAgentsAgent
 
         try
         {
+            // Bounded: this runs while the busy gate is still held, so a stalled
+            // send must not block the thread's later runs.
+            using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
             await _client
-                .SendEventsAsync(sessionId, [ManagedAgentsSessionEvents.Interrupt()], CancellationToken.None)
+                .SendEventsAsync(sessionId, [ManagedAgentsSessionEvents.Interrupt()], sendTimeout.Token)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception)
         {
-            // Best effort: the run is already ending.
+            // Best effort (including the send's own timeout): the run is already ending.
         }
     }
 
