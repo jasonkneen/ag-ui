@@ -387,6 +387,7 @@ public sealed class ManagedAgentsAgent
         {
             SessionId = sessionId,
             ToolNames = customTools.Keys.ToList(),
+            ToolDefinitionsFingerprint = ManagedAgentsCustomTools.FingerprintOf(customTools.Values),
             PendingClientToolUseIds = [],
         };
     }
@@ -413,15 +414,12 @@ public sealed class ManagedAgentsAgent
         return tools;
     }
 
-    /// <summary>
-    /// Registers any client tools the session's agent does not yet have. The tool list is a
-    /// full replacement, so it is merged with what the agent has.
-    /// </summary>
+    /// <summary>Keeps the session's full replacement tool list aligned with this run.</summary>
     private async Task SyncClientToolsAsync(ManagedAgentsSessionRecord record, IList<AGUITool>? clientTools, CancellationToken cancellationToken)
     {
         var desired = CustomToolsFor(clientTools);
-        var known = new HashSet<string>(record.ToolNames, StringComparer.Ordinal);
-        if (desired.Keys.All(known.Contains))
+        var fingerprint = ManagedAgentsCustomTools.FingerprintOf(desired.Values);
+        if (string.Equals(record.ToolDefinitionsFingerprint, fingerprint, StringComparison.Ordinal))
         {
             return;
         }
@@ -429,6 +427,7 @@ public sealed class ManagedAgentsAgent
         var tools = await MergedToolsAsync(desired, cancellationToken).ConfigureAwait(false);
         await _client.UpdateSessionToolsAsync(record.SessionId, tools, cancellationToken).ConfigureAwait(false);
         record.ToolNames = desired.Keys.ToList();
+        record.ToolDefinitionsFingerprint = fingerprint;
     }
 
     /// <summary>

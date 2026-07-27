@@ -29,6 +29,8 @@ class SessionRecord:
     session_id: str
     tool_names: list[str] = field(default_factory=list)
     """Custom tool names currently registered on the session's agent."""
+    tool_definitions_fingerprint: str | None = None
+    """Fingerprint of the canonical custom tool definitions registered on the session."""
     pending_client_tool_use_ids: list[str] = field(default_factory=list)
     """Custom tool calls handed to the frontend that the session is parked on.
 

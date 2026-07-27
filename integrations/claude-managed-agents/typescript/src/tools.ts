@@ -6,6 +6,16 @@ export type CustomToolParams = BetaManagedAgentsCustomToolParams;
 
 const TOOL_NAME_PATTERN = new RegExp(`^[A-Za-z0-9_-]{1,${TOOL_NAME_MAX_LENGTH}}$`);
 
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalize(item)]),
+  );
+};
+
 /** Managed Agents tool names allow only [A-Za-z0-9_-], up to 128 chars. */
 export const normalizeToolName = (name: string): string => {
   if (TOOL_NAME_PATTERN.test(name)) return name;
@@ -27,3 +37,6 @@ export const customToolFrom = (tool: Pick<Tool, "name" | "description" | "parame
   description: (tool.description || `Tool ${tool.name}`).slice(0, TOOL_DESCRIPTION_MAX_LENGTH),
   input_schema: toInputSchema(tool.parameters),
 });
+
+/** Stable representation used to detect any change to custom tool definitions. */
+export const customToolsFingerprint = (tools: CustomToolParams[]): string => JSON.stringify(canonicalize(tools)) ?? "[]";

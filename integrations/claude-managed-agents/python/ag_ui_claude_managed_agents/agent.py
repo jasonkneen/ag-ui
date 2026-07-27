@@ -19,7 +19,7 @@ from anthropic import AsyncAnthropic
 from ._util import get, maybe_await
 from .constants import BEST_EFFORT_SEND_TIMEOUT_S, DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
-from .tools import custom_tool_from, normalize_tool_name
+from .tools import custom_tool_from, custom_tools_fingerprint, normalize_tool_name
 from .turn import Emit, run_turn
 from .types import BackendTool, SessionRecord, SessionStore, TurnOutcome
 
@@ -443,7 +443,9 @@ class ManagedAgentsAgent:
             agent=agent, environment_id=self.environment_id, title=title
         )
         return SessionRecord(
-            session_id=session.id, tool_names=[tool["name"] for tool in custom_tools]
+            session_id=session.id,
+            tool_names=[tool["name"] for tool in custom_tools],
+            tool_definitions_fingerprint=custom_tools_fingerprint(custom_tools),
         )
 
     def _custom_tools(self, client_tools: Sequence[Any]) -> list[dict[str, Any]]:
@@ -464,19 +466,17 @@ class ManagedAgentsAgent:
     async def _sync_client_tools(
         self, record: SessionRecord, client_tools: Sequence[Any]
     ) -> None:
-        """Register any client tools the session's agent does not yet have.
-
-        The tool list is a full replacement, so we merge with what the agent has.
-        """
+        """Keep the session's full replacement tool list aligned with this run."""
         desired = self._custom_tools(client_tools)
-        known = set(record.tool_names)
-        if all(tool["name"] in known for tool in desired):
+        fingerprint = custom_tools_fingerprint(desired)
+        if record.tool_definitions_fingerprint == fingerprint:
             return
         await self.client.beta.sessions.update(
             record.session_id,
             agent={"tools": await self._merged_tools(desired)},
         )
         record.tool_names = [tool["name"] for tool in desired]
+        record.tool_definitions_fingerprint = fingerprint
 
     async def _merged_tools(self, custom_tools: list[dict[str, Any]]) -> list[Any]:
         """The agent's own tools plus custom tools, without duplicate names.

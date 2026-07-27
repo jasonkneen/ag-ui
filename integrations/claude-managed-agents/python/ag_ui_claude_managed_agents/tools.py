@@ -1,5 +1,6 @@
 """Turn AG-UI and backend tool definitions into managed-agent custom tools."""
 
+import json
 import re
 from typing import Any
 
@@ -45,3 +46,8 @@ def custom_tool_from(tool: Any) -> dict[str, Any]:
         "description": (description or f"Tool {name}")[:TOOL_DESCRIPTION_MAX_LENGTH],
         "input_schema": _input_schema(getattr(tool, "parameters", None)),
     }
+
+
+def custom_tools_fingerprint(tools: list[dict[str, Any]]) -> str:
+    """Canonical representation used to detect any tool definition change."""
+    return json.dumps(tools, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

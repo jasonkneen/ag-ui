@@ -6,7 +6,7 @@ import type { BaseEvent, Message, RunAgentInput, Tool } from "@ag-ui/client";
 import { Observable } from "rxjs";
 import { BEST_EFFORT_SEND_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS } from "./constants";
 import { InMemorySessionStore } from "./sessions";
-import { customToolFrom, normalizeToolName, type CustomToolParams } from "./tools";
+import { customToolFrom, customToolsFingerprint, normalizeToolName, type CustomToolParams } from "./tools";
 import { runTurn, type TurnOutcome } from "./turn";
 import type { BackendCustomTool, ManagedAgentsAgentConfig, SessionRecord, SessionStore } from "./types";
 
@@ -301,6 +301,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return {
       sessionId: session.id,
       toolNames: customTools.map((tool) => tool.name),
+      toolDefinitionsFingerprint: customToolsFingerprint(customTools),
       pendingClientToolUseIds: [],
     };
   }
@@ -323,19 +324,17 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return [...byName.values()];
   }
 
-  /**
-   * Register any client tools the session's agent does not yet have.
-   * The tool list is a full replacement, so we merge with what the agent has.
-   */
+  /** Keep the session's full replacement tool list aligned with this run. */
   private async syncClientTools(record: SessionRecord, clientTools: Tool[]): Promise<void> {
     const desired = this.customTools(clientTools);
-    const known = new Set(record.toolNames);
-    if (desired.every((tool) => known.has(tool.name))) return;
+    const fingerprint = customToolsFingerprint(desired);
+    if (record.toolDefinitionsFingerprint === fingerprint) return;
 
     await this.client.beta.sessions.update(record.sessionId, {
       agent: { tools: await this.mergedTools(desired) },
     });
     record.toolNames = desired.map((tool) => tool.name);
+    record.toolDefinitionsFingerprint = fingerprint;
   }
 
   /**

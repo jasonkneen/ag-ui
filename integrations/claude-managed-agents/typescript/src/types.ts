@@ -20,6 +20,8 @@ export interface SessionRecord {
   sessionId: string;
   /** Custom tool names currently registered on the session's agent. */
   toolNames: string[];
+  /** Fingerprint of the canonical custom tool definitions registered on the session's agent. */
+  toolDefinitionsFingerprint?: string;
   /** ID of the last user message forwarded into the session. */
   lastUserMessageId?: string;
   /**

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -52,6 +53,57 @@ internal static partial class ManagedAgentsCustomTools
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns a canonical representation used to detect any custom tool definition change.
+    /// </summary>
+    internal static string FingerprintOf(IEnumerable<JsonElement> tools)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartArray();
+            foreach (var tool in tools)
+            {
+                WriteCanonical(tool, writer);
+            }
+
+            writer.WriteEndArray();
+        }
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteCanonical(JsonElement element, Utf8JsonWriter writer)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject().OrderBy(
+                    static property => property.Name,
+                    StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonical(property.Value, writer);
+                }
+
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                {
+                    WriteCanonical(item, writer);
+                }
+
+                writer.WriteEndArray();
+                break;
+            default:
+                element.WriteTo(writer);
+                break;
+        }
     }
 
     private static JsonObject InputSchemaFrom(JsonElement parameters)

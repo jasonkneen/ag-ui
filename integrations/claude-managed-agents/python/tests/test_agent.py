@@ -1045,7 +1045,7 @@ async def test_frontend_tools_with_colliding_normalized_names_keep_the_last():
     assert tools[0]["description"] == "Second"
 
 
-async def test_does_not_update_session_tools_when_already_registered():
+async def test_refreshes_legacy_name_only_tool_cache():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
@@ -1071,7 +1071,10 @@ async def test_does_not_update_session_tools_when_already_registered():
         ),
     )
 
-    assert fake.update_calls == []
+    assert len(fake.update_calls) == 1
+    record = store.get("thread_1")
+    assert record is not None
+    assert record.tool_definitions_fingerprint is not None
 
 
 async def test_interrupts_backend_tool_and_answers_it_when_client_disconnects():
