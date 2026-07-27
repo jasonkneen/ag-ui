@@ -309,9 +309,9 @@ async def copilotkit_exit() -> Literal[True]:
     ### Examples
 
     ```python
-    from ag_ui_crewai import copilotkit_exit
+    from ag_ui_crewai.sdk import copilotkit_exit
 
-    def my_function():
+    async def my_function():
         await copilotkit_exit()
         return state
     ```
