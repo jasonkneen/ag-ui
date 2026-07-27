@@ -27,8 +27,9 @@ from ag_ui_crewai.events import (
     BridgedTextMessageChunkEvent,
     BridgedToolCallChunkEvent,
 )
+from litellm import CustomStreamWrapper
+
 from ag_ui_crewai.sdk import (
-    _copilotkit_stream_custom_stream_wrapper,
     copilotkit_emit_state,
     copilotkit_predict_state,
     copilotkit_stream,
@@ -89,6 +90,21 @@ def _stream_chunk(chunk_id, *, content=None, tool_calls=None, finish_reason=None
 
 def _tool_call_delta(*, call_id, name, arguments):
     return SimpleNamespace(id=call_id, function={"name": name, "arguments": arguments})
+
+
+class _FakeStreamWrapper(CustomStreamWrapper):
+    """A real ``CustomStreamWrapper`` subclass (so ``copilotkit_stream``'s
+    ``isinstance`` dispatch selects the streaming branch) that iterates a
+    supplied async generator instead of a live litellm stream. Bypasses the
+    base ``__init__`` — the reassembly path only ``async for``-iterates the
+    wrapper and never touches other wrapper machinery.
+    """
+
+    def __init__(self, gen):  # pylint: disable=super-init-not-called
+        self._gen = gen
+
+    def __aiter__(self):
+        return self._gen
 
 
 class _FakeFlow:
@@ -184,15 +200,22 @@ def test_prepare_inputs_strips_leading_system_message():
 
 
 def test_prepare_inputs_keeps_non_leading_system_message():
-    """Only a *leading* system message is stripped; a user-first list is
-    left intact."""
+    """Only a *leading* system message is stripped; a system message that
+    is not first survives. A user-first list with a later system message
+    keeps BOTH — this fails if the impl deletes every system message rather
+    than just the leading one."""
     out = ep.crewai_prepare_inputs(
         state={},
-        messages=[UserMessage(id="u", role="user", content="hello")],
+        messages=[
+            UserMessage(id="u", role="user", content="hello"),
+            SystemMessage(id="s", role="system", content="sys"),
+        ],
         tools=[],
     )
-    assert len(out["messages"]) == 1
+    assert len(out["messages"]) == 2
     assert out["messages"][0]["role"] == "user"
+    assert out["messages"][1]["role"] == "system"
+    assert out["messages"][1]["content"] == "sys"
 
 
 def test_prepare_inputs_reshapes_tools_to_copilotkit_actions():
@@ -256,7 +279,7 @@ async def test_copilotkit_stream_reassembles_text_and_tool_calls():
         ])
         yield _stream_chunk("msg-1", finish_reason="stop")
 
-    resp = await _copilotkit_stream_custom_stream_wrapper(_gen())
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
 
     message = resp.choices[0].message
     assert message.content == "Hello world"
@@ -302,7 +325,7 @@ async def test_copilotkit_stream_emits_chunk_events_per_delta():
             ])
             yield _stream_chunk("msg-2", finish_reason="stop")
 
-        await _copilotkit_stream_custom_stream_wrapper(_gen())
+        await copilotkit_stream(_FakeStreamWrapper(_gen()))
 
     assert text_chunks == [("msg-2", "assistant", "A"), ("msg-2", "assistant", "B")]
     assert tool_chunks == [("c-1", "tool", "{}")]

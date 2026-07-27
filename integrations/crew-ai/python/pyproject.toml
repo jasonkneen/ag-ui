@@ -49,6 +49,23 @@ exclude = [
     "ag_ui_crewai/examples/**",
 ]
 
+# Keep the source archive lean, matching the pre-migration Poetry sdist
+# (~31 KB). Hatch's default sdist would otherwise sweep in tests, uv.lock,
+# .gitignore, dojo.py and examples (~283 KB). Ship only the importable
+# package plus packaging metadata, and drop the same non-shipping modules
+# the wheel excludes.
+[tool.hatch.build.targets.sdist]
+include = [
+    "ag_ui_crewai",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "ag_ui_crewai/dojo.py",
+    "ag_ui_crewai/examples/**",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
