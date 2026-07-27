@@ -57,7 +57,7 @@ async def copilotkit_predict_state(
     await copilotkit_predict_state(
         {
             "steps": {
-                "tool": "SearchTool",
+                "tool_name": "SearchTool",
                 "tool_argument": "steps",
             },
         }
