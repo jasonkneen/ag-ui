@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import uuid
+from typing import Optional, Protocol, runtime_checkable
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -73,7 +74,35 @@ __all__ = [
     "add_crewai_crew_fastapi_endpoint",
     "crewai_prepare_inputs",
     "FastAPICrewFlowEventListener",
+    "CrewBaseInstance",
 ]
+
+
+@runtime_checkable
+class CrewBaseInstance(Protocol):
+    """Structural type for a ``@CrewBase``-decorated crew instance.
+
+    ``add_crewai_crew_fastapi_endpoint`` requires a class decorated with
+    crewai's ``@CrewBase`` — NOT a bare :class:`crewai.Crew` (CPK-7717
+    defect 5). ``ChatWithCrewFlow`` calls ``crew.crew()`` to build the
+    underlying ``Crew`` and reads ``crew.name``; a plain ``Crew`` has
+    neither a ``.crew()`` factory method nor participates in the
+    chat-input generation path, so annotating the parameter as ``Crew``
+    was actively misleading.
+
+    crewai's ``CrewBase`` is a class *decorator* that returns the original
+    (now-wrapped) type — there is no nominal base class to import and
+    annotate against — so we express the requirement structurally: any
+    object exposing a ``name`` and a zero-arg ``crew()`` factory
+    satisfies it. ``@runtime_checkable`` lets callers/tests assert
+    conformance via ``isinstance`` (structural: method/attribute presence
+    only).
+    """
+
+    name: Optional[str]
+
+    def crew(self) -> Crew:  # pragma: no cover - structural protocol stub
+        ...
 
 # Sentinel to distinguish "no item delivered" from a legitimate ``None``
 # queue payload (the happy-path stream-end sentinel). Used by the
@@ -1494,8 +1523,15 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
         )
 
 
-def add_crewai_crew_fastapi_endpoint(app: FastAPI, crew: Crew, path: str = "/"):
+def add_crewai_crew_fastapi_endpoint(
+    app: FastAPI, crew: CrewBaseInstance, path: str = "/"
+):
     """Adds a CrewAI crew endpoint to the FastAPI app.
+
+    ``crew`` must be a ``@CrewBase``-decorated instance (see
+    :class:`CrewBaseInstance`), NOT a bare :class:`crewai.Crew` — the
+    deferred ``ChatWithCrewFlow`` construction calls ``crew.crew()`` and
+    reads ``crew.name`` (CPK-7717 defect 5).
 
     ChatWithCrewFlow construction is deferred to first request because the
     constructor calls crew_chat_generate_crew_chat_inputs which makes an LLM

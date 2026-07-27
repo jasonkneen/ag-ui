@@ -28,25 +28,42 @@ def _patch_instance_state(flow, state):
 
 
 async def test_chat_runs_crew_and_records_string_output():
-    """A crew tool call runs the crew fn, records its string result under
-    ``state['outputs']`` and appends a matching ``tool`` message."""
+    """A crew tool call runs the crew fn, records its string result, appends a
+    ``tool`` message, then (CPK-7717 defect 2) issues a follow-up completion so
+    the assistant speaks. Strengthened from the pre-fix 2-message version that
+    encoded the silent-assistant bug."""
     from ag_ui_crewai import crews as crews_mod
 
     async def _fake_acompletion(**_kwargs):
         return object()
 
+    # Stateful stream mock: turn 1 names the crew tool; the defect-2 follow-up
+    # turn returns plain text.
+    stream_calls = {"n": 0}
+
     async def _fake_stream(_resp):
-        class _Resp:
+        stream_calls["n"] += 1
+        if stream_calls["n"] == 1:
+            class _Resp:
+                choices = [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-crew",
+                            "function": {"name": "dummy", "arguments": '{"topic": "ai"}'},
+                        }],
+                    }
+                }]
+            return _Resp()
+
+        class _FollowUp:
             choices = [{
                 "message": {
                     "role": "assistant",
-                    "tool_calls": [{
-                        "id": "call-crew",
-                        "function": {"name": "dummy", "arguments": '{"topic": "ai"}'},
-                    }],
+                    "content": "Here is what the crew produced.",
                 }
             }]
-        return _Resp()
+        return _FollowUp()
 
     captured = {}
 
@@ -76,12 +93,16 @@ async def test_chat_runs_crew_and_records_string_output():
 
     assert captured["args"] == {"topic": "ai"}
     assert state["outputs"] == "CREW OUTPUT"
-    # Two messages: the assistant tool-call message, then the tool result.
-    assert len(state["messages"]) == 2
-    tool_message = state["messages"][-1]
+    # Three messages: assistant tool-call, tool result, defect-2 follow-up text.
+    assert len(state["messages"]) == 3
+    tool_message = state["messages"][1]
     assert tool_message["role"] == "tool"
     assert tool_message["content"] == "CREW OUTPUT"
     assert tool_message["tool_call_id"] == "call-crew"
+    assert stream_calls["n"] == 2
+    follow_up = state["messages"][-1]
+    assert follow_up["role"] == "assistant"
+    assert follow_up["content"] == "Here is what the crew produced."
 
 
 async def test_chat_crew_output_from_raw_attribute():
