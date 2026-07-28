@@ -724,6 +724,19 @@ describe("ManagedAgentsAgent", () => {
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_result_without_session" });
   });
 
+  it("rejects a blank thread id instead of sharing one session across callers", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new RecordingSessionStore();
+
+    for (const threadId of ["", "   "]) {
+      const events = await collect(newAgent(fake, store), baseInput({ threadId }));
+      expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "invalid_thread_id" });
+    }
+
+    expect(fake.spies.create).not.toHaveBeenCalled();
+    expect(store.keys()).toEqual([]);
+  });
+
   it("errors with empty_run before creating a session when nothing is sendable", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const events = await collect(newAgent(fake), baseInput({ messages: [{ id: "a1", role: "assistant", content: "hi" }] }));

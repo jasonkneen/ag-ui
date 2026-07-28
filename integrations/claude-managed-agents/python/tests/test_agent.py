@@ -924,6 +924,21 @@ async def test_runs_serialize_on_the_same_key_the_store_uses():
         pass
 
 
+async def test_rejects_a_blank_thread_id():
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = RecordingSessionStore()
+
+    for thread_id in ("", "   "):
+        events = await collect(
+            new_agent(fake, store), base_input(thread_id=thread_id)
+        )
+        assert isinstance(events[-1], RunErrorEvent)
+        assert events[-1].code == "invalid_thread_id"
+
+    assert fake.create_calls == []
+    assert store.keys() == []
+
+
 async def test_tool_result_on_unknown_thread_does_not_create_session():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     events = await collect(

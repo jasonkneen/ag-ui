@@ -256,6 +256,17 @@ class ManagedAgentsAgent:
         if input.state is not None:
             emit(StateSnapshotEvent(snapshot=input.state))
 
+        # A blank thread id is not a thread: every caller that omitted one would
+        # share a single key, and so a single managed session and its history.
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            emit(
+                RunErrorEvent(
+                    message="This run has no thread id. Every run must carry a non-empty threadId.",
+                    code="invalid_thread_id",
+                )
+            )
+            return
+
         if store_key in ManagedAgentsAgent._busy_threads.get(id(self.store), ()):
             emit(
                 RunErrorEvent(

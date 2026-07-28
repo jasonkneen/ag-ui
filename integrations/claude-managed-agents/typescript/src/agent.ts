@@ -180,6 +180,13 @@ export class ManagedAgentsAgent extends AbstractAgent {
       emit({ type: EventType.STATE_SNAPSHOT, snapshot: input.state } as BaseEvent);
     }
 
+    // A blank thread id is not a thread: every caller that omitted one would
+    // share a single key, and so a single managed session and its history.
+    if (typeof threadId !== "string" || threadId.trim().length === 0) {
+      emit(runError("This run has no thread id. Every run must carry a non-empty threadId.", "invalid_thread_id"));
+      return;
+    }
+
     if (this.busyThreads.has(key)) {
       emit(runError("A run is already in progress on this thread.", "run_in_progress"));
       return;

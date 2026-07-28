@@ -666,6 +666,24 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task RejectsABlankThreadIdInsteadOfSharingOneSessionAcrossCallers()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new RecordingSessionStore();
+
+        foreach (var threadId in new[] { string.Empty, "   " })
+        {
+            var events = await CollectAsync(
+                NewAgent(fake, store),
+                BaseInput(input => input.ThreadId = threadId));
+            Assert.Equal("invalid_thread_id", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+        }
+
+        Assert.Empty(fake.CreatedSessions);
+        Assert.Empty(store.Keys);
+    }
+
+    [Fact]
     public async Task ErrorsWithoutCreatingASessionWhenAFreshThreadCarriesOnlyAToolResult()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

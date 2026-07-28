@@ -127,6 +127,18 @@ public sealed class ManagedAgentsAgent
             yield return new StateSnapshotEvent { Snapshot = state };
         }
 
+        // A blank thread id is not a thread: every caller that omitted one would share a single
+        // key, and so a single managed session and its history.
+        if (string.IsNullOrWhiteSpace(threadId))
+        {
+            yield return new RunErrorEvent
+            {
+                Message = "This run has no thread id. Every run must carry a non-empty threadId.",
+                Code = "invalid_thread_id",
+            };
+            yield break;
+        }
+
         // One key for the session store and the busy-run gate, so a stored session and the gate
         // that serializes access to it can never disagree.
         var threadKey = SessionKey(threadId);
