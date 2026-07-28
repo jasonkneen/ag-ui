@@ -13,6 +13,7 @@ import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { ENVIRONMENT_NAME, FEATURE_AGENTS, MODEL } from "./agents";
+import { isEntry } from "./entry";
 
 export const IDS_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), ".managed-agents.json");
 
@@ -74,7 +75,17 @@ async function main() {
   console.log(`Wrote ${IDS_PATH}`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/**
+ * Only provision when this file is the process entry point. `server.ts` imports
+ * `IDS_PATH` from here; without the guard that import would create an
+ * environment and agents as a side effect — and exit the server process on the
+ * first API failure.
+ */
+const isEntryPoint = (): boolean => isEntry(import.meta.url);
+
+if (isEntryPoint()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
