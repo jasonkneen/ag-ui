@@ -82,3 +82,69 @@ def safe_deepcopy(obj: object, *, what: str = "crewai object") -> object:
             what,
         )
         return _deepcopy_pinning_uncopyable(obj)
+
+
+def rebind_bound_methods(target: object, attr: str = "_methods") -> None:
+    """Rebind the bound callables in ``target.<attr>`` to ``target`` itself.
+
+    CPK-7718 #11 (crewai 1.15 per-request isolation bug). crewai 1.x drives a
+    Flow's ``@start`` / ``@listen`` methods through a ``_methods`` dict of
+    BOUND methods, each captured against the instance at construction time
+    (``method.__get__(self, type(self))`` in ``_class_bound_methods``). The
+    execution engine looks methods up as ``self._methods[name]`` and calls
+    them, so ``@start`` runs against ``method.__self__`` — NOT necessarily the
+    instance ``kickoff_async`` was called on.
+
+    When the pin-and-share fallback (:func:`_deepcopy_pinning_uncopyable`) is
+    used, trial-deep-copying the ``_methods`` dict raises (its bound methods
+    reference the uncopyable ``memory`` / locks via ``__self__``), so the dict
+    is PINNED — the copy SHARES the original's ``_methods``, whose methods stay
+    bound to the ORIGINAL flow. ``kickoff_async(inputs=...)`` on the copy then
+    seeds the COPY's ``self._state`` (``messages`` / ``copilotkit`` / …) while
+    ``@start`` executes against the ORIGINAL's un-seeded state — a ``KeyError``
+    on ``self.state["messages"]`` (and, more broadly, complete loss of
+    per-request isolation: every request would mutate the one shared original).
+
+    crewai wraps each ``@start`` / ``@listen`` / ``@router`` method in a
+    ``FlowMethod`` descriptor (``crewai.flow.flow_wrappers``) that carries a
+    ``__self__`` and rebinds through the standard descriptor protocol:
+    ``method.__get__(instance, type(instance))`` returns a fresh wrapper bound
+    to ``instance`` (this is exactly how crewai's own ``_class_bound_methods``
+    binds them). This rebuilds ``<attr>`` as a FRESH dict (never mutating the
+    possibly-shared original) with every entry whose ``__self__`` is not
+    ``target`` re-derived via ``__get__``. It is a no-op when:
+
+    * ``<attr>`` is absent or not a dict (e.g. a copied ``Crew``);
+    * an entry is already bound to ``target`` (healthy plain-``deepcopy`` builds
+      rebind ``__self__`` through the memo, so nothing to do);
+    * an entry is not a bound descriptor (no ``__self__`` / no ``__get__``) —
+      left as-is.
+
+    Capability-safe: keyed off object shape (a dict of bound descriptors), never
+    a crewai version. Leaf module: stdlib-only attribute operations, no imports.
+    """
+    methods = getattr(target, attr, None)
+    if not isinstance(methods, dict):
+        return
+    rebound: dict = {}
+    changed = False
+    for name, method in methods.items():
+        owner = getattr(method, "__self__", None)
+        binder = getattr(method, "__get__", None)
+        if owner is not None and owner is not target and callable(binder):
+            rebound[name] = binder(target, type(target))
+            changed = True
+        else:
+            rebound[name] = method
+    if not changed:
+        return
+    # Replace the reference on ``target`` only — the original (whose dict we may
+    # be sharing) keeps its own bindings intact for concurrent requests.
+    # crewai stores ``_methods`` as a Pydantic ``PrivateAttr``; assign straight
+    # into ``__pydantic_private__`` when present (BaseModel ``__setattr__`` for a
+    # private attr is a no-op on some crewai builds), else fall back to setattr.
+    private = getattr(target, "__pydantic_private__", None)
+    if isinstance(private, dict) and attr in private:
+        private[attr] = rebound
+    else:
+        setattr(target, attr, rebound)

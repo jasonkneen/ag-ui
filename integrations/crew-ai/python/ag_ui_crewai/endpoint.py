@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from ._env import _parse_env_float
-from ._copyutil import safe_deepcopy
+from ._copyutil import safe_deepcopy, rebind_bound_methods
 
 # CPK-7718: the flow/method lifecycle events, the event bus, and the listener
 # base moved from ``crewai.utilities.events`` (crewai 0.x) to ``crewai.events``
@@ -818,8 +818,22 @@ def _copy_flow(flow: object) -> object:
     ``Flow`` deep-copy bug (CPK-7718 #10, a NEW breaking change beyond the
     enumerated nine, found by running the suite on the 1.15.7 wheel). Isolation
     of the per-request conversation state is preserved either way.
+
+    CPK-7718 #11: when the pin-and-share fallback runs, the copy SHARES the
+    original's ``_methods`` dict (its bound ``@start`` / ``@listen`` methods
+    trial-deep-copy-fail because they reference the uncopyable ``memory`` via
+    ``__self__``, so the dict is pinned by reference). crewai 1.x executes
+    ``self._methods[name]`` — still bound to the ORIGINAL — so
+    ``kickoff_async``/``astream`` on the copy seeds the COPY's ``self._state``
+    while ``@start`` runs against the ORIGINAL's un-seeded state
+    (``KeyError: 'messages'`` at ``crews.py`` ``*self.state["messages"]``, and a
+    total loss of per-request isolation). Rebind the copy's flow methods to the
+    copy so state seeding and isolation both hold. No-op on healthy deep-copy
+    builds (already rebound) and on non-flow copies (no ``_methods``).
     """
-    return safe_deepcopy(flow, what="flow")
+    flow_copy = safe_deepcopy(flow, what="flow")
+    rebind_bound_methods(flow_copy)
+    return flow_copy
 
 
 async def _flush_event_bus() -> None:

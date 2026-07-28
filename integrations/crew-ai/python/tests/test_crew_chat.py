@@ -31,9 +31,10 @@ except ImportError:  # pragma: no cover - crewai 0.x fallback
     import crewai.cli.crew_chat as crew_chat_mod
 from crewai import Agent, Crew, LLM, Task
 from crewai.project import CrewBase, agent, crew, task
+from crewai.flow.flow import Flow, start
 from crewai.types.crew_chat import ChatInputs
 
-from ag_ui.core import EventType
+from ag_ui.core import EventType, Tool, UserMessage
 from ag_ui_crewai import crews as crews_mod
 from ag_ui_crewai import endpoint as ep
 from ag_ui_crewai.context import flow_context
@@ -984,3 +985,68 @@ def test_crew_path_symbols_exported_from_package_top_level():
     ):
         assert hasattr(pkg, name), f"{name} not importable from ag_ui_crewai"
         assert name in pkg.__all__, f"{name} missing from ag_ui_crewai.__all__"
+
+
+# --------------------------------------------------------------------------
+# CPK-7718 #11: per-request flow COPY seeds state before ``@start`` runs
+# --------------------------------------------------------------------------
+
+class _CrewShapedFlow(Flow):
+    """A real crewai Flow whose ``@start`` reads state EXACTLY like
+    ``ChatWithCrewFlow.chat`` does — ``self.state["messages"]`` and
+    ``self.state["copilotkit"]["actions"]`` (dict state). The class-level
+    ``_seen`` sink records what the running method observed so the test can
+    assert against the instance the engine actually executed."""
+
+    _seen: dict = {}
+
+    @start()
+    async def chat(self):
+        # The exact reads that raised ``KeyError`` at crews.py pre-fix.
+        _CrewShapedFlow._seen = {
+            "self_id": id(self),
+            "messages": list(self.state["messages"]),
+            "actions": list(self.state["copilotkit"]["actions"]),
+            "inputs": self.state.get("inputs"),
+        }
+
+
+async def test_copied_crew_flow_kickoff_seeds_state_before_start_runs():
+    """CPK-7718 #11: a per-request COPY of a crew-shaped Flow, driven through
+    the REAL ``crewai_prepare_inputs`` -> ``kickoff_async(inputs=...)`` seam the
+    crew endpoint uses, must seed ``messages`` / ``copilotkit`` into the COPY's
+    ``self.state`` BEFORE ``@start`` runs.
+
+    Reproduces the crewai 1.x hang: ``_copy_flow``'s pin-and-share fallback
+    shared the original's ``_methods`` (bound to the ORIGINAL), so
+    ``kickoff_async`` seeded the COPY's state while ``chat`` executed against
+    the un-seeded ORIGINAL -> ``KeyError: 'messages'`` at
+    ``crews.py`` ``*self.state["messages"]``. Pre-fix this test raises
+    KeyError; with the ``_copy_flow`` rebind it passes."""
+    _CrewShapedFlow._seen = {}
+    flow = _CrewShapedFlow()
+    flow_copy = ep._copy_flow(flow)
+
+    # Build inputs through the REAL bridge contract (messages/copilotkit/id).
+    inputs = ep.crewai_prepare_inputs(
+        state={},
+        messages=[UserMessage(id="u1", role="user", content="hello crew")],
+        tools=[Tool(name="search", description="", parameters={"type": "object"})],
+    )
+    inputs["id"] = "thread-xyz"
+
+    # The seam the endpoint drives (crew path uses kickoff_async on 1.0-1.5 and
+    # under astream on 1.6+; both funnel through kickoff_async's state seeding).
+    await flow_copy.kickoff_async(inputs=inputs)
+
+    seen = _CrewShapedFlow._seen
+    # (1) State reached the running @start method without a KeyError.
+    assert [m["content"] for m in seen["messages"]] == ["hello crew"]
+    assert [a["function"]["name"] for a in seen["actions"]] == ["search"]
+    # (2) The method executed against the COPY, not the original.
+    assert seen["self_id"] == id(flow_copy)
+    # (3) Per-request isolation: the ORIGINAL flow's state was never seeded,
+    #     and each instance keeps its OWN ``chat`` binding.
+    assert "messages" not in flow._state
+    assert flow_copy._methods["chat"].__self__ is flow_copy
+    assert flow._methods["chat"].__self__ is flow

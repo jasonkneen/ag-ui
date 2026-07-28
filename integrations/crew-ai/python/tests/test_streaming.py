@@ -24,6 +24,7 @@ from ag_ui_crewai.events import (
 from litellm import CustomStreamWrapper
 
 from ag_ui_crewai.sdk import (
+    CopilotKitState,
     copilotkit_emit_state,
     copilotkit_predict_state,
     copilotkit_stream,
@@ -556,6 +557,65 @@ def _make_run_input(thread_id="t-1", run_id="r-1"):
         thread_id=thread_id, run_id=run_id, state={}, messages=[], tools=[],
         context=[], forwarded_props={},
     )
+
+
+# -- CPK-7718 #11: per-request flow COPY seeds state before @start runs ------
+
+class _StateReadingFlow(Flow[CopilotKitState]):
+    """A real crewai Flow shaped like the served example flows
+    (``Flow[CopilotKitState]`` with attribute state access,
+    ``self.state.messages`` / ``self.state.copilotkit.actions`` — exactly like
+    ``examples/agentic_chat.py``). The class-level ``_seen`` sink records what
+    the running @start observed."""
+
+    _seen: dict = {}
+
+    @start()
+    async def chat(self):
+        _StateReadingFlow._seen = {
+            "self_id": id(self),
+            "messages": [m for m in self.state.messages],
+            "actions": [a for a in self.state.copilotkit.actions],
+        }
+
+
+@requires_stream_frames
+async def test_copied_example_flow_astream_seeds_state_before_start_runs():
+    """CPK-7718 #11 (flow-demo path): a per-request COPY of an example-shaped
+    ``Flow[CopilotKitState]``, driven through the REAL
+    ``crewai_prepare_inputs`` -> ``flow.astream(inputs=...)`` seam
+    ``add_crewai_flow_fastapi_endpoint`` uses on crewai 1.6+, must seed
+    ``messages`` / ``copilotkit`` into the COPY's state BEFORE ``@start`` runs.
+
+    Same root cause as the crew path: pre-fix, ``_copy_flow``'s pin-and-share
+    fallback shared the original's ``_methods`` (bound to the ORIGINAL), so
+    ``astream`` seeded the COPY's state while ``chat`` executed against the
+    un-seeded ORIGINAL -> ``AttributeError`` / empty reads. With the
+    ``_copy_flow`` rebind the running method sees the seeded copy."""
+    from ag_ui.core import Tool, UserMessage
+
+    _StateReadingFlow._seen = {}
+    flow = _StateReadingFlow()
+    flow_copy = ep._copy_flow(flow)
+
+    inputs = ep.crewai_prepare_inputs(
+        state={},
+        messages=[UserMessage(id="u1", role="user", content="hi flow")],
+        tools=[Tool(name="do_thing", description="", parameters={"type": "object"})],
+    )
+    inputs["id"] = "thread-flow"
+
+    session = flow_copy.astream(inputs=inputs)
+    async for _frame in session:
+        pass
+
+    seen = _StateReadingFlow._seen
+    assert [m["content"] for m in seen["messages"]] == ["hi flow"]
+    assert [a["function"]["name"] for a in seen["actions"]] == ["do_thing"]
+    # Executed against the COPY, and per-request isolation is preserved.
+    assert seen["self_id"] == id(flow_copy)
+    assert flow_copy._methods["chat"].__self__ is flow_copy
+    assert flow._methods["chat"].__self__ is flow
 
 
 # -- RUN_ERROR taxonomy + env knobs on the StreamFrame path -----------------
