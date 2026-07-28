@@ -42,6 +42,30 @@ const openSse = (res: http.ServerResponse): EventEncoder => {
 
 const input = { threadId: "t", runId: "r", messages: [], tools: [] } as unknown as RunAgentInput;
 
+/** A one-shot event you can await, so a test never has to guess a deadline. */
+const signal = () => {
+  let fire!: () => void;
+  const fired = new Promise<void>((resolve) => {
+    fire = resolve;
+  });
+  return { fired, fire: () => fire() };
+};
+
+/** Await `promise`, failing with `message` instead of hanging if it never settles. */
+const within = async <T>(promise: Promise<T>, message: string, ms = 2000): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
 describe("example server", () => {
   // The setup module's entry-point guard is covered in setup-guard.test.ts: this
   // file's static import of examples/server evaluates examples/setup during its
@@ -117,13 +141,18 @@ describe("example server", () => {
   });
 
   it("unsubscribes the run when the client goes away", async () => {
-    let unsubscribed = false;
+    // Both waits are driven by the run itself rather than a fixed sleep. A sleep
+    // is a guess at two different races: aborting before the server has
+    // subscribed leaves no teardown to observe at all, and teardown may not have
+    // run by an arbitrary deadline on a loaded machine. Awaiting the signals is
+    // both exact and faster.
+    const subscribed = signal();
+    const tornDown = signal();
     const hanging = {
       run: () =>
         new Observable<BaseEvent>(() => {
-          return () => {
-            unsubscribed = true;
-          };
+          subscribed.fire();
+          return () => tornDown.fire();
         }),
     };
     const url = await start((_req, res) => {
@@ -132,11 +161,9 @@ describe("example server", () => {
 
     const controller = new AbortController();
     const pending = fetch(url, { signal: controller.signal }).catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await within(subscribed.fired, "the run was never subscribed");
     controller.abort();
     await pending;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(unsubscribed).toBe(true);
+    await within(tornDown.fired, "the run was never unsubscribed after the client left");
   });
 });
