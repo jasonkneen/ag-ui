@@ -7,7 +7,7 @@ import { Observable } from "rxjs";
 import { BEST_EFFORT_SEND_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS } from "./constants";
 import { reportSwallowedFailure } from "./report";
 import { InMemorySessionStore } from "./sessions";
-import { customToolFrom, customToolsFingerprint, normalizeToolName, type CustomToolParams } from "./tools";
+import { customToolFrom, normalizeToolName, toolsFingerprint, type CustomToolParams } from "./tools";
 import { runTurn, type TurnOutcome } from "./turn";
 import type { BackendCustomTool, ManagedAgentsAgentConfig, SessionRecord, SessionStore } from "./types";
 
@@ -35,6 +35,12 @@ const runError = (message: string, code: string): BaseEvent =>
   ({ type: EventType.RUN_ERROR, message, code }) as BaseEvent;
 
 const ABANDONED_TOOL_TEXT = "The user did not provide a result for this tool call.";
+
+/**
+ * The fingerprint stored for a session created without custom tools, i.e. one
+ * that runs the managed agent as-is with no override list.
+ */
+const NO_OVERRIDES_FINGERPRINT = toolsFingerprint([]);
 
 /**
  * The only thing a client is told about a failure this integration did not
@@ -467,10 +473,13 @@ export class ManagedAgentsAgent extends AbstractAgent {
     const title = this.config.sessionTitle?.(threadId) ?? `AG-UI thread ${threadId}`;
     const agentRef = { id: managedAgentId, ...(agentVersion !== undefined && { version: agentVersion }) };
 
+    // An empty custom list means no overrides at all: the session runs the agent
+    // as-is, so Console edits to its tools apply without an update from here.
+    const registered = customTools.length === 0 ? undefined : await this.mergedTools(customTools, signal);
     const agent: SessionCreateParams["agent"] =
-      customTools.length === 0
+      registered === undefined
         ? { type: "agent", ...agentRef }
-        : { type: "agent_with_overrides", ...agentRef, tools: await this.mergedTools(customTools, signal) };
+        : { type: "agent_with_overrides", ...agentRef, tools: registered };
 
     const session = await this.client.beta.sessions.create(
       {
@@ -484,7 +493,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return {
       sessionId: session.id,
       toolNames: customTools.map((tool) => tool.name),
-      toolDefinitionsFingerprint: customToolsFingerprint(customTools),
+      toolDefinitionsFingerprint: toolsFingerprint(registered ?? []),
       pendingClientToolUseIds: [],
     };
   }
@@ -507,17 +516,32 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return [...byName.values()];
   }
 
-  /** Keep the session's full replacement tool list aligned with this run. */
+  /**
+   * Keep the session's full replacement tool list aligned with this run.
+   *
+   * The fingerprint covers the merged list, not just the custom tools: an
+   * override session's list is a full replacement frozen at the last update, so
+   * editing the agent's own tools in the Console changes what the session should
+   * hold while every custom tool stays identical. Comparing custom tools alone
+   * declared that a match and left the session on a stale list indefinitely.
+   *
+   * The cost is re-reading the agent's tools once per run for a session that
+   * uses overrides. A session with no custom tools runs the agent as-is, needs
+   * no update, and is short-circuited before that read.
+   */
   private async syncClientTools(record: SessionRecord, clientTools: Tool[], signal: AbortSignal): Promise<void> {
     const desired = this.customTools(clientTools);
-    const fingerprint = customToolsFingerprint(desired);
+    // A session created without custom tools has no override list to keep in
+    // step, and Console edits to the agent reach it on their own.
+    if (desired.length === 0 && record.toolDefinitionsFingerprint === NO_OVERRIDES_FINGERPRINT) return;
+
+    // Note this still merges when `desired` is empty but the session does have an
+    // override list: it must be replaced with the agent's own tools, not emptied.
+    const registered = await this.mergedTools(desired, signal);
+    const fingerprint = toolsFingerprint(registered);
     if (record.toolDefinitionsFingerprint === fingerprint) return;
 
-    await this.client.beta.sessions.update(
-      record.sessionId,
-      { agent: { tools: await this.mergedTools(desired, signal) } },
-      { signal },
-    );
+    await this.client.beta.sessions.update(record.sessionId, { agent: { tools: registered } }, { signal });
     record.toolNames = desired.map((tool) => tool.name);
     record.toolDefinitionsFingerprint = fingerprint;
   }

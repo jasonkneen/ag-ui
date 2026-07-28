@@ -143,6 +143,7 @@ def store_for(owner_id: str) -> PerCallerStore:
 - A follow-up message posted immediately after a tool result can race the session's asynchronous un-park and be rejected with a 400. That specific rejection is retried, matched on the message containing `waiting on responses` — wording that has not been confirmed against the live API. If the API rewords it the retry stops firing and the 400 surfaces as a run error; nothing else is affected. See the comment on the matcher.
 - The default in-memory store is bounded (`IN_MEMORY_SESSION_STORE_MAX_ENTRIES`, 10 000 mappings): thread ids are client-supplied, so past that the least-recently-used mapping is evicted and that thread starts a fresh session. Pass a smaller cap to `InMemorySessionStore(max_entries=n)`, or supply a persistent store.
 - A run that is interrupted — a turn timeout, a client disconnect, or a blocked action this integration cannot answer — forgets the frontend tool calls it had recorded as parked. The interrupt cancels whatever the session was waiting on, so answering one of those calls on the next run would be rejected as stale. If the interrupt itself could not be delivered the ids are kept, since the session may still be parked on them.
+- A session that registers custom tools holds a full replacement tool list, frozen at the last update, so the agent's own tools are re-read once per run to catch a Console edit to them. A session with no custom tools runs the agent as-is and skips that read entirely.
 
 ## Running the examples
 

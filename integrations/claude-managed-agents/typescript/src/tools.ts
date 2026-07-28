@@ -48,5 +48,12 @@ export const customToolFrom = (tool: Pick<Tool, "name" | "description" | "parame
   input_schema: toInputSchema(tool.parameters),
 });
 
-/** Stable representation used to detect any change to custom tool definitions. */
-export const customToolsFingerprint = (tools: CustomToolParams[]): string => JSON.stringify(canonicalize(tools)) ?? "[]";
+/**
+ * Stable representation used to detect any change to a session's tool list.
+ *
+ * Fingerprints whatever list is actually registered on the session — base tools
+ * included, not just the custom ones — because an override session's list is a
+ * full replacement frozen at the last update: a Console edit to the agent's own
+ * tools changes what the session should hold without changing any custom tool.
+ */
+export const toolsFingerprint = (tools: readonly unknown[]): string => JSON.stringify(canonicalize(tools)) ?? "[]";

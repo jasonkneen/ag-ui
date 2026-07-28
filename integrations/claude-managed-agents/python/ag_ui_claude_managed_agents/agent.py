@@ -19,7 +19,7 @@ from anthropic import AsyncAnthropic
 from ._util import get, maybe_await, report_swallowed_failure, schedule_detached
 from .constants import BEST_EFFORT_SEND_TIMEOUT_S, DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
-from .tools import custom_tool_from, custom_tools_fingerprint, normalize_tool_name
+from .tools import custom_tool_from, normalize_tool_name, tools_fingerprint
 from .turn import Emit, run_turn
 from .types import (
     BackendTool,
@@ -30,6 +30,10 @@ from .types import (
 )
 
 _DONE = object()
+
+NO_OVERRIDES_FINGERPRINT = tools_fingerprint([])
+"""The fingerprint stored for a session created without custom tools, i.e. one
+that runs the managed agent as-is with no override list."""
 
 RUN_FAILED_MESSAGE = "The run failed."
 """The only thing a client is told about a failure this integration did not author.
@@ -617,6 +621,12 @@ class ManagedAgentsAgent:
             else f"AG-UI thread {thread_id}"
         )
 
+        # An empty custom list means no overrides at all: the session runs the
+        # agent as-is, so Console edits to its tools apply without an update
+        # from here.
+        registered: list[Any] = (
+            await self._merged_tools(custom_tools) if custom_tools else []
+        )
         agent: dict[str, Any]
         if not custom_tools:
             agent = {"type": "agent", "id": self.managed_agent_id}
@@ -627,7 +637,7 @@ class ManagedAgentsAgent:
             if self.agent_version is not None:
                 agent["version"] = self.agent_version
             # Overrides replace the tool list, so keep the agent's own tools.
-            agent["tools"] = await self._merged_tools(custom_tools)
+            agent["tools"] = registered
 
         create_kwargs: dict[str, Any] = {
             "agent": agent,
@@ -640,7 +650,7 @@ class ManagedAgentsAgent:
         return SessionRecord(
             session_id=session.id,
             tool_names=[tool["name"] for tool in custom_tools],
-            tool_definitions_fingerprint=custom_tools_fingerprint(custom_tools),
+            tool_definitions_fingerprint=tools_fingerprint(registered),
         )
 
     def _custom_tools(self, client_tools: Sequence[Any]) -> list[dict[str, Any]]:
@@ -661,14 +671,32 @@ class ManagedAgentsAgent:
     async def _sync_client_tools(
         self, record: SessionRecord, client_tools: Sequence[Any]
     ) -> None:
-        """Keep the session's full replacement tool list aligned with this run."""
+        """Keep the session's full replacement tool list aligned with this run.
+
+        The fingerprint covers the merged list, not just the custom tools: an
+        override session's list is a full replacement frozen at the last update,
+        so editing the agent's own tools in the Console changes what the session
+        should hold while every custom tool stays identical. Comparing custom
+        tools alone declared that a match and left the session on a stale list
+        indefinitely.
+
+        The cost is re-reading the agent's tools once per run for a session that
+        uses overrides. A session with no custom tools runs the agent as-is,
+        needs no update, and is short-circuited before that read.
+        """
         desired = self._custom_tools(client_tools)
-        fingerprint = custom_tools_fingerprint(desired)
+        if not desired and record.tool_definitions_fingerprint == NO_OVERRIDES_FINGERPRINT:
+            return
+
+        # Note this still merges when `desired` is empty but the session does
+        # have an override list: it must be replaced with the agent's own tools,
+        # not emptied.
+        registered = await self._merged_tools(desired)
+        fingerprint = tools_fingerprint(registered)
         if record.tool_definitions_fingerprint == fingerprint:
             return
         await self.client.beta.sessions.update(
-            record.session_id,
-            agent={"tools": await self._merged_tools(desired)},
+            record.session_id, agent={"tools": registered}
         )
         record.tool_names = [tool["name"] for tool in desired]
         record.tool_definitions_fingerprint = fingerprint

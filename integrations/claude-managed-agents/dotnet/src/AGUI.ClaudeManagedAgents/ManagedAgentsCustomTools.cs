@@ -56,8 +56,14 @@ internal static partial class ManagedAgentsCustomTools
     }
 
     /// <summary>
-    /// Returns a canonical representation used to detect any custom tool definition change.
+    /// Returns a canonical representation used to detect any change to a session's tool list.
     /// </summary>
+    /// <remarks>
+    /// Fingerprints whatever list is actually registered on the session — base tools included, not
+    /// just the custom ones — because an override session's list is a full replacement frozen at
+    /// the last update: a Console edit to the agent's own tools changes what the session should
+    /// hold without changing any custom tool.
+    /// </remarks>
     internal static string FingerprintOf(IEnumerable<JsonElement> tools)
     {
         using var stream = new MemoryStream();

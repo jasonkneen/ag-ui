@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from .constants import TOOL_DESCRIPTION_MAX_LENGTH, TOOL_NAME_MAX_LENGTH
@@ -52,6 +53,15 @@ def custom_tool_from(tool: Any) -> dict[str, Any]:
     }
 
 
-def custom_tools_fingerprint(tools: list[dict[str, Any]]) -> str:
-    """Canonical representation used to detect any tool definition change."""
-    return json.dumps(tools, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def tools_fingerprint(tools: Sequence[Any]) -> str:
+    """Canonical representation used to detect any change to a session's tool list.
+
+    Fingerprints whatever list is actually registered on the session -- base
+    tools included, not just the custom ones -- because an override session's
+    list is a full replacement frozen at the last update: a Console edit to the
+    agent's own tools changes what the session should hold without changing any
+    custom tool.
+    """
+    return json.dumps(
+        list(tools), sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    )

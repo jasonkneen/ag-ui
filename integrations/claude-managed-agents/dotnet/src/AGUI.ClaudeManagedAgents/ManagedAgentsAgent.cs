@@ -20,6 +20,12 @@ public sealed class ManagedAgentsAgent
     private const string AbandonedToolResult = "The user did not provide a result for this tool call.";
 
     /// <summary>
+    /// The fingerprint stored for a session created without custom tools, i.e. one that runs the
+    /// managed agent as-is with no override list.
+    /// </summary>
+    private static readonly string s_noOverridesFingerprint = ManagedAgentsCustomTools.FingerprintOf([]);
+
+    /// <summary>
     /// The only thing a client is told about a failure this integration did not author. An SDK,
     /// session-store or API exception can carry session ids, request paths, backend hostnames or
     /// credentials, and the AG-UI client is not necessarily a trusted operator surface — so the
@@ -542,10 +548,14 @@ public sealed class ManagedAgentsAgent
             VaultIds = _options.VaultIds.Count > 0 ? [.. _options.VaultIds] : null,
         };
 
+        // An empty custom list means no overrides at all: the session runs the agent as-is, so
+        // Console edits to its tools apply without an update from here.
+        List<JsonElement> registered = [];
         if (customTools.Count > 0)
         {
             // Overrides replace the tool list, so keep the agent's own tools.
-            request.OverrideTools = await MergedToolsAsync(customTools, cancellationToken).ConfigureAwait(false);
+            registered = await MergedToolsAsync(customTools, cancellationToken).ConfigureAwait(false);
+            request.OverrideTools = registered;
         }
 
         var sessionId = await _client.CreateSessionAsync(request, cancellationToken).ConfigureAwait(false);
@@ -553,7 +563,7 @@ public sealed class ManagedAgentsAgent
         {
             SessionId = sessionId,
             ToolNames = customTools.Keys.ToList(),
-            ToolDefinitionsFingerprint = ManagedAgentsCustomTools.FingerprintOf(customTools.Values),
+            ToolDefinitionsFingerprint = ManagedAgentsCustomTools.FingerprintOf(registered),
             PendingClientToolUseIds = [],
         };
     }
@@ -581,17 +591,39 @@ public sealed class ManagedAgentsAgent
     }
 
     /// <summary>Keeps the session's full replacement tool list aligned with this run.</summary>
+    /// <remarks>
+    /// The fingerprint covers the merged list, not just the custom tools: an override session's
+    /// list is a full replacement frozen at the last update, so editing the agent's own tools in
+    /// the Console changes what the session should hold while every custom tool stays identical.
+    /// Comparing custom tools alone declared that a match and left the session on a stale list
+    /// indefinitely.
+    /// <para>
+    /// The cost is re-reading the agent's tools once per run for a session that uses overrides. A
+    /// session with no custom tools runs the agent as-is, needs no update, and is short-circuited
+    /// before that read.
+    /// </para>
+    /// </remarks>
     private async Task SyncClientToolsAsync(ManagedAgentsSessionRecord record, IList<AGUITool>? clientTools, CancellationToken cancellationToken)
     {
         var desired = CustomToolsFor(clientTools);
-        var fingerprint = ManagedAgentsCustomTools.FingerprintOf(desired.Values);
+        // A session created without custom tools has no override list to keep in step, and Console
+        // edits to the agent reach it on their own.
+        if (desired.Count == 0
+            && string.Equals(record.ToolDefinitionsFingerprint, s_noOverridesFingerprint, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // Note this still merges when `desired` is empty but the session does have an override
+        // list: it must be replaced with the agent's own tools, not emptied.
+        var registered = await MergedToolsAsync(desired, cancellationToken).ConfigureAwait(false);
+        var fingerprint = ManagedAgentsCustomTools.FingerprintOf(registered);
         if (string.Equals(record.ToolDefinitionsFingerprint, fingerprint, StringComparison.Ordinal))
         {
             return;
         }
 
-        var tools = await MergedToolsAsync(desired, cancellationToken).ConfigureAwait(false);
-        await _client.UpdateSessionToolsAsync(record.SessionId, tools, cancellationToken).ConfigureAwait(false);
+        await _client.UpdateSessionToolsAsync(record.SessionId, registered, cancellationToken).ConfigureAwait(false);
         record.ToolNames = desired.Keys.ToList();
         record.ToolDefinitionsFingerprint = fingerprint;
     }

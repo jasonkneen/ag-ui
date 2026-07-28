@@ -100,6 +100,64 @@ public sealed class ManagedAgentsDynamicToolsTest
         };
     }
 
+    [Fact]
+    public async Task PushesAConsoleEditToTheAgentsOwnToolsIntoAnOverrideSession()
+    {
+        // Regression: an override session's tool list is a full replacement frozen at the last
+        // update. Fingerprinting only the custom tools called an unchanged frontend list a match,
+        // so a Console edit to the agent's own tools never reached the session and it kept a stale
+        // replacement list indefinitely.
+        const string EditedBaseTool =
+            """{"type":"agent_toolset_20260401","configs":[{"name":"bash"}],"default_config":{}}""";
+        var showChart = Tool("show_chart", "Render a chart");
+        var fake = new FakeManagedAgentsClient([IdleEndTurn], [IdleEndTurn])
+        {
+            AgentTools = [FakeManagedAgentsClient.Json("""{"type":"agent_toolset_20260401","configs":[],"default_config":{}}""")],
+        };
+        var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
+        {
+            ManagedAgentId = "agent_1",
+            EnvironmentId = "env_1",
+            Client = fake,
+            SessionStore = new InMemorySessionStore(),
+        });
+
+        await CollectAsync(agent, Input("run_1", "u1", [showChart]));
+        Assert.Empty(fake.Updates);
+
+        // The agent's own tools change in the Console; the frontend list does not.
+        fake.AgentTools = [FakeManagedAgentsClient.Json(EditedBaseTool)];
+        await CollectAsync(agent, Input("run_2", "u2", [showChart]));
+
+        var update = Assert.Single(fake.Updates);
+        Assert.Equal(2, update.Count);
+        AssertJson(EditedBaseTool, update[0]);
+        AssertJson(
+            """{"type":"custom","name":"show_chart","description":"Render a chart","input_schema":{"type":"object","properties":{}}}""",
+            update[1]);
+    }
+
+    [Fact]
+    public async Task DoesNotReReadTheAgentsToolsForASessionWithoutCustomTools()
+    {
+        // Such a session runs the agent as-is, so there is nothing to keep in step and no reason to
+        // spend a call per run finding that out.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn], [IdleEndTurn]);
+        var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
+        {
+            ManagedAgentId = "agent_1",
+            EnvironmentId = "env_1",
+            Client = fake,
+            SessionStore = new InMemorySessionStore(),
+        });
+
+        await CollectAsync(agent, Input("run_1", "u1", []));
+        await CollectAsync(agent, Input("run_2", "u2", []));
+
+        Assert.Empty(fake.AgentToolReads);
+        Assert.Empty(fake.Updates);
+    }
+
     private static AGUITool Tool(
         string name,
         string description,

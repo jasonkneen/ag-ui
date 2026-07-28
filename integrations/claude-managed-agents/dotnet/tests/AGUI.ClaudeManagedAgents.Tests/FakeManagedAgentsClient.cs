@@ -57,8 +57,12 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
         return Task.CompletedTask;
     }
 
+    /// <summary>Every agent-tools read, as (managed agent id, pinned version).</summary>
+    public List<(string ManagedAgentId, int? AgentVersion)> AgentToolReads { get; } = [];
+
     public Task<IReadOnlyList<JsonElement>> GetAgentToolsAsync(string managedAgentId, int? agentVersion, CancellationToken cancellationToken)
     {
+        AgentToolReads.Add((managedAgentId, agentVersion));
         return Task.FromResult(AgentTools);
     }
 
