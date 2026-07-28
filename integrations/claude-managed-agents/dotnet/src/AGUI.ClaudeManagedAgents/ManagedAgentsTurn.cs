@@ -808,21 +808,26 @@ internal sealed class ManagedAgentsTurn
     }
 
     /// <summary>
+    /// Compact JSON with no escaping beyond what JSON itself requires — the same bytes
+    /// <c>JSON.stringify</c> and <c>json.dumps(..., ensure_ascii=False)</c> produce in the other
+    /// two ports. <see cref="JsonSerializer"/>'s default encoder escapes HTML-sensitive
+    /// characters, which would send <c>&lt;</c> to the UI as <c>\u003C</c> from .NET alone.
+    /// </summary>
+    private static readonly JsonSerializerOptions s_toolArgsJson = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    /// <summary>
     /// The tool input as JSON text for <c>TOOL_CALL_ARGS</c>.
     /// </summary>
-    /// <remarks>
-    /// The element's own text, not a re-serialization: <see cref="JsonSerializer"/> escapes
-    /// HTML-sensitive characters by default, so <c>&lt;</c> would reach the UI as <c>\u003C</c>
-    /// here while the TypeScript and Python ports emit it literally. Passing the API's bytes
-    /// through keeps all three identical.
-    /// </remarks>
     private static string InputJsonOf(JsonElement rawEvent)
     {
         if (rawEvent.ValueKind == JsonValueKind.Object
             && rawEvent.TryGetProperty("input", out var input)
             && input.ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null))
         {
-            return input.GetRawText();
+            return JsonSerializer.Serialize(input, s_toolArgsJson);
         }
 
         return "{}";

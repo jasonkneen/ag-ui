@@ -408,10 +408,16 @@ public class ManagedAgentsTurnTest
     [Fact]
     public async Task EmitsToolArgumentsAsCompactUnescapedJson()
     {
-        // All three ports must agree byte for byte: no \uXXXX escaping of non-ASCII and no HTML
-        // escaping of < > &, which JsonSerializer applies by default.
+        // All three ports must agree byte for byte: compact, no \uXXXX escaping of non-ASCII and
+        // no HTML escaping of < > & (which JsonSerializer applies by default). The input arrives
+        // pretty-printed here so the normalization is visible too.
         var run = await CollectAsync([
-            """{"type":"agent.tool_use","id":"tu_1","name":"search","input":{"q":"café <b>&</b> 日本","n":1}}""",
+            """
+            {"type":"agent.tool_use","id":"tu_1","name":"search","input":{
+                "q": "café <b>&</b> 日本",
+                "n": 1
+            }}
+            """,
             IdleEndTurn,
         ]);
 
