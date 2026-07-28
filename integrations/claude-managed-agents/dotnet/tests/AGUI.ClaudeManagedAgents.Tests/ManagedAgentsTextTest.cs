@@ -37,9 +37,17 @@ public class ManagedAgentsTextTest
     [Fact]
     public void ReplacesLoneSurrogateEntitiesRatherThanEmittingInvalidText()
     {
-        var described = ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"a&#xD800;b&#55296;c"}]"""));
+        // A lone surrogate makes the string ill-formed UTF-16: it cannot be encoded as UTF-8, so
+        // it would arrive as U+FFFD (or break the encoder) anyway. Every port rejects it here.
+        Assert.Equal("a�b�c", ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"a&#xD800;b&#55296;c"}]""")));
+        Assert.Equal("a�b", ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"a&#xDFFF;b"}]""")));
 
-        Assert.Equal("a�b�c", described);
+        // Out of range, and the boundaries around the surrogate block, still work.
+        Assert.Equal("a�b", ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"a&#x110000;b"}]""")));
+        Assert.Equal("a\uD7FF\uE000b", ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"a&#xD7FF;&#xE000;b"}]""")));
+
+        // A well-formed astral character written as one code point is unaffected.
+        Assert.Equal("\U0001F600", ManagedAgentsText.DescribeToolResult(Blocks("""[{"type":"text","text":"&#x1F600;"}]""")));
     }
 
     [Fact]

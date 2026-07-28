@@ -64,6 +64,20 @@ describe("describeToolResult", () => {
     expect(described).toBe(`[search result] T — https://x\n${"b".repeat(SEARCH_RESULT_PREVIEW_CHARS)}`);
   });
 
+  it("substitutes U+FFFD for entities that do not denote a usable character", () => {
+    // A lone surrogate makes the string ill-formed UTF-16: it cannot be encoded
+    // as UTF-8, so it would arrive as U+FFFD (or crash the encoder) anyway.
+    // Every port rejects it here instead, identically.
+    expect(describeToolResult([{ type: "text", text: "a&#xD800;b" }])).toBe("a�b");
+    expect(describeToolResult([{ type: "text", text: "a&#55296;b" }])).toBe("a�b");
+    expect(describeToolResult([{ type: "text", text: "a&#xDFFF;b" }])).toBe("a�b");
+    // Out of range, and the boundaries around the surrogate block, still work.
+    expect(describeToolResult([{ type: "text", text: "a&#x110000;b" }])).toBe("a�b");
+    expect(describeToolResult([{ type: "text", text: "a&#xD7FF;&#xE000;b" }])).toBe("a\uD7FF\uE000b");
+    // A well-formed surrogate pair written as one code point is unaffected.
+    expect(describeToolResult([{ type: "text", text: "&#x1F600;" }])).toBe("\u{1F600}");
+  });
+
   it("uses a [type] placeholder for unknown blocks and handles nothing", () => {
     expect(describeToolResult([{ type: "image", source: {} }])).toBe("[image]");
     expect(describeToolResult(null)).toBe("");

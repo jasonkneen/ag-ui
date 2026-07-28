@@ -11,8 +11,22 @@ _HEX_ENTITY = re.compile(r"&#x([0-9a-fA-F]+);")
 _DEC_ENTITY = re.compile(r"&#(\d+);")
 
 
+REPLACEMENT_CHARACTER = "�"
+"""Substituted for any entity that does not denote a usable character."""
+
+
 def _code_point(n: int) -> str:
-    return chr(n) if 0 <= n <= 0x10FFFF else "�"
+    """The character an entity's code point denotes, or U+FFFD.
+
+    Surrogate code points (U+D800-U+DFFF) are rejected as well as out-of-range
+    ones: `chr` happily produces a lone surrogate, but that string cannot be
+    encoded as UTF-8, so it would raise inside SSE encoding rather than reach
+    the UI. Substituting here keeps every port's output well-formed and
+    identical.
+    """
+    if n < 0 or n > 0x10FFFF or 0xD800 <= n <= 0xDFFF:
+        return REPLACEMENT_CHARACTER
+    return chr(n)
 
 
 def decode_entities(s: str) -> str:

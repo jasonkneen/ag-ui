@@ -5,8 +5,21 @@ import { SEARCH_RESULT_PREVIEW_CHARS } from "./constants";
 /** Any content block; only `type` is required to route it. */
 type ContentBlock = { type: string } & Record<string, any>;
 
+/** U+FFFD, substituted for any entity that does not denote a usable character. */
+const REPLACEMENT_CHARACTER = "�";
+
+/**
+ * The character an entity's code point denotes, or U+FFFD.
+ *
+ * Surrogate code points (U+D800–U+DFFF) are rejected as well as out-of-range
+ * ones: alone they make the string ill-formed UTF-16, which cannot be encoded
+ * as UTF-8 and turns into U+FFFD (or an encoder error) somewhere downstream.
+ * Substituting here keeps every port's output well-formed and identical.
+ */
 const codePointOf = (n: number): string =>
-  Number.isInteger(n) && n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : "�";
+  Number.isInteger(n) && n >= 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff)
+    ? String.fromCodePoint(n)
+    : REPLACEMENT_CHARACTER;
 
 const decodeEntities = (s: string): string =>
   s

@@ -87,6 +87,27 @@ def test_describe_tool_result_decodes_entities_and_summarizes_blocks():
     )
 
 
+def test_describe_tool_result_substitutes_unusable_entity_code_points() -> None:
+    """A lone surrogate cannot be encoded as UTF-8, so `chr` would produce a
+    string that raises inside SSE encoding rather than reach the UI. Every port
+    substitutes U+FFFD here instead, identically."""
+    assert describe_tool_result([{"type": "text", "text": "a&#xD800;b"}]) == "a�b"
+    assert describe_tool_result([{"type": "text", "text": "a&#55296;b"}]) == "a�b"
+    assert describe_tool_result([{"type": "text", "text": "a&#xDFFF;b"}]) == "a�b"
+    # Out of range, and the boundaries around the surrogate block, still work.
+    assert describe_tool_result([{"type": "text", "text": "a&#x110000;b"}]) == "a�b"
+    assert (
+        describe_tool_result([{"type": "text", "text": "a&#xD7FF;&#xE000;b"}])
+        == "a\ud7ff\ue000b"
+    )
+    # A well-formed astral character written as one code point is unaffected.
+    assert (
+        describe_tool_result([{"type": "text", "text": "&#x1F600;"}]) == "\U0001f600"
+    )
+    # The result is encodable, which is the point of the substitution.
+    describe_tool_result([{"type": "text", "text": "a&#xD800;b"}]).encode("utf-8")
+
+
 def test_custom_tool_from_normalizes_name_and_caps_description() -> None:
     """The API caps descriptions; a long one must be truncated, not rejected."""
     tool = custom_tool_from(
