@@ -142,6 +142,7 @@ PerCallerStore StoreFor(string ownerId) => stores.GetOrAdd(ownerId, id => new Pe
 - Turns are serial per thread. A second run on a busy thread errors.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter shows them for display, so enable them on your agent as usual.
 - Tool-result `text` blocks reach the UI verbatim: they carry literal output (a file read, a shell transcript), where `&lt;` means those four characters. Only `search_result` blocks, whose bodies are extracted from HTML, have their entities decoded.
+- A follow-up message posted immediately after a tool result can race the session's asynchronous un-park and be rejected with a 400. That specific rejection is retried, matched on the message containing `waiting on responses` — wording that has not been confirmed against the live API. If the API rewords it the retry stops firing and the 400 surfaces as a run error; nothing else is affected. See the comment on the matcher.
 
 ## Running the example server
 

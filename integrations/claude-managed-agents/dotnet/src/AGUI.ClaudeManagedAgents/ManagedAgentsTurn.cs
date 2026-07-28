@@ -218,16 +218,34 @@ internal sealed class ManagedAgentsTurn
     }
 
     /// <summary>
+    /// Substring of the API's 400 for an event posted while the session is still parked on tool
+    /// results.
+    /// </summary>
+    /// <remarks>
+    /// NOT VERIFIED AGAINST THE LIVE API. The retry this gates exists because a session un-parks
+    /// asynchronously after a tool result, so a follow-up message can legitimately race ahead of
+    /// that transition; this wording is what the rejection was observed to carry, and the API is
+    /// free to reword it. The tests build the error from the real SDK exception class, which pins
+    /// the shape (status code plus response body) but not the wording.
+    /// <para>
+    /// The failure mode is benign and one-directional: a reworded message means the retry no longer
+    /// fires and the original 400 surfaces to the caller, never that something else is retried by
+    /// mistake. If the parked race starts surfacing as a run error, check this string first.
+    /// </para>
+    /// </remarks>
+    private const string SentWhileParkedMessage = "waiting on responses";
+
+    /// <summary>
     /// Whether the API rejected an event because the session is still parked on tool calls
-    /// (HTTP 400 whose message contains <c>waiting on responses</c>).
+    /// (HTTP 400 whose message contains <see cref="SentWhileParkedMessage"/>).
     /// </summary>
     private static bool IsSentWhileParked(Exception ex)
     {
         return ex is Anthropic.Exceptions.AnthropicApiException api
             ? api.StatusCode == System.Net.HttpStatusCode.BadRequest
-                && api.Message.Contains("waiting on responses", StringComparison.Ordinal)
+                && api.Message.Contains(SentWhileParkedMessage, StringComparison.Ordinal)
             : ex is ManagedAgentsSendException { StatusCode: (int)System.Net.HttpStatusCode.BadRequest } sent
-                && sent.Message.Contains("waiting on responses", StringComparison.Ordinal);
+                && sent.Message.Contains(SentWhileParkedMessage, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -495,10 +513,18 @@ internal sealed class ManagedAgentsTurn
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // The handler keeps running after we stop waiting; observe its
-                // eventual fault so it cannot surface as an unobserved task exception.
+                // The handler keeps running after we stop waiting. Observing its eventual fault
+                // keeps it from surfacing as an unobserved task exception — but it is also the
+                // only trace of a backend tool that failed after the run walked away, so report
+                // it rather than merely consuming it.
                 _ = handlerTask.ContinueWith(
-                    static t => _ = t.Exception,
+                    t =>
+                    {
+                        if (t.Exception is { } failure)
+                        {
+                            Report("abandoned_backend_tool", failure.GetBaseException());
+                        }
+                    },
                     CancellationToken.None,
                     TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                     TaskScheduler.Default);

@@ -39,14 +39,38 @@ Emit = Callable[[BaseEvent], None]
 SentCallback = Callable[[], Awaitable[None] | None]
 ParkCallback = Callable[[str], Awaitable[None] | None]
 
-# Best-effort sends that must outlive a cancelled run (see
-# post_interrupted_result). Strong references only: asyncio keeps weak ones.
-_background_sends: set[asyncio.Future[Any]] = set()
+# Work that outlives a cancelled run: best-effort sends (see
+# post_interrupted_result) and worker-thread tool handlers that cannot be
+# cancelled (see _call_backend_handler). Strong references only: asyncio keeps
+# weak ones and would let the loop drop them mid-flight.
+_background_work: set[asyncio.Future[Any]] = set()
 
 
-def _finish_background_send(task: asyncio.Future[Any]) -> None:
-    _background_sends.discard(task)
+def _finish_background_work(task: asyncio.Future[Any]) -> None:
+    _background_work.discard(task)
     observe_task(task)
+
+
+def _track_background_work(task: asyncio.Future[Any]) -> None:
+    _background_work.add(task)
+    task.add_done_callback(_finish_background_work)
+
+
+def _observe_failure(
+    task: asyncio.Future[Any],
+    on_failure: Callable[[BaseException], None],
+) -> None:
+    """Route a completed background task's failure to `on_failure`.
+
+    Cancellation is the expected end for work the run walked away from and is
+    not reported; a real exception is the only trace of work that ran on after
+    the run stopped waiting for it.
+    """
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        on_failure(error)
 
 
 async def _close_stream(stream: Any) -> None:
@@ -261,12 +285,24 @@ async def _consume(
         # outer cancellation lands while we are shielded, the send finishes in
         # the background and its failure must not surface as "exception was
         # never retrieved".
-        _background_sends.add(task)
-        task.add_done_callback(_finish_background_send)
+        _track_background_work(task)
+        # Once the shield below has re-raised the cancellation this frame is
+        # gone, so the send's own outcome would otherwise only be consumed.
+        # Report it: an unanswered call leaves the session parked, which is
+        # exactly what an operator needs to know about.
+        task.add_done_callback(
+            lambda done: _observe_failure(
+                done, lambda error: report("post_interrupted_tool_result", error)
+            )
+        )
         try:
             await asyncio.shield(task)
-        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - the caller re-raises the original cancellation
-            report("post_interrupted_tool_result", exc)
+        except asyncio.CancelledError:
+            # The run is being torn down; the send continues in the background
+            # and the callback above reports whatever becomes of it.
+            raise
+        except Exception as exc:  # noqa: BLE001 - best-effort; already reported by the callback
+            del exc
 
     async def answer_custom_tool_use(
         tool_use_id: str, text: str, is_error: bool
@@ -301,7 +337,15 @@ async def _consume(
         """
         is_error = False
         try:
-            text = str(await _call_backend_handler(tool.handler, tool_input))
+            text = str(
+                await _call_backend_handler(
+                    tool.handler,
+                    tool_input,
+                    on_abandoned_failure=lambda error: report(
+                        "abandoned_backend_tool", error
+                    ),
+                )
+            )
         except asyncio.CancelledError as err:
             task = asyncio.current_task()
             if task is None or task.cancelling() > 0:
@@ -596,10 +640,27 @@ async def _consume(
         close_all()
 
 
+SENT_WHILE_PARKED_MESSAGE = "waiting on responses"
+"""Substring of the API's 400 for an event posted while the session is still
+parked on tool results.
+
+NOT VERIFIED AGAINST THE LIVE API. The retry this gates exists because a session
+un-parks asynchronously after a tool result, so a follow-up message can
+legitimately race ahead of that transition; this wording is what the rejection
+was observed to carry, and the API is free to reword it. The tests build the
+error from the real SDK exception class, which pins the shape (status code plus
+message) but not the wording.
+
+The failure mode is benign and one-directional: a reworded message means the
+retry no longer fires and the original 400 surfaces to the caller, never that
+something else is retried by mistake. If the parked race starts surfacing as a
+run error, check this string first."""
+
+
 def _is_sent_while_parked(exc: BaseException) -> bool:
     """The API rejects user messages while a session is parked on tool results."""
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-    return status == 400 and "waiting on responses" in str(exc)
+    return status == 400 and SENT_WHILE_PARKED_MESSAGE in str(exc)
 
 
 async def _send_follow_ups(
@@ -617,13 +678,35 @@ async def _send_follow_ups(
             await asyncio.sleep(delay)
 
 
-async def _call_backend_handler(handler: Callable[[Any], Any], tool_input: Any) -> Any:
+async def _call_backend_handler(
+    handler: Callable[[Any], Any],
+    tool_input: Any,
+    on_abandoned_failure: Callable[[BaseException], None] | None = None,
+) -> Any:
     """Run a backend tool handler.
 
     A plain (blocking) function runs in a worker thread so it never stalls
     the event loop that other runs share; a coroutine is awaited directly.
+
+    A worker thread cannot be cancelled, so when the run is torn down the wait
+    is abandoned and the thread runs to completion regardless -- the same as a
+    started handler in the TypeScript and .NET ports. Its eventual failure is
+    then the only trace of a backend tool that broke after the run walked away,
+    so shield the future (cancelling the wait must not discard its outcome) and
+    hand that outcome to `on_abandoned_failure`. A cancelled outcome is not
+    reported: that is the expected end of abandoned work.
     """
     if inspect.iscoroutinefunction(handler):
         return await handler(tool_input)
-    result = await asyncio.to_thread(handler, tool_input)
+
+    pending = asyncio.ensure_future(asyncio.to_thread(handler, tool_input))
+    _track_background_work(pending)
+    try:
+        result = await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        if on_abandoned_failure is not None:
+            pending.add_done_callback(
+                lambda done: _observe_failure(done, on_abandoned_failure)
+            )
+        raise
     return await maybe_await(result)

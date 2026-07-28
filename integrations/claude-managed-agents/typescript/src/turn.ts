@@ -271,7 +271,9 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     let text: string;
     let isError = false;
     try {
-      text = await raceAbort(() => tool.handler(input), signal);
+      text = await raceAbort(() => tool.handler(input), signal, (error) =>
+        report("abandoned_backend_tool", error),
+      );
     } catch (err) {
       if (signal.aborted) {
         await postCustomToolResult(id, INTERRUPTED_TOOL_TEXT, true).catch((error: unknown) =>
@@ -510,12 +512,30 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   }
 }
 
+/**
+ * Substring of the API's 400 for an event posted while the session is still
+ * parked on tool results.
+ *
+ * NOT VERIFIED AGAINST THE LIVE API. The retry this gates exists because a
+ * session un-parks asynchronously after a tool result, so a follow-up message
+ * can legitimately race ahead of that transition; this wording is what the
+ * rejection was observed to carry, and the API is free to reword it. The tests
+ * build the error from the real SDK exception class, which pins the shape
+ * (status code plus message) but not the wording.
+ *
+ * The failure mode is benign and one-directional: a reworded message means the
+ * retry no longer fires and the original 400 surfaces to the caller, never that
+ * something else is retried by mistake. If the parked race starts surfacing as
+ * a run error, check this string first.
+ */
+const SENT_WHILE_PARKED_MESSAGE = "waiting on responses";
+
 /** The API rejects user messages while a session is parked on tool results. */
 const isSentWhileParked = (err: unknown): boolean =>
   typeof err === "object" &&
   err !== null &&
   (err as { status?: unknown }).status === 400 &&
-  String((err as { message?: unknown }).message ?? "").includes("waiting on responses");
+  String((err as { message?: unknown }).message ?? "").includes(SENT_WHILE_PARKED_MESSAGE);
 
 /** Rejects when `signal` aborts, whether it aborts before or during the wait. */
 const abortRejection = <T>(signal: AbortSignal): { promise: Promise<T>; dispose: () => void } => {
@@ -528,11 +548,24 @@ const abortRejection = <T>(signal: AbortSignal): { promise: Promise<T>; dispose:
   return { promise, dispose: () => signal.removeEventListener("abort", onAbort) };
 };
 
-/** Await `work`, but give up as soon as `signal` aborts. */
-const raceAbort = async <T>(work: () => T | Promise<T>, signal: AbortSignal): Promise<T> => {
+/**
+ * Await `work`, but give up as soon as `signal` aborts.
+ *
+ * Work abandoned that way keeps running; if it later rejects, the rejection has
+ * nowhere to go and must not surface as an unhandled rejection — but it is also
+ * the only trace of a backend tool that failed after the run walked away, so it
+ * is reported rather than merely consumed.
+ */
+const raceAbort = async <T>(
+  work: () => T | Promise<T>,
+  signal: AbortSignal,
+  onAbandonedFailure?: (error: unknown) => void,
+): Promise<T> => {
   const aborted = abortRejection<T>(signal);
   const working = Promise.resolve().then(work);
-  working.catch(() => {}); // an abandoned handler that rejects later must not go unhandled
+  working.catch((error: unknown) => {
+    if (signal.aborted) onAbandonedFailure?.(error);
+  });
   try {
     return await Promise.race([working, aborted.promise]);
   } finally {

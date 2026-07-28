@@ -1104,6 +1104,55 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task ReportsABackendToolThatFailsAfterTheRunWalkedAway()
+    {
+        // The handler keeps running after the run stops waiting for it. Its eventual fault was
+        // observed only to keep it off the unobserved-exception path — which means a backend tool
+        // that failed after a disconnect left no trace at all.
+        var reported = new List<string>();
+        var handlerFailed = new TaskCompletionSource();
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+            IdleEndTurn,
+        ]);
+        using var client = new CancellationTokenSource();
+        var agent = NewAgent(fake, configure: options =>
+        {
+            options.OnError = (_, context) => reported.Add(context.Operation);
+            options.BackendTools.Add(new ManagedAgentsBackendTool
+            {
+                Name = "get_time",
+                Handler = async _ =>
+                {
+                    client.Cancel(); // the caller disconnects mid-turn
+                    await handlerFailed.Task.ConfigureAwait(false);
+                    throw new InvalidOperationException("tool blew up late");
+                },
+            });
+        });
+
+        try
+        {
+            await foreach (var _ in agent.RunAsync(BaseInput(), client.Token))
+            {
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected: the caller left
+        }
+
+        // The handler only fails once the run is gone.
+        handlerFailed.SetResult();
+        for (var attempt = 0; attempt < 50 && !reported.Contains("abandoned_backend_tool"); attempt++)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Contains("abandoned_backend_tool", reported);
+    }
+
+    [Fact]
     public async Task ABrokenOnErrorHandlerDoesNotBreakTheRun()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

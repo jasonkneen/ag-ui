@@ -140,7 +140,13 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
       this.runTurnForInput(input, emit, signal)
         .catch((err) => {
-          if (disconnect.signal.aborted) return; // client went away; nothing left to tell
+          if (disconnect.signal.aborted) {
+            // The client went away, so there is nobody to emit to — but the run
+            // may have failed for a reason worth knowing about, and this is its
+            // only trace.
+            this.report("run_after_disconnect", err, { threadId: input.threadId });
+            return;
+          }
           if (timeout.aborted) {
             emit(runError(`The turn exceeded the ${timeoutMs / 1000}s limit and was interrupted.`, "turn_timeout"));
             return;
