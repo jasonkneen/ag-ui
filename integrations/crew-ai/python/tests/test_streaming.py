@@ -559,6 +559,81 @@ def _make_run_input(thread_id="t-1", run_id="r-1"):
     )
 
 
+# -- CPK-7719: ONE RUN_STARTED / ONE RUN_FINISHED per HTTP run --------------
+
+class _InnerKickoffFlow(Flow):
+    """Stands in for the ``crew.kickoff`` a ``ChatWithCrewFlow.chat`` runs
+    mid-method. A real crew kickoff drives crewai's experimental agent
+    executor THROUGH the flow runtime, so it emits its own ``flow_started`` /
+    ``flow_finished`` frames — reproduced here with a real nested Flow so the
+    test needs no LLM/network."""
+
+    @start()
+    async def go(self):
+        return "inner-done"
+
+
+class _TwoCompletionCrewFlow(Flow):
+    """A real Flow that performs TWO internal operations in ONE run — exactly
+    the crew-tool path shape (``crew.kickoff`` off the event loop, then a
+    defect-2 follow-up completion). The nested kickoff runs via
+    ``asyncio.to_thread`` (as the bridge offloads ``crew.kickoff``), which
+    copies the scoped stream-sink contextvar, so the inner flow's
+    ``flow_started`` / ``flow_finished`` frames land on THIS run's sink."""
+
+    @start()
+    async def chat(self):
+        # Completion #1 surrogate: the nested (crew) kickoff. Off the loop, as
+        # ``crews.py`` runs ``crew_function`` via ``asyncio.to_thread``.
+        await asyncio.to_thread(lambda: _InnerKickoffFlow().kickoff())
+        # Completion #2 (CPK-7717 defect 2): the follow-up completion that
+        # makes the assistant speak about the crew result. ``copilotkit_stream``
+        # emits this as a bridged TEXT_MESSAGE_CHUNK on the same sink.
+        f = flow_context.get(None)
+        from ag_ui_crewai._capabilities import crewai_event_bus
+        crewai_event_bus.emit(f, BridgedTextMessageChunkEvent(
+            type=EventType.TEXT_MESSAGE_CHUNK,
+            message_id="m-followup", role="assistant", delta="Crew is done.",
+        ))
+        return "done"
+
+
+@requires_stream_frames
+async def test_frame_path_two_completions_emit_single_run_lifecycle():
+    """CPK-7719: a run whose flow method performs two internal completions —
+    a nested (crew) kickoff plus a defect-2 follow-up — must emit EXACTLY ONE
+    RUN_STARTED (first) and ONE RUN_FINISHED (last), with the follow-up text
+    streaming in between.
+
+    Pre-fix, the nested kickoff's ``flow_started`` produced a SECOND
+    RUN_STARTED (the client rejects it: "Cannot send 'RUN_STARTED' while a run
+    is still active"), and its ``flow_finished`` tripped ``is_run_end`` so the
+    driver broke BEFORE the follow-up text streamed."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_TwoCompletionCrewFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    types = [p["type"] for p in payloads]
+
+    # Exactly one RUN_STARTED and one RUN_FINISHED, bracketing the run.
+    assert types.count("RUN_STARTED") == 1, types
+    assert types.count("RUN_FINISHED") == 1, types
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+
+    # The defect-2 follow-up text reaches the client, inside the run.
+    assert "TEXT_MESSAGE_CHUNK" in types, types
+    follow = next(p for p in payloads if p["type"] == "TEXT_MESSAGE_CHUNK")
+    assert follow["delta"] == "Crew is done."
+    assert types.index("TEXT_MESSAGE_CHUNK") < types.index("RUN_FINISHED")
+
+
 # -- CPK-7718 #11: per-request flow COPY seeds state before @start runs ------
 
 class _StateReadingFlow(Flow[CopilotKitState]):

@@ -94,13 +94,37 @@ class StreamFrameTranslator:
         self._run_id = run_id
         self._state_provider = state_provider
         self.emission_shape = emission_shape
+        # Run-lifecycle idempotency (CPK-7719). A single AG-UI HTTP run must
+        # emit EXACTLY ONE ``RUN_STARTED`` (first) and ONE ``RUN_FINISHED``
+        # (last), regardless of how many crewai flow-lifecycle frames the
+        # scoped stream sink surfaces. It surfaces more than one because a
+        # ``crew.kickoff`` performed inside a flow method runs crewai's
+        # experimental agent executor THROUGH the flow runtime, and the bridge
+        # offloads that kickoff with ``asyncio.to_thread`` — which copies the
+        # scoped stream-sink contextvar into the worker thread, so the nested
+        # flow's own ``flow_started`` / ``flow_finished`` frames land on the
+        # SAME parent sink. We collapse the nesting with a depth counter:
+        # ``RUN_STARTED`` fires on the outermost ``flow_started`` only, and
+        # ``RUN_FINISHED`` fires when the depth unwinds back to zero (the
+        # outermost ``flow_finished``, which ``astream`` always emits last).
+        self._flow_depth = 0
+        self._run_started_emitted = False
+        self._run_finished_emitted = False
 
     # -- public API --------------------------------------------------------
 
-    @staticmethod
-    def is_run_end(frame: Any) -> bool:
-        """Whether ``frame`` terminates the run (RUN_FINISHED was just emitted)."""
-        return getattr(frame, "type", None) in RUN_END_FRAME_TYPES
+    def is_run_end(self, frame: Any) -> bool:
+        """Whether ``frame`` terminated the run (RUN_FINISHED was just emitted).
+
+        Only the OUTERMOST ``flow_finished`` ends the run: a nested crew
+        kickoff's ``flow_finished`` unwinds the depth to a non-zero value and
+        emits nothing, so the driver loop keeps consuming the follow-up
+        completion's frames instead of stopping early.
+        """
+        return (
+            getattr(frame, "type", None) in RUN_END_FRAME_TYPES
+            and self._run_finished_emitted
+        )
 
     def translate(self, frame: Any) -> list[Any]:
         """Map one ``StreamFrame`` to the AG-UI events it should produce."""
@@ -108,6 +132,13 @@ class StreamFrameTranslator:
         data = getattr(frame, "data", None) or {}
 
         if frame_type == _FLOW_STARTED:
+            self._flow_depth += 1
+            # Emit RUN_STARTED for the outermost flow_started only; nested
+            # crew-kickoff flow_started frames are suppressed so the run never
+            # sees a second RUN_STARTED (which the client rejects).
+            if self._run_started_emitted:
+                return []
+            self._run_started_emitted = True
             return [
                 RunStartedEvent(
                     type=EventType.RUN_STARTED,
@@ -116,6 +147,17 @@ class StreamFrameTranslator:
                 )
             ]
         if frame_type == _FLOW_FINISHED:
+            if self._flow_depth > 0:
+                self._flow_depth -= 1
+            # RUN_FINISHED fires once, when the outermost flow finishes (depth
+            # back to zero). Nested flow_finished frames only unwind depth.
+            if self._flow_depth > 0 or self._run_finished_emitted:
+                return []
+            if not self._run_started_emitted:
+                # A stray flow_finished with no matching started — never
+                # synthesize a RUN_FINISHED the run never opened.
+                return []
+            self._run_finished_emitted = True
             return [
                 RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
