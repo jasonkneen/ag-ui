@@ -22,7 +22,13 @@ from ag_ui.core import (
     ToolCallStartEvent,
 )
 
-from ._util import get, maybe_await, observe_task
+from ._util import (
+    get,
+    maybe_await,
+    report_swallowed_failure,
+    schedule_detached,
+    track_background_work,
+)
 from .constants import (
     BEST_EFFORT_SEND_TIMEOUT_S,
     PARKED_RETRY_DELAYS_S,
@@ -38,23 +44,6 @@ the session is never left parked on a call nothing will answer."""
 Emit = Callable[[BaseEvent], None]
 SentCallback = Callable[[], Awaitable[None] | None]
 ParkCallback = Callable[[str], Awaitable[None] | None]
-
-# Work that outlives a cancelled run: best-effort sends (see
-# post_interrupted_result) and worker-thread tool handlers that cannot be
-# cancelled (see _call_backend_handler). Strong references only: asyncio keeps
-# weak ones and would let the loop drop them mid-flight.
-_background_work: set[asyncio.Future[Any]] = set()
-
-
-def _finish_background_work(task: asyncio.Future[Any]) -> None:
-    _background_work.discard(task)
-    observe_task(task)
-
-
-def _track_background_work(task: asyncio.Future[Any]) -> None:
-    _background_work.add(task)
-    task.add_done_callback(_finish_background_work)
-
 
 def _observe_failure(
     task: asyncio.Future[Any],
@@ -221,14 +210,19 @@ async def _consume(
             )
         )
 
-    def report(operation: str, error: BaseException) -> None:
-        """Report a swallowed failure. A broken hook must not break the turn."""
-        if on_error is None:
-            return
-        try:
-            on_error(error, {"operation": operation, "session_id": session_id})
-        except Exception:  # noqa: BLE001 - a broken hook is not the turn's problem
-            pass
+    async def report(operation: str, error: BaseException) -> None:
+        """Report a swallowed failure.
+
+        A broken hook must not break the turn; an async hook is awaited so its
+        telemetry actually runs. See `report_swallowed_failure`.
+        """
+        await report_swallowed_failure(
+            on_error, operation, error, session_id=session_id
+        )
+
+    def report_detached(operation: str, error: BaseException) -> None:
+        """`report` from a frame that cannot await, such as a done callback."""
+        schedule_detached(report(operation, error))
 
     async def interrupt() -> None:
         """Stop the session best-effort.
@@ -245,7 +239,7 @@ async def _consume(
                 BEST_EFFORT_SEND_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 - best-effort interrupt, including its own bound
-            report("interrupt", exc)
+            await report("interrupt", exc)
 
     def fail(message: str, code: str | None = None) -> TurnOutcome:
         close_all()
@@ -290,14 +284,15 @@ async def _consume(
         # outer cancellation lands while we are shielded, the send finishes in
         # the background and its failure must not surface as "exception was
         # never retrieved".
-        _track_background_work(task)
+        track_background_work(task)
         # Once the shield below has re-raised the cancellation this frame is
         # gone, so the send's own outcome would otherwise only be consumed.
         # Report it: an unanswered call leaves the session parked, which is
         # exactly what an operator needs to know about.
         task.add_done_callback(
             lambda done: _observe_failure(
-                done, lambda error: report("post_interrupted_tool_result", error)
+                done,
+                lambda error: report_detached("post_interrupted_tool_result", error),
             )
         )
         try:
@@ -326,7 +321,7 @@ async def _consume(
             # The failure itself goes to the hook; the client is told only that
             # the delivery failed. The underlying exception can carry session ids
             # and request detail, and this event is read by the browser.
-            report("post_tool_result", exc)
+            await report("post_tool_result", exc)
             await interrupt()
             return fail(
                 f"The result of tool call {tool_use_id} could not be delivered "
@@ -349,7 +344,7 @@ async def _consume(
                 await _call_backend_handler(
                     tool.handler,
                     tool_input,
-                    on_abandoned_failure=lambda error: report(
+                    on_abandoned_failure=lambda error: report_detached(
                         "abandoned_backend_tool", error
                     ),
                 )
@@ -603,7 +598,7 @@ async def _consume(
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001 - reported as a terminal run error
-                        report("post_tool_confirmation", exc)
+                        await report("post_tool_confirmation", exc)
                         await interrupt()
                         return fail(
                             "The tool confirmation could not be delivered to the "
@@ -719,7 +714,7 @@ async def _call_backend_handler(
         return await handler(tool_input)
 
     pending = asyncio.ensure_future(asyncio.to_thread(handler, tool_input))
-    _track_background_work(pending)
+    track_background_work(pending)
     try:
         result = await asyncio.shield(pending)
     except asyncio.CancelledError:

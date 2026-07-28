@@ -16,7 +16,7 @@ from ag_ui.core import (
 )
 from anthropic import AsyncAnthropic
 
-from ._util import get, maybe_await
+from ._util import get, maybe_await, report_swallowed_failure, schedule_detached
 from .constants import BEST_EFFORT_SEND_TIMEOUT_S, DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
 from .tools import custom_tool_from, custom_tools_fingerprint, normalize_tool_name
@@ -164,10 +164,16 @@ class ManagedAgentsAgent:
             if isinstance(event, (RunErrorEvent, RunFinishedEvent)):
                 if state.terminated:
                     if isinstance(event, RunErrorEvent):
-                        self._report(
-                            "dropped_terminal_event",
-                            RuntimeError(event.message),
-                            thread_id=thread_id,
+                        # A sync frame (the emit gate), so the hook is scheduled
+                        # rather than awaited; `report_swallowed_failure` keeps
+                        # its failure from surfacing anywhere.
+                        schedule_detached(
+                            report_swallowed_failure(
+                                self.on_error,
+                                "dropped_terminal_event",
+                                RuntimeError(event.message),
+                                thread_id=thread_id,
+                            )
                         )
                     return
                 state.terminated = True
@@ -187,7 +193,9 @@ class ManagedAgentsAgent:
             if not turn_deadline.expired():
                 # An inner bounded operation (a best-effort send) timed out.
                 # Report that, not the turn limit it never reached.
-                self._report("run_failed", timeout_error, thread_id=input.thread_id)
+                await self._report(
+                    "run_failed", timeout_error, thread_id=input.thread_id
+                )
                 emit(
                     RunErrorEvent(
                         message=(
@@ -217,7 +225,7 @@ class ManagedAgentsAgent:
             raise
         except Exception as err:  # noqa: BLE001 - surfaced to the client as RUN_ERROR
             # Detail to the hook, not to the client: see RUN_FAILED_MESSAGE.
-            self._report("run_failed", err, thread_id=input.thread_id)
+            await self._report("run_failed", err, thread_id=input.thread_id)
             emit(RunErrorEvent(message=RUN_FAILED_MESSAGE, code="run_failed"))
         finally:
             # Release the per-thread gate only after any interrupt above has
@@ -242,18 +250,17 @@ class ManagedAgentsAgent:
                 BEST_EFFORT_SEND_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 - best-effort interrupt
-            self._report("interrupt", exc, session_id=session_id)
+            await self._report("interrupt", exc, session_id=session_id)
 
-    def _report(
+    async def _report(
         self, operation: str, error: BaseException, **ids: Any
     ) -> None:
-        """Report a swallowed failure. A broken hook must not break the run."""
-        if self.on_error is None:
-            return
-        try:
-            self.on_error(error, {"operation": operation, **ids})
-        except Exception:  # noqa: BLE001 - a broken hook is not the run's problem
-            pass
+        """Report a swallowed failure.
+
+        A broken hook must not break the run; an async hook is awaited so its
+        telemetry actually runs. See `report_swallowed_failure`.
+        """
+        await report_swallowed_failure(self.on_error, operation, error, **ids)
 
     async def _run_turn_for_input(
         self, input: RunAgentInput, emit: Emit, state: _RunState

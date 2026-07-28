@@ -8,6 +8,7 @@ import type { AccumulatedEvent } from "@anthropic-ai/sdk/lib/sessions/accumulate
 import { EventType } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { BEST_EFFORT_SEND_TIMEOUT_MS, PARKED_RETRY_DELAYS_MS, TOOL_RESULT_MAX_CHARS } from "./constants";
+import { reportSwallowedFailure } from "./report";
 import { describeToolResult, textOf } from "./text";
 import type { BackendCustomTool, ManagedAgentsErrorHandler } from "./types";
 
@@ -81,14 +82,13 @@ interface Preview {
 export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   const { client, sessionId, emit, signal } = opts;
 
-  /** Report a swallowed failure. A broken hook must never break the turn. */
-  const report = (operation: string, error: unknown) => {
-    try {
-      opts.onError?.(error, { operation, sessionId });
-    } catch {
-      // ignored on purpose
-    }
-  };
+  /**
+   * Report a swallowed failure. A broken hook must never break the turn: see
+   * {@link reportSwallowedFailure}, which absorbs both a synchronous throw and
+   * an async hook's rejection.
+   */
+  const report = (operation: string, error: unknown): Promise<void> =>
+    reportSwallowedFailure(opts.onError, operation, error, { sessionId });
 
   // Open the stream before sending so no early events are missed.
   const stream = await client.beta.sessions.events.stream(
@@ -246,7 +246,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       // The failure itself goes to the hook; the client is told only that the
       // delivery failed. The underlying exception can carry session ids and
       // request detail, and this event is read by the browser.
-      report("post_tool_result", error);
+      await report("post_tool_result", error);
       await interrupt();
       return fail(
         `The result of tool call ${toolUseId} could not be delivered to the session.`,
@@ -311,7 +311,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           } catch (error) {
             // A gapped or out-of-order delta: drop this preview and let the
             // buffered agent.message reconcile against what was emitted.
-            report("accumulate_preview", error);
+            await report("accumulate_preview", error);
             preview.snapshot = undefined;
             break;
           }
@@ -457,7 +457,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
                 { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
               );
             } catch (error) {
-              report("post_tool_confirmation", error);
+              await report("post_tool_confirmation", error);
               await interrupt();
               return fail(
                 "The tool confirmation could not be delivered to the session.",

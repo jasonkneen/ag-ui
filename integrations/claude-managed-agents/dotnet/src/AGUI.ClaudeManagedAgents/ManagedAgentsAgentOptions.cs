@@ -80,8 +80,23 @@ public sealed class ManagedAgentsAgentOptions
     /// Gets or sets the handler notified when a best-effort operation fails (an interrupt that
     /// could not be posted, a tool result that could not be delivered). These failures are
     /// deliberately swallowed — they must not fail the run — but without a handler they are also
-    /// invisible, leaving an operator with a wedged thread and nothing in the logs. Exceptions
-    /// thrown by the handler itself are ignored.
+    /// invisible, leaving an operator with a wedged thread and nothing in the logs.
     /// </summary>
-    public Action<Exception, ManagedAgentsErrorContext>? OnError { get; set; }
+    /// <remarks>
+    /// Returns a <see cref="Task"/> so an asynchronous handler can be awaited. An
+    /// <see cref="Action"/> would have forced <c>async void</c> on anyone doing asynchronous
+    /// telemetry, whose exception escapes to the synchronization context and takes the process
+    /// down — the exact opposite of "a broken handler cannot break the run". A synchronous handler
+    /// returns <see cref="Task.CompletedTask"/>:
+    /// <code>
+    /// OnError = (error, context) =>
+    /// {
+    ///     logger.LogWarning(error, "managed agents: {Operation} failed", context.Operation);
+    ///     return Task.CompletedTask;
+    /// };
+    /// </code>
+    /// Exceptions thrown by the handler — synchronously, or from its task — are ignored, as is a
+    /// <see langword="null"/> return.
+    /// </remarks>
+    public Func<Exception, ManagedAgentsErrorContext, Task>? OnError { get; set; }
 }

@@ -475,7 +475,7 @@ public class ManagedAgentsAgentTest
         var reported = new List<string>();
 
         var events = await CollectAsync(
-            NewAgent(fake, store, o => o.OnError = (_, context) => reported.Add(context.Operation)),
+            NewAgent(fake, store, o => o.OnError = (_, context) => { reported.Add(context.Operation); return Task.CompletedTask; }),
             BaseInput());
 
         var terminal = events.Where(static e => e is RunErrorEvent or RunFinishedEvent).ToList();
@@ -1122,7 +1122,7 @@ public class ManagedAgentsAgentTest
         var reported = new List<(Exception Error, ManagedAgentsErrorContext Context)>();
 
         var events = await CollectAsync(
-            NewAgent(fake, configure: o => o.OnError = (error, context) => reported.Add((error, context))),
+            NewAgent(fake, configure: o => o.OnError = (error, context) => { reported.Add((error, context)); return Task.CompletedTask; }),
             BaseInput());
 
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
@@ -1151,7 +1151,7 @@ public class ManagedAgentsAgentTest
         var events = await CollectAsync(
             NewAgent(fake, configure: o =>
             {
-                o.OnError = (error, _) => reported.Add(error);
+                o.OnError = (error, _) => { reported.Add(error); return Task.CompletedTask; };
                 o.BackendTools.Add(new ManagedAgentsBackendTool
                 {
                     Name = "get_time",
@@ -1187,7 +1187,7 @@ public class ManagedAgentsAgentTest
         using var client = new CancellationTokenSource();
         var agent = NewAgent(fake, configure: options =>
         {
-            options.OnError = (error, context) => reported.Add((error, context));
+            options.OnError = (error, context) => { reported.Add((error, context)); return Task.CompletedTask; };
             options.BackendTools.Add(new ManagedAgentsBackendTool
             {
                 Name = "get_time",
@@ -1230,7 +1230,7 @@ public class ManagedAgentsAgentTest
         using var client = new CancellationTokenSource();
         var agent = NewAgent(fake, configure: options =>
         {
-            options.OnError = (_, context) => reported.Add(context.Operation);
+            options.OnError = (_, context) => { reported.Add(context.Operation); return Task.CompletedTask; };
             options.BackendTools.Add(new ManagedAgentsBackendTool
             {
                 Name = "get_time",
@@ -1270,6 +1270,97 @@ public class ManagedAgentsAgentTest
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var agent = NewAgent(fake, configure: options =>
             options.OnError = (_, _) => throw new InvalidOperationException("handler is broken"));
+
+        var events = await CollectAsync(agent, BaseInput());
+
+        Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
+    }
+
+    [Fact]
+    public async Task ReportingAbandonsAHandlerThatNeverCompletes()
+    {
+        // The shape of an await on a host that blackholes the connection. Callers await this
+        // report before emitting the run's terminal event, so without a bound the run never
+        // terminates and the thread's run gate is never released — every later run on that
+        // thread is refused for the process's lifetime. Without the bound the outer WaitAsync
+        // below throws and the test fails.
+        var called = false;
+        Func<Exception, ManagedAgentsErrorContext, Task> hook = (_, _) =>
+        {
+            called = true;
+            return new TaskCompletionSource().Task; // never completes
+        };
+
+        var report = ManagedAgentsErrorReporter.ReportAsync(
+            hook,
+            "interrupt",
+            new InvalidOperationException("boom"),
+            sessionId: "sesn_1",
+            timeout: TimeSpan.FromMilliseconds(50));
+
+        await report.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(called);
+    }
+
+    [Fact]
+    public async Task AnAsynchronousOnErrorHandlerIsAwaited()
+    {
+        // Regression: OnError was an Action, so anyone doing asynchronous telemetry had to write
+        // async void — whose exception escapes to the synchronization context and takes the process
+        // down, the opposite of "a broken handler cannot break the run". It returns a Task now, so
+        // the handler can be awaited and its failure absorbed.
+        var reported = new List<string>();
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["mystery_1"]}}""",
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new InvalidOperationException("interrupt rejected")
+                : null,
+        };
+
+        var events = await CollectAsync(
+            NewAgent(fake, configure: o => o.OnError = async (_, context) =>
+            {
+                await Task.Yield();
+                reported.Add(context.Operation);
+            }),
+            BaseInput());
+
+        // The run reports the real cause, and the awaited handler has already run by the time the
+        // run ends — no polling needed.
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+        Assert.Contains("interrupt", reported);
+    }
+
+    [Fact]
+    public async Task AnAsynchronousOnErrorHandlerThatFaultsDoesNotBreakTheRun()
+    {
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["mystery_1"]}}""",
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new InvalidOperationException("interrupt rejected")
+                : null,
+        };
+
+        var events = await CollectAsync(
+            NewAgent(fake, configure: o => o.OnError = async (_, _) =>
+            {
+                await Task.Yield();
+                throw new InvalidOperationException("telemetry backend is down");
+            }),
+            BaseInput());
+
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+    }
+
+    [Fact]
+    public async Task AnOnErrorHandlerReturningNullDoesNotBreakTheRun()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var agent = NewAgent(fake, configure: options => options.OnError = (_, _) => null!);
 
         var events = await CollectAsync(agent, BaseInput());
 

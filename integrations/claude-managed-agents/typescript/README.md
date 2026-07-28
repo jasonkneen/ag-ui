@@ -78,6 +78,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `toolConfirmation` | error | `"allow"`/`"deny"` to answer built-in tools whose permission policy asks. |
 | `turnTimeoutMs` | 300000 | Interrupt turns that run longer. |
 | `streamDeltas` | `true` | Request text/thinking previews for token streaming. |
+| `onError` | none | Notified when a best-effort operation fails. May be `async`; its rejection is absorbed, so nothing it does can fail a run. Bounded like any other best-effort call, so a hook that never settles cannot hold a run open. With no hook set, the cause goes to `console.error` instead — never to the client. |
 
 ## Security: authenticate and bind threads to callers
 

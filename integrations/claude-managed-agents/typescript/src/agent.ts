@@ -5,6 +5,7 @@ import { AbstractAgent, EventType } from "@ag-ui/client";
 import type { BaseEvent, Message, RunAgentInput, Tool } from "@ag-ui/client";
 import { Observable } from "rxjs";
 import { BEST_EFFORT_SEND_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS } from "./constants";
+import { reportSwallowedFailure } from "./report";
 import { InMemorySessionStore } from "./sessions";
 import { customToolFrom, customToolsFingerprint, normalizeToolName, type CustomToolParams } from "./tools";
 import { runTurn, type TurnOutcome } from "./turn";
@@ -105,13 +106,20 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return cloned;
   }
 
-  /** Report a swallowed failure. A broken hook must never break the run. */
-  private report(operation: string, error: unknown, ids: { sessionId?: string; threadId?: string } = {}) {
-    try {
-      this.config.onError?.(error, { operation, ...ids });
-    } catch {
-      // ignored on purpose
-    }
+  /**
+   * Report a swallowed failure. A broken hook must never break the run: see
+   * {@link reportSwallowedFailure}, which absorbs both a synchronous throw and
+   * an async hook's rejection.
+   *
+   * Returns a promise a caller on an async path can await, so an async hook's
+   * telemetry is not left racing the end of the run.
+   */
+  private report(
+    operation: string,
+    error: unknown,
+    ids: { sessionId?: string; threadId?: string } = {},
+  ): Promise<void> {
+    return reportSwallowedFailure(this.config.onError, operation, error, ids);
   }
 
   public abortRun() {
@@ -148,12 +156,13 @@ export class ManagedAgentsAgent extends AbstractAgent {
       };
 
       this.runTurnForInput(input, emit, signal)
-        .catch((err) => {
+        .catch(async (err) => {
           if (disconnect.signal.aborted) {
             // The client went away, so there is nobody to emit to — but the run
             // may have failed for a reason worth knowing about, and this is its
-            // only trace.
-            this.report("run_after_disconnect", err, { threadId: input.threadId });
+            // only trace. Awaited so an async hook's telemetry is not left
+            // racing the run's completion.
+            await this.report("run_after_disconnect", err, { threadId: input.threadId });
             return;
           }
           if (timeout.aborted) {
@@ -161,7 +170,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
             return;
           }
           // Detail to the hook, not to the client: see RUN_FAILED_MESSAGE.
-          this.report("run_failed", err, { threadId: input.threadId });
+          await this.report("run_failed", err, { threadId: input.threadId });
           emit(runError(RUN_FAILED_MESSAGE, "run_failed"));
         })
         .finally(() => subscriber.complete());

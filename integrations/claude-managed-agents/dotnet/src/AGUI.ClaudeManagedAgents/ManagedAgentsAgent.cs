@@ -108,10 +108,10 @@ public sealed class ManagedAgentsAgent
                 {
                     if (evt is RunErrorEvent dropped)
                     {
-                        Report(
+                        await ReportAsync(
                             "dropped_terminal_event",
                             new InvalidOperationException(dropped.Message),
-                            threadId: input.ThreadId);
+                            threadId: input.ThreadId).ConfigureAwait(false);
                     }
 
                     continue;
@@ -213,7 +213,7 @@ public sealed class ManagedAgentsAgent
                 catch (Exception ex)
                 {
                     // Detail to the hook, not to the client: see RunFailedMessage.
-                    Report("run_failed", ex, run.SessionId, threadId);
+                    await ReportAsync("run_failed", ex, run.SessionId, threadId).ConfigureAwait(false);
                     errorEvent = new RunErrorEvent { Message = RunFailedMessage, Code = "run_failed" };
                     break;
                 }
@@ -579,20 +579,13 @@ public sealed class ManagedAgentsAgent
     }
 
     /// <summary>
-    /// Reports a swallowed failure. A broken handler must never break the run.
+    /// Reports a swallowed failure. A broken handler must never break the run, and an asynchronous
+    /// one is awaited so its telemetry is not left racing the end of the run. See
+    /// <see cref="ManagedAgentsErrorReporter"/>.
     /// </summary>
-    private void Report(string operation, Exception error, string? sessionId = null, string? threadId = null)
+    private Task ReportAsync(string operation, Exception error, string? sessionId = null, string? threadId = null)
     {
-        try
-        {
-            _options.OnError?.Invoke(
-                error,
-                new ManagedAgentsErrorContext { Operation = operation, SessionId = sessionId, ThreadId = threadId });
-        }
-        catch (Exception)
-        {
-            // ignored on purpose
-        }
+        return ManagedAgentsErrorReporter.ReportAsync(_options.OnError, operation, error, sessionId, threadId);
     }
 
     private async Task InterruptAsync(string? sessionId)
@@ -614,7 +607,7 @@ public sealed class ManagedAgentsAgent
         catch (Exception ex)
         {
             // Best effort (including the send's own timeout): the run is already ending.
-            Report("interrupt", ex, sessionId);
+            await ReportAsync("interrupt", ex, sessionId).ConfigureAwait(false);
         }
     }
 

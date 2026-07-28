@@ -104,6 +104,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `ToolConfirmation` | error | `ToolConfirmationPolicy.Allow`/`Deny` to answer built-in tools whose permission policy asks. |
 | `TurnTimeout` | 5 minutes | Interrupt turns that run longer. |
 | `StreamDeltas` | `true` | Request text and thinking previews for token streaming. |
+| `OnError` | none | Notified when a best-effort operation fails. Returns a `Task` so an async handler is awaited rather than `async void`; its failure is absorbed. Bounded like any other best-effort call, so a handler that never completes cannot hold a run open. With no handler set, the cause goes to `Console.Error` instead — never to the client. |
 
 ## Security: authenticate and bind threads to callers
 

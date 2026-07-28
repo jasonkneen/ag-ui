@@ -86,6 +86,7 @@ The handler may be a plain function or a coroutine. A plain function runs in a w
 | `tool_confirmation` | `None` | `"allow"`/`"deny"` answers built-in tools whose permission policy asks. With no policy, such a call interrupts the run with a `tool_confirmation_required` error. |
 | `turn_timeout_s` | 300 | Interrupt turns that run longer. |
 | `stream_deltas` | `True` | Request text/thinking previews for token streaming. |
+| `on_error` | `None` | Notified when a best-effort operation fails. May be a coroutine function; it is awaited and its failure absorbed, so nothing it does can fail a run. Bounded like any other best-effort call, so a hook that never settles cannot hold a run open. With no hook set, the cause is logged to the `ag_ui_claude_managed_agents` logger instead — never sent to the client. |
 
 ## Security: authenticate and bind threads to callers
 

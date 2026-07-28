@@ -518,7 +518,7 @@ describe("ManagedAgentsAgent", () => {
     const errors: { operation: string }[] = [];
 
     const events = await collect(
-      newAgent(fake, failing, { onError: (_error, context) => errors.push(context) }),
+      newAgent(fake, failing, { onError: (_error, context) => void errors.push(context) }),
       baseInput(),
     );
 
@@ -1069,7 +1069,7 @@ describe("ManagedAgentsAgent", () => {
     const reported: { error: unknown; context: { operation: string; threadId?: string } }[] = [];
 
     const events = await collect(
-      newAgent(fake, undefined, { onError: (error, context) => reported.push({ error, context }) }),
+      newAgent(fake, undefined, { onError: (error, context) => void reported.push({ error, context }) }),
       baseInput(),
     );
 
@@ -1099,7 +1099,7 @@ describe("ManagedAgentsAgent", () => {
     ];
 
     const events = await collect(
-      newAgent(fake, undefined, { backendTools, onError: (error) => reported.push(error) }),
+      newAgent(fake, undefined, { backendTools, onError: (error) => void reported.push(error) }),
       baseInput(),
     );
 

@@ -27,9 +27,15 @@ export type ManagedAgentsErrorContext = {
  * Notified when a best-effort operation fails. These failures are deliberately
  * swallowed — they must not fail the run — but without a hook they are also
  * invisible, leaving an operator with a wedged thread and nothing in the logs.
- * Exceptions thrown by the hook itself are ignored.
+ *
+ * May be `async`: the returned promise is awaited where the caller is already
+ * awaiting, and its rejection is absorbed either way. A synchronous throw is
+ * absorbed too. Nothing the hook does can fail a run.
  */
-export type ManagedAgentsErrorHandler = (error: unknown, context: ManagedAgentsErrorContext) => void;
+export type ManagedAgentsErrorHandler = (
+  error: unknown,
+  context: ManagedAgentsErrorContext,
+) => void | Promise<void>;
 
 /** Persistent mapping between an AG-UI thread and a managed session. */
 export interface SessionRecord {

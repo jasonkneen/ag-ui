@@ -30,7 +30,7 @@ internal sealed class ManagedAgentsTurn
     private readonly Func<Task>? _onResultsSent;
     private readonly Func<Task>? _onFollowUpsSent;
     private readonly Func<string, Task>? _onClientPark;
-    private readonly Action<Exception, ManagedAgentsErrorContext>? _onError;
+    private readonly Func<Exception, ManagedAgentsErrorContext, Task>? _onError;
 
     private readonly Queue<BaseEvent> _pending = new();
     private readonly Dictionary<string, StringBuilder> _previews = new(StringComparer.Ordinal);
@@ -77,7 +77,7 @@ internal sealed class ManagedAgentsTurn
         Func<Task>? onResultsSent = null,
         Func<Task>? onFollowUpsSent = null,
         Func<string, Task>? onClientPark = null,
-        Action<Exception, ManagedAgentsErrorContext>? onError = null)
+        Func<Exception, ManagedAgentsErrorContext, Task>? onError = null)
     {
         _client = client;
         _sessionId = sessionId;
@@ -93,18 +93,21 @@ internal sealed class ManagedAgentsTurn
     }
 
     /// <summary>
-    /// Reports a swallowed failure. A broken handler must never break the turn.
+    /// Reports a swallowed failure. A broken handler must never break the turn, and an asynchronous
+    /// one is awaited so its telemetry is not left racing the end of the turn. See
+    /// <see cref="ManagedAgentsErrorReporter"/>.
     /// </summary>
-    private void Report(string operation, Exception error)
+    private Task ReportAsync(string operation, Exception error)
     {
-        try
-        {
-            _onError?.Invoke(error, new ManagedAgentsErrorContext { Operation = operation, SessionId = _sessionId });
-        }
-        catch (Exception)
-        {
-            // ignored on purpose
-        }
+        return ManagedAgentsErrorReporter.ReportAsync(_onError, operation, error, _sessionId);
+    }
+
+    /// <summary>
+    /// <see cref="ReportAsync"/> from a callback that cannot await, such as a task continuation.
+    /// </summary>
+    private void ReportDetached(string operation, Exception error)
+    {
+        ManagedAgentsErrorReporter.ReportDetached(_onError, operation, error, _sessionId);
     }
 
     /// <summary>
@@ -522,7 +525,7 @@ internal sealed class ManagedAgentsTurn
                     {
                         if (t.Exception is { } failure)
                         {
-                            Report("abandoned_backend_tool", failure.GetBaseException());
+                            ReportDetached("abandoned_backend_tool", failure.GetBaseException());
                         }
                     },
                     CancellationToken.None,
@@ -545,7 +548,7 @@ internal sealed class ManagedAgentsTurn
                 catch (Exception postFailure)
                 {
                     // Best-effort: the run is already being torn down.
-                    Report("post_interrupted_tool_result", postFailure);
+                    await ReportAsync("post_interrupted_tool_result", postFailure).ConfigureAwait(false);
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 throw;
@@ -592,7 +595,7 @@ internal sealed class ManagedAgentsTurn
             // The failure itself goes to the hook; the client is told only that the delivery
             // failed. The underlying exception can carry session ids and request detail, and this
             // event is read by the browser.
-            Report("post_tool_result", ex);
+            await ReportAsync("post_tool_result", ex).ConfigureAwait(false);
             await InterruptAsync().ConfigureAwait(false);
             Fail(
                 $"The result of tool call {toolUseId} could not be delivered to the session.",
@@ -680,7 +683,7 @@ internal sealed class ManagedAgentsTurn
             }
             catch (Exception ex)
             {
-                Report("post_tool_confirmation", ex);
+                await ReportAsync("post_tool_confirmation", ex).ConfigureAwait(false);
                 await InterruptAsync().ConfigureAwait(false);
                 Fail(
                     "The tool confirmation could not be delivered to the session.",
@@ -736,7 +739,7 @@ internal sealed class ManagedAgentsTurn
             // not observe the run's token, so an OperationCanceledException here is the HTTP
             // client's own timeout — letting it escape would replace the real cause (a tool
             // confirmation the caller cannot answer, an unsupported action) with run_failed.
-            Report("interrupt", ex);
+            await ReportAsync("interrupt", ex).ConfigureAwait(false);
         }
     }
 

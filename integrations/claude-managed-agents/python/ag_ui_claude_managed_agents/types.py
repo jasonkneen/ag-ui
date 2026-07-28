@@ -22,14 +22,18 @@ class BackendTool:
     handler: Callable[[Any], Awaitable[str] | str]
 
 
-ErrorHandler = Callable[[BaseException, dict[str, Any]], None]
+ErrorHandler = Callable[[BaseException, dict[str, Any]], Awaitable[None] | None]
 """Notified when a best-effort operation fails.
 
 These failures are deliberately swallowed — they must not fail the run — but
 without a hook they are also invisible, leaving an operator with a wedged
 thread and nothing in the logs. Receives the exception and a context dict
 carrying at least ``operation``, plus ``session_id``/``thread_id`` when known.
-Exceptions raised by the handler itself are ignored.
+
+May be a coroutine function: the awaitable it returns is awaited, so async
+telemetry actually runs rather than being dropped as a never-awaited coroutine.
+Exceptions raised by the handler — synchronously or from its awaitable — are
+ignored. Nothing the handler does can fail a run.
 """
 
 
