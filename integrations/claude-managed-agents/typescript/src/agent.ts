@@ -191,6 +191,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
     // `tools` must read as an empty run, not a TypeError.
     input = { ...input, messages: input.messages ?? [], tools: input.tools ?? [] };
     const { threadId, runId } = input;
+    let record: SessionRecord | undefined;
     // One key for the session store and the busy-run gate, so a stored session
     // and the gate that serializes access to it can never disagree.
     const key = this.sessionKey(threadId);
@@ -219,15 +220,17 @@ export class ManagedAgentsAgent extends AbstractAgent {
     }
     this.busyThreads.add(key);
     try {
-      const record = await this.getOrCreateSession(key, threadId, input, emit, signal);
+      record = await this.getOrCreateSession(key, threadId, input, emit, signal);
       if (!record) {
         emit(runError("There is nothing to send: a tool result arrived for a thread with no session.", "tool_result_without_session"));
         return;
       }
-      sessionId = record.sessionId;
-      await this.syncClientTools(record, input.tools, signal);
+      // A local the closures below can close over without re-narrowing.
+      const session = record;
+      sessionId = session.sessionId;
+      await this.syncClientTools(session, input.tools, signal);
 
-      const outbound = this.outboundEvents(record, input.messages);
+      const outbound = this.outboundEvents(session, input.messages);
       if (outbound.events.length === 0) {
         emit(runError("There is nothing new to send: no user message or tool result in this run.", "nothing_to_send"));
         return;
@@ -236,9 +239,9 @@ export class ManagedAgentsAgent extends AbstractAgent {
       // Some parked tool calls are still unanswered: post what we have and
       // stay parked instead of waiting on a session that will not resume.
       if (outbound.stillParked.length > 0) {
-        await this.client.beta.sessions.events.send(record.sessionId, { events: outbound.events }, { signal });
-        record.pendingClientToolUseIds = outbound.stillParked;
-        record.lastUserMessageId = outbound.lastUserMessageId ?? record.lastUserMessageId;
+        await this.client.beta.sessions.events.send(session.sessionId, { events: outbound.events }, { signal });
+        session.pendingClientToolUseIds = outbound.stillParked;
+        session.lastUserMessageId = outbound.lastUserMessageId ?? session.lastUserMessageId;
         await this.store.set(key, record);
         emit({ type: EventType.RUN_FINISHED, threadId, runId } as BaseEvent);
         return;
@@ -246,26 +249,26 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
       const outcome = await runTurn({
         client: this.client,
-        sessionId: record.sessionId,
+        sessionId: session.sessionId,
         outbound: outbound.events,
         // Persist each delivery as soon as it lands, so a failure or
         // interruption later in the turn does not re-post it next run: the
         // tool results resume the session even if the follow-ups then fail.
         onResultsSent: async () => {
-          record.pendingClientToolUseIds = [];
-          await this.store.set(key, record);
+          session.pendingClientToolUseIds = [];
+          await this.store.set(key, session);
         },
         onFollowUpsSent: async () => {
-          if (outbound.lastUserMessageId) record.lastUserMessageId = outbound.lastUserMessageId;
-          await this.store.set(key, record);
+          if (outbound.lastUserMessageId) session.lastUserMessageId = outbound.lastUserMessageId;
+          await this.store.set(key, session);
         },
         // Persist a park the moment the call is handed to the UI. A later
         // event can fail the turn before the session confirms the park, and
         // the remote session would then wait on an ID nothing remembers.
         onClientPark: async (toolUseId) => {
-          if (record.pendingClientToolUseIds.includes(toolUseId)) return;
-          record.pendingClientToolUseIds = [...record.pendingClientToolUseIds, toolUseId];
-          await this.store.set(key, record);
+          if (session.pendingClientToolUseIds.includes(toolUseId)) return;
+          session.pendingClientToolUseIds = [...session.pendingClientToolUseIds, toolUseId];
+          await this.store.set(key, session);
         },
         clientTools: new Map((input.tools ?? []).map((tool) => [normalizeToolName(tool.name), tool.name])),
         backendTools: this.backendTools,
@@ -276,7 +279,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
         signal,
       });
 
-      await this.recordOutcome(key, record, outcome);
+      await this.recordOutcome(key, session, outcome);
       if (outcome.status !== "errored") {
         emit({ type: EventType.RUN_FINISHED, threadId, runId } as BaseEvent);
       }
@@ -284,13 +287,41 @@ export class ManagedAgentsAgent extends AbstractAgent {
       // Interrupt the session while the busy gate is still held, so a user
       // who resends right away is not interrupted by this run's teardown.
       if (signal.aborted && sessionId) {
-        await this.client.beta.sessions.events
+        const interrupted = await this.client.beta.sessions.events
           .send(sessionId, { events: [{ type: "user.interrupt" }] }, { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) })
-          .catch((error: unknown) => this.report("interrupt", error, { sessionId, threadId }));
+          .then(() => true)
+          .catch(async (error: unknown) => {
+            await this.report("interrupt", error, { sessionId, threadId });
+            return false;
+          });
+        // A thrown turn never reaches recordOutcome, so reconcile here: the
+        // landed interrupt cancelled the wait, and a park recorded during this
+        // turn would otherwise be answered against a call that no longer exists.
+        if (interrupted && record) await this.forgetParkedCalls(key, record, { sessionId, threadId });
       }
       throw err;
     } finally {
       this.busyThreads.delete(key);
+    }
+  }
+
+  /**
+   * Drop the parked tool calls recorded for this thread, because the session was
+   * interrupted and will never answer them. Best-effort: the run is already
+   * ending, and a store that refuses the write must not replace the error that
+   * got us here.
+   */
+  private async forgetParkedCalls(
+    key: string,
+    record: SessionRecord,
+    ids: { sessionId?: string; threadId?: string } = {},
+  ): Promise<void> {
+    if (record.pendingClientToolUseIds.length === 0) return;
+    record.pendingClientToolUseIds = [];
+    try {
+      await this.store.set(key, record);
+    } catch (error) {
+      await this.report("forget_parked_calls", error, ids);
     }
   }
 
@@ -333,6 +364,10 @@ export class ManagedAgentsAgent extends AbstractAgent {
   private async recordOutcome(key: string, record: SessionRecord, outcome: TurnOutcome): Promise<void> {
     if (outcome.status === "errored") {
       if (outcome.sessionEnded) await this.store.delete(key);
+      // An interrupt that landed cancelled whatever the session was waiting on,
+      // so a park recorded during this turn is no longer answerable: posting a
+      // result for it next run is rejected as stale and wedges the thread.
+      else if (outcome.sessionInterrupted) await this.forgetParkedCalls(key, record);
       return;
     }
     if (outcome.status === "parked") {

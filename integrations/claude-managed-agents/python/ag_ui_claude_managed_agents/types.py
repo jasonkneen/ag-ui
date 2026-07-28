@@ -92,3 +92,9 @@ class TurnOutcome:
     status: TurnStatus
     client_tool_use_ids: list[str] = field(default_factory=list)
     session_ended: bool = False
+    session_interrupted: bool = False
+    """Whether a `user.interrupt` reached the session.
+
+    It cancels whatever the session was waiting on, so any park recorded during
+    this turn is no longer answerable and must not be carried into the next run.
+    """

@@ -596,10 +596,11 @@ internal sealed class ManagedAgentsTurn
             // failed. The underlying exception can carry session ids and request detail, and this
             // event is read by the browser.
             await ReportAsync("post_tool_result", ex).ConfigureAwait(false);
-            await InterruptAsync().ConfigureAwait(false);
+            var interrupted = await InterruptAsync().ConfigureAwait(false);
             Fail(
                 $"The result of tool call {toolUseId} could not be delivered to the session.",
-                "tool_result_delivery_failed");
+                "tool_result_delivery_failed",
+                interrupted);
             return;
         }
 
@@ -640,11 +641,12 @@ internal sealed class ManagedAgentsTurn
             // A stop reason this version does not know how to answer. Ignoring it left the turn
             // waiting on a session that will never resume until the timeout fired, so interrupt it
             // and say so — the same as the other two ports.
-            await InterruptAsync().ConfigureAwait(false);
+            var interrupted = await InterruptAsync().ConfigureAwait(false);
             Fail(
                 "The session went idle for a reason this integration does not handle: "
                     + (StringPropertyOf(stopReason.Json, "type") ?? "unknown") + ".",
-                "unknown_stop_reason");
+                "unknown_stop_reason",
+                interrupted);
             return;
         }
 
@@ -660,11 +662,12 @@ internal sealed class ManagedAgentsTurn
         {
             if (_toolConfirmation is null)
             {
-                await InterruptAsync().ConfigureAwait(false);
+                var interrupted = await InterruptAsync().ConfigureAwait(false);
                 Fail(
                     "A tool requires confirmation but no confirmation policy is configured. " +
                     "Set `ToolConfirmation` to \"allow\" or \"deny\", or use a permission policy that does not ask.",
-                    "tool_confirmation_required");
+                    "tool_confirmation_required",
+                    interrupted);
                 return;
             }
 
@@ -684,10 +687,11 @@ internal sealed class ManagedAgentsTurn
             catch (Exception ex)
             {
                 await ReportAsync("post_tool_confirmation", ex).ConfigureAwait(false);
-                await InterruptAsync().ConfigureAwait(false);
+                var confirmationInterrupted = await InterruptAsync().ConfigureAwait(false);
                 Fail(
                     "The tool confirmation could not be delivered to the session.",
-                    "tool_confirmation_delivery_failed");
+                    "tool_confirmation_delivery_failed",
+                    confirmationInterrupted);
                 return;
             }
 
@@ -706,8 +710,11 @@ internal sealed class ManagedAgentsTurn
         var unknown = blockedOn.Where(id => !_askedConfirmations.Contains(id) && !_clientParks.Contains(id)).ToList();
         if (unknown.Count > 0)
         {
-            await InterruptAsync().ConfigureAwait(false);
-            Fail("The agent is waiting on an action this integration cannot answer.", "unsupported_action");
+            var unknownInterrupted = await InterruptAsync().ConfigureAwait(false);
+            Fail(
+                "The agent is waiting on an action this integration cannot answer.",
+                "unsupported_action",
+                unknownInterrupted);
             return;
         }
 
@@ -724,7 +731,7 @@ internal sealed class ManagedAgentsTurn
     /// is to reach a session the run is walking away from — but bounded by its own timeout so a
     /// stalled connection cannot hold the thread's run gate open indefinitely.
     /// </summary>
-    private async Task InterruptAsync()
+    private async Task<bool> InterruptAsync()
     {
         try
         {
@@ -740,7 +747,10 @@ internal sealed class ManagedAgentsTurn
             // client's own timeout — letting it escape would replace the real cause (a tool
             // confirmation the caller cannot answer, an unsupported action) with run_failed.
             await ReportAsync("interrupt", ex).ConfigureAwait(false);
+            return false;
         }
+
+        return true;
     }
 
     private void EmitToolCall(string toolCallId, string toolCallName, string inputJson)
@@ -761,11 +771,16 @@ internal sealed class ManagedAgentsTurn
         });
     }
 
-    private void Fail(string message, string? code = null)
+    /// <summary>
+    /// Ends the turn with a <c>RUN_ERROR</c>. <paramref name="sessionInterrupted"/> must be the
+    /// result of the <see cref="InterruptAsync"/> that preceded it: a landed interrupt invalidates
+    /// every park recorded this turn, and a failed one leaves the session parked.
+    /// </summary>
+    private void Fail(string message, string? code = null, bool sessionInterrupted = false)
     {
         CloseAll();
         Emit(new RunErrorEvent { Message = message, Code = code });
-        Finish(ManagedAgentsTurnOutcome.Errored);
+        Finish(ManagedAgentsTurnOutcome.ErroredWith(sessionInterrupted));
     }
 
     private void Finish(ManagedAgentsTurnOutcome outcome)

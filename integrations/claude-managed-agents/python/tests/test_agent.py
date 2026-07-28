@@ -1077,6 +1077,88 @@ async def test_keeps_a_parked_tool_id_when_the_stream_raises_after_the_park():
     assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
 
 
+PARKED_THEN_UNKNOWN_ACTION = [
+    PARKING_CALL,
+    {
+        "type": "session.status_idle",
+        "id": "idle_1",
+        "stop_reason": {"type": "requires_action", "event_ids": ["ctu_1", "mystery_1"]},
+    },
+]
+
+
+async def test_forgets_a_parked_call_once_the_turns_interrupt_has_landed():
+    """Regression: the park is persisted the moment the call is handed over, then
+    the turn interrupts the session and fails. The interrupt cancels the wait, so
+    answering that id on the next run is rejected as stale and wedges the thread
+    -- it must not survive."""
+    fake = FakeClient(streams=[PARKED_THEN_UNKNOWN_ACTION])
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store), base_input(tools=[SHOW_CHART_TOOL])
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "unsupported_action"
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
+
+
+async def test_keeps_a_parked_call_when_the_turns_interrupt_could_not_be_delivered():
+    """The mirror image: nothing reached the session, so it may still be parked
+    and the id is still the only way to answer it."""
+    fake = FakeClient(
+        streams=[PARKED_THEN_UNKNOWN_ACTION],
+        # Send 0 is the user message; send 1 is the interrupt.
+        send_failures={1: RuntimeError("interrupt rejected")},
+    )
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store), base_input(tools=[SHOW_CHART_TOOL])
+    )
+
+    assert events[-1].code == "unsupported_action"
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
+
+
+async def test_forgets_a_parked_call_once_the_teardown_interrupt_has_landed():
+    """A timed-out turn never reaches _record_outcome, so the teardown path has
+    to reconcile the record itself."""
+    fake = FakeClient(streams=[[PARKING_CALL, asyncio.Event()]])
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store, turn_timeout_s=0.05),
+        base_input(tools=[SHOW_CHART_TOOL]),
+    )
+
+    assert events[-1].code == "turn_timeout"
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
+
+
+async def test_keeps_a_parked_call_when_the_teardown_interrupt_could_not_be_delivered():
+    fake = FakeClient(
+        streams=[[PARKING_CALL, asyncio.Event()]],
+        send_failures={1: RuntimeError("interrupt rejected")},
+    )
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store, turn_timeout_s=0.05),
+        base_input(tools=[SHOW_CHART_TOOL]),
+    )
+
+    assert events[-1].code == "turn_timeout"
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
+
+
 async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn():
     """Defensive: end_turn means nothing is awaited, so no pending id may
     survive into the next run and be answered against a resumed session."""

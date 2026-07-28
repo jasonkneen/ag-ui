@@ -196,7 +196,13 @@ public sealed class ManagedAgentsAgent
                 catch (OperationCanceledException) when (linked.IsCancellationRequested)
                 {
                     // Interrupt the session so it does not keep working on a turn nobody hears.
-                    await InterruptAsync(run.SessionId).ConfigureAwait(false);
+                    // A cancelled turn never reaches RecordOutcomeAsync, so reconcile here: the
+                    // landed interrupt cancelled the wait, and a park recorded during this turn
+                    // would otherwise be answered against a call that no longer exists.
+                    if (await InterruptAsync(run.SessionId).ConfigureAwait(false))
+                    {
+                        await ForgetParkedCallsAsync(run).ConfigureAwait(false);
+                    }
                     if (cancellationToken.IsCancellationRequested)
                     {
                         // The client went away; there is nobody left to tell.
@@ -274,6 +280,8 @@ public sealed class ManagedAgentsAgent
         }
 
         run.SessionId = record.SessionId;
+        run.Record = record;
+        run.ThreadKey = threadKey;
         await SyncClientToolsAsync(record, input.Tools, cancellationToken).ConfigureAwait(false);
 
         var outbound = OutboundEvents(record, messages);
@@ -375,6 +383,14 @@ public sealed class ManagedAgentsAgent
             {
                 await _store.DeleteAsync(threadKey, CancellationToken.None).ConfigureAwait(false);
             }
+            else if (outcome.SessionInterrupted && record.PendingClientToolUseIds.Count > 0)
+            {
+                // An interrupt that landed cancelled whatever the session was waiting on, so a
+                // park recorded during this turn is no longer answerable: posting a result for it
+                // next run is rejected as stale and wedges the thread.
+                record.PendingClientToolUseIds = [];
+                await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
+            }
 
             return;
         }
@@ -394,7 +410,7 @@ public sealed class ManagedAgentsAgent
         }
     }
 
-/// <summary>
+    /// <summary>
     /// The key that identifies a thread's state, in the session store and the busy-run gate alike,
     /// so two agents sharing one store neither adopt each other's sessions nor serialize against
     /// each other's threads.
@@ -402,10 +418,11 @@ public sealed class ManagedAgentsAgent
     /// <remarks>
     /// Every field baked into the remote session at creation is part of the key: none of them can
     /// be re-checked or changed on resume, so an agent must never inherit a session created with a
-    /// different environment, pinned version or vault set. Each is length-prefixed so no two combinations can
-    /// collide — plain concatenation would let a <c>ManagedAgentId</c> of <c>support:beta</c> with
-    /// thread <c>t1</c> and one of <c>support</c> with thread <c>beta:t1</c> share one record. The
-    /// thread id is last, so it needs no prefix and may contain anything.
+    /// different environment, pinned version or vault set. Each is length-prefixed so no two
+    /// combinations can collide — plain concatenation would let a <c>ManagedAgentId</c> of
+    /// <c>support:beta</c> with thread <c>t1</c> and one of <c>support</c> with thread
+    /// <c>beta:t1</c> share one record. The thread id is last, so it needs no prefix and may
+    /// contain anything.
     /// </remarks>
     private string SessionKey(string threadId)
     {
@@ -420,7 +437,35 @@ public sealed class ManagedAgentsAgent
             + threadId;
     }
 
-        /// <summary>
+    /// <summary>
+    /// Drops the parked tool calls recorded for this thread, because the session was interrupted
+    /// and will never answer them. Best-effort: the run is already ending, and a store that
+    /// refuses the write must not replace the error that got us here.
+    /// </summary>
+    private async Task ForgetParkedCallsAsync(RunContext run)
+    {
+        if (run.Record is not { } record || run.ThreadKey is not { } threadKey)
+        {
+            return;
+        }
+
+        if (record.PendingClientToolUseIds.Count == 0)
+        {
+            return;
+        }
+
+        record.PendingClientToolUseIds = [];
+        try
+        {
+            await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await ReportAsync("forget_parked_calls", ex, run.SessionId).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// Stores the record after its events were delivered to the session. Non-cancellable: a
     /// skipped write would make the next run re-post the same message and stale tool results.
     /// </summary>
@@ -588,11 +633,12 @@ public sealed class ManagedAgentsAgent
         return ManagedAgentsErrorReporter.ReportAsync(_options.OnError, operation, error, sessionId, threadId);
     }
 
-    private async Task InterruptAsync(string? sessionId)
+    /// <summary>Stops the session best-effort, reporting whether it landed.</summary>
+    private async Task<bool> InterruptAsync(string? sessionId)
     {
         if (sessionId is null)
         {
-            return;
+            return false;
         }
 
         try
@@ -608,7 +654,10 @@ public sealed class ManagedAgentsAgent
         {
             // Best effort (including the send's own timeout): the run is already ending.
             await ReportAsync("interrupt", ex, sessionId).ConfigureAwait(false);
+            return false;
         }
+
+        return true;
     }
 
     /// <summary>A tool message's payload: its content plus any error text, matching the other ports.</summary>
@@ -649,6 +698,11 @@ public sealed class ManagedAgentsAgent
         internal string? SessionId { get; set; }
 
         internal ManagedAgentsTurn? Turn { get; set; }
+
+        /// <summary>This thread's record, so teardown can reconcile it after an interrupt.</summary>
+        internal ManagedAgentsSessionRecord? Record { get; set; }
+
+        internal string? ThreadKey { get; set; }
     }
 
     private sealed class OutboundEventSet

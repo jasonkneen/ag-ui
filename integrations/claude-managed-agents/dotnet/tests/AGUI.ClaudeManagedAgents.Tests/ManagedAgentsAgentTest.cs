@@ -621,6 +621,87 @@ public class ManagedAgentsAgentTest
         Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
     }
 
+    private static readonly string[] s_parkedThenUnknownAction =
+    [
+        ParkingCall,
+        """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["ctu_1","mystery_1"]}}""",
+    ];
+
+    [Fact]
+    public async Task ForgetsAParkedCallOnceTheTurnsInterruptHasLanded()
+    {
+        // Regression: the park is persisted the moment the call is handed over, then the turn
+        // interrupts the session and fails. The interrupt cancels the wait, so answering that id on
+        // the next run is rejected as stale and wedges the thread — it must not survive.
+        var fake = new FakeManagedAgentsClient(s_parkedThenUnknownAction);
+        var store = new RecordingSessionStore();
+
+        var events = await CollectAsync(
+            NewAgent(fake, store),
+            BaseInput(input => input.Tools = [ShowChartTool()]));
+
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+        Assert.Contains("user.interrupt", fake.SentTypes);
+        var record = await store.GetAsync(SessionKey, default);
+        Assert.Empty(record!.PendingClientToolUseIds);
+    }
+
+    [Fact]
+    public async Task KeepsAParkedCallWhenTheTurnsInterruptCouldNotBeDelivered()
+    {
+        // The mirror image: nothing reached the session, so it may still be parked and the id is
+        // still the only way to answer it.
+        var fake = new FakeManagedAgentsClient(s_parkedThenUnknownAction)
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new InvalidOperationException("interrupt rejected")
+                : null,
+        };
+        var store = new RecordingSessionStore();
+
+        var events = await CollectAsync(
+            NewAgent(fake, store),
+            BaseInput(input => input.Tools = [ShowChartTool()]));
+
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(events[^1]).Code);
+        var record = await store.GetAsync(SessionKey, default);
+        Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
+    }
+
+    [Fact]
+    public async Task ForgetsAParkedCallOnceTheTeardownInterruptHasLanded()
+    {
+        // A cancelled turn never reaches RecordOutcomeAsync, so the teardown path has to reconcile
+        // the record itself.
+        var fake = new FakeManagedAgentsClient([ParkingCall]);
+        var store = new RecordingSessionStore();
+        using var client = new CancellationTokenSource();
+        var agent = NewAgent(fake, store);
+
+        // Cancel once the park has been recorded, so the turn unwinds mid-flight.
+        var events = new List<BaseEvent>();
+        try
+        {
+            await foreach (var evt in agent.RunAsync(
+                BaseInput(input => input.Tools = [ShowChartTool()]), client.Token))
+            {
+                events.Add(evt);
+                if (evt is ToolCallEndEvent)
+                {
+                    await client.CancelAsync();
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected: the caller left
+        }
+
+        Assert.Contains("user.interrupt", fake.SentTypes);
+        var record = await store.GetAsync(SessionKey, default);
+        Assert.Empty(record!.PendingClientToolUseIds);
+    }
+
     [Fact]
     public async Task ClearsAStaleParkedIdWhenTheSessionGoesIdleOnEndTurn()
     {

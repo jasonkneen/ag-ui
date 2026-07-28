@@ -72,6 +72,9 @@ class _RunState:
     """The busy-thread gate this run holds, released when the run unwinds."""
     terminated: bool = False
     """Whether a terminal event (RUN_ERROR or RUN_FINISHED) was already emitted."""
+    record: SessionRecord | None = None
+    """This thread's record, so teardown can reconcile it after an interrupt."""
+    store_key: str | None = None
 
 
 class ManagedAgentsAgent:
@@ -206,7 +209,8 @@ class ManagedAgentsAgent:
                     )
                 )
                 return
-            await self._interrupt(state.session_id)
+            if await self._interrupt(state.session_id):
+                await self._forget_parked_calls(state)
             emit(
                 RunErrorEvent(
                     message=(
@@ -221,7 +225,8 @@ class ManagedAgentsAgent:
             # left to tell. This runs before the busy gate is released (see
             # `finally`), so a user who resends right away is not interrupted
             # by this late stop.
-            await self._interrupt(state.session_id)
+            if await self._interrupt(state.session_id):
+                await self._forget_parked_calls(state)
             raise
         except Exception as err:  # noqa: BLE001 - surfaced to the client as RUN_ERROR
             # Detail to the hook, not to the client: see RUN_FAILED_MESSAGE.
@@ -237,9 +242,10 @@ class ManagedAgentsAgent:
                     if not busy:
                         del ManagedAgentsAgent._busy_threads[id(self.store)]
 
-    async def _interrupt(self, session_id: str | None) -> None:
+    async def _interrupt(self, session_id: str | None) -> bool:
+        """Stop the session best-effort, reporting whether it landed."""
         if not session_id:
-            return
+            return False
         try:
             # Bounded: this runs while the busy gate is still held, so a
             # stalled send must not block the thread's later runs.
@@ -251,6 +257,30 @@ class ManagedAgentsAgent:
             )
         except Exception as exc:  # noqa: BLE001 - best-effort interrupt
             await self._report("interrupt", exc, session_id=session_id)
+            return False
+        return True
+
+    async def _forget_parked_calls(self, state: _RunState) -> None:
+        """Drop the parked tool calls recorded for this thread, because the
+        session was interrupted and will never answer them.
+
+        A thrown or timed-out turn never reaches `_record_outcome`, so the
+        teardown paths reconcile here. Best-effort: the run is already ending,
+        and a store that refuses the write must not replace the error that got
+        us here.
+        """
+        record, store_key = state.record, state.store_key
+        if record is None or store_key is None:
+            return
+        if not record.pending_client_tool_use_ids:
+            return
+        record.pending_client_tool_use_ids = []
+        try:
+            await maybe_await(self.store.set(store_key, record))
+        except Exception as exc:  # noqa: BLE001 - best-effort; the run is already ending
+            await self._report(
+                "forget_parked_calls", exc, session_id=state.session_id
+            )
 
     async def _report(
         self, operation: str, error: BaseException, **ids: Any
@@ -324,6 +354,8 @@ class ManagedAgentsAgent:
             )
             return
         state.session_id = record.session_id
+        state.record = record
+        state.store_key = store_key
         await self._sync_client_tools(record, input.tools or [])
 
         outbound = self._outbound_events(record, input.messages)
@@ -449,6 +481,13 @@ class ManagedAgentsAgent:
         if outcome.status == "errored":
             if outcome.session_ended:
                 await maybe_await(self.store.delete(store_key))
+            elif outcome.session_interrupted:
+                # An interrupt that landed cancelled whatever the session was
+                # waiting on, so a park recorded during this turn is no longer
+                # answerable: posting a result for it next run is rejected as
+                # stale and wedges the thread.
+                record.pending_client_tool_use_ids = []
+                await maybe_await(self.store.set(store_key, record))
             return
         if outcome.status == "parked":
             record.pending_client_tool_use_ids = list(outcome.client_tool_use_ids)

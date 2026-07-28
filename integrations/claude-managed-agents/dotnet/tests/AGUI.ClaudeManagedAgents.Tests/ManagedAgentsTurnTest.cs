@@ -387,6 +387,28 @@ public class ManagedAgentsTurnTest
         Assert.True(posted.GetProperty("is_error").GetBoolean());
     }
 
+    private const string IdleUnknownAction =
+        """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["mystery_1"]}}""";
+
+    [Fact]
+    public async Task RecordsWhetherTheInterruptItSentActuallyLanded()
+    {
+        // A landed interrupt cancels whatever the session was waiting on, so the caller has to
+        // know: any park from this turn is no longer answerable.
+        var landed = await CollectAsync([IdleUnknownAction]);
+        Assert.True(landed.Outcome.SessionInterrupted);
+
+        var rejecting = new FakeManagedAgentsClient([IdleUnknownAction])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new InvalidOperationException("interrupt rejected")
+                : null,
+        };
+        var failed = await CollectAsync([], rejecting);
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, failed.Outcome.Status);
+        Assert.False(failed.Outcome.SessionInterrupted);
+    }
+
     [Fact]
     public async Task ReportsAnUnhandledStopReasonInsteadOfWaitingItOut()
     {

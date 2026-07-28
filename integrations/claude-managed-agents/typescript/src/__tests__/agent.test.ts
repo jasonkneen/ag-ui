@@ -485,6 +485,92 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
   });
 
+  it("forgets a parked call once the turn's interrupt has landed", async () => {
+    // Regression: the park is persisted the moment the call is handed over, then
+    // the turn interrupts the session and fails. The interrupt cancels the wait,
+    // so answering that id on the next run is rejected as stale and wedges the
+    // thread — it must not survive.
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          // Blocked on something this integration cannot answer: interrupt + fail.
+          { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["ctu_1", "mystery_1"] } },
+        ],
+      ],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "unsupported_action" });
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [] });
+  });
+
+  it("keeps a parked call when the turn's interrupt could not be delivered", async () => {
+    // The mirror image: nothing reached the session, so it may still be parked
+    // and the id is still the only way to answer it.
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["ctu_1", "mystery_1"] } },
+        ],
+      ],
+      // Send 1 is the user message; send 2 is the interrupt.
+      sendResults: [undefined, new Error("interrupt rejected")],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "unsupported_action" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+  });
+
+  it("forgets a parked call once the teardown interrupt has landed", async () => {
+    // A thrown turn never reaches recordOutcome, so the teardown path has to
+    // reconcile the record itself.
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          new Promise<void>(() => {}), // hang until the turn times out
+        ],
+      ],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store, { turnTimeoutMs: 30 }), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "turn_timeout" });
+    expect(allSentEvents(fake)).toContainEqual({ type: "user.interrupt" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [] });
+  });
+
+  it("keeps a parked call when the teardown interrupt could not be delivered", async () => {
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          new Promise<void>(() => {}),
+        ],
+      ],
+      sendResults: [undefined, new Error("interrupt rejected")],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store, { turnTimeoutMs: 30 }), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "turn_timeout" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+  });
+
   it("clears a stale parked id when the session goes idle on end_turn", async () => {
     // Defensive: end_turn means nothing is awaited, so no pending id may
     // survive into the next run and be answered against a resumed session.

@@ -51,8 +51,14 @@ export type TurnOutcome =
   | { status: "finished" }
   /** The session is parked on custom tool calls the frontend must answer. */
   | { status: "parked"; clientToolUseIds: string[] }
-  /** A RUN_ERROR was already emitted. */
-  | { status: "errored"; sessionEnded?: boolean };
+  /**
+   * A RUN_ERROR was already emitted.
+   *
+   * `sessionInterrupted` means a `user.interrupt` reached the session, which
+   * cancels whatever it was waiting on — so any park recorded during this turn
+   * is no longer answerable and must not be carried into the next run.
+   */
+  | { status: "errored"; sessionEnded?: boolean; sessionInterrupted?: boolean };
 
 type StreamEvent = BetaManagedAgentsStreamSessionEvents;
 
@@ -194,19 +200,28 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
    * bounded by its own timeout so a stalled connection cannot hold the thread's
    * run gate open indefinitely.
    */
-  const interrupt = () =>
+  const interrupt = (): Promise<boolean> =>
     client.beta.sessions.events
       .send(
         sessionId,
         { events: [{ type: "user.interrupt" }] },
         { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
       )
-      .catch((error: unknown) => report("interrupt", error));
+      .then(() => true)
+      .catch(async (error: unknown) => {
+        await report("interrupt", error);
+        return false;
+      });
 
-  const fail = (message: string, code?: string): TurnOutcome => {
+  /**
+   * End the turn with a RUN_ERROR. `sessionInterrupted` must be the result of
+   * the `interrupt()` that preceded it: a landed interrupt invalidates every
+   * park recorded this turn, and a failed one leaves the session parked.
+   */
+  const fail = (message: string, code?: string, sessionInterrupted = false): TurnOutcome => {
     closeAll();
     emit({ type: EventType.RUN_ERROR, message, ...(code ? { code } : {}) } as BaseEvent);
-    return { status: "errored" };
+    return { status: "errored", ...(sessionInterrupted ? { sessionInterrupted: true } : {}) };
   };
 
   /**
@@ -247,10 +262,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       // delivery failed. The underlying exception can carry session ids and
       // request detail, and this event is read by the browser.
       await report("post_tool_result", error);
-      await interrupt();
       return fail(
         `The result of tool call ${toolUseId} could not be delivered to the session.`,
         "tool_result_delivery_failed",
+        await interrupt(),
       );
     }
     emitToolResult(toolUseId, text);
@@ -420,10 +435,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           // exhaustive, but the API is free to add a stop reason to it.
           const reasonType = (stop_reason as { type: string }).type;
           if (reasonType !== "requires_action") {
-            await interrupt();
             return fail(
               `The session went idle for a reason this integration does not handle: ${reasonType}.`,
               "unknown_stop_reason",
+              await interrupt(),
             );
           }
           // requires_action: work out what the session is blocked on.
@@ -433,11 +448,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           const confirmations = blockedOn.filter((id) => askedConfirmations.has(id));
           if (confirmations.length > 0) {
             if (!opts.toolConfirmation) {
-              await interrupt();
               return fail(
                 "A tool requires confirmation but no confirmation policy is configured. " +
                   "Set `toolConfirmation` to \"allow\" or \"deny\", or use a permission policy that does not ask.",
                 "tool_confirmation_required",
+                await interrupt(),
               );
             }
             // Bounded like tool-result posts: the session is parked on these
@@ -458,10 +473,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
               );
             } catch (error) {
               await report("post_tool_confirmation", error);
-              await interrupt();
               return fail(
                 "The tool confirmation could not be delivered to the session.",
                 "tool_confirmation_delivery_failed",
+                await interrupt(),
               );
             }
             for (const id of confirmations) ackedToolUses.add(id);
@@ -471,8 +486,11 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           const clientToolUseIds = blockedOn.filter((id) => clientParks.has(id));
           const unknown = blockedOn.filter((id) => !askedConfirmations.has(id) && !clientParks.has(id));
           if (unknown.length > 0) {
-            await interrupt();
-            return fail("The agent is waiting on an action this integration cannot answer.", "unsupported_action");
+            return fail(
+              "The agent is waiting on an action this integration cannot answer.",
+              "unsupported_action",
+              await interrupt(),
+            );
           }
           if (clientToolUseIds.length > 0) {
             // Hand control back to the frontend to execute its tools.

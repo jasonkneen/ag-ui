@@ -25,11 +25,16 @@ internal enum ManagedAgentsTurnStatus
 /// </remarks>
 internal sealed class ManagedAgentsTurnOutcome
 {
-    private ManagedAgentsTurnOutcome(ManagedAgentsTurnStatus status, IReadOnlyList<string> clientToolUseIds, bool sessionEnded = false)
+    private ManagedAgentsTurnOutcome(
+        ManagedAgentsTurnStatus status,
+        IReadOnlyList<string> clientToolUseIds,
+        bool sessionEnded = false,
+        bool sessionInterrupted = false)
     {
         Status = status;
         ClientToolUseIds = clientToolUseIds;
         SessionEnded = sessionEnded;
+        SessionInterrupted = sessionInterrupted;
     }
 
     /// <summary>The session went idle after the reply completed.</summary>
@@ -37,6 +42,23 @@ internal sealed class ManagedAgentsTurnOutcome
 
     /// <summary>A <c>RUN_ERROR</c> was already emitted for this turn.</summary>
     internal static ManagedAgentsTurnOutcome Errored { get; } = new(ManagedAgentsTurnStatus.Errored, []);
+
+    /// <summary>
+    /// A <c>RUN_ERROR</c> was already emitted, and a <c>user.interrupt</c> reached the session
+    /// first — which cancels whatever it was waiting on, so any park recorded during this turn is
+    /// no longer answerable and must not be carried into the next run.
+    /// </summary>
+    internal static ManagedAgentsTurnOutcome ErroredAfterInterrupt { get; } =
+        new(ManagedAgentsTurnStatus.Errored, [], sessionInterrupted: true);
+
+    /// <summary>
+    /// <see cref="Errored"/> or <see cref="ErroredAfterInterrupt"/>, according to whether the
+    /// interrupt that preceded the failure actually landed.
+    /// </summary>
+    internal static ManagedAgentsTurnOutcome ErroredWith(bool sessionInterrupted)
+    {
+        return sessionInterrupted ? ErroredAfterInterrupt : Errored;
+    }
 
     /// <summary>
     /// A <c>RUN_ERROR</c> was already emitted because the session itself ended on the server
@@ -70,4 +92,7 @@ internal sealed class ManagedAgentsTurnOutcome
 
     /// <summary>Whether the session itself ended on the server (terminated or deleted).</summary>
     internal bool SessionEnded { get; }
+
+    /// <summary>Whether a <c>user.interrupt</c> reached the session.</summary>
+    internal bool SessionInterrupted { get; }
 }

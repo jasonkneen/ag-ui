@@ -224,8 +224,8 @@ async def _consume(
         """`report` from a frame that cannot await, such as a done callback."""
         schedule_detached(report(operation, error))
 
-    async def interrupt() -> None:
-        """Stop the session best-effort.
+    async def interrupt() -> bool:
+        """Stop the session best-effort, reporting whether it landed.
 
         Bounded by its own timeout: this runs while the thread's run gate is
         still held, so a stalled connection must not keep the thread's later
@@ -240,11 +240,21 @@ async def _consume(
             )
         except Exception as exc:  # noqa: BLE001 - best-effort interrupt, including its own bound
             await report("interrupt", exc)
+            return False
+        return True
 
-    def fail(message: str, code: str | None = None) -> TurnOutcome:
+    def fail(
+        message: str, code: str | None = None, session_interrupted: bool = False
+    ) -> TurnOutcome:
+        """End the turn with a RUN_ERROR.
+
+        `session_interrupted` must be the result of the `interrupt()` that
+        preceded it: a landed interrupt invalidates every park recorded this
+        turn, and a failed one leaves the session parked.
+        """
         close_all()
         emit(RunErrorEvent(message=message, code=code))
-        return TurnOutcome(status="errored")
+        return TurnOutcome(status="errored", session_interrupted=session_interrupted)
 
     async def send_custom_tool_result(
         tool_use_id: str, text: str, is_error: bool
@@ -322,11 +332,11 @@ async def _consume(
             # the delivery failed. The underlying exception can carry session ids
             # and request detail, and this event is read by the browser.
             await report("post_tool_result", exc)
-            await interrupt()
             return fail(
                 f"The result of tool call {tool_use_id} could not be delivered "
                 "to the session.",
                 "tool_result_delivery_failed",
+                await interrupt(),
             )
         emit_tool_result(tool_use_id, text)
         return None
@@ -546,11 +556,11 @@ async def _consume(
                     # Waiting for the session to resume would burn the whole turn
                     # timeout, so interrupt it and say so — the same as the other
                     # two ports.
-                    await interrupt()
                     return fail(
                         "The session went idle for a reason this integration does "
                         f"not handle: {reason_type}.",
                         "unknown_stop_reason",
+                        await interrupt(),
                     )
                 # requires_action: work out what the session is blocked on.
                 event_ids: Sequence[str] = get(stop_reason, "event_ids") or []
@@ -569,12 +579,12 @@ async def _consume(
                 ]
                 if confirmations:
                     if not tool_confirmation:
-                        await interrupt()
                         return fail(
                             "A tool requires confirmation but no confirmation policy is configured. "
                             'Set `tool_confirmation` to "allow" or "deny", or use a permission '
                             "policy that does not ask.",
                             "tool_confirmation_required",
+                            await interrupt(),
                         )
                     # Bounded like tool-result posts: the session is parked
                     # waiting on these answers. A failed delivery leaves it
@@ -599,11 +609,11 @@ async def _consume(
                         raise
                     except Exception as exc:  # noqa: BLE001 - reported as a terminal run error
                         await report("post_tool_confirmation", exc)
-                        await interrupt()
                         return fail(
                             "The tool confirmation could not be delivered to the "
                             "session.",
                             "tool_confirmation_delivery_failed",
+                            await interrupt(),
                         )
                     acked_tool_uses.update(confirmations)
                     if len(confirmations) == len(blocked_on):
@@ -619,10 +629,10 @@ async def _consume(
                     and event_id not in client_parks
                 ]
                 if unknown:
-                    await interrupt()
                     return fail(
                         "The agent is waiting on an action this integration cannot answer.",
                         "unsupported_action",
+                        await interrupt(),
                     )
                 if client_tool_use_ids:
                     # Hand control back to the frontend to execute its tools.

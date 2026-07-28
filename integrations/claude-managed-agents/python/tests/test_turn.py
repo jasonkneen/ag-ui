@@ -510,7 +510,7 @@ async def test_fails_run_on_confirmation_gated_tool_with_no_policy():
             },
         ]
     )
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert isinstance(emitted[-1], RunErrorEvent)
     assert emitted[-1].code == "tool_confirmation_required"
     assert fake.sent[1]["events"] == [{"type": "user.interrupt"}]
@@ -526,7 +526,7 @@ async def test_interrupts_and_errors_on_an_unknown_blocking_action():
             }
         ]
     )
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert emitted[-1].code == "unsupported_action"
     assert fake.sent[1]["events"] == [{"type": "user.interrupt"}]
 
@@ -545,7 +545,7 @@ async def test_surfaces_terminal_session_error_with_its_type_as_code():
             }
         ]
     )
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert emitted == [RunErrorEvent(message="Out of credits", code="billing_error")]
 
 
@@ -582,7 +582,7 @@ async def test_treats_retries_exhausted_as_error_not_clean_finish():
             }
         ]
     )
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert emitted[-1].code == "retries_exhausted"
 
 
@@ -671,7 +671,7 @@ async def test_errors_when_stream_ends_before_turn_completes():
     emitted, outcome, _ = await collect(
         [{"type": "event_start", "event": {"type": "agent.message", "id": "msg_1"}}]
     )
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     # The open message is closed before the error.
     assert types(emitted) == ["TEXT_MESSAGE_START", "TEXT_MESSAGE_END", "RUN_ERROR"]
     assert emitted[-1].code == "stream_ended"
@@ -1014,7 +1014,7 @@ async def test_never_reports_a_tool_result_the_session_did_not_receive() -> None
         backend_tools={"get_time": backend},
     )
 
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert [e for e in emitted if isinstance(e, ToolCallResultEvent)] == []
     assert isinstance(emitted[-1], RunErrorEvent)
     assert emitted[-1].code == "tool_result_delivery_failed"
@@ -1033,7 +1033,7 @@ async def test_reports_a_delivery_failure_for_a_tool_nothing_can_execute() -> No
         {"send_failures": {1: RuntimeError("send failed")}},
     )
 
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert [e for e in emitted if isinstance(e, ToolCallResultEvent)] == []
     assert emitted[-1].code == "tool_result_delivery_failed"
     assert {"type": "user.interrupt"} in [
@@ -1160,7 +1160,7 @@ async def test_reports_an_unhandled_stop_reason_instead_of_waiting_it_out() -> N
         ]
     )
 
-    assert outcome == TurnOutcome(status="errored")
+    assert outcome.status == "errored"
     assert isinstance(emitted[-1], RunErrorEvent)
     assert emitted[-1].code == "unknown_stop_reason"
     assert emitted[-1].message == (
@@ -1189,3 +1189,23 @@ async def test_emits_tool_arguments_as_compact_unescaped_json() -> None:
 
     args = next(e for e in emitted if isinstance(e, ToolCallArgsEvent))
     assert args.delta == '{"q":"café <b>&</b> 日本","n":1}'
+
+
+IDLE_UNKNOWN_ACTION = {
+    "type": "session.status_idle",
+    "id": "idle_1",
+    "stop_reason": {"type": "requires_action", "event_ids": ["mystery_1"]},
+}
+
+
+async def test_records_whether_the_interrupt_it_sent_actually_landed() -> None:
+    """A landed interrupt cancels whatever the session was waiting on, so the
+    caller has to know: any park from this turn is no longer answerable."""
+    _emitted, landed, _fake = await collect([IDLE_UNKNOWN_ACTION])
+    assert landed == TurnOutcome(status="errored", session_interrupted=True)
+
+    # Send 0 is the user message; send 1 is the interrupt.
+    _emitted, failed, _fake = await collect(
+        [IDLE_UNKNOWN_ACTION], {"send_failures": {1: RuntimeError("interrupt rejected")}}
+    )
+    assert failed == TurnOutcome(status="errored", session_interrupted=False)

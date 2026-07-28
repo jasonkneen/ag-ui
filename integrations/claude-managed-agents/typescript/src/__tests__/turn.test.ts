@@ -274,7 +274,7 @@ describe("runTurn", () => {
       { sendResults: [undefined, new Error("send failed")] },
     );
 
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(0);
     expect(emitted.at(-1)).toMatchObject({
       type: EventType.RUN_ERROR,
@@ -295,7 +295,7 @@ describe("runTurn", () => {
       { sendResults: [undefined, new Error("send failed")] },
     );
 
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({
       type: EventType.RUN_ERROR,
       code: "tool_confirmation_delivery_failed",
@@ -311,7 +311,7 @@ describe("runTurn", () => {
       { sendResults: [undefined, new Error("send failed")] },
     );
 
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(0);
     expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_result_delivery_failed" });
     expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
@@ -358,6 +358,21 @@ describe("runTurn", () => {
     ]);
   });
 
+  it("records whether the interrupt it sent actually landed", async () => {
+    // A landed interrupt cancels whatever the session was waiting on, so the
+    // caller has to know: any park from this turn is no longer answerable.
+    const idleUnknown = [
+      { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["mystery_1"] } },
+    ];
+
+    const landed = await collect(idleUnknown);
+    expect(landed.outcome).toEqual({ status: "errored", sessionInterrupted: true });
+
+    // The interrupt is send #2 (the user message is #1).
+    const failed = await collect(idleUnknown, {}, { sendResults: [undefined, new Error("interrupt rejected")] });
+    expect(failed.outcome).toEqual({ status: "errored" });
+  });
+
   it("reports an unhandled stop reason instead of reading its absent event ids", async () => {
     // Reading (absent) event_ids used to throw a TypeError here; every port now
     // interrupts the idle session and names the reason.
@@ -365,7 +380,7 @@ describe("runTurn", () => {
       { type: "session.status_idle", id: "idle_1", stop_reason: { type: "awaiting_martian_input" } },
     ]);
 
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({
       type: EventType.RUN_ERROR,
       code: "unknown_stop_reason",
@@ -429,7 +444,7 @@ describe("runTurn", () => {
       { type: "agent.tool_use", id: "tu_1", name: "bash", input: {}, evaluated_permission: "ask" },
       { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["tu_1"] } },
     ]);
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_confirmation_required" });
     expect(fake.sent[1].events).toEqual([{ type: "user.interrupt" }]);
   });
@@ -438,7 +453,7 @@ describe("runTurn", () => {
     const { emitted, outcome, fake } = await collect([
       { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["unknown_1"] } },
     ]);
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "unsupported_action" });
     expect(fake.sent[1].events).toEqual([{ type: "user.interrupt" }]);
   });
@@ -447,7 +462,7 @@ describe("runTurn", () => {
     const { emitted, outcome } = await collect([
       { type: "session.error", id: "err_1", error: { type: "billing_error", message: "Out of credits", retry_status: { type: "terminal" } } },
     ]);
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted).toEqual([{ type: EventType.RUN_ERROR, message: "Out of credits", code: "billing_error" }]);
   });
 
@@ -471,7 +486,7 @@ describe("runTurn", () => {
     const { emitted, outcome } = await collect([
       { type: "session.status_idle", id: "idle_1", stop_reason: { type: "retries_exhausted" } },
     ]);
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "retries_exhausted" });
   });
 
@@ -519,7 +534,7 @@ describe("runTurn", () => {
 
   it("errors when the stream ends before the turn completes", async () => {
     const { emitted, outcome } = await collect([{ type: "event_start", event: { type: "agent.message", id: "msg_1" } }]);
-    expect(outcome).toEqual({ status: "errored" });
+    expect(outcome).toMatchObject({ status: "errored" });
     // The open message is closed before the error.
     expect(types(emitted)).toEqual([EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_END, EventType.RUN_ERROR]);
     expect(emitted.at(-1)).toMatchObject({ code: "stream_ended" });
