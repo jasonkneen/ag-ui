@@ -19,7 +19,7 @@ public sealed class ManagedAgentsDynamicToolsTest
 
         AssertUpdate(
             fake,
-            """{"type":"custom","name":"show_chart","description":"Render a chart","input_schema":{"type":"object","properties":{},"required":[]}}""");
+            """{"type":"custom","name":"show_chart","description":"Render a chart","input_schema":{"type":"object","properties":{}}}""");
     }
 
     [Fact]
@@ -39,7 +39,7 @@ public sealed class ManagedAgentsDynamicToolsTest
 
         AssertUpdate(
             fake,
-            """{"type":"custom","name":"show_chart","description":"Render a visualization","input_schema":{"type":"object","properties":{"series":{"type":"array"}},"required":[]}}""");
+            """{"type":"custom","name":"show_chart","description":"Render a visualization","input_schema":{"type":"object","properties":{"series":{"type":"array"}}}}""");
     }
 
     [Fact]

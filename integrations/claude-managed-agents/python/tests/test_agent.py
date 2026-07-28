@@ -230,7 +230,6 @@ async def test_registers_frontend_tools_as_custom_tools_when_creating_session():
                 "input_schema": {
                     "type": "object",
                     "properties": {"title": {"type": "string"}},
-                    "required": [],
                 },
             },
         ],
@@ -265,7 +264,7 @@ async def test_registers_backend_tools_and_normalizes_names_with_frontend_winnin
             "type": "custom",
             "name": "lookup_docs",
             "description": "Frontend lookup",
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {"type": "object"},
         }
     ]
 
@@ -701,11 +700,7 @@ async def test_updates_session_tools_when_frontend_adds_new_one():
                             "type": "custom",
                             "name": "show_chart",
                             "description": "Render a chart",
-                            "input_schema": {
-                                "type": "object",
-                                "properties": {},
-                                "required": [],
-                            },
+                            "input_schema": {"type": "object"},
                         },
                     ]
                 }
@@ -1321,7 +1316,7 @@ async def test_frontend_tool_wins_normalized_name_collision_with_backend():
             "type": "custom",
             "name": "search_web",
             "description": "Frontend search",
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {"type": "object"},
         }
     ]
 

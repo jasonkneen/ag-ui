@@ -22,7 +22,7 @@ describe("customToolFrom", () => {
       type: "custom",
       name: "ping",
       description: "Tool ping",
-      input_schema: { type: "object", properties: { a: { type: "string" } }, required: [] },
+      input_schema: { type: "object", properties: { a: { type: "string" } } },
     });
   });
 
@@ -31,6 +31,52 @@ describe("customToolFrom", () => {
       type: "object",
       properties: {},
     });
+  });
+
+  it("preserves a nested schema with reused definitions", () => {
+    // Regression: only `properties` and `required` were copied, so `$defs`
+    // vanished and every `$ref` pointing into it became dangling.
+    const parameters = {
+      type: "object",
+      description: "A route",
+      additionalProperties: false,
+      properties: {
+        from: { $ref: "#/$defs/point" },
+        to: { $ref: "#/$defs/point" },
+        via: { type: "array", items: { $ref: "#/$defs/point" } },
+      },
+      required: ["from", "to"],
+      $defs: {
+        point: {
+          type: "object",
+          properties: { x: { type: "number" }, y: { type: "number" } },
+          required: ["x", "y"],
+        },
+      },
+    };
+
+    expect(customToolFrom({ name: "route", description: "Plot", parameters }).input_schema).toEqual(parameters);
+  });
+
+  it("preserves composition keywords and a top-level $ref", () => {
+    const anyOf = { type: "object", anyOf: [{ required: ["a"] }, { required: ["b"] }], properties: { a: {}, b: {} } };
+    expect(customToolFrom({ name: "either", description: "d", parameters: anyOf }).input_schema).toEqual(anyOf);
+
+    const topLevelRef = { $ref: "#/$defs/args", $defs: { args: { type: "object", properties: { q: { type: "string" } } } } };
+    expect(customToolFrom({ name: "ref", description: "d", parameters: topLevelRef }).input_schema).toEqual({
+      ...topLevelRef,
+      // The API accepts object input schemas only, so `type` is asserted.
+      type: "object",
+    });
+  });
+
+  it("falls back to an empty object schema for a non-object parameters value", () => {
+    for (const parameters of [undefined, null, "nope", 7, [1, 2]] as never[]) {
+      expect(customToolFrom({ name: "ping", description: "d", parameters }).input_schema).toEqual({
+        type: "object",
+        properties: {},
+      });
+    }
   });
 
   it("normalizes the name and caps the description length", () => {

@@ -33,7 +33,7 @@ public class ManagedAgentsCustomToolsTest
               "type": "custom",
               "name": "ping",
               "description": "Tool ping",
-              "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": []}
+              "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}
             }
             """);
         Assert.True(System.Text.Json.JsonElement.DeepEquals(expected, tool), tool.GetRawText());
@@ -46,6 +46,58 @@ public class ManagedAgentsCustomToolsTest
 
         Assert.Equal("lookup_docs", ManagedAgentsCustomTools.NameOf(tool));
         Assert.Equal("""{"type":"object","properties":{}}""", tool.GetProperty("input_schema").GetRawText());
+    }
+
+    [Fact]
+    public void PreservesANestedSchemaWithReusedDefinitions()
+    {
+        // Regression: only `properties` and `required` were copied, so `$defs` vanished and every
+        // `$ref` pointing into it became dangling.
+        const string Route = """
+            {
+              "type": "object",
+              "description": "A route",
+              "additionalProperties": false,
+              "properties": {
+                "from": {"$ref": "#/$defs/point"},
+                "to": {"$ref": "#/$defs/point"},
+                "via": {"type": "array", "items": {"$ref": "#/$defs/point"}}
+              },
+              "required": ["from", "to"],
+              "$defs": {
+                "point": {
+                  "type": "object",
+                  "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                  "required": ["x", "y"]
+                }
+              }
+            }
+            """;
+
+        var tool = ManagedAgentsCustomTools.CustomToolFrom("route", "Plot", FakeManagedAgentsClient.Json(Route));
+
+        Assert.True(
+            System.Text.Json.JsonElement.DeepEquals(FakeManagedAgentsClient.Json(Route), tool.GetProperty("input_schema")),
+            tool.GetProperty("input_schema").GetRawText());
+    }
+
+    [Fact]
+    public void PreservesCompositionKeywordsAndATopLevelRef()
+    {
+        const string AnyOf = """{"type":"object","anyOf":[{"required":["a"]},{"required":["b"]}],"properties":{"a":{},"b":{}}}""";
+        var either = ManagedAgentsCustomTools.CustomToolFrom("either", "d", FakeManagedAgentsClient.Json(AnyOf));
+        Assert.True(
+            System.Text.Json.JsonElement.DeepEquals(FakeManagedAgentsClient.Json(AnyOf), either.GetProperty("input_schema")),
+            either.GetProperty("input_schema").GetRawText());
+
+        // The API accepts object input schemas only, so `type` is asserted while everything else
+        // — including the definitions the `$ref` needs — is carried through.
+        const string TopLevelRef = """{"$ref":"#/$defs/args","$defs":{"args":{"type":"object","properties":{"q":{"type":"string"}}}}}""";
+        const string Expected = """{"$ref":"#/$defs/args","$defs":{"args":{"type":"object","properties":{"q":{"type":"string"}}}},"type":"object"}""";
+        var byRef = ManagedAgentsCustomTools.CustomToolFrom("ref", "d", FakeManagedAgentsClient.Json(TopLevelRef));
+        Assert.True(
+            System.Text.Json.JsonElement.DeepEquals(FakeManagedAgentsClient.Json(Expected), byRef.GetProperty("input_schema")),
+            byRef.GetProperty("input_schema").GetRawText());
     }
 
     [Fact]

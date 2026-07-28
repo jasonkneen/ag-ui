@@ -106,21 +106,26 @@ internal static partial class ManagedAgentsCustomTools
         }
     }
 
+    /// <summary>
+    /// The AG-UI tool's JSON Schema, as a managed-agent input schema.
+    /// </summary>
+    /// <remarks>
+    /// The caller's schema is passed through whole: <c>$defs</c>, <c>$ref</c>, <c>oneOf</c>,
+    /// <c>additionalProperties</c>, per-property descriptions and any other keyword survive.
+    /// Copying only <c>properties</c> and <c>required</c> used to drop the rest — which silently
+    /// invalidated every <c>$ref</c> whose <c>$defs</c> went with it — so anything the API accepts
+    /// must reach it intact. <c>type</c> is the one field forced: the API accepts object input
+    /// schemas only.
+    /// </remarks>
     private static JsonObject InputSchemaFrom(JsonElement parameters)
     {
-        var schema = new JsonObject { ["type"] = "object" };
         if (parameters.ValueKind != JsonValueKind.Object)
         {
-            schema["properties"] = new JsonObject();
-            return schema;
+            return new JsonObject { ["type"] = "object", ["properties"] = new JsonObject() };
         }
 
-        schema["properties"] = parameters.TryGetProperty("properties", out var properties) && properties.ValueKind == JsonValueKind.Object
-            ? JsonNode.Parse(properties.GetRawText())
-            : new JsonObject();
-        schema["required"] = parameters.TryGetProperty("required", out var required) && required.ValueKind == JsonValueKind.Array
-            ? JsonNode.Parse(required.GetRawText())
-            : new JsonArray();
+        var schema = JsonNode.Parse(parameters.GetRawText())!.AsObject();
+        schema["type"] = "object";
         return schema;
     }
 

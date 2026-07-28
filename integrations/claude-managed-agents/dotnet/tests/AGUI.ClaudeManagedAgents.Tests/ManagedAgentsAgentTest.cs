@@ -177,7 +177,7 @@ public class ManagedAgentsAgentTest
               "type": "custom",
               "name": "show_chart",
               "description": "Render a chart",
-              "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": []}
+              "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}}
             }
             """,
             tools[1]);
@@ -706,7 +706,7 @@ public class ManagedAgentsAgentTest
         Assert.Equal(2, update.Count);
         AssertJson("""{"type":"agent_toolset_20260401","configs":[],"default_config":{}}""", update[0]);
         AssertJson(
-            """{"type":"custom","name":"show_chart","description":"Render a chart","input_schema":{"type":"object","properties":{},"required":[]}}""",
+            """{"type":"custom","name":"show_chart","description":"Render a chart","input_schema":{"type":"object"}}""",
             update[1]);
     }
 
@@ -848,7 +848,7 @@ public class ManagedAgentsAgentTest
         // Both normalize to "lookup_docs"; the frontend definition wins.
         var tools = Assert.Single(fake.CreatedSessions).OverrideTools!;
         AssertJson(
-            """{"type":"custom","name":"lookup_docs","description":"Frontend lookup","input_schema":{"type":"object","properties":{},"required":[]}}""",
+            """{"type":"custom","name":"lookup_docs","description":"Frontend lookup","input_schema":{"type":"object"}}""",
             Assert.Single(tools));
     }
 

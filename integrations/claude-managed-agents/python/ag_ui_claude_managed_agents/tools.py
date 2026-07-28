@@ -22,15 +22,19 @@ def normalize_tool_name(name: str) -> str:
 
 
 def _input_schema(parameters: Any) -> dict[str, Any]:
-    if isinstance(parameters, dict):
-        properties = parameters.get("properties")
-        required = parameters.get("required")
-        return {
-            "type": "object",
-            "properties": properties if properties is not None else {},
-            "required": required if required is not None else [],
-        }
-    return {"type": "object", "properties": {}}
+    """The AG-UI tool's JSON Schema, as a managed-agent input schema.
+
+    The caller's schema is passed through whole: `$defs`, `$ref`, `oneOf`,
+    `additionalProperties`, per-property descriptions and any other keyword
+    survive. Copying only `properties` and `required` used to drop the rest --
+    which silently invalidated every `$ref` whose `$defs` went with it -- so
+    anything the API accepts must reach it intact.
+
+    `type` is the one field forced: the API accepts object input schemas only.
+    """
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+    return {**parameters, "type": "object"}
 
 
 def custom_tool_from(tool: Any) -> dict[str, Any]:

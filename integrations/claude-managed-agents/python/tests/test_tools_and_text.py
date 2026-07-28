@@ -43,7 +43,6 @@ def test_custom_tool_from_builds_input_schema_and_default_description():
         "input_schema": {
             "type": "object",
             "properties": {"a": {"type": "string"}},
-            "required": [],
         },
     }
 
@@ -184,3 +183,65 @@ def test_describe_tool_result_placeholders_unknown_blocks_and_handles_nothing() 
     assert describe_tool_result([{"type": "image"}]) == "[image]"
     assert describe_tool_result([]) == ""
     assert describe_tool_result(None) == ""
+
+
+ROUTE_SCHEMA = {
+    "type": "object",
+    "description": "A route",
+    "additionalProperties": False,
+    "properties": {
+        "from": {"$ref": "#/$defs/point"},
+        "to": {"$ref": "#/$defs/point"},
+        "via": {"type": "array", "items": {"$ref": "#/$defs/point"}},
+    },
+    "required": ["from", "to"],
+    "$defs": {
+        "point": {
+            "type": "object",
+            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+            "required": ["x", "y"],
+        }
+    },
+}
+
+
+def test_custom_tool_from_preserves_a_nested_schema_with_reused_definitions() -> None:
+    """Regression: only `properties` and `required` were copied, so `$defs`
+    vanished and every `$ref` pointing into it became dangling."""
+    tool = SimpleNamespace(name="route", description="Plot", parameters=ROUTE_SCHEMA)
+    assert custom_tool_from(tool)["input_schema"] == ROUTE_SCHEMA
+
+
+def test_custom_tool_from_preserves_composition_keywords_and_a_top_level_ref() -> None:
+    any_of = {
+        "type": "object",
+        "anyOf": [{"required": ["a"]}, {"required": ["b"]}],
+        "properties": {"a": {}, "b": {}},
+    }
+    assert (
+        custom_tool_from(
+            SimpleNamespace(name="either", description="d", parameters=any_of)
+        )["input_schema"]
+        == any_of
+    )
+
+    top_level_ref = {
+        "$ref": "#/$defs/args",
+        "$defs": {"args": {"type": "object", "properties": {"q": {"type": "string"}}}},
+    }
+    assert custom_tool_from(
+        SimpleNamespace(name="ref", description="d", parameters=top_level_ref)
+    )["input_schema"] == {
+        **top_level_ref,
+        # The API accepts object input schemas only, so `type` is asserted.
+        "type": "object",
+    }
+
+
+def test_custom_tool_from_falls_back_for_a_non_object_parameters_value() -> None:
+    for parameters in (None, "nope", 7, [1, 2]):
+        tool = SimpleNamespace(name="ping", description="d", parameters=parameters)
+        assert custom_tool_from(tool)["input_schema"] == {
+            "type": "object",
+            "properties": {},
+        }

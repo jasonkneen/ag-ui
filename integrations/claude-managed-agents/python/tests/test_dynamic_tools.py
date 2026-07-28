@@ -29,7 +29,6 @@ def custom_tool(name, description, properties=None):
         "input_schema": {
             "type": "object",
             "properties": properties or {},
-            "required": [],
         },
     }
 

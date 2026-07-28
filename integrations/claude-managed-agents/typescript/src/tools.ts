@@ -22,12 +22,22 @@ export const normalizeToolName = (name: string): string => {
   return name.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, TOOL_NAME_MAX_LENGTH) || "tool";
 };
 
+/**
+ * The AG-UI tool's JSON Schema, as a managed-agent input schema.
+ *
+ * The caller's schema is passed through whole: `$defs`, `$ref`, `oneOf`,
+ * `additionalProperties`, per-property descriptions and any other keyword
+ * survive. Copying only `properties` and `required` used to drop the rest —
+ * which silently invalidated every `$ref` whose `$defs` went with it — so
+ * anything the API accepts must reach it intact.
+ *
+ * `type` is the one field forced: the API accepts object input schemas only.
+ */
 const toInputSchema = (parameters: unknown): CustomToolParams["input_schema"] => {
-  if (parameters && typeof parameters === "object") {
-    const p = parameters as { properties?: Record<string, unknown>; required?: string[] };
-    return { type: "object", properties: p.properties ?? {}, required: p.required ?? [] };
+  if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+    return { type: "object", properties: {} };
   }
-  return { type: "object", properties: {} };
+  return { ...(parameters as Record<string, unknown>), type: "object" };
 };
 
 /** An AG-UI (frontend) or backend tool definition → managed-agent custom tool. */

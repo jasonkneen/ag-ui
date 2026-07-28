@@ -60,7 +60,7 @@ const customTool = (name: string, description: string, properties: object = {}) 
   type: "custom",
   name,
   description,
-  input_schema: { type: "object", properties, required: [] },
+  input_schema: properties === undefined ? { type: "object" } : { type: "object", properties },
 });
 
 describe("dynamic frontend tools", () => {

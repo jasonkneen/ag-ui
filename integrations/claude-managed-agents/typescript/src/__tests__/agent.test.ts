@@ -142,7 +142,7 @@ describe("ManagedAgentsAgent", () => {
               type: "custom",
               name: "show_chart",
               description: "Render a chart",
-              input_schema: { type: "object", properties: { title: { type: "string" } }, required: [] },
+              input_schema: { type: "object", properties: { title: { type: "string" } } },
             },
           ],
         },
@@ -159,7 +159,7 @@ describe("ManagedAgentsAgent", () => {
     );
 
     expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
-      { type: "custom", name: "lookup_docs", description: "Frontend lookup", input_schema: { type: "object", properties: {}, required: [] } },
+      { type: "custom", name: "lookup_docs", description: "Frontend lookup", input_schema: { type: "object" } },
     ]);
   });
 
@@ -177,7 +177,7 @@ describe("ManagedAgentsAgent", () => {
 
     expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
     expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
-      { type: "custom", name: "search_web", description: "second", input_schema: { type: "object", properties: {}, required: [] } },
+      { type: "custom", name: "search_web", description: "second", input_schema: { type: "object" } },
     ]);
   });
 
@@ -197,7 +197,7 @@ describe("ManagedAgentsAgent", () => {
     // The frontend tool replaces the agent's same-named custom tool rather than duplicating it.
     expect(fake.spies.create.mock.calls[0]![0].agent.tools).toEqual([
       { type: "agent_toolset_20260401", configs: [], default_config: {} },
-      { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object", properties: {}, required: [] } },
+      { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object" } },
     ]);
   });
 
@@ -743,7 +743,7 @@ describe("ManagedAgentsAgent", () => {
         agent: {
           tools: [
             { type: "agent_toolset_20260401", configs: [], default_config: {} },
-            { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object", properties: {}, required: [] } },
+            { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object" } },
           ],
         },
       },
