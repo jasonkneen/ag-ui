@@ -1,24 +1,43 @@
-name: unit
+# Every unit-*.yml in this repository is called "unit", so this workflow must not
+# key its concurrency group off github.workflow: doing so would put it in the
+# same group as unit-dotnet-sdk.yml on the same ref, and each push would cancel
+# the other's in-flight run. Both the display name and the group are unique.
+name: unit / claude-managed-agents (.NET)
 
 on:
   push:
     branches: [main]
+    # GitHub Actions does not support YAML anchors, so the two filters repeat.
     paths:
       - "integrations/claude-managed-agents/dotnet/**"
       - "sdks/dotnet/src/**"
+      # The library builds against the .NET SDK by project reference, so the
+      # files that govern that build have to trigger it too.
+      - "sdks/dotnet/Directory.Build.props"
+      - "sdks/dotnet/Directory.Build.targets"
+      - "sdks/dotnet/Directory.Packages.props"
+      - "sdks/dotnet/global.json"
+      - "sdks/dotnet/nuget.config"
       - ".github/workflows/unit-claude-managed-agents-dotnet.yml"
   pull_request:
     branches: [main]
     paths:
       - "integrations/claude-managed-agents/dotnet/**"
       - "sdks/dotnet/src/**"
+      # The library builds against the .NET SDK by project reference, so the
+      # files that govern that build have to trigger it too.
+      - "sdks/dotnet/Directory.Build.props"
+      - "sdks/dotnet/Directory.Build.targets"
+      - "sdks/dotnet/Directory.Packages.props"
+      - "sdks/dotnet/global.json"
+      - "sdks/dotnet/nuget.config"
       - ".github/workflows/unit-claude-managed-agents-dotnet.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: unit-claude-managed-agents-dotnet-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
