@@ -10,6 +10,10 @@
 # Run with the API key in the environment; the container listens on $PORT (default 10000):
 #
 #   docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e PORT=8026 -p 8026:8026 agui-cma-dojo
+#
+# The context is the whole repository, so Dockerfile.dockerignore beside this
+# file keeps a developer's .env, host bin/obj, node_modules and .git out of it.
+# Requires BuildKit (the default builder), which is what reads that file.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS builder
 WORKDIR /repo
@@ -18,6 +22,12 @@ WORKDIR /repo
 # at ../../../sdks/dotnet from integrations/claude-managed-agents/dotnet.
 COPY sdks/dotnet ./sdks/dotnet
 COPY integrations/claude-managed-agents/dotnet ./integrations/claude-managed-agents/dotnet
+
+# Belt and braces for a context that slipped through (a legacy builder ignores
+# Dockerfile.dockerignore): restore and publish from a clean tree, and never
+# carry a copied secret into a layer.
+RUN find . -type d \( -name bin -o -name obj \) -prune -exec rm -rf {} + \
+ && find . -name '.env' -type f -delete
 
 WORKDIR /repo/integrations/claude-managed-agents/dotnet
 RUN dotnet publish examples/AGUIDojoServer/AGUIDojoServer.csproj -c Release -o /app/out
