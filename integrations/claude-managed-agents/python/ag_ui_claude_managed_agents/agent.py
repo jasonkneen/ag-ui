@@ -61,6 +61,8 @@ class _RunState:
     session_id: str | None = None
     busy_key: str | None = None
     """The busy-thread gate this run holds, released when the run unwinds."""
+    terminated: bool = False
+    """Whether a terminal event (RUN_ERROR or RUN_FINISHED) was already emitted."""
 
 
 class ManagedAgentsAgent:
@@ -115,7 +117,8 @@ class ManagedAgentsAgent:
         """Run one turn for `input`, yielding AG-UI events."""
         queue: asyncio.Queue[Any] = asyncio.Queue()
         state = _RunState()
-        worker = asyncio.create_task(self._drive(input, queue.put_nowait, state))
+        emit = self._single_terminal_emit(queue.put_nowait, state, input.thread_id)
+        worker = asyncio.create_task(self._drive(input, emit, state))
         self._tasks.add(worker)
         worker.add_done_callback(self._tasks.discard)
         worker.add_done_callback(lambda _task: queue.put_nowait(_DONE))
@@ -130,6 +133,32 @@ class ManagedAgentsAgent:
             # which interrupts the session.
             if not worker.done():
                 worker.cancel()
+
+    def _single_terminal_emit(
+        self, emit: Emit, state: _RunState, thread_id: str
+    ) -> Emit:
+        """Wrap `emit` so the run emits exactly one terminal event.
+
+        Something failing after the turn already reported an outcome — a session
+        store that rejects the closing write, say — must not append a second
+        RUN_ERROR behind a RUN_ERROR or a RUN_FINISHED. The dropped error still
+        reaches the error hook so it is not lost.
+        """
+
+        def guarded(event: BaseEvent) -> None:
+            if isinstance(event, (RunErrorEvent, RunFinishedEvent)):
+                if state.terminated:
+                    if isinstance(event, RunErrorEvent):
+                        self._report(
+                            "dropped_terminal_event",
+                            RuntimeError(event.message),
+                            thread_id=thread_id,
+                        )
+                    return
+                state.terminated = True
+            emit(event)
+
+        return guarded
 
     async def _drive(self, input: RunAgentInput, emit: Emit, state: _RunState) -> None:  # noqa: A002
         try:

@@ -86,6 +86,39 @@ public sealed class ManagedAgentsAgent
     {
         ArgumentNullException.ThrowIfNull(input);
 
+        // A run emits exactly one terminal event. Something failing after the turn already
+        // reported an outcome — a session store that rejects the closing write, say — must not
+        // append a second RUN_ERROR behind a RUN_ERROR or a RUN_FINISHED. The dropped error still
+        // reaches the error hook so it is not lost.
+        var terminated = false;
+        await foreach (var evt in StreamRunAsync(input, cancellationToken).ConfigureAwait(false))
+        {
+            if (evt is RunErrorEvent or RunFinishedEvent)
+            {
+                if (terminated)
+                {
+                    if (evt is RunErrorEvent dropped)
+                    {
+                        Report(
+                            "dropped_terminal_event",
+                            new InvalidOperationException(dropped.Message),
+                            threadId: input.ThreadId);
+                    }
+
+                    continue;
+                }
+
+                terminated = true;
+            }
+
+            yield return evt;
+        }
+    }
+
+    private async IAsyncEnumerable<BaseEvent> StreamRunAsync(
+        RunAgentInput input,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         var threadId = input.ThreadId;
         var runId = input.RunId;
         yield return new RunStartedEvent { ThreadId = threadId, RunId = runId };

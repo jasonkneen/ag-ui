@@ -466,6 +466,39 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task EmitsOneTerminalEventWhenTheClosingWriteFails()
+    {
+        // Regression: the turn already emitted RUN_ERROR, then persisting the outcome failed and
+        // the outer catch appended a second terminal event.
+        var fake = new FakeManagedAgentsClient(["""{"type":"session.status_terminated","id":"term_1"}"""]);
+        var store = new FailingDeleteStore();
+        var reported = new List<string>();
+
+        var events = await CollectAsync(
+            NewAgent(fake, store, o => o.OnError = (_, context) => reported.Add(context.Operation)),
+            BaseInput());
+
+        var terminal = events.Where(static e => e is RunErrorEvent or RunFinishedEvent).ToList();
+        Assert.Equal("session_ended", Assert.IsType<RunErrorEvent>(Assert.Single(terminal)).Code);
+        // The dropped error is not lost: it reaches the hook.
+        Assert.Contains("dropped_terminal_event", reported);
+    }
+
+    private sealed class FailingDeleteStore : ISessionStore
+    {
+        private readonly RecordingSessionStore _inner = new();
+
+        public ValueTask<ManagedAgentsSessionRecord?> GetAsync(string threadKey, CancellationToken cancellationToken)
+            => _inner.GetAsync(threadKey, cancellationToken);
+
+        public ValueTask SetAsync(string threadKey, ManagedAgentsSessionRecord record, CancellationToken cancellationToken)
+            => _inner.SetAsync(threadKey, record, cancellationToken);
+
+        public ValueTask DeleteAsync(string threadKey, CancellationToken cancellationToken)
+            => ValueTask.FromException(new InvalidOperationException("store is down"));
+    }
+
+    [Fact]
     public async Task TwoAgentsSharingAStoreNeverAdoptEachOthersSession()
     {
         // Regression: the busy gate was scoped by managed agent while the store was keyed by the

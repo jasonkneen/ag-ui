@@ -3,7 +3,7 @@
 import asyncio
 from typing import Any
 
-from ag_ui.core import RunAgentInput, RunErrorEvent
+from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 
 from ag_ui_claude_managed_agents import (
     BackendTool,
@@ -1081,6 +1081,34 @@ async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn()
     )
 
     assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
+
+
+async def test_emits_one_terminal_event_when_the_closing_write_fails():
+    """Regression: the turn already emitted RUN_ERROR, then persisting the
+    outcome failed and the outer handler appended a second terminal event."""
+    fake = FakeClient(streams=[[{"type": "session.status_terminated", "id": "term_1"}]])
+    store = RecordingSessionStore()
+
+    def failing_delete(_key: str) -> None:
+        raise RuntimeError("store is down")
+
+    store.delete = failing_delete  # type: ignore[method-assign]
+    reported: list[dict[str, Any]] = []
+
+    events = await collect(
+        new_agent(fake, store, on_error=lambda _e, context: reported.append(context)),
+        base_input(),
+    )
+
+    terminal = [
+        event
+        for event in events
+        if isinstance(event, (RunErrorEvent, RunFinishedEvent))
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].code == "session_ended"
+    # The dropped error is not lost: it reaches the hook.
+    assert "dropped_terminal_event" in [c["operation"] for c in reported]
 
 
 async def test_an_inner_bounded_timeout_is_not_reported_as_the_turn_timeout():

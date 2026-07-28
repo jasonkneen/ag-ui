@@ -462,6 +462,64 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [] });
   });
 
+  it("emits one terminal event when the store rejects the closing write after a run error", async () => {
+    // Regression: the turn already emitted RUN_ERROR, then persisting the
+    // outcome failed and the outer catch appended a second terminal event.
+    const fake = createFakeClient({ streams: [[{ type: "session.status_terminated", id: "term_1" }]] });
+    const store = new RecordingSessionStore();
+    const failing = Object.assign(Object.create(Object.getPrototypeOf(store)) as RecordingSessionStore, store, {
+      delete: async () => {
+        throw new Error("store is down");
+      },
+    });
+    const errors: { operation: string }[] = [];
+
+    const events = await collect(
+      newAgent(fake, failing, { onError: (_error, context) => errors.push(context) }),
+      baseInput(),
+    );
+
+    expect(types(events).filter((type) => type === EventType.RUN_ERROR || type === EventType.RUN_FINISHED)).toEqual([
+      EventType.RUN_ERROR,
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
+    // The dropped error is not lost: it reaches the hook.
+    expect(errors.map((context) => context.operation)).toContain("dropped_terminal_event");
+  });
+
+  // Guard rather than regression: this path already emitted one terminal event,
+  // and must keep doing so now that the gate decides.
+  it("emits one terminal event when the store rejects the closing write after a park", async () => {
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["ctu_1"] } },
+        ],
+      ],
+    });
+    const store = new RecordingSessionStore();
+    let writes = 0;
+    const failing: SessionStore = {
+      get: (key) => store.get(key),
+      set: async (key, record) => {
+        // Let the park write through; fail the closing outcome write.
+        if (++writes > 2) throw new Error("store is down");
+        await store.set(key, record);
+      },
+      delete: (key) => store.delete(key),
+    };
+
+    const events = await collect(
+      newAgent(fake, failing),
+      baseInput({ tools: [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }] }),
+    );
+
+    expect(types(events).filter((type) => type === EventType.RUN_ERROR || type === EventType.RUN_FINISHED)).toEqual([
+      EventType.RUN_ERROR,
+    ]);
+  });
+
   it("clears pending tool ids even when the follow-up send then fails", async () => {
     // Regression: once the tool results resume the session they are recorded
     // as delivered, even if the follow-up messages then fail. Re-posting a

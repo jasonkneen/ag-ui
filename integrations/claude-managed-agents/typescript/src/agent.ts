@@ -93,7 +93,27 @@ export class ManagedAgentsAgent extends AbstractAgent {
       const timeoutMs = this.config.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
       const timeout = AbortSignal.timeout(timeoutMs);
       const signal = AbortSignal.any([disconnect.signal, timeout]);
-      const emit = (event: BaseEvent) => subscriber.next(event);
+
+      // A run emits exactly one terminal event. Something failing after the
+      // turn already reported an outcome — a session store that rejects the
+      // closing write, say — must not append a second RUN_ERROR behind a
+      // RUN_ERROR or a RUN_FINISHED. The dropped error still reaches the
+      // error hook so it is not lost.
+      let terminated = false;
+      const emit = (event: BaseEvent) => {
+        if (event.type === EventType.RUN_ERROR || event.type === EventType.RUN_FINISHED) {
+          if (terminated) {
+            if (event.type === EventType.RUN_ERROR) {
+              this.report("dropped_terminal_event", new Error(String((event as { message?: unknown }).message ?? "")), {
+                threadId: input.threadId,
+              });
+            }
+            return;
+          }
+          terminated = true;
+        }
+        subscriber.next(event);
+      };
 
       this.runTurnForInput(input, emit, signal)
         .catch((err) => {
