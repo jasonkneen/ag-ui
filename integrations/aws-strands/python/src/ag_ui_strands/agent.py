@@ -1044,9 +1044,26 @@ class StrandsAgent:
 
             try:
                 async for event in agent_stream:
-                    # If we've halted, consume remaining events silently to allow proper cleanup
+                    # Frontend-tool halt: STOP the loop rather than muting the
+                    # wire and draining it. The proxy tool returns a SUCCESSFUL
+                    # "Forwarded to client" placeholder, so Strands has every
+                    # reason to run another model cycle — and another. Draining
+                    # those cycles costs: frontend tool calls the client never
+                    # sees (so it can never answer them), real backend tool
+                    # side effects, phantom assistant turns persisted to the
+                    # session store, and RUN_FINISHED stuck behind work the
+                    # client is not watching. Single-agent Strands has no cycle
+                    # cap, so that tail is unbounded — a model that keeps
+                    # retrying the read never yields a terminal event at all.
+                    #
+                    # Safe here because the halt latches only AFTER Strands
+                    # appended the assistant toolUse + placeholder toolResult
+                    # and MessageAddedEvent synced agent state (see
+                    # SessionManager.register_hooks), so the next run's
+                    # reconcile still finds a placeholder to overwrite and the
+                    # wire->native map to key it by.
                     if halt_event_stream:
-                        continue
+                        break
 
                     logger.debug(f"Received event: {event}")
 
@@ -1907,8 +1924,16 @@ class StrandsAgent:
                 # The generator should complete naturally when we consume all events,
                 # but we still try to close it explicitly to be safe
                 try:
+                    # A frontend-tool halt breaks out of the loop with the
+                    # generator SUSPENDED at a yield, where ``ag_running`` is
+                    # False. The exhausted-generator check below would read
+                    # that as "already closed" and defer teardown to GC,
+                    # leaving the halted Strands cycle (and its model stream)
+                    # open. Close it explicitly instead.
+                    if halt_event_stream:
+                        await agent_stream.aclose()
                     # Check if generator is already closed/exhausted
-                    if not agent_stream.ag_running:
+                    elif not agent_stream.ag_running:
                         # Generator is already closed, nothing to do
                         pass
                     else:
