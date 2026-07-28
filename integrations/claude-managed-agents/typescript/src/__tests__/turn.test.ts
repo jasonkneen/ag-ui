@@ -209,7 +209,10 @@ describe("runTurn", () => {
       type: EventType.TOOL_CALL_RESULT,
       messageId: "result_tu_1",
       toolCallId: "tu_1",
-      content: "Caf&eacute; & 'more' <b>\n[search result] Docs & guides — https://example.com\nbody text\n[image]",
+      // The text block is literal tool output and stays verbatim; only the
+      // search result, whose body comes from HTML, is decoded.
+      content:
+        "Caf&eacute; &amp; &#39;more&#39; &lt;b&gt;\n[search result] Docs & guides — https://example.com\nbody text\n[image]",
       role: "tool",
     });
   });

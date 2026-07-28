@@ -7,12 +7,21 @@ from typing import Any
 from ._util import get
 from .constants import SEARCH_RESULT_PREVIEW_CHARS
 
-_HEX_ENTITY = re.compile(r"&#x([0-9a-fA-F]+);")
-_DEC_ENTITY = re.compile(r"&#(\d+);")
-
-
 REPLACEMENT_CHARACTER = "�"
 """Substituted for any entity that does not denote a usable character."""
+
+_NAMED_ENTITIES = {"quot": '"', "lt": "<", "gt": ">", "amp": "&"}
+
+# `[0-9]`, not `\d`: in Python `\d` matches the whole Unicode Nd category, so
+# `&#٦٥;` (Arabic-Indic digits) would decode to `A` here while the TypeScript and
+# .NET ports -- whose `\d` is ASCII-only and whose pattern is literally `[0-9]` --
+# leave it alone. HTML numeric references are ASCII digits only.
+_ENTITY = re.compile(r"&(?:#[xX]([0-9a-fA-F]+)|#([0-9]+)|(quot|lt|gt|amp));")
+
+# Beyond this many decimal digits a code point is necessarily out of range, and
+# CPython refuses to convert a decimal string longer than 4300 digits at all.
+_MAX_DECIMAL_DIGITS = 7
+"""Numeric (hex or decimal) and the handful of named entities, in one alternation."""
 
 
 def _code_point(n: int) -> str:
@@ -29,16 +38,30 @@ def _code_point(n: int) -> str:
     return chr(n)
 
 
+def _decode_match(match: re.Match[str]) -> str:
+    hex_digits, dec_digits, name = match.groups()
+    if name is not None:
+        return _NAMED_ENTITIES[name]
+    if hex_digits is not None:
+        # Base 16 is a power of two and exempt from CPython's str->int limit.
+        return _code_point(int(hex_digits, 16))
+    if len(dec_digits) > _MAX_DECIMAL_DIGITS:
+        # `int()` raises ValueError past 4300 digits, which would escape
+        # `describe_tool_result` and fail the whole run over a display string.
+        # The other two ports fold an unparseable numeric into U+FFFD.
+        return REPLACEMENT_CHARACTER
+    return _code_point(int(dec_digits))
+
+
 def decode_entities(s: str) -> str:
-    """Decode numeric and the common named HTML entities."""
-    s = _HEX_ENTITY.sub(lambda m: _code_point(int(m.group(1), 16)), s)
-    s = _DEC_ENTITY.sub(lambda m: _code_point(int(m.group(1))), s)
-    return (
-        s.replace("&quot;", '"')
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-    )
+    """Decode numeric and the common named HTML entities in one pass.
+
+    One pass matters: decoding numeric entities before named ones would rewrite
+    `&#38;lt;` to `&lt;` and then to `<`, losing the escaping the source went to
+    the trouble of writing. Each match is resolved exactly once, so `&#38;lt;`
+    decodes to the literal `&lt;`.
+    """
+    return _ENTITY.sub(_decode_match, s)
 
 
 def text_of(content: Sequence[Any] | None) -> str:
@@ -52,13 +75,19 @@ def text_of(content: Sequence[Any] | None) -> str:
 
 
 def describe_tool_result(content: Sequence[Any] | None) -> str:
-    """Flatten a tool result's blocks (text, search results, images, documents) into a string."""
+    """Flatten a tool result's blocks (text, search results, images, documents) into a string.
+
+    `text` blocks are passed through verbatim. They carry literal tool output —
+    a file read, a shell transcript — where `&lt;` means those four characters,
+    so decoding them would corrupt the very output the user asked to see. Only
+    `search_result` blocks, whose bodies are extracted from HTML, are decoded.
+    """
     lines: list[str] = []
     for block in content or []:
         block_type = get(block, "type")
         text = get(block, "text")
         if block_type == "text" and isinstance(text, str):
-            lines.append(decode_entities(text))
+            lines.append(text)
             continue
         if block_type == "search_result":
             inner_content = get(block, "content")

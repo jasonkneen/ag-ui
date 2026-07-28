@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SEARCH_RESULT_PREVIEW_CHARS, TOOL_DESCRIPTION_MAX_LENGTH, TOOL_NAME_MAX_LENGTH } from "../constants";
-import { describeToolResult, textOf } from "../text";
+import { decodeEntities, describeToolResult, textOf } from "../text";
 import { customToolFrom, normalizeToolName } from "../tools";
 
 describe("normalizeToolName", () => {
@@ -47,14 +47,70 @@ describe("textOf", () => {
   });
 });
 
+describe("decodeEntities", () => {
+  it("decodes numeric and named entities", () => {
+    expect(decodeEntities("5 &lt; 6 &amp;&amp; &#x1F600; &#65; &quot;q&quot; &gt;")).toBe('5 < 6 && \u{1F600} A "q" >');
+  });
+
+  it("decodes the same inputs as the Python and .NET ports", () => {
+    // Every case here is one where the three ports could drift apart. They are
+    // asserted identically in all three suites.
+    // An uppercase hex marker is accepted (`&#[xX]`).
+    expect(decodeEntities("&#X41;")).toBe("A");
+    // Non-ASCII digits are NOT numeric references: Python's `\d` would have
+    // matched the whole Unicode Nd category and decoded this to "A".
+    expect(decodeEntities("&#\u0666\u0665;")).toBe("&#\u0666\u0665;");
+    // An absurdly long decimal folds to U+FFFD rather than raising: CPython
+    // refuses to convert more than 4300 decimal digits at all.
+    expect(decodeEntities(`&#${"1".repeat(5000)};`)).toBe("\uFFFD");
+  });
+
+  it("resolves each entity exactly once", () => {
+    // Regression: decoding numeric entities before named ones turned `&#38;lt;`
+    // into `&lt;` and then into `<`, discarding the escaping the source wrote.
+    expect(decodeEntities("&#38;lt;")).toBe("&lt;");
+    expect(decodeEntities("&#x26;lt;")).toBe("&lt;");
+    expect(decodeEntities("&amp;lt;")).toBe("&lt;");
+    expect(decodeEntities("&amp;amp;")).toBe("&amp;");
+    expect(decodeEntities("&#38;#60;")).toBe("&#60;");
+  });
+
+  it("substitutes U+FFFD for entities that do not denote a usable character", () => {
+    // A lone surrogate makes the string ill-formed UTF-16: it cannot be encoded
+    // as UTF-8, so it would arrive as U+FFFD (or crash the encoder) anyway.
+    // Every port rejects it here instead, identically.
+    expect(decodeEntities("a&#xD800;b")).toBe("a�b");
+    expect(decodeEntities("a&#55296;b")).toBe("a�b");
+    expect(decodeEntities("a&#xDFFF;b")).toBe("a�b");
+    // Out of range, and the boundaries around the surrogate block, still work.
+    expect(decodeEntities("a&#x110000;b")).toBe("a�b");
+    expect(decodeEntities("a&#xD7FF;&#xE000;b")).toBe("a\uD7FF\uE000b");
+    // A well-formed surrogate pair written as one code point is unaffected.
+    expect(decodeEntities("&#x1F600;")).toBe("\u{1F600}");
+  });
+
+  it("leaves unknown and malformed entities alone", () => {
+    expect(decodeEntities("&nbsp; &copy; &#; &# 65; &lt")).toBe("&nbsp; &copy; &#; &# 65; &lt");
+  });
+});
+
 describe("describeToolResult", () => {
-  it("decodes entities and summarizes each block type", () => {
+  it("summarizes each block type and decodes only search results", () => {
     const described = describeToolResult([
       { type: "text", text: "5 &lt; 6 &amp;&amp; &#x1F600; &#65;" },
-      { type: "search_result", title: "T", source: "https://x", content: [{ type: "text", text: "inner" }] },
+      { type: "search_result", title: "T &amp; U", source: "https://x", content: [{ type: "text", text: "a &lt; b" }] },
       { type: "document" },
     ]);
-    expect(described).toBe("5 < 6 && \u{1F600} A\n[search result] T — https://x\ninner\n[document]");
+    expect(described).toBe(
+      "5 &lt; 6 &amp;&amp; &#x1F600; &#65;\n[search result] T & U — https://x\na < b\n[document]",
+    );
+  });
+
+  it("passes literal tool output through verbatim", () => {
+    // A file read or shell transcript means `&lt;` literally; decoding it would
+    // corrupt the very output the user asked to see.
+    const html = '<a href="x">&lt;div&gt;</a> &amp; more';
+    expect(describeToolResult([{ type: "text", text: html }])).toBe(html);
   });
 
   it("shows only a preview of a long search result body", () => {
@@ -62,20 +118,6 @@ describe("describeToolResult", () => {
       { type: "search_result", title: "T", source: "https://x", content: [{ type: "text", text: "b".repeat(SEARCH_RESULT_PREVIEW_CHARS + 200) }] },
     ]);
     expect(described).toBe(`[search result] T — https://x\n${"b".repeat(SEARCH_RESULT_PREVIEW_CHARS)}`);
-  });
-
-  it("substitutes U+FFFD for entities that do not denote a usable character", () => {
-    // A lone surrogate makes the string ill-formed UTF-16: it cannot be encoded
-    // as UTF-8, so it would arrive as U+FFFD (or crash the encoder) anyway.
-    // Every port rejects it here instead, identically.
-    expect(describeToolResult([{ type: "text", text: "a&#xD800;b" }])).toBe("a�b");
-    expect(describeToolResult([{ type: "text", text: "a&#55296;b" }])).toBe("a�b");
-    expect(describeToolResult([{ type: "text", text: "a&#xDFFF;b" }])).toBe("a�b");
-    // Out of range, and the boundaries around the surrogate block, still work.
-    expect(describeToolResult([{ type: "text", text: "a&#x110000;b" }])).toBe("a�b");
-    expect(describeToolResult([{ type: "text", text: "a&#xD7FF;&#xE000;b" }])).toBe("a\uD7FF\uE000b");
-    // A well-formed surrogate pair written as one code point is unaffected.
-    expect(describeToolResult([{ type: "text", text: "&#x1F600;" }])).toBe("\u{1F600}");
   });
 
   it("uses a [type] placeholder for unknown blocks and handles nothing", () => {

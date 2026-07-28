@@ -140,6 +140,7 @@ PerCallerStore StoreFor(string ownerId) => stores.GetOrAdd(ownerId, id => new Pe
 - The default session store is in-memory: restarting the process starts new sessions. Managed sessions themselves persist server-side.
 - Turns are serial per thread. A second run on a busy thread errors.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter shows them for display, so enable them on your agent as usual.
+- Tool-result `text` blocks reach the UI verbatim: they carry literal output (a file read, a shell transcript), where `&lt;` means those four characters. Only `search_result` blocks, whose bodies are extracted from HTML, have their entities decoded.
 
 ## Running the example server
 

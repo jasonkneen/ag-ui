@@ -525,8 +525,12 @@ public class ManagedAgentsTurnTest
             IdleEndTurn,
         ]);
 
+        // The text block is literal tool output and stays verbatim; only the search result,
+        // whose body is extracted from HTML, is decoded.
         var result = Assert.IsType<ToolCallResultEvent>(run.Emitted[0]);
-        Assert.Equal("Caf&eacute; & 'more' <b>\n[search result] Docs & guides — https://example.com\nbody text\n[image]", result.Content);
+        Assert.Equal(
+            "Caf&eacute; &amp; &#39;more&#39; &lt;b&gt;\n[search result] Docs & guides — https://example.com\nbody text\n[image]",
+            result.Content);
     }
 
     [Fact]

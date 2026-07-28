@@ -11,7 +11,11 @@ from ag_ui_claude_managed_agents.constants import (
     SEARCH_RESULT_PREVIEW_CHARS,
     TOOL_DESCRIPTION_MAX_LENGTH,
 )
-from ag_ui_claude_managed_agents.text import describe_tool_result, text_of
+from ag_ui_claude_managed_agents.text import (
+    decode_entities,
+    describe_tool_result,
+    text_of,
+)
 
 
 def test_normalize_tool_name_keeps_valid_names():
@@ -68,44 +72,82 @@ def test_text_of_joins_text_blocks_only():
     assert text_of(None) == ""
 
 
-def test_describe_tool_result_decodes_entities_and_summarizes_blocks():
+def test_decode_entities_decodes_numeric_and_named_entities() -> None:
+    assert (
+        decode_entities("5 &lt; 6 &amp;&amp; &#x1F600; &#65; &quot;q&quot; &gt;")
+        == '5 < 6 && \U0001f600 A "q" >'
+    )
+
+
+def test_decode_entities_matches_the_typescript_and_dotnet_ports() -> None:
+    """Cases where the three ports could drift apart, asserted in all three."""
+    # An uppercase hex marker is accepted (`&#[xX]`).
+    assert decode_entities("&#X41;") == "A"
+    # Non-ASCII digits are not numeric references. With `\d` (the whole Unicode
+    # Nd category) this decoded to "A" in Python alone.
+    assert decode_entities("&#\u0666\u0665;") == "&#\u0666\u0665;"
+    # An absurdly long decimal folds to U+FFFD rather than raising ValueError out
+    # of the turn: CPython refuses more than 4300 decimal digits.
+    assert decode_entities("&#" + "1" * 5000 + ";") == "\ufffd"
+
+
+def test_decode_entities_resolves_each_entity_exactly_once() -> None:
+    """Regression: decoding numeric entities before named ones turned `&#38;lt;`
+    into `&lt;` and then into `<`, discarding the escaping the source wrote."""
+    assert decode_entities("&#38;lt;") == "&lt;"
+    assert decode_entities("&#x26;lt;") == "&lt;"
+    assert decode_entities("&amp;lt;") == "&lt;"
+    assert decode_entities("&amp;amp;") == "&amp;"
+    assert decode_entities("&#38;#60;") == "&#60;"
+
+
+def test_decode_entities_leaves_unknown_and_malformed_entities_alone() -> None:
+    assert (
+        decode_entities("&nbsp; &copy; &#; &# 65; &lt")
+        == "&nbsp; &copy; &#; &# 65; &lt"
+    )
+
+
+def test_describe_tool_result_summarizes_blocks_and_decodes_only_search_results():
     described = describe_tool_result(
         [
             {"type": "text", "text": "5 &lt; 6 &amp;&amp; &#x1F600; &#65;"},
             {
                 "type": "search_result",
-                "title": "T",
+                "title": "T &amp; U",
                 "source": "https://x",
-                "content": [{"type": "text", "text": "inner"}],
+                "content": [{"type": "text", "text": "a &lt; b"}],
             },
             {"type": "document"},
         ]
     )
-    assert (
-        described
-        == "5 < 6 && \U0001f600 A\n[search result] T — https://x\ninner\n[document]"
+    assert described == (
+        "5 &lt; 6 &amp;&amp; &#x1F600; &#65;\n"
+        "[search result] T & U — https://x\na < b\n[document]"
     )
 
 
-def test_describe_tool_result_substitutes_unusable_entity_code_points() -> None:
+def test_describe_tool_result_passes_literal_tool_output_through_verbatim() -> None:
+    """A file read or shell transcript means `&lt;` literally; decoding it would
+    corrupt the very output the user asked to see."""
+    html = '<a href="x">&lt;div&gt;</a> &amp; more'
+    assert describe_tool_result([{"type": "text", "text": html}]) == html
+
+
+def test_decode_entities_substitutes_unusable_code_points() -> None:
     """A lone surrogate cannot be encoded as UTF-8, so `chr` would produce a
     string that raises inside SSE encoding rather than reach the UI. Every port
     substitutes U+FFFD here instead, identically."""
-    assert describe_tool_result([{"type": "text", "text": "a&#xD800;b"}]) == "a�b"
-    assert describe_tool_result([{"type": "text", "text": "a&#55296;b"}]) == "a�b"
-    assert describe_tool_result([{"type": "text", "text": "a&#xDFFF;b"}]) == "a�b"
+    assert decode_entities("a&#xD800;b") == "a�b"
+    assert decode_entities("a&#55296;b") == "a�b"
+    assert decode_entities("a&#xDFFF;b") == "a�b"
     # Out of range, and the boundaries around the surrogate block, still work.
-    assert describe_tool_result([{"type": "text", "text": "a&#x110000;b"}]) == "a�b"
-    assert (
-        describe_tool_result([{"type": "text", "text": "a&#xD7FF;&#xE000;b"}])
-        == "a\ud7ff\ue000b"
-    )
+    assert decode_entities("a&#x110000;b") == "a�b"
+    assert decode_entities("a&#xD7FF;&#xE000;b") == "a\ud7ff\ue000b"
     # A well-formed astral character written as one code point is unaffected.
-    assert (
-        describe_tool_result([{"type": "text", "text": "&#x1F600;"}]) == "\U0001f600"
-    )
+    assert decode_entities("&#x1F600;") == "\U0001f600"
     # The result is encodable, which is the point of the substitution.
-    describe_tool_result([{"type": "text", "text": "a&#xD800;b"}]).encode("utf-8")
+    decode_entities("a&#xD800;b").encode("utf-8")
 
 
 def test_custom_tool_from_normalizes_name_and_caps_description() -> None:

@@ -136,6 +136,7 @@ def store_for(owner_id: str) -> PerCallerStore:
 - Only text parts of a user message are forwarded. A message carrying only images or documents has nothing to send and errors with `empty_run`.
 - A client disconnect or a turn timeout posts `user.interrupt` into the session so the agent stops instead of running unattended.
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter surfaces them for display, so enable them on your agent as usual.
+- Tool-result `text` blocks reach the UI verbatim: they carry literal output (a file read, a shell transcript), where `&lt;` means those four characters. Only `search_result` blocks, whose bodies are extracted from HTML, have their entities decoded.
 
 ## Running the examples
 

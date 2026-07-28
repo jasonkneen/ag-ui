@@ -38,6 +38,12 @@ internal static partial class ManagedAgentsText
     /// Flattens the mixed block types of a tool result (text, search results, images,
     /// documents) into a readable string for the UI.
     /// </summary>
+    /// <remarks>
+    /// <c>text</c> blocks are passed through verbatim. They carry literal tool output — a file
+    /// read, a shell transcript — where <c>&amp;lt;</c> means those four characters, so decoding
+    /// them would corrupt the very output the user asked to see. Only <c>search_result</c> blocks,
+    /// whose bodies are extracted from HTML, are decoded.
+    /// </remarks>
     internal static string DescribeToolResult(IEnumerable<JsonElement>? blocks)
     {
         if (blocks is null)
@@ -50,7 +56,7 @@ internal static partial class ManagedAgentsText
         {
             if (IsType(block, "text") && TryGetString(block, "text", out var text))
             {
-                parts.Add(DecodeEntities(text));
+                parts.Add(text);
                 continue;
             }
 
@@ -104,17 +110,47 @@ internal static partial class ManagedAgentsText
         return false;
     }
 
+    private static readonly Dictionary<string, string> s_namedEntities = new(StringComparer.Ordinal)
+    {
+        ["quot"] = "\"",
+        ["lt"] = "<",
+        ["gt"] = ">",
+        ["amp"] = "&",
+    };
+
+    /// <summary>
+    /// Decodes numeric and the common named HTML entities in one pass.
+    /// </summary>
+    /// <remarks>
+    /// One pass matters: decoding numeric entities before named ones would rewrite
+    /// <c>&amp;#38;lt;</c> to <c>&amp;lt;</c> and then to <c>&lt;</c>, losing the escaping the
+    /// source went to the trouble of writing. Each match is resolved exactly once.
+    /// </remarks>
     private static string DecodeEntities(string value)
     {
-        var decoded = HexEntity().Replace(value, match => CodePointOf(match.Groups[1].Value, NumberStyles.HexNumber));
-        decoded = DecimalEntity().Replace(decoded, match => CodePointOf(match.Groups[1].Value, NumberStyles.Integer));
-        return decoded
-            .Replace("&quot;", "\"", StringComparison.Ordinal)
-            .Replace("&lt;", "<", StringComparison.Ordinal)
-            .Replace("&gt;", ">", StringComparison.Ordinal)
-            .Replace("&amp;", "&", StringComparison.Ordinal);
+        return Entity().Replace(value, static match =>
+        {
+            var name = match.Groups["name"];
+            if (name.Success)
+            {
+                return s_namedEntities[name.Value];
+            }
+
+            var hex = match.Groups["hex"];
+            return hex.Success
+                ? CodePointOf(hex.Value, NumberStyles.HexNumber)
+                : CodePointOf(match.Groups["dec"].Value, NumberStyles.Integer);
+        });
     }
 
+    /// <summary>
+    /// The character an entity's code point denotes, or U+FFFD.
+    /// </summary>
+    /// <remarks>
+    /// Surrogate code points (U+D800-U+DFFF) are rejected as well as out-of-range ones: alone they
+    /// make the string ill-formed UTF-16, which cannot be encoded as UTF-8 and turns into U+FFFD
+    /// (or an encoder error) somewhere downstream.
+    /// </remarks>
     private static string CodePointOf(string digits, NumberStyles style)
     {
         if (!long.TryParse(digits, style, CultureInfo.InvariantCulture, out var codePoint))
@@ -130,9 +166,6 @@ internal static partial class ManagedAgentsText
         return char.ConvertFromUtf32((int)codePoint);
     }
 
-    [GeneratedRegex("&#x([0-9a-fA-F]+);")]
-    private static partial Regex HexEntity();
-
-    [GeneratedRegex("&#(\\d+);")]
-    private static partial Regex DecimalEntity();
+    [GeneratedRegex("&(?:#[xX](?<hex>[0-9a-fA-F]+)|#(?<dec>[0-9]+)|(?<name>quot|lt|gt|amp));")]
+    private static partial Regex Entity();
 }

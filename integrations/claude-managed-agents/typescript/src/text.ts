@@ -21,14 +21,24 @@ const codePointOf = (n: number): string =>
     ? String.fromCodePoint(n)
     : REPLACEMENT_CHARACTER;
 
-const decodeEntities = (s: string): string =>
-  s
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => codePointOf(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec) => codePointOf(Number(dec)))
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
+const NAMED_ENTITIES: Record<string, string> = { quot: '"', lt: "<", gt: ">", amp: "&" };
+
+/** Numeric (hex or decimal) and the handful of named entities, in one alternation. */
+const ENTITY_PATTERN = /&(?:#[xX]([0-9a-fA-F]+)|#(\d+)|(quot|lt|gt|amp));/g;
+
+/**
+ * Decode HTML entities in one pass.
+ *
+ * One pass matters: decoding numeric entities before named ones would rewrite
+ * `&#38;lt;` to `&lt;` and then to `<`, losing the escaping the source went to
+ * the trouble of writing. Each match is resolved exactly once, so `&#38;lt;`
+ * decodes to the literal `&lt;`.
+ */
+export const decodeEntities = (s: string): string =>
+  s.replace(ENTITY_PATTERN, (_match, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
+    if (name !== undefined) return NAMED_ENTITIES[name]!;
+    return codePointOf(hex !== undefined ? parseInt(hex, 16) : parseInt(dec!, 10));
+  });
 
 /** Concatenate the text of every `text` block. */
 export const textOf = (content: ReadonlyArray<ContentBlock> | null | undefined): string =>
@@ -40,11 +50,16 @@ export const textOf = (content: ReadonlyArray<ContentBlock> | null | undefined):
 /**
  * Tool results mix block types: text, search results, images, documents.
  * Flatten them into a readable string for the UI.
+ *
+ * `text` blocks are passed through verbatim. They carry literal tool output —
+ * a file read, a shell transcript — where `&lt;` means those four characters,
+ * so decoding them would corrupt the very output the user asked to see. Only
+ * `search_result` blocks, whose bodies are extracted from HTML, are decoded.
  */
 export const describeToolResult = (content: ReadonlyArray<ContentBlock> | null | undefined): string =>
   (content ?? [])
     .map((block) => {
-      if (block.type === "text" && typeof block.text === "string") return decodeEntities(block.text);
+      if (block.type === "text" && typeof block.text === "string") return block.text as string;
       if (block.type === "search_result") {
         const inner = Array.isArray(block.content) ? textOf(block.content) : "";
         const title = decodeEntities(String(block.title ?? ""));
