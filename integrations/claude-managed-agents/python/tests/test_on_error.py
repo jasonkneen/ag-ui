@@ -32,10 +32,12 @@ IDLE_END_TURN = {
 
 
 async def test_reports_an_interrupt_that_could_not_be_posted() -> None:
+    """Drive the teardown via the turn timeout rather than task.cancel(): the
+    timeout path is deterministic across Python versions, whereas the exact
+    point at which an external cancellation unwinds is not."""
     reported: list[tuple[BaseException, dict[str, Any]]] = []
     gate = asyncio.Event()
-    # The stream stays open, so cancelling the run triggers the teardown
-    # interrupt — which is the send scripted to fail here.
+    # Send 0 is the outbound user message; send 1 is the teardown interrupt.
     fake = FakeClient(
         streams=[[gate]],
         send_failures={1: RuntimeError("interrupt rejected")},
@@ -44,22 +46,19 @@ async def test_reports_an_interrupt_that_could_not_be_posted() -> None:
         managed_agent_id="agent_1",
         environment_id="env_1",
         client=fake,  # type: ignore[arg-type]
+        turn_timeout_s=0.05,
         on_error=lambda error, context: reported.append((error, context)),
     )
 
-    async def drive() -> None:
-        async for _ in agent.run(base_input()):
-            pass
+    events = [event async for event in agent.run(base_input())]
 
-    task = asyncio.create_task(drive())
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with __import__("contextlib").suppress(asyncio.CancelledError):
-        await task
-
+    # The run still reports the timeout to the client...
+    assert events[-1].code == "turn_timeout"
+    # ...and the interrupt that could not be delivered is no longer silent.
     assert [c["operation"] for _, c in reported] == ["interrupt"]
     assert str(reported[0][0]) == "interrupt rejected"
     assert reported[0][1]["session_id"] == "sesn_1"
+    gate.set()
 
 
 async def test_a_broken_hook_does_not_break_the_run() -> None:

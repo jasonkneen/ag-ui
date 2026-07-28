@@ -21,7 +21,13 @@ from .constants import BEST_EFFORT_SEND_TIMEOUT_S, DEFAULT_TURN_TIMEOUT_S
 from .sessions import InMemorySessionStore
 from .tools import custom_tool_from, custom_tools_fingerprint, normalize_tool_name
 from .turn import Emit, run_turn
-from .types import BackendTool, SessionRecord, SessionStore, TurnOutcome
+from .types import (
+    BackendTool,
+    ErrorHandler,
+    SessionRecord,
+    SessionStore,
+    TurnOutcome,
+)
 
 _DONE = object()
 

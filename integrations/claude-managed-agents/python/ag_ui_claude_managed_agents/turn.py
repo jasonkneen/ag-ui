@@ -29,7 +29,7 @@ from .constants import (
     TOOL_RESULT_MAX_CHARS,
 )
 from .text import describe_tool_result, text_of
-from .types import ErrorHandler, BackendTool, TurnOutcome
+from .types import BackendTool, ErrorHandler, TurnOutcome
 
 INTERRUPTED_TOOL_RESULT_TEXT = "Tool execution was interrupted."
 """Posted for a backend tool cut off by a timeout or client disconnect, so
