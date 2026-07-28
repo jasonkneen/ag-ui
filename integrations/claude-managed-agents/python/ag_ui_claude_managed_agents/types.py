@@ -58,15 +58,20 @@ class SessionStore(Protocol):
     The default is in-memory (lost on restart, in which case a fresh session
     is created). Provide your own to survive restarts or run several replicas.
     Methods may be plain functions or coroutines.
+
+    `key` is opaque: it is derived from the managed agent id and the AG-UI
+    thread id, so two agents sharing one store never adopt each other's
+    sessions. Treat it as a string to store under, not as a thread id to parse.
+    Thread ids are client-supplied, so put the endpoint behind your own
+    authentication and use a store that partitions by caller if you need
+    multi-tenant isolation.
     """
 
-    def get(
-        self, thread_id: str
-    ) -> SessionRecord | None | Awaitable[SessionRecord | None]: ...
+    def get(self, key: str) -> SessionRecord | None | Awaitable[SessionRecord | None]: ...
 
-    def set(self, thread_id: str, record: SessionRecord) -> None | Awaitable[None]: ...
+    def set(self, key: str, record: SessionRecord) -> None | Awaitable[None]: ...
 
-    def delete(self, thread_id: str) -> None | Awaitable[None]: ...
+    def delete(self, key: str) -> None | Awaitable[None]: ...
 
 
 TurnStatus = Literal["finished", "parked", "errored"]

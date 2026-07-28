@@ -51,11 +51,17 @@ export interface SessionRecord {
  * Where thread↔session mappings live. The default is in-memory (lost on
  * restart, in which case a fresh session is created). Provide your own to
  * survive restarts or run multiple replicas.
+ *
+ * `key` is opaque: it is derived from the managed agent id and the AG-UI thread
+ * id, so two agents sharing one store never adopt each other's sessions. Treat
+ * it as a string to store under, not as a thread id to parse. Thread ids are
+ * client-supplied, so put the endpoint behind your own authentication and use a
+ * store that partitions by caller if you need multi-tenant isolation.
  */
 export interface SessionStore {
-  get(threadId: string): Promise<SessionRecord | undefined> | SessionRecord | undefined;
-  set(threadId: string, record: SessionRecord): Promise<void> | void;
-  delete(threadId: string): Promise<void> | void;
+  get(key: string): Promise<SessionRecord | undefined> | SessionRecord | undefined;
+  set(key: string, record: SessionRecord): Promise<void> | void;
+  delete(key: string): Promise<void> | void;
 }
 
 export interface ManagedAgentsAgentConfig extends AgentConfig {
@@ -71,10 +77,8 @@ export interface ManagedAgentsAgentConfig extends AgentConfig {
   /** Anthropic client. Defaults to `new Anthropic()`, which reads `ANTHROPIC_API_KEY`. */
   client?: Anthropic;
   /**
-   * Thread↔session store, keyed by AG-UI thread ID. Defaults to an in-memory
-   * store. Thread IDs are client-supplied, so put the endpoint behind your own
-   * authentication and supply a store that partitions by caller if you need
-   * multi-tenant isolation.
+   * Thread↔session store. Defaults to an in-memory store. Records are keyed by
+   * `managedAgentId:threadId`; see {@link SessionStore}.
    */
   sessionStore?: SessionStore;
   /** Tools the agent can call that this server executes. */

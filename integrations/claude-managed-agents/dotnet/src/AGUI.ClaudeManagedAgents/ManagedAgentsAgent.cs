@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using AGUI.Abstractions;
@@ -29,6 +30,15 @@ public sealed class ManagedAgentsAgent
     // sharing a store serialize runs per thread (even across instances), while
     // per-caller stores keep one caller's runs from blocking another's.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ISessionStore, ConcurrentDictionary<string, byte>> s_busyThreadsByStore = new();
+
+    /// <summary>
+    /// The keys currently held by the busy-run gate for <paramref name="store"/>, or
+    /// <see langword="null"/> if it has none. Exists so tests can assert that the gate and the
+    /// session store agree on the key; the TypeScript and Python ports reach their equivalents
+    /// directly.
+    /// </summary>
+    internal static IReadOnlyCollection<string>? BusyKeysFor(ISessionStore store)
+        => s_busyThreadsByStore.TryGetValue(store, out var busy) ? [.. busy.Keys] : null;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ManagedAgentsAgent"/> class.
@@ -64,8 +74,8 @@ public sealed class ManagedAgentsAgent
 
     /// <summary>
     /// Runs one turn for the input's thread and streams the resulting AG-UI events. Thread↔session
-    /// state is keyed by the AG-UI thread ID; supply a session store that partitions by caller if
-    /// you need multi-tenant isolation.
+    /// state is keyed by <c>managedAgentId:threadId</c> (see <see cref="ISessionStore"/>); supply a
+    /// session store that partitions by caller if you need multi-tenant isolation.
     /// </summary>
     /// <param name="input">The AG-UI run input.</param>
     /// <param name="cancellationToken">A token that aborts the run, for example when the client disconnects.</param>
@@ -84,10 +94,11 @@ public sealed class ManagedAgentsAgent
             yield return new StateSnapshotEvent { Snapshot = state };
         }
 
-        var threadKey = threadId;
-        var busyKey = $"{_options.ManagedAgentId}:{threadKey}";
+        // One key for the session store and the busy-run gate, so a stored session and the gate
+        // that serializes access to it can never disagree.
+        var threadKey = SessionKey(threadId);
         var busyThreads = s_busyThreadsByStore.GetOrCreateValue(_store);
-        if (!busyThreads.TryAdd(busyKey, 0))
+        if (!busyThreads.TryAdd(threadKey, 0))
         {
             yield return new RunErrorEvent { Message = "A run is already in progress on this thread.", Code = "run_in_progress" };
             yield break;
@@ -174,7 +185,7 @@ public sealed class ManagedAgentsAgent
         }
         finally
         {
-            busyThreads.TryRemove(busyKey, out _);
+            busyThreads.TryRemove(threadKey, out _);
         }
     }
 
@@ -331,7 +342,30 @@ public sealed class ManagedAgentsAgent
         }
     }
 
-    /// <summary>
+/// <summary>
+    /// The key that identifies a thread's state, in the session store and the busy-run gate alike,
+    /// so two agents sharing one store neither adopt each other's sessions nor serialize against
+    /// each other's threads.
+    /// </summary>
+    /// <remarks>
+    /// Every field baked into the remote session at creation is part of the key: none of them can
+    /// be re-checked or changed on resume, so an agent must never inherit a session created with a
+    /// different environment or pinned version. Each is length-prefixed so no two combinations can
+    /// collide — plain concatenation would let a <c>ManagedAgentId</c> of <c>support:beta</c> with
+    /// thread <c>t1</c> and one of <c>support</c> with thread <c>beta:t1</c> share one record. The
+    /// thread id is last, so it needs no prefix and may contain anything.
+    /// </remarks>
+    private string SessionKey(string threadId)
+    {
+        static string Field(string value) => $"{value.Length}:{value}|";
+
+        return Field(_options.ManagedAgentId)
+            + Field(_options.AgentVersion?.ToString(CultureInfo.InvariantCulture) ?? string.Empty)
+            + Field(_options.EnvironmentId)
+            + threadId;
+    }
+
+        /// <summary>
     /// Stores the record after its events were delivered to the session. Non-cancellable: a
     /// skipped write would make the next run re-post the same message and stale tool results.
     /// </summary>

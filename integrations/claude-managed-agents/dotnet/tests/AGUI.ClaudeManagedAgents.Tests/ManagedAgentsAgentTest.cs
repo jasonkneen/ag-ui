@@ -9,6 +9,12 @@ public class ManagedAgentsAgentTest
     private const string IdleEndTurn =
         """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"end_turn"}}""";
 
+    /// <summary>
+    /// The key the store and the busy gate share: scoped to the managed agent, not the bare
+    /// (client-supplied) thread id.
+    /// </summary>
+    private const string SessionKey = "7:agent_1|0:|5:env_1|thread_1";
+
     private static ManagedAgentsAgent NewAgent(FakeManagedAgentsClient fake, ISessionStore? store = null, Action<ManagedAgentsAgentOptions>? configure = null)
     {
         var options = new ManagedAgentsAgentOptions
@@ -201,7 +207,7 @@ public class ManagedAgentsAgentTest
                 AGUIEventTypes.RunFinished,
             ],
             Types(first));
-        Assert.Equal(["ctu_1"], (await store.GetAsync("thread_1", default))!.PendingClientToolUseIds);
+        Assert.Equal(["ctu_1"], (await store.GetAsync(SessionKey, default))!.PendingClientToolUseIds);
 
         var second = await CollectAsync(NewAgent(fake, store), BaseInput(input =>
         {
@@ -219,7 +225,7 @@ public class ManagedAgentsAgentTest
             fake.Sent[1].Single());
         Assert.Contains(AGUIEventTypes.TextMessageContent, Types(second));
         Assert.Equal(AGUIEventTypes.RunFinished, second[^1].Type);
-        Assert.Empty((await store.GetAsync("thread_1", default))!.PendingClientToolUseIds);
+        Assert.Empty((await store.GetAsync(SessionKey, default))!.PendingClientToolUseIds);
     }
 
     [Fact]
@@ -259,7 +265,7 @@ public class ManagedAgentsAgentTest
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
         await store.SetAsync(
-            "thread_1",
+            SessionKey,
             new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = [], LastUserMessageId = "u1" },
             default);
 
@@ -274,7 +280,7 @@ public class ManagedAgentsAgentTest
         Assert.Equal(2, sent.Count);
         AssertJson("""{"type":"user.message","content":[{"type":"text","text":"second"}]}""", sent[0]);
         AssertJson("""{"type":"user.message","content":[{"type":"text","text":"third"}]}""", sent[1]);
-        Assert.Equal("u3", (await store.GetAsync("thread_1", default))!.LastUserMessageId);
+        Assert.Equal("u3", (await store.GetAsync(SessionKey, default))!.LastUserMessageId);
     }
 
     [Fact]
@@ -286,7 +292,7 @@ public class ManagedAgentsAgentTest
         ]);
         var store = new InMemorySessionStore();
         await store.SetAsync(
-            "thread_1",
+            SessionKey,
             new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = ["ctu_1"], LastUserMessageId = "u1" },
             default);
 
@@ -312,7 +318,7 @@ public class ManagedAgentsAgentTest
         AssertJson("""{"type":"user.message","content":[{"type":"text","text":"never mind"}]}""", fake.Sent[1].Single());
         Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
 
-        var record = (await store.GetAsync("thread_1", default))!;
+        var record = (await store.GetAsync(SessionKey, default))!;
         Assert.Empty(record.PendingClientToolUseIds);
         Assert.Equal("u2", record.LastUserMessageId);
     }
@@ -323,7 +329,7 @@ public class ManagedAgentsAgentTest
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
         await store.SetAsync(
-            "thread_1",
+            SessionKey,
             new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = [], LastUserMessageId = "u1" },
             default);
 
@@ -369,7 +375,7 @@ public class ManagedAgentsAgentTest
         ]);
         var store = new InMemorySessionStore();
         await store.SetAsync(
-            "thread_1",
+            SessionKey,
             new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = ["ctu_1"], LastUserMessageId = "u1" },
             default);
 
@@ -407,7 +413,7 @@ public class ManagedAgentsAgentTest
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
         await store.SetAsync(
-            "thread_1",
+            SessionKey,
             new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = ["ctu_1"], LastUserMessageId = "u1" },
             default);
 
@@ -438,6 +444,78 @@ public class ManagedAgentsAgentTest
         Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
     }
 
+    [Fact]
+    public async Task AgentsDifferingOnlyInEnvironmentDoNotShareASession()
+    {
+        // EnvironmentId and AgentVersion are baked into the remote session at creation and can
+        // never be checked or changed on resume, so a key scoped only by managed agent let a
+        // staging and a production agent on one store share a session: every prod turn would then
+        // execute in staging, with nothing surfaced to say so.
+        var staging = new FakeManagedAgentsClient([IdleEndTurn]) { SessionId = "sesn_staging" };
+        var prod = new FakeManagedAgentsClient([IdleEndTurn]) { SessionId = "sesn_prod" };
+        var store = new RecordingSessionStore();
+
+        await CollectAsync(NewAgent(staging, store, o => o.EnvironmentId = "env_staging"), BaseInput());
+        await CollectAsync(NewAgent(prod, store, o => o.EnvironmentId = "env_prod"), BaseInput());
+
+        Assert.Single(staging.CreatedSessions);
+        Assert.Single(prod.CreatedSessions);
+        Assert.Equal(
+            ["7:agent_1|0:|11:env_staging|thread_1", "7:agent_1|0:|8:env_prod|thread_1"],
+            store.Keys.Order());
+    }
+
+    [Fact]
+    public async Task TwoAgentsSharingAStoreNeverAdoptEachOthersSession()
+    {
+        // Regression: the busy gate was scoped by managed agent while the store was keyed by the
+        // bare thread id, so a second agent on the same thread id read the first agent's session —
+        // a session created against a different managed agent — without serializing against it.
+        var first = new FakeManagedAgentsClient([IdleEndTurn]) { SessionId = "sesn_first" };
+        var second = new FakeManagedAgentsClient([IdleEndTurn]) { SessionId = "sesn_second" };
+        var store = new RecordingSessionStore();
+
+        await CollectAsync(NewAgent(first, store, o => o.ManagedAgentId = "agent_a"), BaseInput());
+        await CollectAsync(
+            NewAgent(second, store, o => o.ManagedAgentId = "agent_b"),
+            BaseInput(input => input.RunId = "run_2"));
+
+        Assert.Single(first.CreatedSessions);
+        Assert.Single(second.CreatedSessions);
+        Assert.Equal(["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"], store.Keys.Order());
+        Assert.Equal("sesn_first", (await store.GetAsync("7:agent_a|0:|5:env_1|thread_1", default))!.SessionId);
+        Assert.Equal("sesn_second", (await store.GetAsync("7:agent_b|0:|5:env_1|thread_1", default))!.SessionId);
+    }
+
+    [Fact]
+    public async Task RunsSerializeOnTheSameKeyTheStoreUses()
+    {
+        var gate = new TaskCompletionSource();
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]) { Gate = gate };
+        var store = new RecordingSessionStore();
+        var agent = NewAgent(fake, store);
+
+        var events = agent.RunAsync(BaseInput()).GetAsyncEnumerator();
+        await using var scope = events.ConfigureAwait(false);
+        // Advance far enough to create the session and open the stream.
+        while (await events.MoveNextAsync() && events.Current is not CustomEvent)
+        {
+            // keep going
+        }
+
+        Assert.Equal([SessionKey], store.Keys);
+        // The point of the commit: the gate and the store must agree on the key. Asserting only
+        // store.Keys made this a duplicate of KeysTheSessionStoreByThreadId, so re-splitting the
+        // two keys in this port alone would have gone unnoticed.
+        Assert.Equal([SessionKey], ManagedAgentsAgent.BusyKeysFor(store));
+
+        gate.SetResult();
+        while (await events.MoveNextAsync())
+        {
+            // drain
+        }
+    }
+
     private const string ParkingCall =
         """{"type":"agent.custom_tool_use","id":"ctu_1","name":"show_chart","input":{}}""";
 
@@ -459,7 +537,7 @@ public class ManagedAgentsAgentTest
 
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
         Assert.Equal("overloaded_error", error.Code);
-        var record = await store.GetAsync("thread_1", default);
+        var record = await store.GetAsync(SessionKey, default);
         Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
     }
 
@@ -476,7 +554,7 @@ public class ManagedAgentsAgentTest
 
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
         Assert.Equal("run_failed", error.Code);
-        var record = await store.GetAsync("thread_1", default);
+        var record = await store.GetAsync(SessionKey, default);
         Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
     }
 
@@ -487,7 +565,7 @@ public class ManagedAgentsAgentTest
         // next run and be answered against a resumed session.
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new RecordingSessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_stale"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_stale"]), default);
 
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
         [
@@ -495,7 +573,7 @@ public class ManagedAgentsAgentTest
             new AGUIUserMessage { Id = "u2", Content = "never mind" },
         ]));
 
-        var record = await store.GetAsync("thread_1", default);
+        var record = await store.GetAsync(SessionKey, default);
         Assert.Empty(record!.PendingClientToolUseIds);
     }
 
@@ -508,7 +586,7 @@ public class ManagedAgentsAgentTest
         // out-of-process-shaped store so only genuinely persisted state counts.
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new RecordingSessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1"]), default);
         store.Writes.Clear();
 
         fake.SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.message")
@@ -525,7 +603,7 @@ public class ManagedAgentsAgentTest
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
         Assert.Equal(("server exploded", "run_failed"), (error.Message, error.Code));
 
-        var record = await store.GetAsync("thread_1", default);
+        var record = await store.GetAsync(SessionKey, default);
         Assert.NotNull(record);
         Assert.Empty(record!.PendingClientToolUseIds);
         // The follow-up never landed, so the user message stays undelivered.
@@ -537,7 +615,7 @@ public class ManagedAgentsAgentTest
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new RecordingSessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1"]), default);
         store.Writes.Clear();
 
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
@@ -699,7 +777,7 @@ public class ManagedAgentsAgentTest
         }
 
         Assert.Single(fake.CreatedSessions);
-        Assert.NotNull(await store.GetAsync("thread_1", default));
+        Assert.NotNull(await store.GetAsync(SessionKey, default));
     }
 
     [Fact]
@@ -772,7 +850,7 @@ public class ManagedAgentsAgentTest
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1"]), default);
 
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
         [
@@ -790,7 +868,7 @@ public class ManagedAgentsAgentTest
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1"]), default);
 
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
         [
@@ -808,7 +886,7 @@ public class ManagedAgentsAgentTest
     {
         var fake = new FakeManagedAgentsClient();
         var store = new InMemorySessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1", "ctu_2"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1", "ctu_2"]), default);
 
         var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
         [
@@ -823,7 +901,7 @@ public class ManagedAgentsAgentTest
             Assert.Single(fake.Sent).Single());
         Assert.Empty(fake.StreamRequests);
         Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
-        Assert.Equal(["ctu_2"], (await store.GetAsync("thread_1", default))!.PendingClientToolUseIds);
+        Assert.Equal(["ctu_2"], (await store.GetAsync(SessionKey, default))!.PendingClientToolUseIds);
     }
 
     [Fact]
@@ -836,7 +914,7 @@ public class ManagedAgentsAgentTest
 
         var events = await CollectAsync(NewAgent(fake, store), BaseInput());
         Assert.Equal("session_ended", Assert.IsType<RunErrorEvent>(events[^1]).Code);
-        Assert.Null(await store.GetAsync("thread_1", default));
+        Assert.Null(await store.GetAsync(SessionKey, default));
 
         // The next run creates a fresh session.
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.RunId = "run_2"));
@@ -1040,7 +1118,7 @@ public class ManagedAgentsAgentTest
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);
         var store = new InMemorySessionStore();
-        await store.SetAsync("thread_1", Record(["ctu_1", "ctu_2"]), default);
+        await store.SetAsync(SessionKey, Record(["ctu_1", "ctu_2"]), default);
 
         await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
         [

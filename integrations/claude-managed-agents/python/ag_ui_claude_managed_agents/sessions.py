@@ -11,16 +11,16 @@ class InMemorySessionStore:
     def __init__(self) -> None:
         self._records: dict[str, SessionRecord] = {}
 
-    def get(self, thread_id: str) -> SessionRecord | None:
-        record = self._records.get(thread_id)
+    def get(self, key: str) -> SessionRecord | None:
+        record = self._records.get(key)
         # Hand out a copy: the agent mutates records in place between
         # persists, so an aliased record would make an unpersisted mutation
         # indistinguishable from a persisted one — and a dropped write would
         # only surface against a real out-of-process store.
         return None if record is None else deepcopy(record)
 
-    def set(self, thread_id: str, record: SessionRecord) -> None:
-        self._records[thread_id] = deepcopy(record)
+    def set(self, key: str, record: SessionRecord) -> None:
+        self._records[key] = deepcopy(record)
 
-    def delete(self, thread_id: str) -> None:
-        self._records.pop(thread_id, None)
+    def delete(self, key: str) -> None:
+        self._records.pop(key, None)

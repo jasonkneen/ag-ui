@@ -96,7 +96,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `AgentVersion` | latest | Pin an agent version. |
 | `AnthropicClient` | `new AnthropicClient()` | Bring your own Anthropic SDK client. |
 | `Client` | `AnthropicManagedAgentsClient` | Replace the Managed Agents API surface, for example in tests. |
-| `SessionStore` | in-memory | Thread↔session mapping. Provide your own to survive restarts. |
+| `SessionStore` | in-memory | Thread↔session mapping, keyed by `managedAgentId:threadId`. Provide your own to survive restarts. |
 | `BackendTools` | `[]` | Server-executed custom tools. |
 | `SessionTitle` | `AG-UI thread <id>` | Title for created sessions. |
 | `ToolConfirmation` | error | `ToolConfirmationPolicy.Allow`/`Deny` to answer built-in tools whose permission policy asks. |
@@ -105,21 +105,23 @@ The tool call and its result stream to the UI, and the result is returned to the
 
 ## Security: authenticate and bind threads to callers
 
-AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by thread ID, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by `managedAgentId:threadId`, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
 
 - Put the endpoint behind your own authentication. Never expose it unauthenticated.
 - In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread ID. Do this with an `ISessionStore` whose keys include the caller identity derived from your auth layer (never from the request body):
 
+The `threadKey` the agent passes in is already scoped to the managed agent; treat it as an opaque string and prefix it with the caller identity rather than parsing it:
+
 ```csharp
 sealed class PerCallerStore(string ownerId, ConcurrentDictionary<string, ManagedAgentsSessionRecord> inner) : ISessionStore
 {
-    string Key(string threadId) => $"{ownerId}:{threadId}";
+    string Scoped(string threadKey) => $"{ownerId}|{threadKey}";
     public ValueTask<ManagedAgentsSessionRecord?> GetAsync(string threadKey, CancellationToken ct)
-        => new(inner.TryGetValue(Key(threadKey), out var record) ? record : null);
+        => new(inner.TryGetValue(Scoped(threadKey), out var record) ? record : null);
     public ValueTask SetAsync(string threadKey, ManagedAgentsSessionRecord record, CancellationToken ct)
-    { inner[Key(threadKey)] = record; return ValueTask.CompletedTask; }
+    { inner[Scoped(threadKey)] = record; return ValueTask.CompletedTask; }
     public ValueTask DeleteAsync(string threadKey, CancellationToken ct)
-    { inner.TryRemove(Key(threadKey), out _); return ValueTask.CompletedTask; }
+    { inner.TryRemove(Scoped(threadKey), out _); return ValueTask.CompletedTask; }
 }
 ```
 

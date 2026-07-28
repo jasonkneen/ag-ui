@@ -122,14 +122,16 @@ export class ManagedAgentsAgent extends AbstractAgent {
     // `tools` must read as an empty run, not a TypeError.
     input = { ...input, messages: input.messages ?? [], tools: input.tools ?? [] };
     const { threadId, runId } = input;
-    const busyKey = this.threadKey(threadId);
+    // One key for the session store and the busy-run gate, so a stored session
+    // and the gate that serializes access to it can never disagree.
+    const key = this.sessionKey(threadId);
     let sessionId: string | undefined;
     emit({ type: EventType.RUN_STARTED, threadId, runId } as BaseEvent);
     if (input.state !== undefined && input.state !== null) {
       emit({ type: EventType.STATE_SNAPSHOT, snapshot: input.state } as BaseEvent);
     }
 
-    if (this.busyThreads.has(busyKey)) {
+    if (this.busyThreads.has(key)) {
       emit(runError("A run is already in progress on this thread.", "run_in_progress"));
       return;
     }
@@ -139,9 +141,9 @@ export class ManagedAgentsAgent extends AbstractAgent {
       emit(runError("There is nothing to send: this run has no user message or tool result.", "empty_run"));
       return;
     }
-    this.busyThreads.add(busyKey);
+    this.busyThreads.add(key);
     try {
-      const record = await this.getOrCreateSession(threadId, input, emit);
+      const record = await this.getOrCreateSession(key, threadId, input, emit);
       if (!record) {
         emit(runError("There is nothing to send: a tool result arrived for a thread with no session.", "tool_result_without_session"));
         return;
@@ -161,7 +163,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
         await this.client.beta.sessions.events.send(record.sessionId, { events: outbound.events }, { signal });
         record.pendingClientToolUseIds = outbound.stillParked;
         record.lastUserMessageId = outbound.lastUserMessageId ?? record.lastUserMessageId;
-        await this.store.set(threadId, record);
+        await this.store.set(key, record);
         emit({ type: EventType.RUN_FINISHED, threadId, runId } as BaseEvent);
         return;
       }
@@ -175,11 +177,11 @@ export class ManagedAgentsAgent extends AbstractAgent {
         // tool results resume the session even if the follow-ups then fail.
         onResultsSent: async () => {
           record.pendingClientToolUseIds = [];
-          await this.store.set(threadId, record);
+          await this.store.set(key, record);
         },
         onFollowUpsSent: async () => {
           if (outbound.lastUserMessageId) record.lastUserMessageId = outbound.lastUserMessageId;
-          await this.store.set(threadId, record);
+          await this.store.set(key, record);
         },
         // Persist a park the moment the call is handed to the UI. A later
         // event can fail the turn before the session confirms the park, and
@@ -187,7 +189,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
         onClientPark: async (toolUseId) => {
           if (record.pendingClientToolUseIds.includes(toolUseId)) return;
           record.pendingClientToolUseIds = [...record.pendingClientToolUseIds, toolUseId];
-          await this.store.set(threadId, record);
+          await this.store.set(key, record);
         },
         clientTools: new Map((input.tools ?? []).map((tool) => [normalizeToolName(tool.name), tool.name])),
         backendTools: this.backendTools,
@@ -198,7 +200,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
         signal,
       });
 
-      await this.recordOutcome(threadId, record, outcome);
+      await this.recordOutcome(key, record, outcome);
       if (outcome.status !== "errored") {
         emit({ type: EventType.RUN_FINISHED, threadId, runId } as BaseEvent);
       }
@@ -212,7 +214,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
       }
       throw err;
     } finally {
-      this.busyThreads.delete(busyKey);
+      this.busyThreads.delete(key);
     }
   }
 
@@ -221,9 +223,28 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return hasUserText(messages) || messages.some((message) => message.role === "tool");
   }
 
-  /** Shared-state key scoped to this managed agent so distinct agents never collide. */
-  private threadKey(threadId: string): string {
-    return `${this.config.managedAgentId}:${threadId}`;
+  /**
+   * The key that identifies this thread's state, in the session store and in
+   * the busy-run gate alike, so two agents sharing one store neither adopt each
+   * other's sessions nor serialize against each other's threads.
+   *
+   * Every field baked into the remote session at creation is part of the key:
+   * none of them can be re-checked or changed on resume, so an agent must never
+   * inherit a session created with a different environment, pinned version or
+   * vault set. Each is length-prefixed so no two combinations can collide —
+   * plain concatenation would let a `managedAgentId` of `support:beta` with
+   * thread `t1` and one of `support` with thread `beta:t1` share one record.
+   * The thread id is last, so it needs no prefix and may contain anything.
+   */
+  private sessionKey(threadId: string): string {
+    const { managedAgentId, agentVersion, environmentId } = this.config;
+    const field = (value: string) => `${value.length}:${value}|`;
+    return (
+      field(managedAgentId) +
+      field(agentVersion === undefined ? "" : String(agentVersion)) +
+      field(environmentId) +
+      threadId
+    );
   }
 
   /**
@@ -231,20 +252,20 @@ export class ManagedAgentsAgent extends AbstractAgent {
    * whatever `onClientPark` already persisted: the remote session is still
    * parked on those calls and the next run has to answer them.
    */
-  private async recordOutcome(threadId: string, record: SessionRecord, outcome: TurnOutcome): Promise<void> {
+  private async recordOutcome(key: string, record: SessionRecord, outcome: TurnOutcome): Promise<void> {
     if (outcome.status === "errored") {
-      if (outcome.sessionEnded) await this.store.delete(threadId);
+      if (outcome.sessionEnded) await this.store.delete(key);
       return;
     }
     if (outcome.status === "parked") {
       record.pendingClientToolUseIds = outcome.clientToolUseIds;
-      await this.store.set(threadId, record);
+      await this.store.set(key, record);
       return;
     }
     // The session went idle on end_turn: nothing is awaited any more.
     if (record.pendingClientToolUseIds.length > 0) {
       record.pendingClientToolUseIds = [];
-      await this.store.set(threadId, record);
+      await this.store.set(key, record);
     }
   }
 
@@ -298,11 +319,12 @@ export class ManagedAgentsAgent extends AbstractAgent {
   }
 
   private async getOrCreateSession(
+    key: string,
     threadId: string,
     input: RunAgentInput,
     emit: (event: BaseEvent) => void,
   ): Promise<SessionRecord | undefined> {
-    const existing = await this.store.get(threadId);
+    const existing = await this.store.get(key);
     if (existing) return existing;
 
     // A tool result only answers a pending call on an existing session;
@@ -311,7 +333,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
 
     // The busy-thread gate serializes runs per thread, so creation cannot race.
     const record = await this.createSession(threadId, input.tools ?? []);
-    await this.store.set(threadId, record);
+    await this.store.set(key, record);
     emit({
       type: EventType.CUSTOM,
       name: "managed_agents.session",

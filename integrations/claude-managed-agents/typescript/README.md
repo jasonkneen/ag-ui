@@ -71,7 +71,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `managedAgentId`, `environmentId` | required | The managed agent (`agent_...`) and environment behind each session. |
 | `agentVersion` | latest | Pin an agent version. |
 | `client` | `new Anthropic()` | Bring your own Anthropic client. |
-| `sessionStore` | in-memory | Thread↔session mapping. Provide your own to survive restarts. |
+| `sessionStore` | in-memory | Thread↔session mapping, keyed by `managedAgentId:threadId`. Provide your own to survive restarts. |
 | `backendTools` | `[]` | Server-executed custom tools. |
 | `sessionTitle` | `AG-UI thread <id>` | Title for created sessions. |
 | `toolConfirmation` | error | `"allow"`/`"deny"` to answer built-in tools whose permission policy asks. |
@@ -80,18 +80,20 @@ The tool call and its result stream to the UI, and the result is returned to the
 
 ## Security: authenticate and bind threads to callers
 
-AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by thread ID, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by `managedAgentId:threadId`, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
 
 - Put the endpoint behind your own authentication. Never expose it unauthenticated.
 - In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread ID. Do this with a `sessionStore` whose keys include the caller identity derived from your auth layer (never from the request body):
 
+The key the agent passes in is already scoped to the managed agent; treat it as an opaque string and prefix it with the caller identity rather than parsing it:
+
 ```ts
 class PerCallerStore implements SessionStore {
   constructor(private ownerId: string, private inner = new Map<string, SessionRecord>()) {}
-  private key = (threadId: string) => `${this.ownerId}:${threadId}`;
-  get = (threadId: string) => this.inner.get(this.key(threadId));
-  set = (threadId: string, record: SessionRecord) => void this.inner.set(this.key(threadId), record);
-  delete = (threadId: string) => void this.inner.delete(this.key(threadId));
+  private scoped = (key: string) => `${this.ownerId}|${key}`;
+  get = (key: string) => this.inner.get(this.scoped(key));
+  set = (key: string, record: SessionRecord) => void this.inner.set(this.scoped(key), record);
+  delete = (key: string) => void this.inner.delete(this.scoped(key));
 }
 ```
 

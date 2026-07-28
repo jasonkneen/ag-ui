@@ -23,6 +23,10 @@ IDLE_END_TURN = {
     "stop_reason": {"type": "end_turn"},
 }
 
+SESSION_KEY = "7:agent_1|0:|5:env_1|thread_1"
+"""The key the store and the busy gate share: scoped to the managed agent, not
+the bare (client-supplied) thread id."""
+
 
 def base_input(**overrides: Any) -> RunAgentInput:
     data: dict[str, Any] = {
@@ -47,11 +51,15 @@ def types(events: list[Any]) -> list[str]:
 
 
 def new_agent(
-    fake: FakeClient, store: SessionStore | None = None, **kwargs: Any
+    fake: FakeClient,
+    store: SessionStore | None = None,
+    managed_agent_id_override: str = "agent_1",
+    environment_id: str = "env_1",
+    **kwargs: Any,
 ) -> ManagedAgentsAgent:
     return ManagedAgentsAgent(
-        managed_agent_id="agent_1",
-        environment_id="env_1",
+        managed_agent_id=managed_agent_id_override,
+        environment_id=environment_id,
         client=fake,  # type: ignore[arg-type]
         session_store=store,
         **kwargs,
@@ -307,7 +315,7 @@ async def test_round_trips_frontend_tool_park_then_resume_with_client_result():
         "TOOL_CALL_END",
         "RUN_FINISHED",
     ]
-    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_1"]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
 
     second = await collect(
         new_agent(fake, store),
@@ -336,14 +344,14 @@ async def test_round_trips_frontend_tool_park_then_resume_with_client_result():
     ]
     assert "TEXT_MESSAGE_CONTENT" in types(second)
     assert types(second)[-1] == "RUN_FINISHED"
-    assert store.get("thread_1").pending_client_tool_use_ids == []
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
 
 
 async def test_forwards_tool_message_error_flag():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -380,7 +388,7 @@ async def test_stays_parked_when_some_tool_calls_remain_unanswered():
     fake = FakeClient(streams=[])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -410,7 +418,7 @@ async def test_stays_parked_when_some_tool_calls_remain_unanswered():
     ]
     assert fake.stream_calls == []
     assert types(events)[-1] == "RUN_FINISHED"
-    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_2"]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_2"]
 
 
 async def test_default_session_store_persists_across_runs():
@@ -484,7 +492,7 @@ async def test_forwards_every_undelivered_user_message_in_order():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -508,7 +516,7 @@ async def test_forwards_every_undelivered_user_message_in_order():
         {"type": "user.message", "content": [{"type": "text", "text": "second"}]},
         {"type": "user.message", "content": [{"type": "text", "text": "third"}]},
     ]
-    assert store.get("thread_1").last_user_message_id == "u3"
+    assert store.get(SESSION_KEY).last_user_message_id == "u3"
 
 
 async def test_extracts_text_from_multimodal_user_content():
@@ -545,7 +553,7 @@ async def test_abandons_parked_tool_calls_when_user_sends_new_message_instead():
     )
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -584,7 +592,7 @@ async def test_abandons_parked_tool_calls_when_user_sends_new_message_instead():
         {"type": "user.message", "content": [{"type": "text", "text": "never mind"}]}
     ]
     assert types(events)[-1] == "RUN_FINISHED"
-    record = store.get("thread_1")
+    record = store.get(SESSION_KEY)
     assert record.pending_client_tool_use_ids == []
     assert record.last_user_message_id == "u2"
 
@@ -593,7 +601,7 @@ async def test_errors_when_run_has_nothing_new_to_send():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -717,7 +725,7 @@ async def test_deletes_thread_record_when_session_ends():
     events = await collect(new_agent(fake, store), base_input())
     assert isinstance(events[-1], RunErrorEvent)
     assert events[-1].code == "session_ended"
-    assert store.get("thread_1") is None
+    assert store.get(SESSION_KEY) is None
 
     # The next run creates a fresh session.
     await collect(new_agent(fake, store), base_input(run_id="run_2"))
@@ -835,7 +843,7 @@ async def test_stops_streaming_deltas_when_disabled():
     assert fake.stream_calls == [("sesn_1", {})]
 
 
-async def test_session_store_is_keyed_by_thread_id():
+async def test_session_store_is_keyed_by_managed_agent_and_thread_id():
     fake = FakeClient(
         streams=[
             [
@@ -848,12 +856,77 @@ async def test_session_store_is_keyed_by_thread_id():
             ],
         ]
     )
-    store = InMemorySessionStore()
+    store = RecordingSessionStore()
 
     await collect(new_agent(fake, store), base_input())
 
     assert len(fake.create_calls) == 1
-    assert store.get("thread_1") is not None
+    assert store.keys() == [SESSION_KEY]
+    # Never the bare, client-supplied thread id.
+    assert store.get("thread_1") is None
+
+
+async def test_agents_differing_only_in_environment_do_not_share_a_session():
+    """environment_id, agent_version and vault_ids are baked into the remote
+    session at creation and can never be checked or changed on resume, so a key
+    scoped only by managed agent let a staging and a production agent on one
+    store share a session: every prod turn would then execute in staging,
+    against staging vaults, with nothing surfaced to say so."""
+    staging = FakeClient(streams=[[IDLE_END_TURN]], session_id="sesn_staging")
+    prod = FakeClient(streams=[[IDLE_END_TURN]], session_id="sesn_prod")
+    store = RecordingSessionStore()
+
+    await collect(new_agent(staging, store, environment_id="env_staging"), base_input())
+    await collect(
+        new_agent(prod, store, environment_id="env_prod"), base_input(run_id="run_2")
+    )
+
+    assert len(staging.create_calls) == 1
+    assert len(prod.create_calls) == 1
+    assert sorted(store.keys()) == sorted(["7:agent_1|0:|11:env_staging|thread_1", "7:agent_1|0:|8:env_prod|thread_1"])
+
+
+async def test_two_agents_sharing_a_store_never_adopt_each_others_session():
+    """Regression: the busy gate was scoped by managed agent while the store was
+    keyed by the bare thread id, so a second agent on the same thread id read
+    the first agent's session — a session created against a different managed
+    agent — without ever serializing against its runs."""
+    first = FakeClient(streams=[[IDLE_END_TURN]], session_id="sesn_first")
+    second = FakeClient(streams=[[IDLE_END_TURN]], session_id="sesn_second")
+    store = RecordingSessionStore()
+
+    await collect(
+        new_agent(first, store, managed_agent_id_override="agent_a"), base_input()
+    )
+    await collect(
+        new_agent(second, store, managed_agent_id_override="agent_b"),
+        base_input(run_id="run_2"),
+    )
+
+    assert len(first.create_calls) == 1
+    assert len(second.create_calls) == 1
+    assert sorted(store.keys()) == ["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"]
+    assert store.get("7:agent_a|0:|5:env_1|thread_1").session_id == "sesn_first"
+    assert store.get("7:agent_b|0:|5:env_1|thread_1").session_id == "sesn_second"
+
+
+async def test_runs_serialize_on_the_same_key_the_store_uses():
+    gate = asyncio.Event()
+    fake = FakeClient(streams=[[gate, IDLE_END_TURN]])
+    store = RecordingSessionStore()
+    agent = new_agent(fake, store)
+
+    generator = agent.run(base_input())
+    await generator.__anext__()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert ManagedAgentsAgent._busy_threads[id(store)] == {SESSION_KEY}
+    assert store.keys() == [SESSION_KEY]
+
+    gate.set()
+    async for _event in generator:
+        pass
 
 
 async def test_tool_result_on_unknown_thread_does_not_create_session():
@@ -883,7 +956,7 @@ async def test_interrupt_is_posted_before_busy_gate_is_released():
     gate = asyncio.Event()
     fake = FakeClient(streams=[[gate]])
     agent = new_agent(fake)
-    busy_key = agent._thread_key("thread_1")
+    busy_key = agent._session_key("thread_1")
     busy_when_interrupted: list[bool] = []
     original_send = fake._send
 
@@ -966,7 +1039,7 @@ async def test_keeps_a_parked_tool_id_when_a_later_event_fails_the_turn():
 
     assert isinstance(events[-1], RunErrorEvent)
     assert events[-1].code == "overloaded_error"
-    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_1"]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
 
 
 async def test_keeps_a_parked_tool_id_when_the_stream_raises_after_the_park():
@@ -979,7 +1052,7 @@ async def test_keeps_a_parked_tool_id_when_the_stream_raises_after_the_park():
 
     assert isinstance(events[-1], RunErrorEvent)
     assert events[-1].code == "run_failed"
-    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_1"]
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == ["ctu_1"]
 
 
 async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn():
@@ -988,7 +1061,7 @@ async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn()
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = RecordingSessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -1007,7 +1080,7 @@ async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn()
         ),
     )
 
-    assert store.get("thread_1").pending_client_tool_use_ids == []
+    assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
 
 
 async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
@@ -1023,7 +1096,7 @@ async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     )
     store = RecordingSessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -1045,7 +1118,7 @@ async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
 
     assert isinstance(events[-1], RunErrorEvent)
     assert "server exploded" in events[-1].message
-    record = store.get("thread_1")
+    record = store.get(SESSION_KEY)
     assert record.pending_client_tool_use_ids == []
     # The follow-up never landed, so the user message stays undelivered.
     assert record.last_user_message_id == "u1"
@@ -1056,7 +1129,7 @@ async def test_records_the_follow_up_delivery_separately_from_the_results():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = RecordingSessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -1087,7 +1160,7 @@ async def test_abandons_multiple_pending_calls_in_original_order():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=[],
@@ -1171,7 +1244,7 @@ async def test_refreshes_legacy_name_only_tool_cache():
     fake = FakeClient(streams=[[IDLE_END_TURN]])
     store = InMemorySessionStore()
     store.set(
-        "thread_1",
+        SESSION_KEY,
         SessionRecord(
             session_id="sesn_1",
             tool_names=["show_chart"],
@@ -1194,7 +1267,7 @@ async def test_refreshes_legacy_name_only_tool_cache():
     )
 
     assert len(fake.update_calls) == 1
-    record = store.get("thread_1")
+    record = store.get(SESSION_KEY)
     assert record is not None
     assert record.tool_definitions_fingerprint is not None
 
@@ -1241,7 +1314,7 @@ async def test_interrupts_backend_tool_and_answers_it_when_client_disconnects():
         "is_error": True,
     } in sent
     assert {"type": "user.interrupt"} in sent
-    assert agent._thread_key("thread_1") not in ManagedAgentsAgent._busy_threads.get(
+    assert agent._session_key("thread_1") not in ManagedAgentsAgent._busy_threads.get(
         id(agent.store), set()
     )
 
@@ -1280,4 +1353,4 @@ async def test_deletes_thread_record_when_the_session_is_deleted() -> None:
 
     assert isinstance(events[-1], RunErrorEvent)
     assert events[-1].code == "session_ended"
-    assert store.get("thread_1") is None
+    assert store.get(SESSION_KEY) is None

@@ -79,7 +79,7 @@ The handler may be a plain function or a coroutine. A plain function runs in a w
 | `managed_agent_id`, `environment_id` | required | The managed agent and environment behind each session. |
 | `agent_version` | latest | Pin an agent version. |
 | `client` | `AsyncAnthropic()` | Bring your own Anthropic client. |
-| `session_store` | in-memory | Thread to session mapping. Provide your own to survive restarts. |
+| `session_store` | in-memory | Thread to session mapping, keyed by `managed_agent_id:thread_id`. Provide your own to survive restarts. |
 | `backend_tools` | `[]` | Server-executed custom tools. |
 | `session_title` | `AG-UI thread <id>` | Callable returning the title for created sessions. |
 | `tool_confirmation` | `None` | `"allow"`/`"deny"` answers built-in tools whose permission policy asks. With no policy, such a call interrupts the run with a `tool_confirmation_required` error. |
@@ -88,10 +88,12 @@ The handler may be a plain function or a coroutine. A plain function runs in a w
 
 ## Security: authenticate and bind threads to callers
 
-AG-UI thread ids are supplied by the client and this agent keys thread↔session state by thread id, so a thread id is effectively a bearer identifier: **any caller who presents a thread id resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
+AG-UI thread ids are supplied by the client and this agent keys thread↔session state by `managed_agent_id:thread_id`, so a thread id is effectively a bearer identifier: **any caller who presents a thread id resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
 
 - Put the endpoint behind your own authentication. Never expose it unauthenticated.
 - In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread id. Do this with a `session_store` whose keys include the caller identity derived from your auth layer (never from the request body):
+
+The key the agent passes in is already scoped to the managed agent; treat it as an opaque string and prefix it with the caller identity rather than parsing it:
 
 ```python
 class PerCallerStore:
@@ -99,17 +101,17 @@ class PerCallerStore:
         self._owner_id = owner_id
         self._inner: dict[str, SessionRecord] = inner if inner is not None else {}
 
-    def _key(self, thread_id: str) -> str:
-        return f"{self._owner_id}:{thread_id}"
+    def _scoped(self, key: str) -> str:
+        return f"{self._owner_id}|{key}"
 
-    def get(self, thread_id: str) -> SessionRecord | None:
-        return self._inner.get(self._key(thread_id))
+    def get(self, key: str) -> SessionRecord | None:
+        return self._inner.get(self._scoped(key))
 
-    def set(self, thread_id: str, record: SessionRecord) -> None:
-        self._inner[self._key(thread_id)] = record
+    def set(self, key: str, record: SessionRecord) -> None:
+        self._inner[self._scoped(key)] = record
 
-    def delete(self, thread_id: str) -> None:
-        self._inner.pop(self._key(thread_id), None)
+    def delete(self, key: str) -> None:
+        self._inner.pop(self._scoped(key), None)
 ```
 
   Reuse ONE store instance per caller — construct it once and cache it:

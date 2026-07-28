@@ -10,6 +10,12 @@ import { RecordingSessionStore } from "./fake-store";
 
 const idleEndTurn = { type: "session.status_idle", id: "idle_1", stop_reason: { type: "end_turn" } };
 
+/**
+ * The key the store and the busy gate share: scoped to the managed agent, not
+ * the bare (client-supplied) thread id.
+ */
+const SESSION_KEY = "7:agent_1|0:|5:env_1|thread_1";
+
 const baseInput = (overrides: Partial<RunAgentInput> = {}): RunAgentInput => ({
   threadId: "thread_1",
   runId: "run_1",
@@ -218,7 +224,7 @@ describe("ManagedAgentsAgent", () => {
       EventType.TOOL_CALL_END,
       EventType.RUN_FINISHED,
     ]);
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
 
     const second = await collect(
       newAgent(fake, store),
@@ -237,13 +243,13 @@ describe("ManagedAgentsAgent", () => {
     ]);
     expect(types(second)).toContain(EventType.TEXT_MESSAGE_CONTENT);
     expect(second.at(-1)?.type).toBe(EventType.RUN_FINISHED);
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [] });
   });
 
   it("forwards a tool message's error flag and error text", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
 
     await collect(
       newAgent(fake, store),
@@ -263,7 +269,7 @@ describe("ManagedAgentsAgent", () => {
   it("stays parked when only some pending tool calls are answered", async () => {
     const fake = createFakeClient({ streams: [] });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1", "ctu_2"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1", "ctu_2"], lastUserMessageId: "u1" });
 
     const events = await collect(
       newAgent(fake, store),
@@ -282,7 +288,7 @@ describe("ManagedAgentsAgent", () => {
     ]);
     expect(fake.spies.stream).not.toHaveBeenCalled();
     expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_2"] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_2"] });
   });
 
   it("shares the session store across clones so a resumed run finds its parked session", async () => {
@@ -321,7 +327,7 @@ describe("ManagedAgentsAgent", () => {
   it("forwards every undelivered user message in order", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: [], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: [], lastUserMessageId: "u1" });
 
     await collect(
       newAgent(fake, store),
@@ -338,7 +344,7 @@ describe("ManagedAgentsAgent", () => {
       { type: "user.message", content: [{ type: "text", text: "second" }] },
       { type: "user.message", content: [{ type: "text", text: "third" }] },
     ]);
-    expect(await store.get("thread_1")).toMatchObject({ lastUserMessageId: "u3" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ lastUserMessageId: "u3" });
   });
 
   it("extracts the text of multimodal user content", async () => {
@@ -369,7 +375,7 @@ describe("ManagedAgentsAgent", () => {
       streams: [[{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "Moving on." }] }, idleEndTurn]],
     });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
 
     const events = await collect(
       newAgent(fake, store),
@@ -394,7 +400,7 @@ describe("ManagedAgentsAgent", () => {
     ]);
     expect(fake.sent[1].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "never mind" }] }]);
     expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u2" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u2" });
   });
 
   it("keeps a parked tool id when a later session event fails the turn", async () => {
@@ -415,7 +421,7 @@ describe("ManagedAgentsAgent", () => {
     const events = await collect(newAgent(fake, store), baseInput({ tools }));
 
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "overloaded_error" });
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
   });
 
   it("keeps a parked tool id when the stream throws after the park", async () => {
@@ -433,7 +439,7 @@ describe("ManagedAgentsAgent", () => {
     const events = await collect(newAgent(fake, store), baseInput({ tools }));
 
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "run_failed" });
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
   });
 
   it("clears a stale parked id when the session goes idle on end_turn", async () => {
@@ -441,7 +447,7 @@ describe("ManagedAgentsAgent", () => {
     // survive into the next run and be answered against a resumed session.
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new RecordingSessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_stale"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_stale"], lastUserMessageId: "u1" });
 
     await collect(
       newAgent(fake, store),
@@ -453,7 +459,7 @@ describe("ManagedAgentsAgent", () => {
       }),
     );
 
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [] });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [] });
   });
 
   it("clears pending tool ids even when the follow-up send then fails", async () => {
@@ -468,7 +474,7 @@ describe("ManagedAgentsAgent", () => {
       sendResults: [undefined, new Error("server exploded")],
     });
     const store = new RecordingSessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
 
     const events = await collect(
       newAgent(fake, store),
@@ -484,14 +490,14 @@ describe("ManagedAgentsAgent", () => {
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "server exploded", code: "run_failed" });
     // The results were persisted as delivered; the follow-up never landed, so
     // the user message stays undelivered and is retried next run.
-    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
+    expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
     expect(store.writes.at(-1)?.record).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
   });
 
   it("records the follow-up delivery separately from the tool results", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new RecordingSessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
     store.writes.length = 0;
 
     await collect(
@@ -515,7 +521,7 @@ describe("ManagedAgentsAgent", () => {
   it("abandons multiple parked tool calls in their original order", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", {
+    await store.set(SESSION_KEY, {
       sessionId: "sesn_1",
       toolNames: [],
       pendingClientToolUseIds: ["ctu_1", "ctu_2", "ctu_3"],
@@ -548,16 +554,73 @@ describe("ManagedAgentsAgent", () => {
     expect(fake.sent[1].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "never mind" }] }]);
   });
 
-  it("keys the session store by thread id", async () => {
+  it("keys the session store by managed agent and thread id", async () => {
     const fake = createFakeClient({
       streams: [[{ type: "agent.message", id: "msg_1", content: [{ type: "text", text: "a" }] }, idleEndTurn]],
     });
-    const store = new InMemorySessionStore();
+    const store = new RecordingSessionStore();
 
     await collect(newAgent(fake, store), baseInput());
 
     expect(fake.spies.create).toHaveBeenCalledTimes(1);
-    expect(await store.get("thread_1")).toBeDefined();
+    expect(store.keys()).toEqual([SESSION_KEY]);
+    // Never the bare, client-supplied thread id.
+    expect(await store.get("thread_1")).toBeUndefined();
+  });
+
+  it("does not let agents differing only in environment share a session", async () => {
+    // environmentId, agentVersion and vaultIds are baked into the remote session
+    // at creation and can never be checked or changed on resume, so a key scoped
+    // only by managed agent let a staging and a production agent on one store
+    // share a session: every prod turn would then execute in staging, against
+    // staging vaults, with nothing surfaced to say so.
+    const staging = createFakeClient({ streams: [[idleEndTurn]], sessionId: "sesn_staging" });
+    const prod = createFakeClient({ streams: [[idleEndTurn]], sessionId: "sesn_prod" });
+    const store = new RecordingSessionStore();
+
+    await collect(newAgent(staging, store, { environmentId: "env_staging" }), baseInput());
+    await collect(newAgent(prod, store, { environmentId: "env_prod" }), baseInput({ runId: "run_2" }));
+
+    expect(staging.spies.create).toHaveBeenCalledTimes(1);
+    expect(prod.spies.create).toHaveBeenCalledTimes(1);
+    expect(store.keys().sort()).toEqual(["7:agent_1|0:|8:env_prod|thread_1", "7:agent_1|0:|11:env_staging|thread_1"].sort());
+  });
+
+  it("does not let two agents sharing a store adopt each other's session", async () => {
+    // Regression: the busy gate was scoped by managed agent while the store was
+    // keyed by the bare thread id, so a second agent on the same thread id read
+    // the first agent's session — a session created against a different managed
+    // agent — without ever serializing against its runs.
+    const first = createFakeClient({ streams: [[idleEndTurn]], sessionId: "sesn_first" });
+    const second = createFakeClient({ streams: [[idleEndTurn]], sessionId: "sesn_second" });
+    const store = new RecordingSessionStore();
+
+    await collect(newAgent(first, store, { managedAgentId: "agent_a" }), baseInput());
+    await collect(newAgent(second, store, { managedAgentId: "agent_b" }), baseInput({ runId: "run_2" }));
+
+    // Each agent created and kept its own session.
+    expect(first.spies.create).toHaveBeenCalledTimes(1);
+    expect(second.spies.create).toHaveBeenCalledTimes(1);
+    expect(store.keys().sort()).toEqual(["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"]);
+    expect(await store.get("7:agent_a|0:|5:env_1|thread_1")).toMatchObject({ sessionId: "sesn_first" });
+    expect(await store.get("7:agent_b|0:|5:env_1|thread_1")).toMatchObject({ sessionId: "sesn_second" });
+  });
+
+  it("serializes runs on the same key that the store uses", async () => {
+    const hold = gate();
+    const fake = createFakeClient({ streams: [[hold.promise, idleEndTurn]] });
+    const store = new RecordingSessionStore();
+    const agent = newAgent(fake, store);
+
+    const first = collect(agent, baseInput());
+    await settle();
+    const busy = (ManagedAgentsAgent as unknown as { busyThreadsByStore: WeakMap<object, Set<string>> })
+      .busyThreadsByStore.get(store);
+    expect([...(busy ?? [])]).toEqual([SESSION_KEY]);
+    expect(store.keys()).toEqual([SESSION_KEY]);
+
+    hold.release();
+    await first;
   });
 
   it("does not create a session for a tool result on an unknown thread", async () => {
@@ -591,7 +654,7 @@ describe("ManagedAgentsAgent", () => {
   it("errors with nothing_to_send when a run has nothing new", async () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     const store = new InMemorySessionStore();
-    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: [], lastUserMessageId: "u1" });
+    await store.set(SESSION_KEY, { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: [], lastUserMessageId: "u1" });
 
     const events = await collect(newAgent(fake, store), baseInput());
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "nothing_to_send" });
@@ -632,7 +695,7 @@ describe("ManagedAgentsAgent", () => {
 
     const events = await collect(newAgent(fake, store), baseInput());
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
-    expect(await store.get("thread_1")).toBeUndefined();
+    expect(await store.get(SESSION_KEY)).toBeUndefined();
 
     // The next run creates a fresh session.
     await collect(newAgent(fake, store), baseInput({ runId: "run_2" }));
@@ -645,7 +708,7 @@ describe("ManagedAgentsAgent", () => {
 
     const events = await collect(newAgent(fake, store), baseInput());
     expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "session_ended" });
-    expect(await store.get("thread_1")).toBeUndefined();
+    expect(await store.get(SESSION_KEY)).toBeUndefined();
   });
 
   it("rejects a second concurrent run on the same thread with run_in_progress", async () => {
@@ -717,7 +780,7 @@ describe("ManagedAgentsAgent", () => {
       if (params.events.some((event) => (event as { type?: string }).type === "user.interrupt")) {
         const busy = (ManagedAgentsAgent as unknown as { busyThreadsByStore: WeakMap<object, Set<string>> })
           .busyThreadsByStore.get(store);
-        busyWhenInterrupted.push(busy?.has("agent_1:thread_1") ?? false);
+        busyWhenInterrupted.push(busy?.has(SESSION_KEY) ?? false);
       }
       return originalSend(sessionId, params);
     }) as typeof originalSend;
@@ -730,7 +793,7 @@ describe("ManagedAgentsAgent", () => {
     expect(busyWhenInterrupted).toEqual([true]);
     const busyAfter = (ManagedAgentsAgent as unknown as { busyThreadsByStore: WeakMap<object, Set<string>> })
       .busyThreadsByStore.get(store);
-    expect(busyAfter?.has("agent_1:thread_1") ?? false).toBe(false);
+    expect(busyAfter?.has(SESSION_KEY) ?? false).toBe(false);
   });
 
   it("interrupts the session and errors when the turn times out", async () => {

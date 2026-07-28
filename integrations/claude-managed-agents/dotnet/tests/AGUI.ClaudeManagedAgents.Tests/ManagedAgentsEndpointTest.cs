@@ -67,7 +67,7 @@ public class ManagedAgentsEndpointTest : IAsyncLifetime
     }
 
     [Fact]
-    public async Task KeysTheSessionStoreByThreadId()
+    public async Task KeysTheSessionStoreByTheManagedAgentAndThreadId()
     {
         var store = new InMemorySessionStore();
         var agent = new ManagedAgentsAgent(new ManagedAgentsAgentOptions
@@ -89,7 +89,9 @@ public class ManagedAgentsEndpointTest : IAsyncLifetime
         using var response = await _http.SendAsync(request);
         _ = await response.Content.ReadAsStringAsync();
 
-        Assert.NotNull(await store.GetAsync("thread_1", default));
+        // Scoped, not the bare (client-supplied) thread id.
+        Assert.Null(await store.GetAsync("thread_1", default));
+        Assert.NotNull(await store.GetAsync("14:agent_endpoint|0:|5:env_1|thread_1", default));
     }
 
     [Fact]

@@ -205,12 +205,14 @@ class ManagedAgentsAgent:
         if getattr(input, "messages", None) is None:
             input = input.model_copy(update={"messages": []})
         thread_id, run_id = input.thread_id, input.run_id
-        busy_key = self._thread_key(thread_id)
+        # One key for the session store and the busy-run gate, so a stored
+        # session and the gate that serializes access to it cannot disagree.
+        store_key = self._session_key(thread_id)
         emit(RunStartedEvent(thread_id=thread_id, run_id=run_id))
         if input.state is not None:
             emit(StateSnapshotEvent(snapshot=input.state))
 
-        if busy_key in ManagedAgentsAgent._busy_threads.get(id(self.store), ()):
+        if store_key in ManagedAgentsAgent._busy_threads.get(id(self.store), ()):
             emit(
                 RunErrorEvent(
                     message="A run is already in progress on this thread.",
@@ -231,10 +233,10 @@ class ManagedAgentsAgent:
 
         # Hold the per-thread gate for the rest of the run; `_drive` releases
         # it after any interrupt has been posted.
-        ManagedAgentsAgent._busy_threads.setdefault(id(self.store), set()).add(busy_key)
-        state.busy_key = busy_key
+        ManagedAgentsAgent._busy_threads.setdefault(id(self.store), set()).add(store_key)
+        state.busy_key = store_key
 
-        record = await self._get_or_create_session(thread_id, input, emit)
+        record = await self._get_or_create_session(store_key, thread_id, input, emit)
         if record is None:
             emit(
                 RunErrorEvent(
@@ -255,8 +257,6 @@ class ManagedAgentsAgent:
                 )
             )
             return
-
-        store_key = thread_id
 
         # Some parked tool calls are still unanswered: post what we have and
         # stay parked instead of waiting on a session that will not resume.
@@ -311,7 +311,7 @@ class ManagedAgentsAgent:
             emit=emit,
         )
 
-        await self._record_outcome(thread_id, record, outcome)
+        await self._record_outcome(store_key, record, outcome)
         if outcome.status != "errored":
             emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
 
@@ -332,12 +332,33 @@ class ManagedAgentsAgent:
                 return True
         return False
 
-    def _thread_key(self, thread_id: str) -> str:
-        """Shared-state key scoped to this managed agent so distinct agents never collide."""
-        return f"{self.managed_agent_id}:{thread_id}"
+    def _session_key(self, thread_id: str) -> str:
+        """The key that identifies this thread's state, in the session store and
+        in the busy-run gate alike, so two agents sharing one store neither adopt
+        each other's sessions nor serialize against each other's threads.
+
+        Every field baked into the remote session at creation is part of the key:
+        none of them can be re-checked or changed on resume, so an agent must
+        never inherit a session created with a different environment, pinned
+        version or vault set. Each is length-prefixed so no two combinations can
+        collide -- plain concatenation would let a `managed_agent_id` of
+        "support:beta" with thread "t1" and one of "support" with thread
+        "beta:t1" share one record. The thread id is last, so it needs no prefix
+        and may contain anything.
+        """
+
+        def field(value: str) -> str:
+            return f"{len(value)}:{value}|"
+
+        return (
+            field(self.managed_agent_id)
+            + field("" if self.agent_version is None else str(self.agent_version))
+            + field(self.environment_id)
+            + thread_id
+        )
 
     async def _record_outcome(
-        self, thread_id: str, record: SessionRecord, outcome: TurnOutcome
+        self, store_key: str, record: SessionRecord, outcome: TurnOutcome
     ) -> None:
         """Reconcile the record with how the turn ended.
 
@@ -347,16 +368,16 @@ class ManagedAgentsAgent:
         """
         if outcome.status == "errored":
             if outcome.session_ended:
-                await maybe_await(self.store.delete(thread_id))
+                await maybe_await(self.store.delete(store_key))
             return
         if outcome.status == "parked":
             record.pending_client_tool_use_ids = list(outcome.client_tool_use_ids)
-            await maybe_await(self.store.set(thread_id, record))
+            await maybe_await(self.store.set(store_key, record))
             return
         # The session went idle on end_turn: nothing is awaited any more.
         if record.pending_client_tool_use_ids:
             record.pending_client_tool_use_ids = []
-            await maybe_await(self.store.set(thread_id, record))
+            await maybe_await(self.store.set(store_key, record))
 
     def _outbound_events(
         self, record: SessionRecord, messages: Sequence[Any]
@@ -442,9 +463,9 @@ class ManagedAgentsAgent:
         )
 
     async def _get_or_create_session(
-        self, thread_id: str, input: RunAgentInput, emit: Emit
+        self, store_key: str, thread_id: str, input: RunAgentInput, emit: Emit
     ) -> SessionRecord | None:  # noqa: A002
-        existing = await maybe_await(self.store.get(thread_id))
+        existing = await maybe_await(self.store.get(store_key))
         if existing is not None:
             return existing
 
@@ -458,7 +479,7 @@ class ManagedAgentsAgent:
 
         # The busy-thread gate serializes runs per thread, so creation cannot race.
         record = await self._create_session(thread_id, input.tools or [])
-        await maybe_await(self.store.set(thread_id, record))
+        await maybe_await(self.store.set(store_key, record))
         emit(
             CustomEvent(
                 name="managed_agents.session",

@@ -14,16 +14,16 @@ const copy = (record: SessionRecord): SessionRecord => structuredClone(record);
 export class InMemorySessionStore implements SessionStore {
   private records = new Map<string, SessionRecord>();
 
-  get(threadId: string): SessionRecord | undefined {
-    const record = this.records.get(threadId);
+  get(key: string): SessionRecord | undefined {
+    const record = this.records.get(key);
     return record === undefined ? undefined : copy(record);
   }
 
-  set(threadId: string, record: SessionRecord): void {
-    this.records.set(threadId, copy(record));
+  set(key: string, record: SessionRecord): void {
+    this.records.set(key, copy(record));
   }
 
-  delete(threadId: string): void {
-    this.records.delete(threadId);
+  delete(key: string): void {
+    this.records.delete(key);
   }
 }
