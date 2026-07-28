@@ -18,9 +18,10 @@ direct evidence about the loop rather than about a mocked stream.
 from __future__ import annotations
 
 import asyncio
+import copy
 
 import pytest
-from ag_ui.core import EventType, RunAgentInput, Tool, UserMessage
+from ag_ui.core import EventType, RunAgentInput, Tool, ToolMessage, UserMessage
 from strands import Agent
 from strands.models.model import Model
 from strands.session.file_session_manager import FileSessionManager
@@ -238,6 +239,8 @@ class _MixedBatchModel(Model):
     def __init__(self, backend_name: str = "run_script"):
         self.calls = 0
         self.backend_name = backend_name
+        # Transcript handed to the provider on each call, for round-trip asserts.
+        self.seen_messages: list[list[dict]] = []
 
     def get_config(self):
         return {}
@@ -251,6 +254,7 @@ class _MixedBatchModel(Model):
 
     async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
         self.calls += 1
+        self.seen_messages.append(copy.deepcopy(messages))
         if self.calls > _RUNAWAY_GUARD:
             raise RuntimeError("halt did not stop the loop")
         yield {"messageStart": {"role": "assistant"}}
@@ -397,6 +401,116 @@ async def test_state_from_result_fires_for_a_backend_tool_in_a_halting_batch():
 
     snapshots = [e.snapshot for e in events if e.type == EventType.STATE_SNAPSHOT]
     assert any(s.get("tables") == ["orders", "customers"] for s in snapshots)
+
+
+def _orphan_tool_uses(transcript: list[dict]) -> list[str]:
+    """Apply the provider rule: every ``toolUse`` needs a matching ``toolResult``.
+
+    Bedrock and Anthropic both reject a transcript containing a ``toolUse`` with
+    no corresponding ``toolResult``, so this is the check that decides whether
+    the next run is servable at all.
+    """
+    tool_uses: dict[str, str] = {}
+    resolved: set[str] = set()
+    for message in transcript:
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if "toolUse" in block:
+                tool_uses[block["toolUse"]["toolUseId"]] = block["toolUse"]["name"]
+            elif "toolResult" in block:
+                resolved.add(block["toolResult"]["toolUseId"])
+    return [name for tid, name in tool_uses.items() if tid not in resolved]
+
+
+@pytest.mark.asyncio
+async def test_event_stream_alone_replays_into_a_servable_transcript():
+    """Round-trip: a client that persists from the event stream must be able to
+    replay a transcript the model provider will accept.
+
+    This is the failure the other tests cannot see, because it surfaces one run
+    LATER and at the provider rather than in our code. With no session manager
+    the adapter does ``strands_agent.messages = _build_strands_history(
+    input_data.messages)``, and that builder transcribes straight through with
+    no orphan handling — so whatever the client persisted becomes the literal
+    transcript. If the halting batch dropped the backend result, turn 2 carries
+    a ``toolUse`` with no ``toolResult`` and the provider rejects it.
+
+    History here is rebuilt from the emitted MESSAGES_SNAPSHOT rather than
+    hand-written, so the test asserts the property that actually matters: the
+    event stream carries enough information to reconstruct a valid transcript.
+    """
+    model = _MixedBatchModel()
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent"
+    )
+    tools = [
+        Tool(
+            name="get_cell",
+            description="Read the selected cell",
+            parameters={"type": "object", "properties": {}},
+        )
+    ]
+
+    async def run(thread_id: str, run_id: str, messages: list) -> list:
+        run_input = RunAgentInput(
+            thread_id=thread_id,
+            run_id=run_id,
+            parent_run_id=None,
+            state={},
+            messages=messages,
+            tools=tools,
+            context=[],
+            forwarded_props={},
+        )
+
+        async def drive():
+            return [event async for event in adapter.run(run_input)]
+
+        return await asyncio.wait_for(drive(), timeout=30)
+
+    # --- Turn 1: the halting mixed batch -------------------------------------
+    turn_1 = await run(
+        "t-roundtrip", "r-1", [UserMessage(id="u1", role="user", content="What tables?")]
+    )
+
+    # --- Rebuild client-side history from the wire, as an event-sourced client
+    #     would, then append the result it produced for the frontend tool.
+    client_history = list(
+        [e for e in turn_1 if e.type == EventType.MESSAGES_SNAPSHOT][-1].messages
+    )
+    fe_wire_id = next(
+        e.tool_call_id
+        for e in turn_1
+        if e.type == EventType.TOOL_CALL_START and e.tool_call_name == "get_cell"
+    )
+    client_history.append(
+        ToolMessage(
+            id="tm-fe",
+            role="tool",
+            tool_call_id=fe_wire_id,
+            content='{"cell": "B4", "value": 42}',
+        )
+    )
+
+    # --- Turn 2: replay it -----------------------------------------------------
+    await run("t-roundtrip", "r-2", client_history)
+
+    transcript = model.seen_messages[-1]
+    orphans = _orphan_tool_uses(transcript)
+    assert not orphans, (
+        f"replayed transcript has toolUse with no toolResult: {orphans} — "
+        "the provider rejects this, so turn 2 cannot be served"
+    )
+
+    # And the backend result must actually be IN the replayed transcript, so the
+    # model can answer from it instead of re-running the expensive tool.
+    assert any(
+        "orders" in str(block.get("toolResult", ""))
+        for message in transcript
+        for block in message.get("content") or []
+        if isinstance(block, dict)
+    ), "backend result absent from the replayed transcript; the model would re-run it"
 
 
 def _persisted_messages(sm: FileSessionManager, session_id: str) -> list[dict]:
