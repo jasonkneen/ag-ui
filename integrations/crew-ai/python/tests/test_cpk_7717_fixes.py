@@ -134,6 +134,75 @@ def _make_real_crewbase(cls_name="ResearchCrew"):
     return _Crew()
 
 
+def _build_real_crew() -> Crew:
+    """Build a REAL ``crewai.Crew`` (like the repo's own ``CrewChatCrew``)
+    without ``@CrewBase`` so no config lookups or init-time LLM calls fire.
+    Shared by the value-equal and non-weakref-able cache-test wrappers."""
+    assistant = Agent(
+        role="assistant", goal="help with {topic}",
+        backstory="a helpful assistant",
+        llm=LLM(model="gpt-4o", api_key="k"),
+    )
+    assist_task = Task(
+        description="Handle {topic}", expected_output="a response",
+        agent=assistant,
+    )
+    return Crew(
+        agents=[assistant], tasks=[assist_task],
+        chat_llm=LLM(model="gpt-4o", api_key="k"),
+    )
+
+
+class _ValueEqualCrew:
+    """Crew wrapper with VALUE-BASED ``__eq__`` / ``__hash__``.
+
+    Defined once at module level (NOT per factory call) so two instances
+    share the same class and ``isinstance`` in ``__eq__`` succeeds. Two
+    instances built with the same ``equal_key`` are distinct objects that
+    compare equal and hash equal — the exact shape a ``WeakKeyDictionary``
+    would collapse to a single (cross-serving) cache entry. Its ``crew()``
+    returns a REAL ``crewai.Crew``.
+    """
+
+    def __init__(self, cls_name, equal_key):
+        self._crew_name = cls_name
+        self._key = equal_key
+
+    def __eq__(self, other):
+        return isinstance(other, _ValueEqualCrew) and self._key == other._key
+
+    def __hash__(self):
+        return hash(self._key)
+
+    def crew(self) -> Crew:
+        return _build_real_crew()
+
+
+def _make_value_equal_crew(*, cls_name, equal_key):
+    return _ValueEqualCrew(cls_name, equal_key)
+
+
+class _NonWeakrefableCrew:
+    """Crew wrapper that CANNOT be weak-referenced.
+
+    ``__slots__`` without a ``__weakref__`` entry makes instances reject
+    ``weakref.ref``, exercising the cache's non-weakref-able skip path.
+    Its ``crew()`` returns a REAL ``crewai.Crew``.
+    """
+
+    __slots__ = ("_crew_name",)
+
+    def __init__(self, cls_name):
+        self._crew_name = cls_name
+
+    def crew(self) -> Crew:
+        return _build_real_crew()
+
+
+def _make_non_weakrefable_crew(*, cls_name):
+    return _NonWeakrefableCrew(cls_name)
+
+
 def _new_crew_flow(*, chat_llm=None, crew_model="crew-model-string"):
     """Build a ``ChatWithCrewFlow`` via ``__new__`` with the minimal
     attributes the ``chat`` method reads, bypassing the LLM-calling
@@ -264,6 +333,91 @@ async def test_chat_forwards_connection_fields_to_acompletion_real_llm():
     assert calls[1]["tool_choice"] == "none"
 
 
+async def test_additional_params_do_not_collide_with_call_owned_kwargs():
+    """A REAL ``crewai.LLM`` whose ``additional_params`` include keys the
+    ``chat()`` call sites ALSO set explicitly must NOT raise ``TypeError:
+    got multiple values for keyword argument`` — and the CALL-OWNED values
+    must win (round-3 finding 1).
+
+    The reviewer's repro was ``LLM(model="gpt-4o",
+    parallel_tool_calls=True)``: crewai routes ``parallel_tool_calls`` into
+    ``additional_params``, which the old code spread into the same
+    ``acompletion(**kwargs, parallel_tool_calls=False, ...)`` call. Here we
+    additionally seed ``messages`` / ``tools`` / ``tool_choice`` sentinels
+    into ``additional_params`` and assert the framework's own values are
+    used, plus a benign custom param survives."""
+    real_llm = LLM(
+        model="gpt-4o",
+        parallel_tool_calls=True,
+        messages="SHOULD_LOSE",
+        tools="SHOULD_LOSE",
+        tool_choice="SHOULD_LOSE",
+        foo_custom="bar",
+    )
+    # Sanity: these all landed in additional_params (the collision source).
+    for key in ("parallel_tool_calls", "messages", "tools", "tool_choice", "foo_custom"):
+        assert key in real_llm.additional_params
+
+    calls = []
+
+    async def _fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    stream_n = {"n": 0}
+
+    async def _fake_stream(_resp):
+        stream_n["n"] += 1
+        if stream_n["n"] == 1:
+            class _R:
+                choices = [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-crew",
+                            "function": {"name": "dummy", "arguments": "{}"},
+                        }],
+                    }
+                }]
+            return _R()
+
+        class _F:
+            choices = [{"message": {"role": "assistant", "content": "done"}}]
+        return _F()
+
+    async def _noop_emit_state(_state):
+        return True
+
+    flow = _new_crew_flow(chat_llm=real_llm)
+    state = {"messages": [], "inputs": {}, "copilotkit": {"actions": []}}
+
+    with _patch_instance_state(flow, state):
+        with patch.object(crews_mod, "acompletion", _fake_acompletion):
+            with patch.object(crews_mod, "copilotkit_stream", _fake_stream):
+                with patch.object(crews_mod, "copilotkit_emit_state", _noop_emit_state):
+                    with patch.object(
+                        crews_mod, "crew_chat_create_tool_function",
+                        lambda crew, messages: (lambda **_k: "OUT"),
+                    ):
+                        # Must NOT raise TypeError on the collision.
+                        await flow.chat()
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["model"] == "gpt-4o"
+        # Call-owned settings WIN over additional_params.
+        assert call["parallel_tool_calls"] is False
+        assert call["stream"] is True
+        assert isinstance(call["messages"], list) and call["messages"]
+        assert isinstance(call["tools"], list) and call["tools"]
+        # Benign custom additional_param is still forwarded.
+        assert call["foo_custom"] == "bar"
+    # The follow-up (defect 2) turn sets tool_choice explicitly, so the
+    # call-owned "none" overrides the additional_params "SHOULD_LOSE"
+    # sentinel — proving call-owned tool_choice wins on collision.
+    assert calls[1]["tool_choice"] == "none"
+
+
 # --------------------------------------------------------------------------
 # Defect 2: text follow-up after a backend tool result
 # --------------------------------------------------------------------------
@@ -379,11 +533,36 @@ async def test_crew_run_emits_state_snapshot():
 
 def test_real_crewbase_matches_structural_protocol():
     """A REAL ``@CrewBase`` instance satisfies ``CrewBaseInstance``
-    (structural: ``crew()`` + ``_crew_name``); a bare object does not."""
+    (structural: presence of ``crew()``); a bare object does not."""
     real = _make_real_crewbase()
     assert isinstance(real, ep.CrewBaseInstance)
     assert isinstance(real, crews_mod.CrewBaseInstance)
     assert not isinstance(object(), ep.CrewBaseInstance)
+
+
+def test_protocol_accepts_name_only_and_crew_name_only_wrappers():
+    """The protocol pins ONLY ``crew()`` (round-3 finding 3), so BOTH
+    supported shapes conform: the repo's own ``CrewChatCrew`` (which
+    exposes ``.name`` only, no ``_crew_name``) AND a real ``@CrewBase``
+    instance (which exposes ``_crew_name`` only, no ``.name``). Requiring
+    ``_crew_name`` in the protocol — as an earlier round did — wrongly
+    rejected the name-only ``CrewChatCrew`` even though it works at
+    runtime."""
+    from ag_ui_crewai.examples.crew_chat import CrewChatCrew
+
+    name_only = CrewChatCrew()
+    # Precondition: name-only shape (has .name, lacks _crew_name).
+    assert isinstance(getattr(name_only, "name", None), str)
+    assert not hasattr(name_only, "_crew_name")
+    assert isinstance(name_only, crews_mod.CrewBaseInstance)
+    assert isinstance(name_only, ep.CrewBaseInstance)
+
+    crew_name_only = _make_real_crewbase(cls_name="CrewNameOnly")
+    # Precondition: _crew_name shape (has _crew_name, lacks a real .name).
+    assert isinstance(getattr(crew_name_only, "_crew_name", None), str)
+    assert not hasattr(crew_name_only, "name")
+    assert isinstance(crew_name_only, crews_mod.CrewBaseInstance)
+    assert isinstance(crew_name_only, ep.CrewBaseInstance)
 
 
 def test_real_crewbase_direct_construction_reads_crew_name_and_builds_chatinputs():
@@ -392,7 +571,6 @@ def test_real_crewbase_direct_construction_reads_crew_name_and_builds_chatinputs
     @CrewBase and previously AttributeError'd) and feeds it into a REAL
     ``ChatInputs`` with no validation error (round-2 finding 2)."""
     crews_mod._CREW_INPUTS_CACHE.clear()
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
 
     real = _make_real_crewbase(cls_name="ResearchCrew")
     with _stub_llm_network():
@@ -479,7 +657,6 @@ def test_same_crew_reuses_cached_inputs_real_crewbase():
     ``generate_crew_chat_inputs`` — the caching win is preserved. The real
     generator still runs (wrapped, not replaced) so nothing is masked."""
     crews_mod._CREW_INPUTS_CACHE.clear()
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
 
     real = _make_real_crewbase(cls_name="ReuseCrew")
     wrapped = crews_mod.crew_chat_generate_crew_chat_inputs
@@ -497,14 +674,13 @@ def test_same_crew_reuses_cached_inputs_real_crewbase():
 
 
 def test_cache_evicts_on_gc_and_regenerates_for_new_crew():
-    """The cache is keyed on the crew OBJECT (WeakKeyDictionary), so when a
-    crew is garbage-collected its schema entry is evicted — eliminating the
-    ``id(crew)`` reuse hazard where a freshly allocated wrapper inherits a
-    collected wrapper's id and is silently served the wrong schema
-    (round-2 finding 3). A brand-new crew therefore regenerates rather than
-    receiving the old schema."""
+    """The cache maps ``id(crew) -> (weakref.ref(crew, evict_cb), schema)``,
+    so when a weakref-able crew is garbage-collected the ``evict_cb`` pops
+    its entry — eliminating the ``id(crew)`` reuse hazard where a freshly
+    allocated wrapper inherits a collected wrapper's id and is silently
+    served the wrong schema (round-3 finding 2). A brand-new crew therefore
+    regenerates rather than receiving the old schema."""
     crews_mod._CREW_INPUTS_CACHE.clear()
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
 
     crew_a = _make_real_crewbase(cls_name="CrewA")
     with _stub_llm_network():
@@ -512,15 +688,15 @@ def test_cache_evicts_on_gc_and_regenerates_for_new_crew():
     schema_a = flow_a.crew_chat_inputs
     ref_a = weakref.ref(crew_a)
 
-    # The live crew keeps its cache entry.
-    assert crew_a in crews_mod._CREW_INPUTS_CACHE
+    # The live crew keeps its cache entry, keyed on ``id(crew)``.
+    assert id(crew_a) in crews_mod._CREW_INPUTS_CACHE
 
     # Drop every strong reference to crew A and its flow, then collect.
     del crew_a, flow_a
     gc.collect()
 
-    # The weak reference is dead => the entry auto-evicted. No stale schema
-    # can be served under a reused id.
+    # The weak reference is dead => the ``evict_cb`` fired and popped the
+    # entry. No stale schema can be served under a reused id.
     assert ref_a() is None
     assert len(crews_mod._CREW_INPUTS_CACHE) == 0
 
@@ -532,36 +708,71 @@ def test_cache_evicts_on_gc_and_regenerates_for_new_crew():
     assert flow_b.crew_chat_inputs.crew_name == "CrewB"
 
     crews_mod._CREW_INPUTS_CACHE.clear()
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
 
 
-def test_cache_fallback_is_identity_safe_under_id_reuse():
-    """The non-weakref-able fallback store keys on ``id`` but verifies true
-    object identity before serving: it returns the schema for the same
-    crew, but if a DIFFERENT object is looked up under a colliding id (the
-    id-reuse scenario) it returns ``None`` and drops the stale entry rather
-    than cross-serving another crew's schema (round-2 finding 3)."""
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
+def test_distinct_but_equal_crews_get_distinct_schemas_no_cross_serve():
+    """Two DISTINCT-BUT-EQUAL crew wrappers (value-based ``__eq__`` /
+    ``__hash__``) must receive DISTINCT schemas (round-3 finding 2). The
+    prior ``WeakKeyDictionary`` keyed by ``__eq__`` / ``__hash__`` and so
+    collapsed the two to one entry, cross-serving the first crew's schema
+    to the second. The ``id(crew)`` key keys on identity, so each wrapper
+    regenerates its own schema. Each wrapper's ``crew()`` returns a REAL
+    ``crewai.Crew`` and the real ``generate_crew_chat_inputs`` runs."""
+    crews_mod._CREW_INPUTS_CACHE.clear()
 
-    class _Crew:  # a stand-in crew object
-        pass
+    crew_1 = _make_value_equal_crew(cls_name="EqualCrew", equal_key="same")
+    crew_2 = _make_value_equal_crew(cls_name="EqualCrew", equal_key="same")
 
-    crew = _Crew()
-    schema = object()
+    # Precondition: the two wrappers are DISTINCT objects that compare EQUAL
+    # and hash equal — exactly the shape that collapsed under a
+    # WeakKeyDictionary.
+    assert crew_1 is not crew_2
+    assert crew_1 == crew_2
+    assert hash(crew_1) == hash(crew_2)
 
-    # Same-crew hit: strong ref + id key, identity verified.
-    crews_mod._CREW_INPUTS_FALLBACK[id(crew)] = (crew, schema)
-    assert crews_mod._crew_inputs_cache_get(crew) is schema
+    with _stub_llm_network():
+        flow_1 = crews_mod.ChatWithCrewFlow(crew=crew_1)
+        flow_2 = crews_mod.ChatWithCrewFlow(crew=crew_2)
 
-    # Simulate id reuse: a NEW object lands with the same id as a stale
-    # entry that stores a DIFFERENT crew. The get must refuse to serve it
-    # and evict the stale entry.
-    other = _Crew()
-    crews_mod._CREW_INPUTS_FALLBACK[id(other)] = (crew, schema)  # mismatched
-    assert crews_mod._crew_inputs_cache_get(other) is None
-    assert id(other) not in crews_mod._CREW_INPUTS_FALLBACK
+    # No cross-serve: each equal-but-distinct crew has its OWN schema.
+    assert flow_1.crew_chat_inputs is not flow_2.crew_chat_inputs
+    assert id(crew_1) in crews_mod._CREW_INPUTS_CACHE
+    assert id(crew_2) in crews_mod._CREW_INPUTS_CACHE
 
-    crews_mod._CREW_INPUTS_FALLBACK.clear()
+    crews_mod._CREW_INPUTS_CACHE.clear()
+
+
+def test_non_weakrefable_crew_is_not_cached_no_permanent_entry():
+    """A genuinely non-weakref-able crew (``__slots__`` without
+    ``__weakref__``) is NOT cached — the set path skips it rather than
+    pinning a strong reference forever (which would leak the wrapper).
+    Constructing multiple flows for such crews therefore accumulates NO
+    permanent cache entries (round-3 finding 2). ``crew()`` returns a REAL
+    ``crewai.Crew`` and the real ``generate_crew_chat_inputs`` runs."""
+    crews_mod._CREW_INPUTS_CACHE.clear()
+
+    crew_1 = _make_non_weakrefable_crew(cls_name="NoWeakrefCrewA")
+    crew_2 = _make_non_weakrefable_crew(cls_name="NoWeakrefCrewB")
+
+    # Precondition: these instances truly cannot be weak-referenced.
+    for c in (crew_1, crew_2):
+        try:
+            weakref.ref(c)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("test crew was unexpectedly weak-referenceable")
+
+    with _stub_llm_network():
+        flow_1 = crews_mod.ChatWithCrewFlow(crew=crew_1)
+        flow_2 = crews_mod.ChatWithCrewFlow(crew=crew_2)
+
+    # Nothing was cached, so no permanent strong references accumulate.
+    assert len(crews_mod._CREW_INPUTS_CACHE) == 0
+    # Correctness is preserved: each still gets a valid, distinct schema.
+    assert flow_1.crew_chat_inputs is not flow_2.crew_chat_inputs
+
+    crews_mod._CREW_INPUTS_CACHE.clear()
 
 
 # --------------------------------------------------------------------------

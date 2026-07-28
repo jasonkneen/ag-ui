@@ -2,7 +2,7 @@ import uuid
 import copy
 import json
 import weakref
-from typing import Any, Optional, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 from crewai import Crew, Flow
 from crewai.flow import start
 from crewai.cli.crew_chat import (
@@ -22,30 +22,28 @@ from .sdk import (
 
 # Cache of generated chat-input schemas, keyed by the ``@CrewBase``
 # instance passed to ``add_crewai_crew_fastapi_endpoint`` (CPK-7717
-# review round 2, finding 3).
+# review round 3, finding 2).
 #
-# The primary store is a ``WeakKeyDictionary`` keyed on the crew OBJECT
-# itself — NOT ``id(crew)``. Keying on ``id`` was unsafe: CPython reuses
-# ``id`` values once an object is garbage-collected, and now that
-# ``ChatWithCrewFlow`` is exported for direct construction the wrapper is
-# not necessarily retained for the process lifetime. A freshly allocated
-# crew wrapper could therefore inherit a collected wrapper's ``id`` and
-# silently be served the collected crew's schema. A ``WeakKeyDictionary``
-# keys on true object identity and auto-evicts an entry the moment its
-# crew is collected, so no stale schema can outlive its crew.
+# The store maps ``id(crew) -> (weakref.ref(crew, evict_cb), schema)``.
+# Keying by ``id`` alone was unsafe (CPython reuses ``id`` values after
+# GC), and a ``WeakKeyDictionary`` keyed on the crew object was ALSO
+# unsafe: it keys by ``__eq__`` / ``__hash__``, so two distinct-but-equal
+# crew objects (e.g. value-based ``@dataclass``-style wrappers) collapse
+# to one entry and cross-serve each other's schema. Combining the two —
+# an ``id`` key plus a STRICT-IDENTITY weakref check — fixes both:
 #
-# ``_CREW_INPUTS_FALLBACK`` handles the unlikely crew object that is not
-# weak-referenceable (or not hashable): we key on ``id`` but store a
-# STRONG reference to the crew alongside the schema, which keeps the
-# object alive so its ``id`` cannot be reused while the entry is live,
-# and we verify the stored object *is* the crew before serving (dropping
-# the entry on mismatch). Either path preserves the caching win for a
-# repeated construction of the same crew (which otherwise re-issues the
-# LLM call in ``generate_crew_chat_inputs``).
-_CREW_INPUTS_CACHE: "weakref.WeakKeyDictionary[Any, Any]" = (
-    weakref.WeakKeyDictionary()
-)
-_CREW_INPUTS_FALLBACK: dict = {}
+#   * ``evict_cb`` pops the ``id`` entry the moment its referent is
+#     garbage-collected, so a later ``id`` reuse can never inherit a
+#     stale schema.
+#   * On read we only return the schema when the stored ``ref() is crew``
+#     (strict identity, and still alive); anything else is a miss and the
+#     stale entry is dropped so we regenerate.
+#
+# Genuinely NON-weak-referenceable crews are simply NOT cached: retaining
+# a strong reference to keep the ``id`` stable would leak every such
+# wrapper for the process lifetime, so we prefer correctness (regenerate)
+# over the caching win for that rare shape.
+_CREW_INPUTS_CACHE: "dict[int, tuple[weakref.ref, Any]]" = {}
 
 
 def _crew_inputs_cache_get(crew: Any) -> Any:
@@ -53,35 +51,48 @@ def _crew_inputs_cache_get(crew: Any) -> Any:
 
     ``None`` is an unambiguous miss sentinel: ``generate_crew_chat_inputs``
     always returns a populated ``ChatInputs`` object, never ``None``.
+
+    Strict-identity + liveness check: the stored weakref must still point
+    at *this exact* ``crew`` object. A dead weakref (referent collected)
+    or a mismatch (``id`` reused by a different object) is a miss, and the
+    stale entry is dropped so the caller regenerates rather than being
+    served another crew's schema.
     """
-    try:
-        cached = _CREW_INPUTS_CACHE.get(crew)
-    except TypeError:
-        # ``crew`` is unhashable — cannot live in the WeakKeyDictionary.
-        cached = None
-    if cached is not None:
-        return cached
-    entry = _CREW_INPUTS_FALLBACK.get(id(crew))
-    if entry is not None:
-        stored_crew, schema = entry
-        if stored_crew is crew:
-            return schema
-        # ``id`` was reused by a DIFFERENT object; drop the stale entry so
-        # we regenerate rather than serve another crew's schema.
-        _CREW_INPUTS_FALLBACK.pop(id(crew), None)
+    entry = _CREW_INPUTS_CACHE.get(id(crew))
+    if entry is None:
+        return None
+    ref, schema = entry
+    if ref() is crew:
+        return schema
+    # Dead referent, or ``id`` reused by a DIFFERENT object: drop the
+    # stale entry so we regenerate.
+    _CREW_INPUTS_CACHE.pop(id(crew), None)
     return None
 
 
 def _crew_inputs_cache_set(crew: Any, schema: Any) -> None:
-    """Cache ``schema`` for ``crew`` in the identity-safe store."""
+    """Cache ``schema`` for ``crew`` in the identity-safe store.
+
+    Non-weak-referenceable crews are intentionally not cached (see the
+    module comment) — no permanent strong reference is ever retained.
+    """
+    key = id(crew)
+
+    def _evict(dead_ref: "weakref.ref") -> None:
+        # Only evict if THIS entry is still the live one. Guards against
+        # popping a freshly-stored entry whose crew happens to reuse the
+        # collected crew's ``id``.
+        existing = _CREW_INPUTS_CACHE.get(key)
+        if existing is not None and existing[0] is dead_ref:
+            _CREW_INPUTS_CACHE.pop(key, None)
+
     try:
-        _CREW_INPUTS_CACHE[crew] = schema
-        return
+        ref = weakref.ref(crew, _evict)
     except TypeError:
-        # Not weak-referenceable (or unhashable): fall back to an id key
-        # with a STRONG crew reference so the id cannot be reused while
-        # live, plus an identity check on read.
-        _CREW_INPUTS_FALLBACK[id(crew)] = (crew, schema)
+        # Not weak-referenceable: skip caching entirely rather than pin a
+        # strong reference forever (which would leak the wrapper).
+        return
+    _CREW_INPUTS_CACHE[key] = (ref, schema)
 
 
 @runtime_checkable
@@ -89,26 +100,22 @@ class CrewBaseInstance(Protocol):
     """Structural type for a ``@CrewBase``-decorated crew instance.
 
     ``add_crewai_crew_fastapi_endpoint`` and ``ChatWithCrewFlow`` require a
-    class decorated with crewai's ``@CrewBase`` — NOT a bare
-    :class:`crewai.Crew`. The flow calls ``crew.crew()`` to build the
-    underlying ``Crew`` and reads the crew's name; a plain ``Crew`` has
-    neither a ``.crew()`` factory nor a name accessor, so annotating the
-    parameter as ``Crew`` was actively misleading (CPK-7717 defect 5).
+    crew wrapper exposing a ``crew()`` factory that builds the underlying
+    :class:`crewai.Crew` — NOT a bare :class:`crewai.Crew`, which has no
+    ``.crew()`` factory (annotating the parameter as ``Crew`` was actively
+    misleading; CPK-7717 defect 5).
 
-    Name accessor (CPK-7717 review round 2, finding 2): crewai's
-    ``@CrewBase`` decorator does NOT expose a public ``.name`` attribute —
-    it sets ``_crew_name`` on the wrapped class (to the decorated class'
-    ``__name__``). We therefore express the structural requirement as
-    ``crew()`` + ``_crew_name``. The runtime name reader
-    (:func:`_read_crew_name`) additionally accepts a hand-rolled ``.name``
-    for flexibility, but ``_crew_name`` is the canonical @CrewBase
-    accessor and the one the protocol pins.
+    The protocol pins ONLY ``crew()`` — the single structural essential
+    (CPK-7717 review round 3, finding 3). Name handling is deliberately
+    left OUT of the protocol and delegated to :func:`_read_crew_name`,
+    which accepts a real ``@CrewBase`` instance's ``_crew_name`` OR a
+    hand-rolled ``.name``. Requiring ``_crew_name`` in the protocol (as an
+    earlier round did) wrongly rejected the repo's own ``CrewChatCrew``
+    wrapper, which exposes only ``.name`` yet works at runtime.
 
     ``@runtime_checkable`` lets callers/tests assert conformance via
-    ``isinstance`` (structural: method/attribute presence only).
+    ``isinstance`` (structural: method presence only).
     """
-
-    _crew_name: str
 
     def crew(self) -> Crew:  # pragma: no cover - structural protocol stub
         ...
@@ -271,6 +278,32 @@ class ChatWithCrewFlow(Flow):
                 kwargs[attr] = value
         return kwargs
 
+    def _completion_call_params(self, **call_owned: Any) -> dict:
+        """Build the FULL kwargs dict for one ``acompletion`` call.
+
+        Defect 1 (CPK-7717 review round 3): ``_completion_llm_kwargs``
+        spreads the crewai ``LLM.additional_params``, which legitimately
+        may contain keys each ``chat()`` call site ALSO sets explicitly —
+        ``messages`` / ``tools`` / ``tool_choice`` / ``stream`` /
+        ``timeout`` / ``parallel_tool_calls`` (e.g.
+        ``LLM(model="gpt-4o", parallel_tool_calls=True)`` puts
+        ``parallel_tool_calls`` in ``additional_params``). Passing such a
+        key both via ``**connection`` AND as an explicit ``kw=`` argument
+        raised ``TypeError: acompletion() got multiple values for keyword
+        argument``.
+
+        We funnel EVERYTHING through one dict here and let the CALL-OWNED
+        settings win over anything from ``additional_params`` (they are
+        the framework's fixed contract for the chat loop — e.g. we must
+        keep ``parallel_tool_calls=False`` and ``stream=True`` regardless
+        of user LLM extras). Call sites splat the result as
+        ``acompletion(**self._completion_call_params(...))`` and never mix
+        explicit ``kw=`` args with the splat, so no key is passed twice.
+        """
+        params = self._completion_llm_kwargs()
+        params.update(call_owned)  # call-owned settings win on collision.
+        return params
+
     @start()
     async def chat(self):
         """Chat with the crew"""
@@ -295,12 +328,13 @@ class ChatWithCrewFlow(Flow):
 
         response = await copilotkit_stream(
             await acompletion(
-                **self._completion_llm_kwargs(),
-                messages=messages,
-                tools=tools,
-                parallel_tool_calls=False,
-                stream=True,
-                timeout=_llm_timeout_seconds(),
+                **self._completion_call_params(
+                    messages=messages,
+                    tools=tools,
+                    parallel_tool_calls=False,
+                    stream=True,
+                    timeout=_llm_timeout_seconds(),
+                )
             )
         )
 
@@ -350,23 +384,24 @@ class ChatWithCrewFlow(Flow):
                 # answer (no further tool calls), mirroring the crew_exit
                 # branch.
                 response = await copilotkit_stream(
-                    await acompletion( # pylint: disable=too-many-arguments
-                        **self._completion_llm_kwargs(),
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "The crew has finished running. "
-                                           "Use the tool result to answer the "
-                                           "user's request.",
-                                "id": str(uuid.uuid4()) + "-system"
-                            },
-                            *self.state["messages"]
-                        ],
-                        tools=tools,
-                        parallel_tool_calls=False,
-                        stream=True,
-                        tool_choice="none",
-                        timeout=_llm_timeout_seconds(),
+                    await acompletion(
+                        **self._completion_call_params(
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": "The crew has finished running. "
+                                               "Use the tool result to answer the "
+                                               "user's request.",
+                                    "id": str(uuid.uuid4()) + "-system"
+                                },
+                                *self.state["messages"]
+                            ],
+                            tools=tools,
+                            parallel_tool_calls=False,
+                            stream=True,
+                            tool_choice="none",
+                            timeout=_llm_timeout_seconds(),
+                        )
                     )
                 )
                 message = cast(Any, response).choices[0]["message"]
@@ -380,21 +415,22 @@ class ChatWithCrewFlow(Flow):
                 })
 
                 response = await copilotkit_stream(
-                    await acompletion( # pylint: disable=too-many-arguments
-                        **self._completion_llm_kwargs(),
-                        messages = [
-                            {
-                                "role": "system",
-                                "content": "Indicate to the user that the crew has exited",
-                                "id": str(uuid.uuid4()) + "-system"
-                            },
-                            *self.state["messages"]
-                        ],
-                        tools=tools,
-                        parallel_tool_calls=False,
-                        stream=True,
-                        tool_choice="none",
-                        timeout=_llm_timeout_seconds(),
+                    await acompletion(
+                        **self._completion_call_params(
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": "Indicate to the user that the crew has exited",
+                                    "id": str(uuid.uuid4()) + "-system"
+                                },
+                                *self.state["messages"]
+                            ],
+                            tools=tools,
+                            parallel_tool_calls=False,
+                            stream=True,
+                            tool_choice="none",
+                            timeout=_llm_timeout_seconds(),
+                        )
                     )
                 )
                 message = cast(Any, response).choices[0]["message"]

@@ -20,7 +20,6 @@ from crewai.utilities.events import (
 )
 from crewai.flow.flow import Flow
 from crewai.utilities.events.base_event_listener import BaseEventListener
-from crewai import Crew
 
 from ag_ui.core import (
     RunAgentInput,
@@ -1507,10 +1506,13 @@ def add_crewai_crew_fastapi_endpoint(
 ):
     """Adds a CrewAI crew endpoint to the FastAPI app.
 
-    ``crew`` must be a ``@CrewBase``-decorated instance (see
-    :class:`CrewBaseInstance`), NOT a bare :class:`crewai.Crew` — the
-    deferred ``ChatWithCrewFlow`` construction calls ``crew.crew()`` and
-    reads ``crew.name`` (CPK-7717 defect 5).
+    ``crew`` must be a crew wrapper exposing a ``crew()`` factory (see
+    :class:`CrewBaseInstance`) — a ``@CrewBase``-decorated instance or an
+    equivalent wrapper — NOT a bare :class:`crewai.Crew`. The deferred
+    ``ChatWithCrewFlow`` construction calls ``crew.crew()`` and reads the
+    crew name via ``_read_crew_name`` (which accepts either a
+    ``@CrewBase``'s ``_crew_name`` or a hand-rolled ``.name``; CPK-7717
+    defect 5 / review round 3).
 
     ChatWithCrewFlow construction is deferred to first request because the
     constructor calls crew_chat_generate_crew_chat_inputs which makes an LLM
