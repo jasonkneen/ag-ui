@@ -388,6 +388,29 @@ def test_completion_llm_kwargs_falls_back_when_llm_unresolved():
     assert flow._completion_llm_kwargs() == {"model": "gpt-4o"}
 
 
+def test_completion_llm_kwargs_forwards_generation_config_real_llm():
+    """A REAL ``crewai.LLM`` carrying generation config has it forwarded
+    (round-4 finding 1). crewai's own ``LLM._prepare_completion_params``
+    forwards temperature/top_p/max_tokens/etc., so the bridge must too or
+    the config is silently replaced by provider defaults. ``temperature=0``
+    (falsy but meaningful) survives; the empty default ``stop=[]`` is not
+    forwarded."""
+    real_llm = LLM(
+        model="gpt-4o",
+        api_key="sk-1",
+        temperature=0,
+        top_p=0.9,
+        max_tokens=256,
+        seed=42,
+    )
+    kwargs = _new_crew_flow(chat_llm=real_llm)._completion_llm_kwargs()
+    assert kwargs["temperature"] == 0
+    assert kwargs["top_p"] == 0.9
+    assert kwargs["max_tokens"] == 256
+    assert kwargs["seed"] == 42
+    assert "stop" not in kwargs  # empty default not forwarded
+
+
 async def test_chat_forwards_connection_fields_to_acompletion_real_llm():
     """Both completion call sites receive the resolved connection fields
     from a REAL ``crewai.LLM`` — the crew-run turn AND the defect-2

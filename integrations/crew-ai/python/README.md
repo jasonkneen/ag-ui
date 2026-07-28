@@ -65,6 +65,12 @@ initial call, the post-crew-run follow-up (tool-choice=`"none"`) that
 lets the assistant speak about the crew result, and the post-`crew_exit`
 (tool-choice=`"none"`) call.
 
+> **Limitation — no tool chaining after a crew run.** The post-crew-run
+> follow-up uses `tool_choice="none"`, so the assistant summarizes the crew
+> result as text but cannot call a frontend action in the same turn. A flow
+> like "run the crew, then update the UI" is not reachable on this path
+> today; allowing bounded tool re-entry there is future work.
+
 - **Default:** `120` seconds.
 - **Non-positive** (e.g. `0`, `-1`): disables the per-read timeout —
   the underlying HTTP client's default applies instead.

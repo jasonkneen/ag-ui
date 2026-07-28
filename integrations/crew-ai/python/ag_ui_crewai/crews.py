@@ -249,10 +249,14 @@ class ChatWithCrewFlow(Flow):
         / ``base_url`` still dropped ``api_base`` / ``api_version`` and the
         provider-specific ``additional_params`` — so Azure and other
         custom-endpoint users still hit the wrong endpoint. crewai's own
-        ``LLM._prepare_completion_params`` forwards ``api_base``,
-        ``base_url``, ``api_version``, ``api_key`` AND spreads
-        ``additional_params`` (see ``crewai/llm.py``); we mirror that here
-        so both completion call sites authenticate exactly the way
+        ``LLM._prepare_completion_params`` forwards the connection fields
+        (``api_base``, ``base_url``, ``api_version``, ``api_key``), the
+        generation config (``temperature``, ``top_p``, ``n``, ``stop``,
+        ``max_tokens``/``max_completion_tokens``, ``presence_penalty``,
+        ``frequency_penalty``, ``logit_bias``, ``response_format``, ``seed``,
+        ``logprobs``, ``top_logprobs``, ``reasoning_effort``) AND spreads
+        ``additional_params`` (see ``crewai/llm.py``); we mirror all of that
+        here so both completion call sites behave exactly the way
         ``generate_crew_chat_inputs`` does (it drives the same LLM object).
 
         Defensive: ``getattr`` with a fall back to the crew's model string
@@ -272,10 +276,27 @@ class ChatWithCrewFlow(Flow):
                 if value is not None:
                     kwargs[key] = value
 
-        for attr in ("api_key", "base_url", "api_base", "api_version"):
+        # Connection fields AND generation config, matching what crewai's
+        # LLM._prepare_completion_params forwards. Without the generation
+        # config, a resolved chat_llm's temperature/max_tokens/etc. are
+        # silently dropped and litellm applies provider defaults (e.g.
+        # LLM(model="gpt-4o", temperature=0) would not be honored).
+        for attr in (
+            "api_key", "base_url", "api_base", "api_version",
+            "temperature", "top_p", "n", "stop",
+            "max_tokens", "max_completion_tokens",
+            "presence_penalty", "frequency_penalty", "logit_bias",
+            "response_format", "seed", "logprobs", "top_logprobs",
+            "reasoning_effort",
+        ):
             value = getattr(llm, attr, None)
-            if value is not None:
-                kwargs[attr] = value
+            # Skip None and empty containers (crewai defaults `stop` to `[]`)
+            # so we never override litellm's own resolution with a no-op.
+            # temperature=0 and other explicit falsy-but-meaningful values
+            # (0, 0.0) are preserved.
+            if value is None or value == [] or value == {}:
+                continue
+            kwargs[attr] = value
         return kwargs
 
     def _completion_call_params(self, **call_owned: Any) -> dict:
@@ -372,7 +393,13 @@ class ChatWithCrewFlow(Flow):
                 # observable here — surfacing those requires the CrewAI
                 # StreamFrame integration tracked in CPK-7719. Until then
                 # this is the finest granularity reachable without that
-                # work.
+                # work. First blocker for that ticket (not StreamFrame
+                # itself): ``result = crew_function(**args)`` above is a
+                # SYNCHRONOUS ``crew.kickoff`` run on the event loop inside
+                # this async ``@start()``, so it blocks SSE flushing and
+                # prevents AGUI_CREWAI_FLOW_TIMEOUT_SECONDS / client-
+                # disconnect cancellation from firing until the crew
+                # returns. CPK-7719 needs ``asyncio.to_thread`` here.
                 await copilotkit_emit_state(self.state)
 
                 # Defect 2 (CPK-7717): a backend tool result on its own
@@ -381,8 +408,12 @@ class ChatWithCrewFlow(Flow):
                 # (the crew_exit branch below always had one). Issue a
                 # streamed follow-up so the assistant produces text about
                 # the crew result. ``tool_choice="none"`` forces a text
-                # answer (no further tool calls), mirroring the crew_exit
-                # branch.
+                # answer, mirroring the crew_exit branch. LIMITATION: it
+                # also blocks tool chaining — the assistant cannot call a
+                # frontend action after a crew run, so "run the crew, then
+                # update the UI" is unreachable on this path. Documented in
+                # README next to the timeout wording; allowing bounded tool
+                # re-entry here is future work.
                 response = await copilotkit_stream(
                     await acompletion(
                         **self._completion_call_params(
