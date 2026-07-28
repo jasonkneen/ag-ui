@@ -6,16 +6,17 @@ Connect an [AG-UI](https://ag-ui.com) frontend to [Claude Managed Agents](https:
 
 The library targets `net10.0`, `net9.0`, and `net8.0`, and depends on the [`Anthropic`](https://www.nuget.org/packages/Anthropic) NuGet package (12.34.0 or later, which carries the Managed Agents surface), `AGUI.Abstractions`, and `AGUI.Formatting`.
 
-> **This package is not yet published to NuGet.** Reference the project directly:
+```bash
+dotnet add package AGUI.ClaudeManagedAgents
+```
+
+> **Not on NuGet yet.** The package is enrolled in this repository's release
+> pipeline (release scope `integration-claude-managed-agents-dotnet`), so the
+> command above works from the first release onwards. Until then, reference the
+> project directly:
 
 ```xml
 <ProjectReference Include="path/to/integrations/claude-managed-agents/dotnet/src/AGUI.ClaudeManagedAgents/AGUI.ClaudeManagedAgents.csproj" />
-```
-
-Once it ships, installation will be:
-
-```bash
-dotnet add package AGUI.ClaudeManagedAgents
 ```
 
 ## Usage

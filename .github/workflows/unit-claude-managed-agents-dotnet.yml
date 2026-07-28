@@ -69,3 +69,16 @@ jobs:
 
       - name: Run unit tests
         run: dotnet test tests/AGUI.ClaudeManagedAgents.Tests -c Release --no-build
+
+      # The package is enrolled for release, so packing has to keep working: a
+      # missing README, a bad PackageId or an unpackable target framework should
+      # fail here rather than in the release pipeline.
+      - name: Pack the NuGet package
+        run: dotnet pack src/AGUI.ClaudeManagedAgents -c Release --no-build -o ./artifacts
+
+      - name: Check the produced package files
+        run: |
+          set -euo pipefail
+          ls -1 ./artifacts
+          test -n "$(find ./artifacts -name 'AGUI.ClaudeManagedAgents.*.nupkg' -print -quit)"
+          test -n "$(find ./artifacts -name 'AGUI.ClaudeManagedAgents.*.snupkg' -print -quit)"
