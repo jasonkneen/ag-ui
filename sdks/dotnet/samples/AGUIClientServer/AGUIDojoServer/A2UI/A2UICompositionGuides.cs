@@ -1,17 +1,13 @@
 
 namespace AGUIDojoServer.A2UI;
 
-/// <summary>
-/// Project-specific composition rules for the A2UI subagent — tells it how to use the
-/// pre-made domain components shipped in the dojo's dynamic catalog. Mirrors the
-/// LangGraph dojo examples so all integrations exercise the same demos.
-/// </summary>
+// Project-specific composition rules for the A2UI subagent — tells it how to use the pre-made domain components shipped in the dojo's dynamic catalog. Mirrors the LangGraph dojo examples so all integrations exercise the same demos.
 internal static class A2UICompositionGuides
 {
-    /// <summary>The catalog id of the dojo's dynamic component catalog.</summary>
+    // The catalog id of the dojo's dynamic component catalog.
     public const string DynamicCatalogId = "https://a2ui.org/demos/dojo/dynamic_catalog.json";
 
-    /// <summary>The planner system prompt for the dynamic-schema and recovery demos.</summary>
+    // The planner system prompt for the dynamic-schema and recovery demos.
     public const string PlannerInstructions = """
         You are a helpful assistant that creates rich visual UI on the fly.
 
@@ -20,7 +16,7 @@ internal static class A2UICompositionGuides
         IMPORTANT: After calling the tool, do NOT repeat the data in your text response. The tool renders UI automatically. Just confirm what was rendered.
         """;
 
-    /// <summary>The composition guide for the dynamic-schema demo.</summary>
+    // The composition guide for the dynamic-schema demo.
     public const string DynamicSchema = """
         ## Available Pre-made Components
 
@@ -59,7 +55,7 @@ internal static class A2UICompositionGuides
         - Generate 3-4 realistic items with diverse data
         """;
 
-    /// <summary>The composition guide for the recovery demo (structural validation showcase).</summary>
+    // The composition guide for the recovery demo (structural validation showcase).
     public const string Recovery = """
         ## Available Pre-made Components
 

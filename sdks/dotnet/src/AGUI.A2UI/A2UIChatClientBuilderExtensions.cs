@@ -1,4 +1,3 @@
-using System;
 using Microsoft.Extensions.AI;
 
 namespace AGUI.A2UI;

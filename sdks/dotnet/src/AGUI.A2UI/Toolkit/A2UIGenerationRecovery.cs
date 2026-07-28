@@ -1,43 +1,6 @@
-
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Text.Json.Nodes;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace AGUI.A2UI;
-
-/// <summary>
-/// One attempt of the A2UI validate-and-retry generation loop.
-/// </summary>
-/// <param name="Attempt">The 1-based attempt number.</param>
-/// <param name="Ok">Whether the attempt produced a valid component tree.</param>
-/// <param name="Errors">The validation errors when <paramref name="Ok"/> is <see langword="false"/>.</param>
-public sealed record A2UIAttemptRecord(int Attempt, bool Ok, IReadOnlyList<A2UIValidationError> Errors);
-
-/// <summary>
-/// Configuration for the A2UI generation recovery loop.
-/// </summary>
-public sealed class A2UIRecoveryConfig
-{
-    /// <summary>
-    /// Gets the maximum number of generation attempts. Defaults to
-    /// <see cref="A2UIConstants.MaxA2UIAttempts"/> when unset.
-    /// </summary>
-    public int? MaxAttempts { get; init; }
-}
-
-/// <summary>
-/// The outcome of the A2UI generation recovery loop.
-/// </summary>
-/// <param name="Envelope">
-/// The operations envelope on success, or a structured hard-failure envelope
-/// (<c>code: "a2ui_recovery_exhausted"</c>) when all attempts failed.
-/// </param>
-/// <param name="Attempts">The per-attempt records, in order.</param>
-/// <param name="Ok">Whether a valid surface was produced.</param>
-public sealed record A2UIRecoveryResult(string Envelope, IReadOnlyList<A2UIAttemptRecord> Attempts, bool Ok);
 
 /// <summary>
 /// The A2UI validate-and-retry generation loop, mirroring
@@ -138,28 +101,18 @@ public static class A2UIGenerationRecovery
         return new A2UIRecoveryResult(WrapRecoveryExhaustedEnvelope(maxAttempts, attempts), attempts, Ok: false);
     }
 
-    /// <summary>
-    /// Resolves the attempt cap, falling back to <see cref="A2UIConstants.MaxA2UIAttempts"/>
-    /// when the configured value is unset or non-positive. A zero/negative cap would skip
-    /// the loop entirely and emit a confusing "0 attempt(s)" envelope, so it is treated as
-    /// unset rather than honored. Shared by both generation paths.
-    /// </summary>
-    /// <param name="config">The recovery configuration, if any.</param>
-    /// <returns>The effective maximum number of attempts (at least 1).</returns>
+    // Resolves the attempt cap, falling back to A2UIConstants.MaxA2UIAttempts
+    // when the configured value is unset or non-positive. A zero/negative cap would skip
+    // the loop entirely and emit a confusing "0 attempt(s)" envelope, so it is treated as
+    // unset rather than honored. Shared by both generation paths.
     internal static int ResolveMaxAttempts(A2UIRecoveryConfig? config)
         => config?.MaxAttempts is int max && max > 0 ? max : A2UIConstants.MaxA2UIAttempts;
 
-    /// <summary>
-    /// Validates one attempt's structured <c>render_a2ui</c> arguments, narrowing the
-    /// untrusted model output to the expected component/data shapes. A <see langword="null"/>
-    /// <paramref name="args"/> (the subagent did not call the tool) is a failed, retryable
-    /// attempt. Shared by the non-streaming loop and the streaming twin in <c>A2UIAgent</c>
-    /// so the two cannot drift on attempt semantics.
-    /// </summary>
-    /// <param name="attempt">The 1-based attempt number.</param>
-    /// <param name="args">The structured tool arguments, or <see langword="null"/> when absent.</param>
-    /// <param name="catalog">The catalog used for semantic validation, when available.</param>
-    /// <returns>The attempt record.</returns>
+    // Validates one attempt's structured render_a2ui arguments, narrowing the
+    // untrusted model output to the expected component/data shapes. A null
+    // args (the subagent did not call the tool) is a failed, retryable
+    // attempt. Shared by the non-streaming loop and the streaming twin in A2UIChatClient
+    // so the two cannot drift on attempt semantics.
     internal static A2UIAttemptRecord ValidateAttempt(int attempt, JsonObject? args, A2UIValidationCatalog? catalog)
     {
         if (args is null)

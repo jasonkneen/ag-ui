@@ -1,3 +1,4 @@
+using System.ClientModel;
 using System.ComponentModel;
 using System.Text.Json;
 using AGUI.A2UI;
@@ -8,11 +9,10 @@ using AGUIDojoServer.AgenticUI;
 using AGUIDojoServer.BackendToolRendering;
 using AGUIDojoServer.PredictiveStateUpdates;
 using AGUIDojoServer.SharedState;
-using System.ClientModel;
 using Azure.AI.OpenAI;
 using Azure.Identity;
-using OpenAI;
 using Microsoft.Extensions.AI;
+using OpenAI;
 using ChatClient = OpenAI.Chat.ChatClient;
 
 namespace AGUIDojoServer;
@@ -293,20 +293,28 @@ internal static class ChatClientAgentFactory
     /// </summary>
     public const string A2UIPlannerSystemPrompt = A2UICompositionGuides.PlannerInstructions;
 
-    /// <summary>
-    /// Builds an A2UI-enabled chat client: the planner (with function invocation for any
-    /// server tools) wrapped by <see cref="A2UIChatClient"/>, which auto-injects
-    /// <c>generate_a2ui</c> and drives a raw render subagent through the recovery loop.
-    /// </summary>
+    // Builds an A2UI-enabled chat client: the planner (with function invocation for any server
+    // tools) wrapped by A2UIChatClient, which auto-injects generate_a2ui and drives a raw render
+    // subagent through the recovery loop.
     private static IChatClient CreateA2UIChatClient(A2UIChatClientOptions options)
     {
         // The subagent must be raw (no function invocation): A2UIChatClient reads the forced
         // render_a2ui call's arguments directly rather than letting it be invoked.
         IChatClient subagent = s_chatClient!.AsIChatClient();
 
+        // Reuse the same OpenAI fragment extractor the endpoint registers for the wire tap, so
+        // the adapter can learn the streamed render_a2ui call id before the call coalesces and
+        // still balance a mid-stream failure.
+        A2UIChatClientOptions resolved = new()
+        {
+            InjectA2UITool = options.InjectA2UITool,
+            ToolParams = options.ToolParams,
+            StreamingToolCallArgumentExtractor = OpenAIStreamingToolArguments.Extract,
+        };
+
         return s_chatClient!.AsIChatClient()
             .AsBuilder()
-            .UseA2UI(subagent, options)
+            .UseA2UI(subagent, resolved)
             .UseFunctionInvocation()
             .Build();
     }
@@ -322,8 +330,10 @@ internal static class ChatClientAgentFactory
     });
 
     /// <summary>
-    /// Error-recovery demo: no catalog is supplied, so structural validation (missing root,
-    /// dangling child refs, duplicate ids) drives the validate-and-regenerate loop.
+    /// Error-recovery demo: a catalog id is supplied but no validation <c>Catalog</c>, so
+    /// structural validation (missing root, dangling child refs, duplicate ids) drives the
+    /// validate-and-regenerate loop. <c>MaxAttempts</c> is set explicitly to demonstrate the knob
+    /// (it already defaults to <see cref="A2UIConstants.MaxA2UIAttempts"/>).
     /// </summary>
     public static IChatClient CreateA2UIRecovery() => CreateA2UIChatClient(new A2UIChatClientOptions
     {

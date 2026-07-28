@@ -1,11 +1,6 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Threading;
-using System.Threading.Tasks;
 using AGUI.Abstractions;
 using AGUI.Server;
 using Microsoft.Extensions.AI;
@@ -43,15 +38,14 @@ public sealed class A2UIChatClient : DelegatingChatClient
     // surface rides the streamed arguments, so the result only has to balance the call.
     private const string RenderAcknowledgement = "{\"status\":\"rendered\"}";
 
-    /// <summary>
-    /// The cap on planner rounds (model turn -> generation -> result fed back) per run,
-    /// guarding against a planner that keeps requesting surfaces without terminating.
-    /// </summary>
+    // The cap on planner rounds (model turn -> generation -> result fed back) per run,
+    // guarding against a planner that keeps requesting surfaces without terminating.
     internal const int MaxPlannerRounds = 8;
 
     private readonly IChatClient _subagentChatClient;
     private readonly A2UIResolvedToolParams _parameters;
     private readonly bool? _injectOption;
+    private readonly Func<ChatResponseUpdate, IEnumerable<AGUIToolCallArgumentFragment>?>? _streamingArgExtractor;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="A2UIChatClient"/> class.
@@ -71,6 +65,7 @@ public sealed class A2UIChatClient : DelegatingChatClient
         this._subagentChatClient = subagentChatClient;
         this._parameters = A2UIToolDefinitions.ResolveA2UIToolParams(options?.ToolParams);
         this._injectOption = options?.InjectA2UITool;
+        this._streamingArgExtractor = options?.StreamingToolCallArgumentExtractor;
     }
 
     /// <inheritdoc/>
@@ -187,12 +182,10 @@ public sealed class A2UIChatClient : DelegatingChatClient
         }
     }
 
-    /// <summary>
-    /// Runs one <c>generate_a2ui</c> invocation with the validate-and-retry loop, streaming
-    /// the render subagent's updates (each retry is a fresh, visible subagent call) and
-    /// depositing the final envelope — operations, request error, or recovery-exhausted —
-    /// into <paramref name="envelopeBox"/>.
-    /// </summary>
+    // Runs one generate_a2ui invocation with the validate-and-retry loop, streaming
+    // the render subagent's updates (each retry is a fresh, visible subagent call) and
+    // depositing the final envelope — operations, request error, or recovery-exhausted —
+    // into envelopeBox.
     private async IAsyncEnumerable<ChatResponseUpdate> RunGenerateStreamingAsync(
         FunctionCallContent call,
         IReadOnlyList<ChatMessage> conversation,
@@ -256,10 +249,20 @@ public sealed class A2UIChatClient : DelegatingChatClient
                     }
 
                     attemptUpdates.Add(update);
+
+                    // Learn the render call id as early as possible. The typed FunctionCallContent
+                    // only appears once the call has fully coalesced, so on a mid-stream failure it
+                    // never arrives; the streamed fragments carry the id on their first fragment.
+                    // The sub-agent is forced to call only render_a2ui, so any fragment id is it.
                     liveCallId ??= update.Contents
                         .OfType<FunctionCallContent>()
                         .FirstOrDefault(c => string.Equals(c.Name, A2UIConstants.RenderA2UIToolName, StringComparison.Ordinal))
                         ?.CallId;
+                    if (liveCallId is null && this._streamingArgExtractor is not null)
+                    {
+                        liveCallId = this._streamingArgExtractor(update)?
+                            .FirstOrDefault(f => !string.IsNullOrEmpty(f.ToolCallId))?.ToolCallId;
+                    }
 
                     yield return update;
                 }
@@ -322,11 +325,9 @@ public sealed class A2UIChatClient : DelegatingChatClient
         envelopeBox.Value = ParseEnvelope(A2UIGenerationRecovery.WrapRecoveryExhaustedEnvelope(maxAttempts, attempts));
     }
 
-    /// <summary>
-    /// Resolves the per-run injection decision. The forwarded runtime flag wins when present
-    /// (an explicit client <see langword="false"/> beats a backend opt-in); otherwise the
-    /// backend option; otherwise on, because wrapping is itself the opt-in.
-    /// </summary>
+    // Resolves the per-run injection decision. The forwarded runtime flag wins when present
+    // (an explicit client false beats a backend opt-in); otherwise the
+    // backend option; otherwise on, because wrapping is itself the opt-in.
     private static bool ShouldInject(bool? injectOption, ChatOptions? options)
     {
         if (options is not null &&
@@ -341,10 +342,8 @@ public sealed class A2UIChatClient : DelegatingChatClient
         return injectOption ?? true;
     }
 
-    /// <summary>
-    /// Reads the A2UI state (catalog schema + forwarded context entries) from the
-    /// <see cref="RunAgentInput"/> the AG-UI hosting layer stamped onto the chat options.
-    /// </summary>
+    // Reads the A2UI state (catalog schema + forwarded context entries) from the
+    // RunAgentInput the AG-UI hosting layer stamped onto the chat options.
     internal static A2UIAgentState ReadAgentState(ChatOptions? options)
     {
         if (options is null ||
@@ -371,11 +370,9 @@ public sealed class A2UIChatClient : DelegatingChatClient
         return new A2UIAgentState { Context = context, A2UISchema = schema };
     }
 
-    /// <summary>
-    /// Classifies a subagent stream error: cancellation (when requested) and programmer
-    /// errors rethrow; everything else (transient provider/network faults) is recoverable
-    /// and becomes a failed, retryable attempt. Mirrors the sibling adapters' classifiers.
-    /// </summary>
+    // Classifies a subagent stream error: cancellation (when requested) and programmer
+    // errors rethrow; everything else (transient provider/network faults) is recoverable
+    // and becomes a failed, retryable attempt. Mirrors the sibling adapters' classifiers.
     private static bool IsRecoverableSubagentError(Exception ex, CancellationToken cancellationToken)
     {
         if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
@@ -392,18 +389,16 @@ public sealed class A2UIChatClient : DelegatingChatClient
     private static A2UIValidationError ToTransientError(Exception ex) =>
         new(A2UIValidationErrorCodes.EmptyComponents, "components", $"Sub-agent call failed: {ex.Message}");
 
-    /// <summary>Builds the render subagent's message list: the generation prompt plus the sanitized conversation.</summary>
+    // Builds the render subagent's message list: the generation prompt plus the sanitized conversation.
     private static List<ChatMessage> BuildSubagentMessages(string prompt, IReadOnlyList<ChatMessage> messages) =>
         [new ChatMessage(ChatRole.System, prompt), .. SanitizeForSubagent(messages)];
 
-    /// <summary>
-    /// Strips unbalanced tool plumbing from the conversation before it is handed to the render
-    /// subagent. The in-flight <c>generate_a2ui</c> assistant tool-call has no matching result
-    /// yet (its result is what we are generating), and providers reject an assistant message
-    /// whose <c>tool_calls</c> are not each answered by a following tool message. Drop any
-    /// function call without a matching result (and any assistant message left empty); balanced
-    /// prior call/result pairs are kept so prior-surface grounding survives.
-    /// </summary>
+    // Strips unbalanced tool plumbing from the conversation before it is handed to the render
+    // subagent. The in-flight generate_a2ui assistant tool-call has no matching result
+    // yet (its result is what we are generating), and providers reject an assistant message
+    // whose tool_calls are not each answered by a following tool message. Drop any
+    // function call without a matching result (and any assistant message left empty); balanced
+    // prior call/result pairs are kept so prior-surface grounding survives.
     private static List<ChatMessage> SanitizeForSubagent(IReadOnlyList<ChatMessage> messages)
     {
         var answeredCallIds = new HashSet<string>(StringComparer.Ordinal);
@@ -439,14 +434,14 @@ public sealed class A2UIChatClient : DelegatingChatClient
         return sanitized;
     }
 
-    /// <summary>Builds the render subagent's chat options: a forced <c>render_a2ui</c> structured call.</summary>
+    // Builds the render subagent's chat options: a forced render_a2ui structured call.
     private static ChatOptions CreateSubagentOptions() => new()
     {
         Tools = [new RenderA2UIToolDeclaration()],
         ToolMode = ChatToolMode.RequireSpecific(A2UIConstants.RenderA2UIToolName),
     };
 
-    /// <summary>Reads a string argument from a function call's argument dictionary.</summary>
+    // Reads a string argument from a function call's argument dictionary.
     private static string? GetStringArgument(IDictionary<string, object?>? arguments, string name) =>
         arguments is not null && arguments.TryGetValue(name, out object? value)
             ? value switch
@@ -458,10 +453,8 @@ public sealed class A2UIChatClient : DelegatingChatClient
             }
             : null;
 
-    /// <summary>
-    /// Maps a chat message onto the toolkit's history shape: the role name plus the
-    /// message's textual content (for tool results, the function result payload).
-    /// </summary>
+    // Maps a chat message onto the toolkit's history shape: the role name plus the
+    // message's textual content (for tool results, the function result payload).
     private static A2UIHistoryMessage ToHistoryMessage(ChatMessage message)
     {
         string? content = message.Text;
@@ -518,11 +511,9 @@ public sealed class A2UIChatClient : DelegatingChatClient
         return result;
     }
 
-    /// <summary>
-    /// The schema-only declaration of the planner-facing <c>generate_a2ui</c> tool, used so
-    /// the planner's call surfaces on the update stream instead of being invoked by an
-    /// automatic function-invocation layer.
-    /// </summary>
+    // The schema-only declaration of the planner-facing generate_a2ui tool, used so
+    // the planner's call surfaces on the update stream instead of being invoked by an
+    // automatic function-invocation layer.
     private sealed class GenerateA2UIToolDeclaration : AIFunctionDeclaration
     {
         private static readonly JsonElement s_schema = ParseSchema();
@@ -571,10 +562,8 @@ public sealed class A2UIChatClient : DelegatingChatClient
         public override JsonElement JsonSchema => s_schema;
     }
 
-    /// <summary>
-    /// The schema-only declaration of the inner <c>render_a2ui</c> structured-output tool.
-    /// The subagent is forced to call it; the adapter reads the arguments instead of invoking it.
-    /// </summary>
+    // The schema-only declaration of the inner render_a2ui structured-output tool.
+    // The subagent is forced to call it; the adapter reads the arguments instead of invoking it.
     private sealed class RenderA2UIToolDeclaration : AIFunctionDeclaration
     {
         private static readonly (string Description, JsonElement Schema) s_definition = ParseDefinition();

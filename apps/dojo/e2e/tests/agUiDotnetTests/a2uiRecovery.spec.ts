@@ -31,9 +31,14 @@ test("[AG-UI .NET SDK] A2UI recovery — exhaustion never paints a faulty surfac
   await a2ui.openChat();
   await a2ui.sendMessage("Compare 3 broken hotels with ratings and prices.");
 
-  // Every attempt is invalid → no faulty surface ever paints. The no-wipe invariant
-  // holds even under total exhaustion. This is the server-side guarantee (middleware
-  // gate + adapter loop) and is independent of the client renderer.
+  // Wait for the run to actually exhaust (the hard-failure panel appears) BEFORE asserting
+  // no faulty surface painted — a bare toHaveCount(0) right after send passes trivially,
+  // before the agent has produced anything, and would not verify the no-wipe invariant.
+  await expect(
+    page.getByText("Couldn't generate the UI").first(),
+  ).toBeVisible({ timeout: 30_000 });
+  // Every attempt was invalid → no faulty surface ever painted. The no-wipe invariant holds
+  // even under total exhaustion (server-side middleware gate + adapter loop).
   await expect(a2ui.surface("hotel-comparison")).toHaveCount(0);
 
   // Conversation remains usable after the hard failure.
@@ -50,16 +55,15 @@ test("[AG-UI .NET SDK] A2UI recovery — exhaustion shows the hard-failure UI", 
   await a2ui.openChat();
   await a2ui.sendMessage("Compare 3 broken hotels with ratings and prices.");
 
-  // No faulty surface ever paints...
-  await expect(a2ui.surface("hotel-comparison")).toHaveCount(0);
-  // ...and the tasteful hard-failure message is shown to the user. The renderer is
-  // registered by the dojo's a2ui_recovery page via renderActivityMessages (TEMP — see
-  // recovery-renderer.tsx — until @copilotkit/react-core publishes the built-in). Target
-  // the title specifically: the panel also has a "Something went wrong…" subtitle, so a
+  // Wait for the tasteful hard-failure message first (proves the run reached exhaustion).
+  // Target the title specifically: the panel also has a "Something went wrong…" subtitle, so a
   // broad /went wrong/ regex would match two elements and trip Playwright strict mode.
   await expect(
     page.getByText("Couldn't generate the UI").first(),
   ).toBeVisible({ timeout: 30_000 });
+  // ...and, now that the terminal state is reached, no faulty surface ever painted (asserting
+  // this before the terminal state would pass trivially).
+  await expect(a2ui.surface("hotel-comparison")).toHaveCount(0);
 
   // Conversation remains usable after the hard failure.
   await a2ui.sendMessage("Thanks anyway.");

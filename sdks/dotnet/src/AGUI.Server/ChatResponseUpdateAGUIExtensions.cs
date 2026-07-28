@@ -1,10 +1,6 @@
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
 using AGUI.Abstractions;
 using Microsoft.Extensions.AI;
 
@@ -215,7 +211,24 @@ public static class ChatResponseUpdateAGUIExtensions
             {
                 foreach (var fragment in fragments)
                 {
-                    if (!rawToolCallIdsByIndex.TryGetValue(fragment.Index, out var rawToolCallId))
+                    var haveIndex = rawToolCallIdsByIndex.TryGetValue(fragment.Index, out var rawToolCallId);
+
+                    // A new first fragment (only first fragments carry the function name) that
+                    // reuses an index still held by a prior, never-coalesced call means the prior
+                    // call at that index ended without its typed FunctionCallContent — e.g. a
+                    // mid-stream provider error on a retried sub-agent turn, where providers
+                    // restart tool-call indexes at 0 (and may even reuse the same id). Close the
+                    // stale call so the next call's fragments are not misattributed to it (and its
+                    // later coalesced FunctionCallContent no longer double-emits).
+                    if (haveIndex && !string.IsNullOrEmpty(fragment.FunctionName))
+                    {
+                        yield return ToolCallEndEvent.Create(rawToolCallId!, raw);
+                        rawToolCallIndexById.Remove(rawToolCallId!);
+                        rawToolCallIdsByIndex.Remove(fragment.Index);
+                        haveIndex = false;
+                    }
+
+                    if (!haveIndex)
                     {
                         // The first fragment of a call carries its id and function name;
                         // later fragments only carry the index plus an arguments delta.
@@ -244,7 +257,7 @@ public static class ChatResponseUpdateAGUIExtensions
 
                     if (fragment.ArgumentsDelta.Length > 0)
                     {
-                        yield return ToolCallArgsEvent.Create(rawToolCallId, fragment.ArgumentsDelta, raw);
+                        yield return ToolCallArgsEvent.Create(rawToolCallId!, fragment.ArgumentsDelta, raw);
                     }
                 }
             }
@@ -326,6 +339,17 @@ public static class ChatResponseUpdateAGUIExtensions
                             }
 
                             yield return ToolCallEndEvent.Create(fcc.CallId, raw);
+
+                            // Emit the mapped call events the atomic path emits, so a registered
+                            // MapCall mapper is not silently skipped for a tool whose arguments
+                            // streamed as fragments.
+                            if (options.TryGetCallMapping(fcc.Name, out var rawCallMapper))
+                            {
+                                foreach (var mappedEvt in rawCallMapper(fcc))
+                                {
+                                    yield return mappedEvt;
+                                }
+                            }
 
                             // Preserve result-mapping correlation the atomic path performs.
                             if (options.TryGetResultMapping(fcc.Name, out _))

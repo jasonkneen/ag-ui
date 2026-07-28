@@ -1,4 +1,5 @@
-using AGUI.A2UI;
+using AGUI.Server;
+using Microsoft.Extensions.AI;
 
 namespace AGUI.A2UI;
 
@@ -24,4 +25,15 @@ public sealed class A2UIChatClientOptions
     /// are filled per the shared toolkit rules when unset.
     /// </summary>
     public A2UIToolParams? ToolParams { get; init; }
+
+    /// <summary>
+    /// Gets an optional extractor that reads provider-native streamed tool-call argument
+    /// fragments off a render sub-agent update (the same kind registered on the server's
+    /// <see cref="AGUIStreamOptions.MapStreamingToolCallArguments"/>). It lets the adapter learn
+    /// the streamed <c>render_a2ui</c> call id before the coalesced tool call arrives, so a
+    /// generation attempt that streams fragments and then fails mid-stream can still emit a
+    /// balancing tool result and leave the persisted conversation valid. When unset, balancing
+    /// falls back to the coalesced call id (which is unavailable on a mid-stream failure).
+    /// </summary>
+    public Func<ChatResponseUpdate, IEnumerable<AGUIToolCallArgumentFragment>?>? StreamingToolCallArgumentExtractor { get; init; }
 }

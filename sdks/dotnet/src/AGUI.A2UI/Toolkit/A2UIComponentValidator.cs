@@ -1,86 +1,6 @@
-
-using System;
-using System.Collections.Generic;
 using System.Text.Json.Nodes;
 
 namespace AGUI.A2UI;
-
-/// <summary>
-/// Error codes emitted by <see cref="A2UIComponentValidator"/>.
-/// </summary>
-/// <remarks>
-/// The string values are part of the cross-language A2UI contract (shared with the
-/// TypeScript and Python toolkits) and feed back into subagent retry prompts; they
-/// must not diverge from the sibling implementations.
-/// </remarks>
-public static class A2UIValidationErrorCodes
-{
-    /// <summary>The component set is missing or empty.</summary>
-    public const string EmptyComponents = "empty_components";
-
-    /// <summary>A component has no usable string <c>id</c>.</summary>
-    public const string MissingId = "missing_id";
-
-    /// <summary>A component has no usable string <c>component</c> type.</summary>
-    public const string MissingComponentType = "missing_component_type";
-
-    /// <summary>Two or more components share the same <c>id</c>.</summary>
-    public const string DuplicateId = "duplicate_id";
-
-    /// <summary>No component carries the mandatory <c>id</c> of <c>"root"</c>.</summary>
-    public const string NoRoot = "no_root";
-
-    /// <summary>A component type is not present in the supplied catalog.</summary>
-    public const string UnknownComponent = "unknown_component";
-
-    /// <summary>A component lacks a property the catalog marks as required.</summary>
-    public const string MissingRequiredProp = "missing_required_prop";
-
-    /// <summary>A child reference points at a component id that does not exist.</summary>
-    public const string UnresolvedChild = "unresolved_child";
-
-    /// <summary>A component participates in a child-reference cycle; the child/children tree must be a DAG.</summary>
-    public const string ChildCycle = "child_cycle";
-
-    /// <summary>An absolute data binding path does not resolve in the data model.</summary>
-    public const string UnresolvedBinding = "unresolved_binding";
-}
-
-/// <summary>
-/// A single semantic validation finding for an A2UI component tree.
-/// </summary>
-/// <param name="Code">One of the <see cref="A2UIValidationErrorCodes"/> values.</param>
-/// <param name="Path">A JSON-pointer-style location, e.g. <c>components[1].rating</c>.</param>
-/// <param name="Message">A human/model-readable description used in retry prompts.</param>
-public sealed record A2UIValidationError(string Code, string Path, string Message);
-
-/// <summary>
-/// The outcome of validating an A2UI component tree.
-/// </summary>
-/// <param name="Valid"><see langword="true"/> when no errors were found.</param>
-/// <param name="Errors">The findings, empty when <paramref name="Valid"/> is <see langword="true"/>.</param>
-public sealed record A2UIValidationResult(bool Valid, IReadOnlyList<A2UIValidationError> Errors);
-
-/// <summary>
-/// An inline component catalog used for semantic validation: component schemas
-/// (standard JSON Schema fragments with an optional <c>required</c> array) keyed by component name.
-/// </summary>
-public sealed class A2UIValidationCatalog
-{
-    /// <summary>
-    /// Initializes a new instance of the <see cref="A2UIValidationCatalog"/> class.
-    /// </summary>
-    /// <param name="components">Component schemas keyed by component name.</param>
-    public A2UIValidationCatalog(JsonObject components)
-    {
-        this.Components = components ?? throw new ArgumentNullException(nameof(components));
-    }
-
-    /// <summary>
-    /// Gets the component schemas keyed by component name.
-    /// </summary>
-    public JsonObject Components { get; }
-}
 
 /// <summary>
 /// Semantic validator for A2UI v0.9 component trees, mirroring
@@ -95,10 +15,10 @@ public sealed class A2UIValidationCatalog
 /// </remarks>
 public static class A2UIComponentValidator
 {
-    /// <summary>Schema <c>format</c> marker tagging a property whose value is a single child reference.</summary>
+    // Schema format marker tagging a property whose value is a single child reference.
     private const string ComponentRefFormat = "componentRef";
 
-    /// <summary>Schema <c>format</c> marker tagging a property whose value is a list of child references.</summary>
+    // Schema format marker tagging a property whose value is a list of child references.
     private const string ComponentRefListFormat = "componentRefList";
 
     /// <summary>
@@ -310,17 +230,15 @@ public static class A2UIComponentValidator
         return true;
     }
 
-    /// <summary>
-    /// Collects every child reference a component carries, paired with the field-specific path
-    /// suffix that locates it (e.g. <c>child</c>, <c>children[2]</c>, <c>tabItems[0].child</c>).
-    /// The singular <c>child</c> and plural <c>children</c> containers are always traversed — they
-    /// are the structural child fields every catalog shares. Extended ref-fields are catalog-derived:
-    /// a property contributes references only when its schema carries the <c>componentRef</c> /
-    /// <c>componentRefList</c> format marker, and array-of-object properties are introspected so
-    /// nested refs (e.g. Tabs <c>tabItems[].child</c>) are caught. Without a catalog only the
-    /// structural fields are returned. A reference value is a bare id string or a
-    /// <c>{ componentId, ... }</c> template object.
-    /// </summary>
+    // Collects every child reference a component carries, paired with the field-specific path
+    // suffix that locates it (e.g. child, children[2], tabItems[0].child).
+    // The singular child and plural children containers are always traversed — they
+    // are the structural child fields every catalog shares. Extended ref-fields are catalog-derived:
+    // a property contributes references only when its schema carries the componentRef /
+    // componentRefList format marker, and array-of-object properties are introspected so
+    // nested refs (e.g. Tabs tabItems[].child) are caught. Without a catalog only the
+    // structural fields are returned. A reference value is a bare id string or a
+    // { componentId, ... } template object.
     private static List<(string Path, string RefId)> CollectComponentRefEdges(JsonObject component, JsonObject? schema)
     {
         List<(string Path, string RefId)> edges = [];
@@ -422,11 +340,9 @@ public static class A2UIComponentValidator
         return edges;
     }
 
-    /// <summary>
-    /// id → ordered child-id references for the cycle graph, drawn from the same
-    /// <see cref="CollectComponentRefEdges"/> edge set the dangling-ref check uses so both views of
-    /// the child graph stay consistent.
-    /// </summary>
+    // id -> ordered child-id references for the cycle graph, drawn from the same
+    // CollectComponentRefEdges edge set the dangling-ref check uses so both views of
+    // the child graph stay consistent.
     private static Dictionary<string, List<string>> BuildChildAdjacency(JsonArray components, A2UIValidationCatalog? catalog)
     {
         var adjacency = new Dictionary<string, List<string>>(StringComparer.Ordinal);
@@ -455,15 +371,13 @@ public static class A2UIComponentValidator
         return adjacency;
     }
 
-    /// <summary>
-    /// Finds unique child-reference cycles (self-references and longer loops) over the child graph
-    /// via an iterative depth-first search. The traversal is explicit-stack rather than recursive
-    /// so a pathologically deep child chain in untrusted model output cannot overflow the call
-    /// stack (an uncatchable failure on .NET). Each cycle is canonicalised — rotated so the
-    /// lexicographically smallest id leads — so the same loop reached from different entry points
-    /// collapses to one finding, and the reported chain stays byte-identical across the sibling
-    /// toolkits.
-    /// </summary>
+    // Finds unique child-reference cycles (self-references and longer loops) over the child graph
+    // via an iterative depth-first search. The traversal is explicit-stack rather than recursive
+    // so a pathologically deep child chain in untrusted model output cannot overflow the call
+    // stack (an uncatchable failure on .NET). Each cycle is canonicalised — rotated so the
+    // lexicographically smallest id leads — so the same loop reached from different entry points
+    // collapses to one finding, and the reported chain stays byte-identical across the sibling
+    // toolkits.
     private static List<List<string>> FindChildCycles(JsonArray components, A2UIValidationCatalog? catalog)
     {
         Dictionary<string, List<string>> adjacency = BuildChildAdjacency(components, catalog);
@@ -531,7 +445,7 @@ public static class A2UIComponentValidator
         return cycles;
     }
 
-    /// <summary>Rotates a cycle's node list so the lexicographically smallest (ordinal) id leads.</summary>
+    // Rotates a cycle's node list so the lexicographically smallest (ordinal) id leads.
     private static List<string> Canonicalize(List<string> nodes)
     {
         int m = 0;

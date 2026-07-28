@@ -1,5 +1,3 @@
-using System;
-using System.Collections.Generic;
 using System.Text.Json;
 using AGUI.Abstractions;
 using Microsoft.Extensions.AI;
@@ -20,6 +18,7 @@ public sealed class AGUIStreamOptions
     private readonly Dictionary<string, Func<FunctionCallContent, IEnumerable<BaseEvent>>> _callMappings = new(StringComparer.Ordinal);
     private List<Func<AIContent, AGUIInterrupt?>>? _interruptMappers;
     private List<Func<AIContent, IEnumerable<BaseEvent>?>>? _contentMappers;
+    private Func<ChatResponseUpdate, IEnumerable<AGUIToolCallArgumentFragment>?>? _toolCallArgumentExtractor;
 
     /// <summary>
     /// Registers a fallback that maps an <see cref="AIContent"/> to an <see cref="AGUIInterrupt"/>.
@@ -117,8 +116,6 @@ public sealed class AGUIStreamOptions
         _callMappings[toolName] = mapper;
         return this;
     }
-
-    private Func<ChatResponseUpdate, IEnumerable<AGUIToolCallArgumentFragment>?>? _toolCallArgumentExtractor;
 
     /// <summary>
     /// Registers an extractor that reads provider-native streamed tool-call argument fragments
