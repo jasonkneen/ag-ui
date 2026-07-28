@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { IN_MEMORY_SESSION_STORE_MAX_ENTRIES } from "../constants";
 import { InMemorySessionStore } from "../sessions";
 import type { SessionRecord } from "../types";
 
@@ -36,6 +37,29 @@ describe("InMemorySessionStore", () => {
     const second = store.get("t")!;
     expect(second.pendingClientToolUseIds).toEqual(["ctu_1"]);
     expect(second.lastUserMessageId).toBeUndefined();
+  });
+
+  it("evicts the least recently used mapping once it is full", () => {
+    // Thread ids come from the client, so an unbounded map is a memory leak an
+    // untrusted caller controls.
+    const store = new InMemorySessionStore(2);
+    store.set("a", record());
+    store.set("b", record());
+    // A read counts as use: "a" is now the newer of the two.
+    expect(store.get("a")).toBeDefined();
+
+    store.set("c", record());
+
+    expect(store.size).toBe(2);
+    expect(store.get("b")).toBeUndefined();
+    expect(store.get("a")).toBeDefined();
+    expect(store.get("c")).toBeDefined();
+  });
+
+  it("defaults to a bounded capacity and rejects a nonsensical one", () => {
+    expect(IN_MEMORY_SESSION_STORE_MAX_ENTRIES).toBeGreaterThan(0);
+    expect(() => new InMemorySessionStore(0)).toThrow(RangeError);
+    expect(() => new InMemorySessionStore(1.5)).toThrow(RangeError);
   });
 
   it("returns undefined for an unknown thread and forgets deleted ones", () => {

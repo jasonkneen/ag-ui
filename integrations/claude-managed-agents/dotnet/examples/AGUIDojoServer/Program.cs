@@ -23,7 +23,13 @@ if (args.Length > 0 && string.Equals(args[0], "setup", StringComparison.Ordinal)
 }
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls(builder.Configuration["urls"] ?? "http://0.0.0.0:8026");
+// PORT is what the README and the Dockerfile advertise; honour it here as well so
+// `PORT=9000 dotnet run` listens where it says it does rather than only inside the
+// container, whose entrypoint sets ASPNETCORE_URLS from it. An explicit --urls (or
+// ASPNETCORE_URLS) still wins.
+var port = Environment.GetEnvironmentVariable("PORT");
+var defaultUrl = string.IsNullOrWhiteSpace(port) ? "http://0.0.0.0:8026" : $"http://0.0.0.0:{port}";
+builder.WebHost.UseUrls(builder.Configuration["urls"] ?? defaultUrl);
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.AllowAnyOrigin().AllowAnyHeader().WithMethods("GET", "POST", "OPTIONS")));
 

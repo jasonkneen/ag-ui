@@ -13,7 +13,7 @@ public class ManagedAgentsAgentTest
     /// The key the store and the busy gate share: scoped to the managed agent, not the bare
     /// (client-supplied) thread id.
     /// </summary>
-    private const string SessionKey = "7:agent_1|0:|5:env_1|thread_1";
+    private const string SessionKey = "7:agent_1|0:|5:env_1|0:|thread_1";
 
     private static ManagedAgentsAgent NewAgent(FakeManagedAgentsClient fake, ISessionStore? store = null, Action<ManagedAgentsAgentOptions>? configure = null)
     {
@@ -461,7 +461,7 @@ public class ManagedAgentsAgentTest
         Assert.Single(staging.CreatedSessions);
         Assert.Single(prod.CreatedSessions);
         Assert.Equal(
-            ["7:agent_1|0:|11:env_staging|thread_1", "7:agent_1|0:|8:env_prod|thread_1"],
+            ["7:agent_1|0:|11:env_staging|0:|thread_1", "7:agent_1|0:|8:env_prod|0:|thread_1"],
             store.Keys.Order());
     }
 
@@ -499,6 +499,36 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task AttachesConfiguredVaultIdsToTheCreatedSession()
+    {
+        // Parity with the TypeScript `vaultIds` and Python `vault_ids` options. The .NET port
+        // omitted this, and the README blamed a missing SDK field that in fact exists on the
+        // pinned Anthropic 12.37.0 SessionCreateParams.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var agent = NewAgent(fake, new RecordingSessionStore(), options =>
+        {
+            options.VaultIds.Add("vlt_one");
+            options.VaultIds.Add("vlt_two");
+        });
+
+        await CollectAsync(agent, BaseInput());
+
+        Assert.Equal(["vlt_one", "vlt_two"], Assert.Single(fake.CreatedSessions).VaultIds);
+    }
+
+    [Fact]
+    public async Task LeavesVaultIdsUnsetWhenNoneAreConfigured()
+    {
+        // Sent as absent rather than an empty list, so the payload matches the other two ports.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var agent = NewAgent(fake, new RecordingSessionStore());
+
+        await CollectAsync(agent, BaseInput());
+
+        Assert.Null(Assert.Single(fake.CreatedSessions).VaultIds);
+    }
+
+    [Fact]
     public async Task TwoAgentsSharingAStoreNeverAdoptEachOthersSession()
     {
         // Regression: the busy gate was scoped by managed agent while the store was keyed by the
@@ -515,9 +545,9 @@ public class ManagedAgentsAgentTest
 
         Assert.Single(first.CreatedSessions);
         Assert.Single(second.CreatedSessions);
-        Assert.Equal(["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"], store.Keys.Order());
-        Assert.Equal("sesn_first", (await store.GetAsync("7:agent_a|0:|5:env_1|thread_1", default))!.SessionId);
-        Assert.Equal("sesn_second", (await store.GetAsync("7:agent_b|0:|5:env_1|thread_1", default))!.SessionId);
+        Assert.Equal(["7:agent_a|0:|5:env_1|0:|thread_1", "7:agent_b|0:|5:env_1|0:|thread_1"], store.Keys.Order());
+        Assert.Equal("sesn_first", (await store.GetAsync("7:agent_a|0:|5:env_1|0:|thread_1", default))!.SessionId);
+        Assert.Equal("sesn_second", (await store.GetAsync("7:agent_b|0:|5:env_1|0:|thread_1", default))!.SessionId);
     }
 
     [Fact]
@@ -634,7 +664,7 @@ public class ManagedAgentsAgentTest
         ]));
 
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
-        Assert.Equal(("server exploded", "run_failed"), (error.Message, error.Code));
+        Assert.Equal((ManagedAgentsAgent.RunFailedMessage, "run_failed"), (error.Message, error.Code));
 
         var record = await store.GetAsync(SessionKey, default);
         Assert.NotNull(record);
@@ -1074,6 +1104,70 @@ public class ManagedAgentsAgentTest
         AssertJson(
             """{"type":"user.custom_tool_result","custom_tool_use_id":"ctu_1","content":[{"type":"text","text":"noon"}],"is_error":false}""",
             Assert.Single(fake.SentEvents, evt => evt.GetProperty("type").GetString() == "user.custom_tool_result"));
+    }
+
+    private const string Sensitive =
+        "401 from https://internal.example/v1/sessions (key sk-ant-SECRET, session sesn_private)";
+
+    [Fact]
+    public async Task SurfacesASessionCreateFailureWithoutRelayingItsText()
+    {
+        // The exception can carry session ids, request paths or credentials, and the client is not
+        // necessarily a trusted operator surface: the cause belongs to the hook, the client gets
+        // the code.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn])
+        {
+            CreateFailure = new InvalidOperationException(Sensitive),
+        };
+        var reported = new List<(Exception Error, ManagedAgentsErrorContext Context)>();
+
+        var events = await CollectAsync(
+            NewAgent(fake, configure: o => o.OnError = (error, context) => reported.Add((error, context))),
+            BaseInput());
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal((ManagedAgentsAgent.RunFailedMessage, "run_failed"), (error.Message, error.Code));
+        Assert.DoesNotContain("sk-ant-SECRET", JsonSerializer.Serialize(events));
+
+        var runFailed = Assert.Single(reported, r => r.Context.Operation == "run_failed");
+        Assert.Equal(Sensitive, runFailed.Error.Message);
+        Assert.Equal("thread_1", runFailed.Context.ThreadId);
+    }
+
+    [Fact]
+    public async Task DoesNotRelayAFailedDeliverysExceptionTextToTheClient()
+    {
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+            IdleEndTurn,
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.custom_tool_result")
+                ? new InvalidOperationException(Sensitive)
+                : null,
+        };
+        var reported = new List<Exception>();
+
+        var events = await CollectAsync(
+            NewAgent(fake, configure: o =>
+            {
+                o.OnError = (error, _) => reported.Add(error);
+                o.BackendTools.Add(new ManagedAgentsBackendTool
+                {
+                    Name = "get_time",
+                    Handler = _ => Task.FromResult("noon"),
+                });
+            }),
+            BaseInput());
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal(
+            ("The result of tool call ctu_1 could not be delivered to the session.", "tool_result_delivery_failed"),
+            (error.Message, error.Code));
+        // Not in the RUN_ERROR, and no TOOL_CALL_RESULT was emitted at all.
+        Assert.DoesNotContain("sk-ant-SECRET", JsonSerializer.Serialize(events));
+        Assert.Empty(events.OfType<ToolCallResultEvent>());
+        Assert.Contains(Sensitive, reported.Select(e => e.Message));
     }
 
     [Fact]

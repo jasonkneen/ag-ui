@@ -6,8 +6,15 @@ export const TOOL_RESULT_MAX_CHARS = 4000;
 export const SEARCH_RESULT_PREVIEW_CHARS = 300;
 /** Managed Agents tool names allow only [A-Za-z0-9_-], up to this many chars. */
 export const TOOL_NAME_MAX_LENGTH = 128;
-/** Tool descriptions are capped by the API. */
-export const TOOL_DESCRIPTION_MAX_LENGTH = 1024;
+/** Tool descriptions are capped by the API at 1-4096 characters. */
+export const TOOL_DESCRIPTION_MAX_LENGTH = 4096;
+/**
+ * How many thread↔session mappings the default in-memory store keeps. Thread
+ * ids are client-supplied, so the map has to be bounded; past this the
+ * least-recently-used mapping is evicted and that thread starts a fresh
+ * session on its next run.
+ */
+export const IN_MEMORY_SESSION_STORE_MAX_ENTRIES = 10_000;
 /**
  * Backoff for re-posting follow-up messages while a session finishes
  * un-parking; that transition happens asynchronously after a tool result.

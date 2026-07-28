@@ -200,8 +200,13 @@ async def _consume(
 
     def emit_tool_call(tool_call_id: str, name: str, tool_input: Any) -> None:
         emit(ToolCallStartEvent(tool_call_id=tool_call_id, tool_call_name=name))
+        # ensure_ascii=False so non-ASCII arguments arrive as themselves rather
+        # than \uXXXX escapes: the other two ports emit them literally, and the
+        # transport is UTF-8 either way.
         delta = json.dumps(
-            tool_input if tool_input is not None else {}, separators=(",", ":")
+            tool_input if tool_input is not None else {},
+            separators=(",", ":"),
+            ensure_ascii=False,
         )
         emit(ToolCallArgsEvent(tool_call_id=tool_call_id, delta=delta))
         emit(ToolCallEndEvent(tool_call_id=tool_call_id))
@@ -318,11 +323,14 @@ async def _consume(
         try:
             await send_custom_tool_result(tool_use_id, text, is_error)
         except Exception as exc:  # noqa: BLE001 - reported as a terminal run error
+            # The failure itself goes to the hook; the client is told only that
+            # the delivery failed. The underlying exception can carry session ids
+            # and request detail, and this event is read by the browser.
             report("post_tool_result", exc)
             await interrupt()
             return fail(
                 f"The result of tool call {tool_use_id} could not be delivered "
-                f"to the session: {exc or exc.__class__.__name__}",
+                "to the session.",
                 "tool_result_delivery_failed",
             )
         emit_tool_result(tool_use_id, text)
@@ -538,6 +546,17 @@ async def _consume(
                         "The session gave up after exhausting its retries.",
                         "retries_exhausted",
                     )
+                if reason_type != "requires_action":
+                    # A stop reason this version does not know how to answer.
+                    # Waiting for the session to resume would burn the whole turn
+                    # timeout, so interrupt it and say so — the same as the other
+                    # two ports.
+                    await interrupt()
+                    return fail(
+                        "The session went idle for a reason this integration does "
+                        f"not handle: {reason_type}.",
+                        "unknown_stop_reason",
+                    )
                 # requires_action: work out what the session is blocked on.
                 event_ids: Sequence[str] = get(stop_reason, "event_ids") or []
                 blocked_on = [
@@ -588,7 +607,7 @@ async def _consume(
                         await interrupt()
                         return fail(
                             "The tool confirmation could not be delivered to the "
-                            f"session: {exc or exc.__class__.__name__}",
+                            "session.",
                             "tool_confirmation_delivery_failed",
                         )
                     acked_tool_uses.update(confirmations)

@@ -589,11 +589,13 @@ internal sealed class ManagedAgentsTurn
         }
         catch (Exception ex)
         {
+            // The failure itself goes to the hook; the client is told only that the delivery
+            // failed. The underlying exception can carry session ids and request detail, and this
+            // event is read by the browser.
             Report("post_tool_result", ex);
             await InterruptAsync().ConfigureAwait(false);
             Fail(
-                $"The result of tool call {toolUseId} could not be delivered to the session: "
-                    + (string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message),
+                $"The result of tool call {toolUseId} could not be delivered to the session.",
                 "tool_result_delivery_failed");
             return;
         }
@@ -632,6 +634,14 @@ internal sealed class ManagedAgentsTurn
 
         if (!stopReason.TryPickBetaManagedAgentsSessionRequiresAction(out var requiresAction))
         {
+            // A stop reason this version does not know how to answer. Ignoring it left the turn
+            // waiting on a session that will never resume until the timeout fired, so interrupt it
+            // and say so — the same as the other two ports.
+            await InterruptAsync().ConfigureAwait(false);
+            Fail(
+                "The session went idle for a reason this integration does not handle: "
+                    + (StringPropertyOf(stopReason.Json, "type") ?? "unknown") + ".",
+                "unknown_stop_reason");
             return;
         }
 
@@ -673,8 +683,7 @@ internal sealed class ManagedAgentsTurn
                 Report("post_tool_confirmation", ex);
                 await InterruptAsync().ConfigureAwait(false);
                 Fail(
-                    "The tool confirmation could not be delivered to the session: "
-                        + (string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message),
+                    "The tool confirmation could not be delivered to the session.",
                     "tool_confirmation_delivery_failed");
                 return;
             }
@@ -798,13 +807,22 @@ internal sealed class ManagedAgentsTurn
         }
     }
 
+    /// <summary>
+    /// The tool input as JSON text for <c>TOOL_CALL_ARGS</c>.
+    /// </summary>
+    /// <remarks>
+    /// The element's own text, not a re-serialization: <see cref="JsonSerializer"/> escapes
+    /// HTML-sensitive characters by default, so <c>&lt;</c> would reach the UI as <c>\u003C</c>
+    /// here while the TypeScript and Python ports emit it literally. Passing the API's bytes
+    /// through keeps all three identical.
+    /// </remarks>
     private static string InputJsonOf(JsonElement rawEvent)
     {
         if (rawEvent.ValueKind == JsonValueKind.Object
             && rawEvent.TryGetProperty("input", out var input)
             && input.ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null))
         {
-            return JsonSerializer.Serialize(input);
+            return input.GetRawText();
         }
 
         return "{}";

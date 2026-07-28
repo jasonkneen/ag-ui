@@ -1020,7 +1020,7 @@ async def test_never_reports_a_tool_result_the_session_did_not_receive() -> None
     assert emitted[-1].code == "tool_result_delivery_failed"
     assert (
         emitted[-1].message
-        == "The result of tool call ctu_1 could not be delivered to the session: send failed"
+        == "The result of tool call ctu_1 could not be delivered to the session."
     )
     assert {"type": "user.interrupt"} in [
         event for send in fake.sent for event in send["events"]
@@ -1145,3 +1145,47 @@ async def test_the_best_effort_interrupt_is_bounded(monkeypatch) -> None:  # noq
     assert isinstance(events[-1], RunErrorEvent)
     assert events[-1].code == "unsupported_action"
     assert "interrupt" in [context["operation"] for context in reported]
+
+
+async def test_reports_an_unhandled_stop_reason_instead_of_waiting_it_out() -> None:
+    """Ignoring an unknown stop reason left the turn waiting on a session that
+    will never resume until the timeout fired."""
+    emitted, outcome, fake = await collect(
+        [
+            {
+                "type": "session.status_idle",
+                "id": "idle_1",
+                "stop_reason": {"type": "awaiting_martian_input"},
+            }
+        ]
+    )
+
+    assert outcome == TurnOutcome(status="errored")
+    assert isinstance(emitted[-1], RunErrorEvent)
+    assert emitted[-1].code == "unknown_stop_reason"
+    assert emitted[-1].message == (
+        "The session went idle for a reason this integration does not handle: "
+        "awaiting_martian_input."
+    )
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
+
+
+async def test_emits_tool_arguments_as_compact_unescaped_json() -> None:
+    """All three ports must agree byte for byte: no \\uXXXX escaping of
+    non-ASCII and no HTML escaping of < > &."""
+    emitted, _outcome, _fake = await collect(
+        [
+            {
+                "type": "agent.tool_use",
+                "id": "tu_1",
+                "name": "search",
+                "input": {"q": "café <b>&</b> 日本", "n": 1},
+            },
+            IDLE_END_TURN,
+        ]
+    )
+
+    args = next(e for e in emitted if isinstance(e, ToolCallArgsEvent))
+    assert args.delta == '{"q":"café <b>&</b> 日本","n":1}'

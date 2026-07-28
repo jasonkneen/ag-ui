@@ -31,6 +31,15 @@ from .types import (
 
 _DONE = object()
 
+RUN_FAILED_MESSAGE = "The run failed."
+"""The only thing a client is told about a failure this integration did not author.
+
+An SDK, session-store or API exception can carry session ids, request paths,
+backend hostnames or credentials, and the AG-UI client is not necessarily a
+trusted operator surface -- so the cause goes to `on_error` and the client gets
+this plus the machine-readable `code`.
+"""
+
 
 def _user_text(message: Any) -> str:
     """The text of a user message (string content or multimodal parts).
@@ -88,6 +97,7 @@ class ManagedAgentsAgent:
         session_store: SessionStore | None = None,
         backend_tools: list[BackendTool] | None = None,
         session_title: Callable[[str], str] | None = None,
+        vault_ids: Sequence[str] | None = None,
         tool_confirmation: Literal["allow", "deny"] | None = None,
         turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         stream_deltas: bool = True,
@@ -106,6 +116,11 @@ class ManagedAgentsAgent:
             normalize_tool_name(tool.name): tool for tool in backend_tools or []
         }
         self.session_title = session_title
+        # Vault ids (`vlt_...`) for stored credentials the agent may use, attached
+        # to each session this agent creates. Required for MCP servers that
+        # authenticate; the API only accepts them at session creation, so changing
+        # them takes effect on new threads.
+        self.vault_ids = list(vault_ids or [])
         self.tool_confirmation = tool_confirmation
         self.turn_timeout_s = turn_timeout_s
         self.stream_deltas = stream_deltas
@@ -168,10 +183,11 @@ class ManagedAgentsAgent:
             # the turn ran past its configured limit.
             async with asyncio.timeout(self.turn_timeout_s) as turn_deadline:
                 await self._run_turn_for_input(input, emit, state)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as timeout_error:
             if not turn_deadline.expired():
                 # An inner bounded operation (a best-effort send) timed out.
                 # Report that, not the turn limit it never reached.
+                self._report("run_failed", timeout_error, thread_id=input.thread_id)
                 emit(
                     RunErrorEvent(
                         message=(
@@ -200,9 +216,9 @@ class ManagedAgentsAgent:
             await self._interrupt(state.session_id)
             raise
         except Exception as err:  # noqa: BLE001 - surfaced to the client as RUN_ERROR
-            emit(
-                RunErrorEvent(message=str(err) or "The run failed.", code="run_failed")
-            )
+            # Detail to the hook, not to the client: see RUN_FAILED_MESSAGE.
+            self._report("run_failed", err, thread_id=input.thread_id)
+            emit(RunErrorEvent(message=RUN_FAILED_MESSAGE, code="run_failed"))
         finally:
             # Release the per-thread gate only after any interrupt above has
             # been posted, never before.
@@ -409,6 +425,8 @@ class ManagedAgentsAgent:
             field(self.managed_agent_id)
             + field("" if self.agent_version is None else str(self.agent_version))
             + field(self.environment_id)
+            # Sorted: the same vaults in a different order are the same session.
+            + field(",".join(sorted(self.vault_ids)))
             + thread_id
         )
 
@@ -565,9 +583,14 @@ class ManagedAgentsAgent:
             # Overrides replace the tool list, so keep the agent's own tools.
             agent["tools"] = await self._merged_tools(custom_tools)
 
-        session = await self.client.beta.sessions.create(
-            agent=agent, environment_id=self.environment_id, title=title
-        )
+        create_kwargs: dict[str, Any] = {
+            "agent": agent,
+            "environment_id": self.environment_id,
+            "title": title,
+        }
+        if self.vault_ids:
+            create_kwargs["vault_ids"] = list(self.vault_ids)
+        session = await self.client.beta.sessions.create(**create_kwargs)
         return SessionRecord(
             session_id=session.id,
             tool_names=[tool["name"] for tool in custom_tools],

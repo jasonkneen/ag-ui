@@ -20,6 +20,25 @@ public class ManagedAgentsCustomToolsTest
     }
 
     [Fact]
+    public void NormalizesANameWithATrailingNewline()
+    {
+        // Regression: the validity pattern ended in `$`, which in .NET also matches immediately
+        // before a trailing newline — so "show_chart\n" was treated as already valid and forwarded
+        // to the API unchanged.
+        Assert.Equal("show_chart_", ManagedAgentsCustomTools.NormalizeToolName("show_chart\n"));
+        Assert.Equal("show_chart__", ManagedAgentsCustomTools.NormalizeToolName("show_chart\r\n"));
+    }
+
+    [Fact]
+    public void CapsTheDescriptionAtTheApisLimit()
+    {
+        // The API accepts 1-4096; capping lower silently truncated valid descriptions.
+        Assert.Equal(4096, ManagedAgentsLimits.ToolDescriptionMaxLength);
+        var kept = ManagedAgentsCustomTools.CustomToolFrom("ok", new string('d', 2000), parameters: default);
+        Assert.Equal(2000, kept.GetProperty("description").GetString()!.Length);
+    }
+
+    [Fact]
     public void BuildsAnInputSchemaAndADefaultDescription()
     {
         var tool = ManagedAgentsCustomTools.CustomToolFrom(

@@ -279,7 +279,7 @@ describe("runTurn", () => {
     expect(emitted.at(-1)).toMatchObject({
       type: EventType.RUN_ERROR,
       code: "tool_result_delivery_failed",
-      message: "The result of tool call ctu_1 could not be delivered to the session: send failed",
+      message: "The result of tool call ctu_1 could not be delivered to the session.",
     });
     expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
   });
@@ -356,6 +356,33 @@ describe("runTurn", () => {
         is_error: true,
       },
     ]);
+  });
+
+  it("reports an unhandled stop reason instead of reading its absent event ids", async () => {
+    // Reading (absent) event_ids used to throw a TypeError here; every port now
+    // interrupts the idle session and names the reason.
+    const { emitted, outcome, fake } = await collect([
+      { type: "session.status_idle", id: "idle_1", stop_reason: { type: "awaiting_martian_input" } },
+    ]);
+
+    expect(outcome).toEqual({ status: "errored" });
+    expect(emitted.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      code: "unknown_stop_reason",
+      message: "The session went idle for a reason this integration does not handle: awaiting_martian_input.",
+    });
+    expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
+  });
+
+  it("emits tool arguments as compact, unescaped JSON", async () => {
+    // All three ports must agree byte for byte: no \uXXXX escaping of non-ASCII
+    // and no HTML escaping of < > &.
+    const { emitted } = await collect([
+      { type: "agent.tool_use", id: "tu_1", name: "search", input: { q: "café <b>&</b> 日本", n: 1 } },
+      idleEndTurn,
+    ]);
+    const args = emitted.find((event) => event.type === EventType.TOOL_CALL_ARGS) as unknown as { delta: string };
+    expect(args.delta).toBe('{"q":"café <b>&</b> 日本","n":1}');
   });
 
   it("parks the turn when the frontend must execute a tool", async () => {

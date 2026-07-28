@@ -15,8 +15,15 @@ internal static class ManagedAgentsLimits
     /// <summary>Managed Agents tool names are at most 128 characters.</summary>
     internal const int ToolNameMaxLength = 128;
 
-    /// <summary>Tool descriptions are capped by the API.</summary>
-    internal const int ToolDescriptionMaxLength = 1024;
+    /// <summary>Tool descriptions are capped by the API at 1-4096 characters.</summary>
+    internal const int ToolDescriptionMaxLength = 4096;
+
+    /// <summary>
+    /// How many thread↔session mappings the default in-memory store keeps. Thread ids are
+    /// client-supplied, so the map has to be bounded; past this the least-recently-used mapping is
+    /// evicted and that thread starts a fresh session on its next run.
+    /// </summary>
+    internal const int InMemorySessionStoreMaxEntries = 10_000;
 
     /// <summary>The default limit after which a turn is interrupted.</summary>
     internal static readonly TimeSpan DefaultTurnTimeout = TimeSpan.FromMinutes(5);

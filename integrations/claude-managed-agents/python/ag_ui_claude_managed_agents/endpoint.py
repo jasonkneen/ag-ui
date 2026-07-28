@@ -16,7 +16,10 @@ def add_managed_agents_fastapi_endpoint(
 
     POST `path` runs one turn and streams the encoded AG-UI events. Closing
     the response (a client disconnect) cancels the run, which interrupts the
-    managed session. GET `{path}/health` reports the managed agent id.
+    managed session. GET `{path}/health` is a liveness probe and deliberately
+    says nothing else: it is reachable by whoever can reach the endpoint, and
+    the managed agent id it used to return is an internal identifier probes have
+    no use for.
     """
 
     @app.post(path)
@@ -34,5 +37,5 @@ def add_managed_agents_fastapi_endpoint(
 
     @app.get(f"{path.rstrip('/')}/health")
     def health():
-        """Health check."""
-        return {"status": "ok", "agent": {"managedAgentId": agent.managed_agent_id}}
+        """Liveness probe. Returns no identifiers: see the note above."""
+        return {"status": "ok"}

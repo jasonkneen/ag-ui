@@ -158,6 +158,12 @@ def test_custom_tool_from_normalizes_name_and_caps_description() -> None:
     )
     assert tool["name"] == "show_chart_"
     assert len(tool["description"]) == TOOL_DESCRIPTION_MAX_LENGTH
+    # The API accepts 1-4096; capping lower silently truncated valid descriptions.
+    assert TOOL_DESCRIPTION_MAX_LENGTH == 4096
+    kept = custom_tool_from(
+        SimpleNamespace(name="ok", description="d" * 2000, parameters=None)
+    )
+    assert len(kept["description"]) == 2000
 
 
 def test_describe_tool_result_previews_a_long_search_result_body() -> None:

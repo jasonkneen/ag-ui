@@ -14,7 +14,7 @@ const idleEndTurn = { type: "session.status_idle", id: "idle_1", stop_reason: { 
  * The key the store and the busy gate share: scoped to the managed agent, not
  * the bare (client-supplied) thread id.
  */
-const SESSION_KEY = "7:agent_1|0:|5:env_1|thread_1";
+const SESSION_KEY = "7:agent_1|0:|5:env_1|0:|thread_1";
 
 const baseInput = (overrides: Partial<RunAgentInput> = {}): RunAgentInput => ({
   threadId: "thread_1",
@@ -92,6 +92,16 @@ describe("ManagedAgentsAgent", () => {
       title: "Chat thread_1",
     });
     expect(fake.spies.retrieve).not.toHaveBeenCalled();
+  });
+
+  it("attaches configured vault ids when creating a session", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn], [idleEndTurn]] });
+    await collect(newAgent(fake, undefined, { vaultIds: ["vlt_1", "vlt_2"] }), baseInput());
+    expect(fake.spies.create.mock.calls[0]![0]).toMatchObject({ vault_ids: ["vlt_1", "vlt_2"] });
+
+    // Omitted entirely when none are configured, so the field is not sent empty.
+    await collect(newAgent(fake), baseInput());
+    expect(fake.spies.create.mock.calls[1]![0]).not.toHaveProperty("vault_ids");
   });
 
   it("reuses the session on the thread's next run and sends only the new message", async () => {
@@ -578,7 +588,7 @@ describe("ManagedAgentsAgent", () => {
       }),
     );
 
-    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "server exploded", code: "run_failed" });
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "The run failed.", code: "run_failed" });
     // The results were persisted as delivered; the follow-up never landed, so
     // the user message stays undelivered and is retried next run.
     expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
@@ -674,7 +684,7 @@ describe("ManagedAgentsAgent", () => {
 
     expect(staging.spies.create).toHaveBeenCalledTimes(1);
     expect(prod.spies.create).toHaveBeenCalledTimes(1);
-    expect(store.keys().sort()).toEqual(["7:agent_1|0:|8:env_prod|thread_1", "7:agent_1|0:|11:env_staging|thread_1"].sort());
+    expect(store.keys().sort()).toEqual(["7:agent_1|0:|8:env_prod|0:|thread_1", "7:agent_1|0:|11:env_staging|0:|thread_1"].sort());
   });
 
   it("does not let two agents sharing a store adopt each other's session", async () => {
@@ -692,9 +702,9 @@ describe("ManagedAgentsAgent", () => {
     // Each agent created and kept its own session.
     expect(first.spies.create).toHaveBeenCalledTimes(1);
     expect(second.spies.create).toHaveBeenCalledTimes(1);
-    expect(store.keys().sort()).toEqual(["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"]);
-    expect(await store.get("7:agent_a|0:|5:env_1|thread_1")).toMatchObject({ sessionId: "sesn_first" });
-    expect(await store.get("7:agent_b|0:|5:env_1|thread_1")).toMatchObject({ sessionId: "sesn_second" });
+    expect(store.keys().sort()).toEqual(["7:agent_a|0:|5:env_1|0:|thread_1", "7:agent_b|0:|5:env_1|0:|thread_1"]);
+    expect(await store.get("7:agent_a|0:|5:env_1|0:|thread_1")).toMatchObject({ sessionId: "sesn_first" });
+    expect(await store.get("7:agent_b|0:|5:env_1|0:|thread_1")).toMatchObject({ sessionId: "sesn_second" });
   });
 
   it("serializes runs on the same key that the store uses", async () => {
@@ -1050,9 +1060,57 @@ describe("ManagedAgentsAgent", () => {
     expect(interrupt?.signal?.aborted).toBe(false);
   });
 
-  it("surfaces a session-create failure as a run error", async () => {
-    const fake = createFakeClient({ createError: new Error("quota exceeded") });
-    const events = await collect(newAgent(fake), baseInput());
-    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "quota exceeded" });
+  it("surfaces a session-create failure as a run error without relaying its text", async () => {
+    // The exception can carry session ids, request paths or credentials, and the
+    // client is not necessarily a trusted operator surface: the cause belongs to
+    // the hook, the client gets the code.
+    const sensitive = "401 from https://internal.example/v1/sessions (key sk-ant-SECRET, session sesn_private)";
+    const fake = createFakeClient({ createError: new Error(sensitive) });
+    const reported: { error: unknown; context: { operation: string; threadId?: string } }[] = [];
+
+    const events = await collect(
+      newAgent(fake, undefined, { onError: (error, context) => reported.push({ error, context }) }),
+      baseInput(),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "The run failed.", code: "run_failed" });
+    for (const event of events) expect(JSON.stringify(event)).not.toContain("sk-ant-SECRET");
+
+    const reportedRun = reported.find((entry) => entry.context.operation === "run_failed");
+    expect((reportedRun?.error as Error).message).toBe(sensitive);
+    expect(reportedRun?.context.threadId).toBe("thread_1");
+  });
+
+  it("does not relay a failed delivery's exception text to the client", async () => {
+    const sensitive = "500 from https://internal.example/v1/sessions/sesn_private/events (token sk-ant-SECRET)";
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "get_time", input: {} },
+          idleEndTurn,
+        ],
+      ],
+      // The user message posts fine; the tool result does not.
+      sendResults: [undefined, new Error(sensitive)],
+    });
+    const reported: unknown[] = [];
+    const backendTools: BackendCustomTool[] = [
+      { name: "get_time", description: "", parameters: {}, handler: () => "noon" },
+    ];
+
+    const events = await collect(
+      newAgent(fake, undefined, { backendTools, onError: (error) => reported.push(error) }),
+      baseInput(),
+    );
+
+    expect(events.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      message: "The result of tool call ctu_1 could not be delivered to the session.",
+      code: "tool_result_delivery_failed",
+    });
+    // Not in the RUN_ERROR, and no TOOL_CALL_RESULT was emitted at all.
+    for (const event of events) expect(JSON.stringify(event)).not.toContain("sk-ant-SECRET");
+    expect(types(events)).not.toContain(EventType.TOOL_CALL_RESULT);
+    expect(reported.map((error) => (error as Error).message)).toContain(sensitive);
   });
 });

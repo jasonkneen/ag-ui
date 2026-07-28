@@ -74,6 +74,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 | `sessionStore` | in-memory | Thread↔session mapping, keyed by `managedAgentId:threadId`. Provide your own to survive restarts. |
 | `backendTools` | `[]` | Server-executed custom tools. |
 | `sessionTitle` | `AG-UI thread <id>` | Title for created sessions. |
+| `vaultIds` | `[]` | Vault IDs (`vlt_...`) for stored credentials the agent may use, e.g. for MCP servers that authenticate. Applied at session creation. |
 | `toolConfirmation` | error | `"allow"`/`"deny"` to answer built-in tools whose permission policy asks. |
 | `turnTimeoutMs` | 300000 | Interrupt turns that run longer. |
 | `streamDeltas` | `true` | Request text/thinking previews for token streaming. |
@@ -83,6 +84,7 @@ The tool call and its result stream to the UI, and the result is returned to the
 AG-UI thread IDs are supplied by the client and this agent keys thread↔session state by `managedAgentId:threadId`, so a thread ID is effectively a bearer identifier: **any caller who presents a thread ID resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
 
 - Put the endpoint behind your own authentication. Never expose it unauthenticated.
+- `RUN_ERROR` never relays the text of a failure this integration did not author. An SDK, session-store or API exception can carry session ids, request paths or credentials, so its message goes to `onError` and the client gets a stable message plus the machine-readable `code`. Two things are deliberately still verbatim, because they are the point of the event: a `session.error` from the API (a structured field with its own `type` code, and the only account of why a session broke) and a backend tool's own exception message (your code, and what the agent needs to recover).
 - In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread ID. Do this with a `sessionStore` whose keys include the caller identity derived from your auth layer (never from the request body):
 
 The key the agent passes in is already scoped to the managed agent; treat it as an opaque string and prefix it with the caller identity rather than parsing it:
@@ -120,6 +122,7 @@ const storeFor = (ownerId: string): PerCallerStore => {
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter surfaces them for display, so enable them on your agent as usual.
 - Tool-result `text` blocks reach the UI verbatim: they carry literal output (a file read, a shell transcript), where `&lt;` means those four characters. Only `search_result` blocks, whose bodies are extracted from HTML, have their entities decoded.
 - A follow-up message posted immediately after a tool result can race the session's asynchronous un-park and be rejected with a 400. That specific rejection is retried, matched on the message containing `waiting on responses` — wording that has not been confirmed against the live API. If the API rewords it the retry stops firing and the 400 surfaces as a run error; nothing else is affected. See the comment on the matcher.
+- The default in-memory store is bounded (`IN_MEMORY_SESSION_STORE_MAX_ENTRIES`, 10 000 mappings): thread ids are client-supplied, so past that the least-recently-used mapping is evicted and that thread starts a fresh session. Pass a smaller cap to `new InMemorySessionStore(n)`, or supply a persistent store.
 
 ## Running the examples
 

@@ -28,6 +28,12 @@ public sealed class ManagedAgentSessionRequest
     public string Title { get; set; } = string.Empty;
 
     /// <summary>
+    /// Gets or sets the vault IDs (<c>vlt_...</c>) for stored credentials the agent may use, or
+    /// <see langword="null"/> for none.
+    /// </summary>
+    public IReadOnlyList<string>? VaultIds { get; set; }
+
+    /// <summary>
     /// Gets or sets the tool list that replaces the agent's own for this session
     /// (<c>agent_with_overrides</c>), or <see langword="null"/> to use the agent as-is.
     /// </summary>

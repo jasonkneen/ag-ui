@@ -46,6 +46,32 @@ public class InMemorySessionStoreTest
     }
 
     [Fact]
+    public async Task EvictsTheLeastRecentlyUsedMappingOnceFull()
+    {
+        // Thread ids come from the client, so an unbounded map is a memory leak an untrusted
+        // caller controls.
+        var store = new InMemorySessionStore(maxEntries: 2);
+        await store.SetAsync("a", Record(), default);
+        await store.SetAsync("b", Record(), default);
+        // A read counts as use: "a" is now the newer of the two.
+        Assert.NotNull(await store.GetAsync("a", default));
+
+        await store.SetAsync("c", Record(), default);
+
+        Assert.Equal(2, store.Count);
+        Assert.Null(await store.GetAsync("b", default));
+        Assert.NotNull(await store.GetAsync("a", default));
+        Assert.NotNull(await store.GetAsync("c", default));
+    }
+
+    [Fact]
+    public void RejectsANonsensicalCapacity()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new InMemorySessionStore(maxEntries: 0));
+        Assert.True(ManagedAgentsLimits.InMemorySessionStoreMaxEntries > 0);
+    }
+
+    [Fact]
     public async Task UnknownAndDeletedThreadsReadAsNull()
     {
         var store = new InMemorySessionStore();

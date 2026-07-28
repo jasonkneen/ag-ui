@@ -129,7 +129,9 @@ internal static partial class ManagedAgentsCustomTools
         return schema;
     }
 
-    [GeneratedRegex("^[A-Za-z0-9_-]{1,128}$")]
+    // \z, not $: in .NET `$` also matches immediately before a trailing newline, so
+    // "show_chart\n" would pass validation and be forwarded to the API unchanged.
+    [GeneratedRegex(@"^[A-Za-z0-9_-]{1,128}\z")]
     private static partial Regex ValidNamePattern();
 
     [GeneratedRegex("[^A-Za-z0-9_-]")]

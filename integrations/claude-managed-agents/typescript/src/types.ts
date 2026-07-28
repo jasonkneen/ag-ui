@@ -86,6 +86,13 @@ export interface ManagedAgentsAgentConfig extends AgentConfig {
   /** Title for newly created sessions. Defaults to `AG-UI thread <threadId>`. */
   sessionTitle?: (threadId: string) => string;
   /**
+   * Vault IDs (`vlt_...`) for stored credentials the agent may use, attached to
+   * each session this agent creates. Required for MCP servers that authenticate;
+   * the API only accepts them at session creation, so changing them takes effect
+   * on new threads.
+   */
+  vaultIds?: string[];
+  /**
    * When a built-in tool is gated on user confirmation (`evaluated_permission: "ask"`),
    * answer it automatically. `undefined` (default) ends the run with an error
    * instead, since there is no confirmation UI wired up yet.

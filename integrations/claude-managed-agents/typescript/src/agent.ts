@@ -36,6 +36,15 @@ const runError = (message: string, code: string): BaseEvent =>
 const ABANDONED_TOOL_TEXT = "The user did not provide a result for this tool call.";
 
 /**
+ * The only thing a client is told about a failure this integration did not
+ * author. An SDK, session-store or API exception can carry session ids, request
+ * paths, backend hostnames or credentials, and the AG-UI client is not
+ * necessarily a trusted operator surface — so the cause goes to `onError` and
+ * the client gets this plus the machine-readable `code`.
+ */
+const RUN_FAILED_MESSAGE = "The run failed.";
+
+/**
  * An AG-UI agent backed by Claude Managed Agents. Each AG-UI thread maps to
  * one managed session; each run drives one turn of that session.
  */
@@ -151,7 +160,9 @@ export class ManagedAgentsAgent extends AbstractAgent {
             emit(runError(`The turn exceeded the ${timeoutMs / 1000}s limit and was interrupted.`, "turn_timeout"));
             return;
           }
-          emit(runError(err instanceof Error && err.message ? err.message : "The run failed.", "run_failed"));
+          // Detail to the hook, not to the client: see RUN_FAILED_MESSAGE.
+          this.report("run_failed", err, { threadId: input.threadId });
+          emit(runError(RUN_FAILED_MESSAGE, "run_failed"));
         })
         .finally(() => subscriber.complete());
 
@@ -293,12 +304,14 @@ export class ManagedAgentsAgent extends AbstractAgent {
    * The thread id is last, so it needs no prefix and may contain anything.
    */
   private sessionKey(threadId: string): string {
-    const { managedAgentId, agentVersion, environmentId } = this.config;
+    const { managedAgentId, agentVersion, environmentId, vaultIds } = this.config;
     const field = (value: string) => `${value.length}:${value}|`;
     return (
       field(managedAgentId) +
       field(agentVersion === undefined ? "" : String(agentVersion)) +
       field(environmentId) +
+      // Sorted: the same vaults in a different order are the same session.
+      field([...(vaultIds ?? [])].sort().join(",")) +
       threadId
     );
   }
@@ -416,7 +429,12 @@ export class ManagedAgentsAgent extends AbstractAgent {
         : { type: "agent_with_overrides", ...agentRef, tools: await this.mergedTools(customTools, signal) };
 
     const session = await this.client.beta.sessions.create(
-      { agent, environment_id: environmentId, title },
+      {
+        agent,
+        environment_id: environmentId,
+        title,
+        ...(this.config.vaultIds?.length ? { vault_ids: this.config.vaultIds } : {}),
+      },
       { signal },
     );
     return {

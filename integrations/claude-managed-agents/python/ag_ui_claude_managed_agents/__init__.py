@@ -15,6 +15,7 @@ from importlib.metadata import PackageNotFoundError, version
 from .agent import ManagedAgentsAgent
 from .constants import (
     DEFAULT_TURN_TIMEOUT_S,
+    IN_MEMORY_SESSION_STORE_MAX_ENTRIES,
     PARKED_RETRY_DELAYS_S,
     SEARCH_RESULT_PREVIEW_CHARS,
     TOOL_DESCRIPTION_MAX_LENGTH,
@@ -25,7 +26,13 @@ from .endpoint import add_managed_agents_fastapi_endpoint
 from .sessions import InMemorySessionStore
 from .tools import custom_tool_from, normalize_tool_name
 from .turn import run_turn
-from .types import BackendTool, SessionRecord, SessionStore, TurnOutcome
+from .types import (
+    BackendTool,
+    ErrorHandler,
+    SessionRecord,
+    SessionStore,
+    TurnOutcome,
+)
 
 try:
     __version__ = version("ag-ui-claude-managed-agents")
@@ -34,6 +41,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "DEFAULT_TURN_TIMEOUT_S",
+    "IN_MEMORY_SESSION_STORE_MAX_ENTRIES",
     "PARKED_RETRY_DELAYS_S",
     "SEARCH_RESULT_PREVIEW_CHARS",
     "TOOL_DESCRIPTION_MAX_LENGTH",

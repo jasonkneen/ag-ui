@@ -243,11 +243,13 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     try {
       await postCustomToolResult(toolUseId, text, isError);
     } catch (error) {
+      // The failure itself goes to the hook; the client is told only that the
+      // delivery failed. The underlying exception can carry session ids and
+      // request detail, and this event is read by the browser.
       report("post_tool_result", error);
       await interrupt();
       return fail(
-        `The result of tool call ${toolUseId} could not be delivered to the session: ` +
-          (error instanceof Error && error.message ? error.message : String(error)),
+        `The result of tool call ${toolUseId} could not be delivered to the session.`,
         "tool_result_delivery_failed",
       );
     }
@@ -410,8 +412,22 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           if (stop_reason.type === "retries_exhausted") {
             return fail("The session gave up after exhausting its retries.", "retries_exhausted");
           }
+          // Anything other than requires_action is a stop reason this version
+          // does not know how to answer. Reading its (absent) event_ids used to
+          // throw here; all three ports now interrupt the idle session and say
+          // so, rather than waiting out the turn timeout on a session that will
+          // never resume. Read through a widened type: the static union is
+          // exhaustive, but the API is free to add a stop reason to it.
+          const reasonType = (stop_reason as { type: string }).type;
+          if (reasonType !== "requires_action") {
+            await interrupt();
+            return fail(
+              `The session went idle for a reason this integration does not handle: ${reasonType}.`,
+              "unknown_stop_reason",
+            );
+          }
           // requires_action: work out what the session is blocked on.
-          const blockedOn = stop_reason.event_ids.filter((id) => !ackedToolUses.has(id));
+          const blockedOn = (stop_reason.event_ids ?? []).filter((id) => !ackedToolUses.has(id));
           if (blockedOn.length === 0) break; // everything is already answered; wait for it to resume
 
           const confirmations = blockedOn.filter((id) => askedConfirmations.has(id));
@@ -444,8 +460,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
               report("post_tool_confirmation", error);
               await interrupt();
               return fail(
-                "The tool confirmation could not be delivered to the session: " +
-                  (error instanceof Error && error.message ? error.message : String(error)),
+                "The tool confirmation could not be delivered to the session.",
                 "tool_confirmation_delivery_failed",
               );
             }

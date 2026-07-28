@@ -36,6 +36,9 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     /// <summary>When set, a stream throws this after yielding its scripted events.</summary>
     public Exception? StreamFailure { get; set; }
 
+    /// <summary>When set, <see cref="CreateSessionAsync"/> throws this instead of creating.</summary>
+    public Exception? CreateFailure { get; set; }
+
     /// <summary>
     /// Optional hook consulted on every send: return an exception to make that send fail,
     /// or <see langword="null"/> to record it as sent.
@@ -45,7 +48,7 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     public Task<string> CreateSessionAsync(ManagedAgentSessionRequest request, CancellationToken cancellationToken)
     {
         CreatedSessions.Add(request);
-        return Task.FromResult(SessionId);
+        return CreateFailure is not null ? Task.FromException<string>(CreateFailure) : Task.FromResult(SessionId);
     }
 
     public Task UpdateSessionToolsAsync(string sessionId, IReadOnlyList<JsonElement> tools, CancellationToken cancellationToken)

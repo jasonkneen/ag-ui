@@ -82,6 +82,7 @@ The handler may be a plain function or a coroutine. A plain function runs in a w
 | `session_store` | in-memory | Thread to session mapping, keyed by `managed_agent_id:thread_id`. Provide your own to survive restarts. |
 | `backend_tools` | `[]` | Server-executed custom tools. |
 | `session_title` | `AG-UI thread <id>` | Callable returning the title for created sessions. |
+| `vault_ids` | `[]` | Vault ids (`vlt_...`) for stored credentials the agent may use, e.g. for MCP servers that authenticate. Applied at session creation. |
 | `tool_confirmation` | `None` | `"allow"`/`"deny"` answers built-in tools whose permission policy asks. With no policy, such a call interrupts the run with a `tool_confirmation_required` error. |
 | `turn_timeout_s` | 300 | Interrupt turns that run longer. |
 | `stream_deltas` | `True` | Request text/thinking previews for token streaming. |
@@ -91,6 +92,7 @@ The handler may be a plain function or a coroutine. A plain function runs in a w
 AG-UI thread ids are supplied by the client and this agent keys thread↔session state by `managed_agent_id:thread_id`, so a thread id is effectively a bearer identifier: **any caller who presents a thread id resumes that thread's session.** The AG-UI protocol carries no user identity of its own, so authorization is your host's responsibility:
 
 - Put the endpoint behind your own authentication. Never expose it unauthenticated.
+- `RUN_ERROR` never relays the text of a failure this integration did not author. An SDK, session-store or API exception can carry session ids, request paths or credentials, so its message goes to `on_error` and the client gets a stable message plus the machine-readable `code`. Two things are deliberately still verbatim, because they are the point of the event: a `session.error` from the API (a structured field with its own `type` code, and the only account of why a session broke) and a backend tool's own exception message (your code, and what the agent needs to recover).
 - In multi-tenant deployments, bind threads to the authenticated caller so one caller cannot resume another's session by guessing or replaying a thread id. Do this with a `session_store` whose keys include the caller identity derived from your auth layer (never from the request body):
 
 The key the agent passes in is already scoped to the managed agent; treat it as an opaque string and prefix it with the caller identity rather than parsing it:
@@ -138,6 +140,7 @@ def store_for(owner_id: str) -> PerCallerStore:
 - Built-in tools (bash, file editing, web) execute inside the managed environment. This adapter surfaces them for display, so enable them on your agent as usual.
 - Tool-result `text` blocks reach the UI verbatim: they carry literal output (a file read, a shell transcript), where `&lt;` means those four characters. Only `search_result` blocks, whose bodies are extracted from HTML, have their entities decoded.
 - A follow-up message posted immediately after a tool result can race the session's asynchronous un-park and be rejected with a 400. That specific rejection is retried, matched on the message containing `waiting on responses` — wording that has not been confirmed against the live API. If the API rewords it the retry stops firing and the 400 surfaces as a run error; nothing else is affected. See the comment on the matcher.
+- The default in-memory store is bounded (`IN_MEMORY_SESSION_STORE_MAX_ENTRIES`, 10 000 mappings): thread ids are client-supplied, so past that the least-recently-used mapping is evicted and that thread starts a fresh session. Pass a smaller cap to `InMemorySessionStore(max_entries=n)`, or supply a persistent store.
 
 ## Running the examples
 

@@ -9,8 +9,15 @@ SEARCH_RESULT_PREVIEW_CHARS = 300
 TOOL_NAME_MAX_LENGTH = 128
 """Managed Agents tool names allow only [A-Za-z0-9_-], up to this many chars."""
 
-TOOL_DESCRIPTION_MAX_LENGTH = 1024
-"""Tool descriptions are capped by the API."""
+TOOL_DESCRIPTION_MAX_LENGTH = 4096
+"""Tool descriptions are capped by the API at 1-4096 characters."""
+
+IN_MEMORY_SESSION_STORE_MAX_ENTRIES = 10_000
+"""How many thread-to-session mappings the default in-memory store keeps.
+
+Thread ids are client-supplied, so the map has to be bounded; past this the
+least-recently-used mapping is evicted and that thread starts a fresh session on
+its next run."""
 
 PARKED_RETRY_DELAYS_S: tuple[float, ...] = (0.15, 0.3, 0.6, 1.0, 1.5, 2.0)
 """Backoff for re-posting follow-up messages while a session finishes

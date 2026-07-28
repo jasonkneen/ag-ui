@@ -52,7 +52,9 @@ async def test_streams_encoded_events_and_serves_health():
     transport = httpx.ASGITransport(app=make_app(fake))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health = await client.get("/agentic_chat/health")
-        assert health.json() == {"status": "ok", "agent": {"managedAgentId": "agent_1"}}
+        # A liveness probe and nothing else: the managed agent id is an internal
+        # identifier and this route is as reachable as the endpoint itself.
+        assert health.json() == {"status": "ok"}
 
         payload = {
             "threadId": "thread_1",
@@ -91,4 +93,4 @@ async def test_health_route_is_well_formed_when_mounted_at_root():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health = await client.get("/health")
     assert health.status_code == 200
-    assert health.json() == {"status": "ok", "agent": {"managedAgentId": "agent_1"}}
+    assert health.json() == {"status": "ok"}

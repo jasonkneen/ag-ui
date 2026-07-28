@@ -50,6 +50,13 @@ public sealed class ManagedAgentsAgentOptions
     public Func<string, string>? SessionTitle { get; set; }
 
     /// <summary>
+    /// Gets the vault IDs (<c>vlt_...</c>) for stored credentials the agent may use, attached to
+    /// each session this agent creates. Required for MCP servers that authenticate; the API only
+    /// accepts them at session creation, so changing them takes effect on new threads.
+    /// </summary>
+    public IList<string> VaultIds { get; } = [];
+
+    /// <summary>
     /// Gets or sets how to answer a built-in tool gated on user confirmation
     /// (<c>evaluated_permission: "ask"</c>): <see cref="ToolConfirmationPolicy.Allow"/>,
     /// <see cref="ToolConfirmationPolicy.Deny"/>, or <see langword="null"/> (the default) to end

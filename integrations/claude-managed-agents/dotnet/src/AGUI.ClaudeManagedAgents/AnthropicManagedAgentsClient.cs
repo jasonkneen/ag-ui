@@ -48,6 +48,8 @@ public sealed class AnthropicManagedAgentsClient : IManagedAgentsClient
             Agent = new Agent(AgentReference(request)),
             EnvironmentID = request.EnvironmentId,
             Title = request.Title,
+            // Left unset rather than sent empty, so the payload matches the other two ports.
+            VaultIds = request.VaultIds is { Count: > 0 } ? [.. request.VaultIds] : null,
         };
 
         var session = await _client.Beta.Sessions.Create(parameters, cancellationToken).ConfigureAwait(false);

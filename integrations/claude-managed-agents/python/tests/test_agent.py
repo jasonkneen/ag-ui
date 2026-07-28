@@ -23,7 +23,7 @@ IDLE_END_TURN = {
     "stop_reason": {"type": "end_turn"},
 }
 
-SESSION_KEY = "7:agent_1|0:|5:env_1|thread_1"
+SESSION_KEY = "7:agent_1|0:|5:env_1|0:|thread_1"
 """The key the store and the busy gate share: scoped to the managed agent, not
 the bare (client-supplied) thread id."""
 
@@ -116,6 +116,18 @@ async def test_pins_agent_version_and_custom_title_when_configured():
         "version": 3,
     }
     assert fake.create_calls[0]["title"] == "Chat thread_1"
+
+
+async def test_attaches_configured_vault_ids_when_creating_a_session():
+    fake = FakeClient(streams=[[IDLE_END_TURN], [IDLE_END_TURN]])
+    await collect(
+        new_agent(fake, vault_ids=["vlt_1", "vlt_2"]), base_input()
+    )
+    assert fake.create_calls[0]["vault_ids"] == ["vlt_1", "vlt_2"]
+
+    # Omitted entirely when none are configured, so the field is not sent empty.
+    await collect(new_agent(fake), base_input(thread_id="thread_2"))
+    assert "vault_ids" not in fake.create_calls[1]
 
 
 async def test_reuses_session_on_next_run_and_sends_only_new_message():
@@ -878,7 +890,7 @@ async def test_agents_differing_only_in_environment_do_not_share_a_session():
 
     assert len(staging.create_calls) == 1
     assert len(prod.create_calls) == 1
-    assert sorted(store.keys()) == sorted(["7:agent_1|0:|11:env_staging|thread_1", "7:agent_1|0:|8:env_prod|thread_1"])
+    assert sorted(store.keys()) == sorted(["7:agent_1|0:|11:env_staging|0:|thread_1", "7:agent_1|0:|8:env_prod|0:|thread_1"])
 
 
 async def test_two_agents_sharing_a_store_never_adopt_each_others_session():
@@ -900,9 +912,9 @@ async def test_two_agents_sharing_a_store_never_adopt_each_others_session():
 
     assert len(first.create_calls) == 1
     assert len(second.create_calls) == 1
-    assert sorted(store.keys()) == ["7:agent_a|0:|5:env_1|thread_1", "7:agent_b|0:|5:env_1|thread_1"]
-    assert store.get("7:agent_a|0:|5:env_1|thread_1").session_id == "sesn_first"
-    assert store.get("7:agent_b|0:|5:env_1|thread_1").session_id == "sesn_second"
+    assert sorted(store.keys()) == ["7:agent_a|0:|5:env_1|0:|thread_1", "7:agent_b|0:|5:env_1|0:|thread_1"]
+    assert store.get("7:agent_a|0:|5:env_1|0:|thread_1").session_id == "sesn_first"
+    assert store.get("7:agent_b|0:|5:env_1|0:|thread_1").session_id == "sesn_second"
 
 
 async def test_runs_serialize_on_the_same_key_the_store_uses():
@@ -1230,7 +1242,7 @@ async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     )
 
     assert isinstance(events[-1], RunErrorEvent)
-    assert "server exploded" in events[-1].message
+    assert events[-1].message == "The run failed."
     record = store.get(SESSION_KEY)
     assert record.pending_client_tool_use_ids == []
     # The follow-up never landed, so the user message stays undelivered.
@@ -1432,15 +1444,80 @@ async def test_interrupts_backend_tool_and_answers_it_when_client_disconnects():
     )
 
 
-async def test_surfaces_a_session_create_failure_as_a_run_error() -> None:
-    """A failed sessions.create must reach the client as run_failed, not hang."""
-    fake = FakeClient(create_error=RuntimeError("quota exceeded"))
+SENSITIVE = (
+    "401 from https://internal.example/v1/sessions "
+    "(key sk-ant-SECRET, session sesn_private)"
+)
 
-    events = await collect(new_agent(fake), base_input())
+
+async def test_surfaces_a_session_create_failure_without_relaying_its_text() -> None:
+    """A failed sessions.create must reach the client as run_failed, not hang --
+    and the exception can carry session ids, request paths or credentials, so the
+    cause belongs to the hook and the client gets the code."""
+    fake = FakeClient(create_error=RuntimeError(SENSITIVE))
+    reported: list[tuple[BaseException, dict[str, Any]]] = []
+
+    events = await collect(
+        new_agent(fake, on_error=lambda error, context: reported.append((error, context))),
+        base_input(),
+    )
 
     assert isinstance(events[-1], RunErrorEvent)
-    assert events[-1].message == "quota exceeded"
+    assert events[-1].message == "The run failed."
     assert events[-1].code == "run_failed"
+    for event in events:
+        assert "sk-ant-SECRET" not in event.model_dump_json()
+
+    run_failed = [
+        (error, context)
+        for error, context in reported
+        if context["operation"] == "run_failed"
+    ]
+    assert [str(error) for error, _context in run_failed] == [SENSITIVE]
+    assert run_failed[0][1]["thread_id"] == "thread_1"
+
+
+async def test_does_not_relay_a_failed_deliverys_exception_text_to_the_client() -> None:
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.custom_tool_use",
+                    "id": "ctu_1",
+                    "name": "get_time",
+                    "input": {},
+                },
+                IDLE_END_TURN,
+            ]
+        ],
+        # The user message posts fine; the tool result does not.
+        send_failures={1: RuntimeError(SENSITIVE)},
+    )
+    reported: list[BaseException] = []
+    backend = BackendTool(
+        name="get_time", description="", parameters={}, handler=lambda _i: "noon"
+    )
+
+    events = await collect(
+        new_agent(
+            fake,
+            backend_tools=[backend],
+            on_error=lambda error, _context: reported.append(error),
+        ),
+        base_input(),
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert (
+        events[-1].message
+        == "The result of tool call ctu_1 could not be delivered to the session."
+    )
+    assert events[-1].code == "tool_result_delivery_failed"
+    # Not in the RUN_ERROR, and no TOOL_CALL_RESULT was emitted at all.
+    for event in events:
+        assert "sk-ant-SECRET" not in event.model_dump_json()
+    assert "TOOL_CALL_RESULT" not in types(events)
+    assert SENSITIVE in [str(error) for error in reported]
 
 
 async def test_input_without_messages_or_tools_fields_is_an_empty_run() -> None:

@@ -239,7 +239,7 @@ public class ManagedAgentsTurnTest
         var error = Assert.IsType<RunErrorEvent>(run.Emitted[^1]);
         Assert.Equal("tool_result_delivery_failed", error.Code);
         Assert.Equal(
-            "The result of tool call ctu_1 could not be delivered to the session: send failed",
+            "The result of tool call ctu_1 could not be delivered to the session.",
             error.Message);
         Assert.Contains("user.interrupt", run.Fake.SentTypes);
     }
@@ -385,6 +385,38 @@ public class ManagedAgentsTurnTest
         Assert.Equal("user.custom_tool_result", posted.GetProperty("type").GetString());
         Assert.Equal("ctu_1", posted.GetProperty("custom_tool_use_id").GetString());
         Assert.True(posted.GetProperty("is_error").GetBoolean());
+    }
+
+    [Fact]
+    public async Task ReportsAnUnhandledStopReasonInsteadOfWaitingItOut()
+    {
+        // Ignoring an unknown stop reason left the turn waiting on a session that will never
+        // resume until the timeout fired.
+        var run = await CollectAsync([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"awaiting_martian_input"}}""",
+        ]);
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        var error = Assert.IsType<RunErrorEvent>(run.Emitted[^1]);
+        Assert.Equal("unknown_stop_reason", error.Code);
+        Assert.Equal(
+            "The session went idle for a reason this integration does not handle: awaiting_martian_input.",
+            error.Message);
+        Assert.Contains("user.interrupt", run.Fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task EmitsToolArgumentsAsCompactUnescapedJson()
+    {
+        // All three ports must agree byte for byte: no \uXXXX escaping of non-ASCII and no HTML
+        // escaping of < > &, which JsonSerializer applies by default.
+        var run = await CollectAsync([
+            """{"type":"agent.tool_use","id":"tu_1","name":"search","input":{"q":"café <b>&</b> 日本","n":1}}""",
+            IdleEndTurn,
+        ]);
+
+        var args = run.Emitted.OfType<ToolCallArgsEvent>().Single();
+        Assert.Equal("""{"q":"café <b>&</b> 日本","n":1}""", args.Delta);
     }
 
     [Fact]

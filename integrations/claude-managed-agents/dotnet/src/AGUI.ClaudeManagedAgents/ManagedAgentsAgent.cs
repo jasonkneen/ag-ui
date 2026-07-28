@@ -19,6 +19,15 @@ public sealed class ManagedAgentsAgent
 
     private const string AbandonedToolResult = "The user did not provide a result for this tool call.";
 
+    /// <summary>
+    /// The only thing a client is told about a failure this integration did not author. An SDK,
+    /// session-store or API exception can carry session ids, request paths, backend hostnames or
+    /// credentials, and the AG-UI client is not necessarily a trusted operator surface — so the
+    /// cause goes to <see cref="ManagedAgentsAgentOptions.OnError"/> and the client gets this plus
+    /// the machine-readable code.
+    /// </summary>
+    internal const string RunFailedMessage = "The run failed.";
+
     private readonly ManagedAgentsAgentOptions _options;
     private readonly IManagedAgentsClient _client;
     private readonly ISessionStore _store;
@@ -203,11 +212,9 @@ public sealed class ManagedAgentsAgent
                 }
                 catch (Exception ex)
                 {
-                    errorEvent = new RunErrorEvent
-                    {
-                        Message = string.IsNullOrEmpty(ex.Message) ? "The run failed." : ex.Message,
-                        Code = "run_failed",
-                    };
+                    // Detail to the hook, not to the client: see RunFailedMessage.
+                    Report("run_failed", ex, run.SessionId, threadId);
+                    errorEvent = new RunErrorEvent { Message = RunFailedMessage, Code = "run_failed" };
                     break;
                 }
 
@@ -395,7 +402,7 @@ public sealed class ManagedAgentsAgent
     /// <remarks>
     /// Every field baked into the remote session at creation is part of the key: none of them can
     /// be re-checked or changed on resume, so an agent must never inherit a session created with a
-    /// different environment or pinned version. Each is length-prefixed so no two combinations can
+    /// different environment, pinned version or vault set. Each is length-prefixed so no two combinations can
     /// collide — plain concatenation would let a <c>ManagedAgentId</c> of <c>support:beta</c> with
     /// thread <c>t1</c> and one of <c>support</c> with thread <c>beta:t1</c> share one record. The
     /// thread id is last, so it needs no prefix and may contain anything.
@@ -404,9 +411,12 @@ public sealed class ManagedAgentsAgent
     {
         static string Field(string value) => $"{value.Length}:{value}|";
 
+        // Sorted: the same vaults in a different order are the same session.
+        var vaults = _options.VaultIds.OrderBy(id => id, StringComparer.Ordinal);
         return Field(_options.ManagedAgentId)
             + Field(_options.AgentVersion?.ToString(CultureInfo.InvariantCulture) ?? string.Empty)
             + Field(_options.EnvironmentId)
+            + Field(string.Join(",", vaults))
             + threadId;
     }
 
@@ -484,6 +494,7 @@ public sealed class ManagedAgentsAgent
             AgentVersion = _options.AgentVersion,
             EnvironmentId = _options.EnvironmentId,
             Title = _options.SessionTitle?.Invoke(input.ThreadId) ?? $"AG-UI thread {input.ThreadId}",
+            VaultIds = _options.VaultIds.Count > 0 ? [.. _options.VaultIds] : null,
         };
 
         if (customTools.Count > 0)
