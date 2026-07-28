@@ -291,6 +291,39 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get(SESSION_KEY)).toMatchObject({ pendingClientToolUseIds: ["ctu_2"] });
   });
 
+  it("clone() carries the AbstractAgent state and keeps the client and store shared", () => {
+    // Regression: clone() constructed a fresh ManagedAgentsAgent, so the thread
+    // ID, messages, state, subscribers and middleware of the original were all
+    // silently reset on the copy.
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new InMemorySessionStore();
+    const agent = newAgent(fake, store, { agentId: "agent_ui", description: "Managed" });
+    agent.threadId = "thread_carried";
+    agent.messages = [{ id: "m1", role: "user", content: "carried" }];
+    agent.state = { count: 1 };
+    agent.subscribe({ onEvent: () => {} });
+
+    const cloned = agent.clone();
+
+    expect(cloned).toBeInstanceOf(ManagedAgentsAgent);
+    expect(cloned).not.toBe(agent);
+    expect(cloned.agentId).toBe("agent_ui");
+    expect(cloned.description).toBe("Managed");
+    expect(cloned.threadId).toBe("thread_carried");
+    expect(cloned.messages).toEqual(agent.messages);
+    expect(cloned.state).toEqual({ count: 1 });
+    expect(cloned.subscribers).toHaveLength(agent.subscribers.length);
+    // Copied, not aliased: mutating the clone must not touch the original.
+    cloned.messages.push({ id: "m2", role: "user", content: "only mine" });
+    expect(agent.messages).toHaveLength(1);
+    // The client and store stay shared so the clone resumes the same sessions.
+    const fields = (instance: ManagedAgentsAgent) => instance as unknown as { client: unknown; store: unknown };
+    expect(fields(cloned).client).toBe(fields(agent).client);
+    expect(fields(cloned).store).toBe(fields(agent).store);
+    // And a clone of a clone keeps them.
+    expect(fields(cloned.clone()).store).toBe(fields(agent).store);
+  });
+
   it("shares the session store across clones so a resumed run finds its parked session", async () => {
     const fake = createFakeClient({
       streams: [

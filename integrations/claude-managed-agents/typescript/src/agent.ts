@@ -67,10 +67,33 @@ export class ManagedAgentsAgent extends AbstractAgent {
     this.backendTools = new Map((config.backendTools ?? []).map((tool) => [normalizeToolName(tool.name), tool]));
   }
 
-  public clone() {
-    // Clones share the client and session store so per-run copies see the
-    // same thread↔session mappings.
-    return new ManagedAgentsAgent({ ...this.config, client: this.client, sessionStore: this.store });
+  /**
+   * A copy of this agent that carries its conversation with it.
+   *
+   * `super.clone()` provides the AbstractAgent half — thread ID, messages,
+   * state, subscribers, middleware, debug settings — the way `HttpAgent.clone()`
+   * does; constructing a fresh instance instead would silently reset all of it.
+   * The client and session store are shared on purpose, so per-run copies see
+   * the same thread↔session mappings.
+   */
+  public clone(): ManagedAgentsAgent {
+    const cloned = super.clone() as ManagedAgentsAgent;
+    const own = cloned as unknown as {
+      config: ManagedAgentsAgentConfig;
+      client: Anthropic;
+      store: SessionStore;
+      backendTools: Map<string, BackendCustomTool>;
+      currentRunAbort: AbortController | null;
+    };
+    // Resolved rather than raw, so a clone of a clone keeps the same client and
+    // store instead of constructing new ones from an incomplete config.
+    own.config = { ...this.config, client: this.client, sessionStore: this.store };
+    own.client = this.client;
+    own.store = this.store;
+    own.backendTools = this.backendTools;
+    // The copy is not mid-run, so it must not be able to abort this one's.
+    own.currentRunAbort = null;
+    return cloned;
   }
 
   /** Report a swallowed failure. A broken hook must never break the run. */
