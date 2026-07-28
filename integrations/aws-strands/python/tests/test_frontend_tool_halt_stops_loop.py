@@ -24,6 +24,7 @@ from ag_ui.core import EventType, RunAgentInput, Tool, UserMessage
 from strands import Agent
 from strands.models.model import Model
 from strands.session.file_session_manager import FileSessionManager
+from strands.tools.tools import PythonAgentTool
 
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.client_proxy_tool import PROXY_RESULT_PLACEHOLDER
@@ -224,6 +225,178 @@ async def test_continue_after_frontend_call_still_runs_further_cycles():
 
     assert model.calls > 1, "continue_after_frontend_call must not halt the loop"
     assert any(e.type == EventType.RUN_FINISHED for e in events)
+
+
+class _MixedBatchModel(Model):
+    """One assistant message calling a frontend tool AND a backend tool.
+
+    This is the shape that loses data: the halt is triggered by the frontend
+    tool, but the tool-result message it latches on also carries the backend
+    tool's REAL result.
+    """
+
+    def __init__(self, backend_name: str = "run_script"):
+        self.calls = 0
+        self.backend_name = backend_name
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(self, output_model, prompt, **kwargs):  # pragma: no cover
+        if False:
+            yield {}
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.calls += 1
+        if self.calls > _RUNAWAY_GUARD:
+            raise RuntimeError("halt did not stop the loop")
+        yield {"messageStart": {"role": "assistant"}}
+        if self.calls == 1:
+            yield {
+                "contentBlockStart": {
+                    "start": {"toolUse": {"toolUseId": "native-fe", "name": "get_cell"}}
+                }
+            }
+            # A no-argument tool still streams one (empty) input delta. Without
+            # any delta Strands never surfaces `current_tool_use` and the call
+            # is invisible to the adapter entirely.
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": ""}}}}
+            yield {"contentBlockStop": {}}
+            yield {
+                "contentBlockStart": {
+                    "start": {"toolUse": {"toolUseId": "native-be", "name": self.backend_name}}
+                }
+            }
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": '{"q":"tables"}'}}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+        else:
+            yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+def _backend_tool(name: str = "run_script") -> PythonAgentTool:
+    def _func(tool_use, **_kwargs):
+        return {
+            "toolUseId": tool_use["toolUseId"],
+            "status": "success",
+            "content": [{"text": '{"tables": ["orders", "customers"]}'}],
+        }
+
+    _func.__name__ = name
+    return PythonAgentTool(
+        tool_name=name,
+        tool_spec={"name": name, "description": name, "inputSchema": {"json": {}}},
+        tool_func=_func,
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_result_in_a_halting_batch_still_reaches_the_client():
+    """A backend tool batched with a frontend tool must not lose its result.
+
+    The halt latches on the tool-result message, which in a mixed batch also
+    carries the backend tool's real result. Dropping that message wholesale
+    strands the client: the tool card never resolves, and consumers that
+    persist from the event stream end up with a toolUse that has no
+    toolResult — a transcript the next run replays to the model provider.
+    """
+    model = _MixedBatchModel()
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent"
+    )
+    events = await _collect(adapter, "t-mixed")
+
+    started = [e.tool_call_name for e in events if e.type == EventType.TOOL_CALL_START]
+    results = [e.tool_call_id for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+    assert started == ["get_cell", "run_script"]
+    # The backend result goes out; the frontend placeholder stays suppressed
+    # (the client produces the real one) — so exactly one result, the backend's.
+    assert results == ["native-be"]
+    assert model.calls == 1
+    assert any(e.type == EventType.RUN_FINISHED for e in events)
+
+
+@pytest.mark.asyncio
+async def test_halting_batch_backend_result_lands_in_the_messages_snapshot():
+    """MESSAGES_SNAPSHOT is the only path into client-side history.
+
+    TOOL_CALL_RESULT is emitted role-less by design so the frontend does not
+    add it to the conversation, so if the snapshot splice is skipped the result
+    exists nowhere the client can persist it.
+    """
+    model = _MixedBatchModel()
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent"
+    )
+    events = await _collect(adapter, "t-mixed-snapshot")
+
+    final_snapshot = [e for e in events if e.type == EventType.MESSAGES_SNAPSHOT][-1]
+    tool_messages = [
+        m for m in final_snapshot.messages if getattr(m, "role", None) == "tool"
+    ]
+    assert [m.tool_call_id for m in tool_messages] == ["native-be"]
+
+
+@pytest.mark.asyncio
+async def test_stop_streaming_after_result_survives_a_frontend_halt_in_the_batch():
+    """Guards the interaction that emitting backend results makes reachable.
+
+    ``stop_streaming_after_result`` halts from INSIDE the per-item loop. Before
+    this change the loop never ran on a halting batch, so the two halts could
+    not meet; now they can, and the run must still emit the backend result and
+    terminate cleanly rather than double-halting or stalling.
+
+    Scope: this does NOT test suppression of later items in the batch — with a
+    single backend tool there is no later item, and adding one would be flaky
+    because batch result ordering is nondeterministic (the same repro emits
+    two backend results in either order across runs). Suppression is covered
+    deterministically against a mocked stream by Scenario C in
+    ``test_parallel_tool_call_handling.py``.
+    """
+    model = _MixedBatchModel()
+    config = StrandsAgentConfig(
+        tool_behaviors={"run_script": ToolBehavior(stop_streaming_after_result=True)}
+    )
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent", config=config
+    )
+    events = await _collect(adapter, "t-mixed-stop-streaming")
+
+    results = [e.tool_call_id for e in events if e.type == EventType.TOOL_CALL_RESULT]
+    assert results == ["native-be"]
+    assert model.calls == 1
+    assert any(e.type == EventType.RUN_FINISHED for e in events)
+
+
+@pytest.mark.asyncio
+async def test_state_from_result_fires_for_a_backend_tool_in_a_halting_batch():
+    """Derived state must not be silently dropped by the halt.
+
+    Skipping the tool-result message also skipped ``state_from_result``, so an
+    app mapping backend results into shared state lost the update with no error
+    anywhere.
+    """
+    model = _MixedBatchModel()
+    config = StrandsAgentConfig(
+        tool_behaviors={
+            "run_script": ToolBehavior(
+                state_from_result=lambda ctx: {"tables": ctx.result_data["tables"]}
+            )
+        }
+    )
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent", config=config
+    )
+    events = await _collect(adapter, "t-mixed-state")
+
+    snapshots = [e.snapshot for e in events if e.type == EventType.STATE_SNAPSHOT]
+    assert any(s.get("tables") == ["orders", "customers"] for s in snapshots)
 
 
 def _persisted_messages(sm: FileSessionManager, session_id: str) -> list[dict]:
