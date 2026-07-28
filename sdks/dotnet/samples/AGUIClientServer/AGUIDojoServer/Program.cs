@@ -45,6 +45,24 @@ app.MapDojoEndpoint("/predictive_state_updates",
     systemPrompt: ChatClientAgentFactory.PredictiveStateUpdatesSystemPrompt,
     configureStreamOptions: json => ChatClientAgentFactory.CreatePredictiveStateUpdatesStreamOptions(json));
 
+// A2UI (agent-generated UI). generate_a2ui is auto-injected and handled by A2UIChatClient
+// (subagent + recovery); the stream options surface the render_a2ui argument fragments so
+// surfaces paint progressively.
+app.MapDojoEndpoint("/a2ui_dynamic_schema",
+    ChatClientAgentFactory.CreateA2UIDynamicSchema(),
+    systemPrompt: ChatClientAgentFactory.A2UIPlannerSystemPrompt,
+    configureStreamOptions: _ => ChatClientAgentFactory.CreateA2UIStreamOptions());
+
+app.MapDojoEndpoint("/a2ui_recovery",
+    ChatClientAgentFactory.CreateA2UIRecovery(),
+    systemPrompt: ChatClientAgentFactory.A2UIPlannerSystemPrompt,
+    configureStreamOptions: _ => ChatClientAgentFactory.CreateA2UIStreamOptions());
+
+app.MapDojoEndpoint("/a2ui_advanced",
+    ChatClientAgentFactory.CreateA2UIAdvanced(),
+    systemPrompt: ChatClientAgentFactory.A2UIPlannerSystemPrompt,
+    configureStreamOptions: _ => ChatClientAgentFactory.CreateA2UIStreamOptions());
+
 await app.RunAsync();
 
 public partial class Program;

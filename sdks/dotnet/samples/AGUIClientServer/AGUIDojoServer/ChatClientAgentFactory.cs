@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Text.Json;
+using AGUI.A2UI;
 using AGUI.Abstractions;
 using AGUI.Server;
+using AGUIDojoServer.A2UI;
 using AGUIDojoServer.AgenticUI;
 using AGUIDojoServer.BackendToolRendering;
 using AGUIDojoServer.PredictiveStateUpdates;
@@ -282,6 +284,70 @@ internal static class ChatClientAgentFactory
         });
         return options;
     }
+
+    // ---- A2UI (agent-generated UI) -----------------------------------------------------
+
+    /// <summary>
+    /// The shared A2UI planner prompt. Kept as a system prompt (passed via MapDojoEndpoint)
+    /// rather than baked into the client, matching the other feature endpoints.
+    /// </summary>
+    public const string A2UIPlannerSystemPrompt = A2UICompositionGuides.PlannerInstructions;
+
+    /// <summary>
+    /// Builds an A2UI-enabled chat client: the planner (with function invocation for any
+    /// server tools) wrapped by <see cref="A2UIChatClient"/>, which auto-injects
+    /// <c>generate_a2ui</c> and drives a raw render subagent through the recovery loop.
+    /// </summary>
+    private static IChatClient CreateA2UIChatClient(A2UIChatClientOptions options)
+    {
+        // The subagent must be raw (no function invocation): A2UIChatClient reads the forced
+        // render_a2ui call's arguments directly rather than letting it be invoked.
+        IChatClient subagent = s_chatClient!.AsIChatClient();
+
+        return s_chatClient!.AsIChatClient()
+            .AsBuilder()
+            .UseA2UI(subagent, options)
+            .UseFunctionInvocation()
+            .Build();
+    }
+
+    /// <summary>Dynamic-schema demo: a subagent designs the UI via generate_a2ui against the dojo catalog.</summary>
+    public static IChatClient CreateA2UIDynamicSchema() => CreateA2UIChatClient(new A2UIChatClientOptions
+    {
+        ToolParams = new A2UIToolParams
+        {
+            DefaultCatalogId = A2UICompositionGuides.DynamicCatalogId,
+            Guidelines = new A2UIGuidelines { CompositionGuide = A2UICompositionGuides.DynamicSchema },
+        },
+    });
+
+    /// <summary>
+    /// Error-recovery demo: no catalog is supplied, so structural validation (missing root,
+    /// dangling child refs, duplicate ids) drives the validate-and-regenerate loop.
+    /// </summary>
+    public static IChatClient CreateA2UIRecovery() => CreateA2UIChatClient(new A2UIChatClientOptions
+    {
+        ToolParams = new A2UIToolParams
+        {
+            DefaultCatalogId = A2UICompositionGuides.DynamicCatalogId,
+            Guidelines = new A2UIGuidelines { CompositionGuide = A2UICompositionGuides.Recovery },
+            Recovery = new A2UIRecoveryConfig { MaxAttempts = A2UIConstants.MaxA2UIAttempts },
+        },
+    });
+
+    /// <summary>
+    /// Zero-config / advanced demo: no backend catalog or guide. The catalog schema and the
+    /// per-run injectA2UITool flag arrive on the forwarded <c>RunAgentInput</c>; A2UIChatClient
+    /// reads them and auto-injects — the easy-devex path.
+    /// </summary>
+    public static IChatClient CreateA2UIAdvanced() => CreateA2UIChatClient(new A2UIChatClientOptions());
+
+    /// <summary>
+    /// Stream options for the A2UI endpoints: surface OpenAI's per-chunk tool-call argument
+    /// fragments as incremental TOOL_CALL_ARGS so render_a2ui surfaces paint progressively.
+    /// </summary>
+    public static AGUIStreamOptions CreateA2UIStreamOptions() =>
+        new AGUIStreamOptions().MapStreamingToolCallArguments(OpenAIStreamingToolArguments.Extract);
 
     [Description("Get the weather for a given location.")]
     private static WeatherInfo GetWeather([Description("The location to get the weather for.")] string location) => new()
