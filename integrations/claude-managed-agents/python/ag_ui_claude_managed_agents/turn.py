@@ -306,8 +306,8 @@ async def _consume(
             # The run is being torn down; the send continues in the background
             # and the callback above reports whatever becomes of it.
             raise
-        except Exception as exc:  # noqa: BLE001 - best-effort; already reported by the callback
-            del exc
+        except Exception:  # noqa: BLE001 - best-effort; the done callback reports it
+            pass
 
     async def answer_custom_tool_use(
         tool_use_id: str, text: str, is_error: bool
@@ -600,9 +600,9 @@ async def _consume(
                             ),
                             BEST_EFFORT_SEND_TIMEOUT_S,
                         )
-                    except BaseException as exc:  # noqa: BLE001 - reported as a terminal run error
-                        if isinstance(exc, asyncio.CancelledError):
-                            raise
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - reported as a terminal run error
                         report("post_tool_confirmation", exc)
                         await interrupt()
                         return fail(

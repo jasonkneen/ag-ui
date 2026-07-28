@@ -1094,7 +1094,7 @@ async def test_falls_back_to_a_stock_message_when_a_session_error_carries_none()
     assert emitted[0].code == "unknown_error"
 
 
-async def test_the_best_effort_interrupt_is_bounded(monkeypatch) -> None:  # noqa: PLR0915
+async def test_the_best_effort_interrupt_is_bounded(monkeypatch) -> None:
     """Regression: the turn's interrupt was unbounded, so a stalled connection
     held the thread's run gate open for as long as the socket did."""
     monkeypatch.setattr(turn_module, "BEST_EFFORT_SEND_TIMEOUT_S", 0.05)
