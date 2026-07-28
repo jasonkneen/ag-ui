@@ -245,6 +245,49 @@ public class ManagedAgentsTurnTest
     }
 
     [Fact]
+    public async Task ReportsItsOwnCauseWhenAToolConfirmationCannotBeDelivered()
+    {
+        // Regression: the HTTP client's TaskCanceledException escaped the confirmation send and
+        // the interrupt, so the run degraded to run_failed instead of naming the real cause.
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.tool_use","id":"tu_1","name":"bash","input":{},"evaluated_permission":"ask"}""",
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["tu_1"]}}""",
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.tool_confirmation")
+                ? new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout")
+                : null,
+        };
+
+        var run = await CollectAsync([], fake, toolConfirmation: "allow");
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        Assert.Equal("tool_confirmation_delivery_failed", Assert.IsType<RunErrorEvent>(run.Emitted[^1]).Code);
+        // The session is parked on the confirmation, so it is interrupted.
+        Assert.Contains("user.interrupt", run.Fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task AnInterruptThatTimesOutDoesNotReplaceTheRealCause()
+    {
+        // The interrupt is best-effort; its own timeout must not hijack the unsupported-action
+        // error the turn is in the middle of reporting.
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["mystery_1"]}}""",
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout")
+                : null,
+        };
+
+        var run = await CollectAsync([], fake);
+
+        var error = Assert.IsType<RunErrorEvent>(run.Emitted[^1]);
+        Assert.Equal("unsupported_action", error.Code);
+    }
+
+    [Fact]
     public async Task ReportsADeliveryFailureForAToolNothingCanExecute()
     {
         var fake = new FakeManagedAgentsClient([

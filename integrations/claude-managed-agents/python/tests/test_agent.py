@@ -1083,6 +1083,81 @@ async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn()
     assert store.get(SESSION_KEY).pending_client_tool_use_ids == []
 
 
+async def test_an_inner_bounded_timeout_is_not_reported_as_the_turn_timeout():
+    """Regression: an inner best-effort send has its own 15s bound, and both it
+    and the turn deadline raise TimeoutError. Reporting the inner one as
+    `turn_timeout` claimed the run had exceeded a limit it never came near."""
+
+    class SlowStore:
+        """A store whose write outlives the inner bound but not the turn."""
+
+        def __init__(self) -> None:
+            self._records: dict[str, SessionRecord] = {}
+
+        def get(self, key: str) -> SessionRecord | None:
+            return self._records.get(key)
+
+        async def set(self, key: str, record: SessionRecord) -> None:
+            self._records[key] = record
+
+        def delete(self, key: str) -> None:
+            self._records.pop(key, None)
+
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = SlowStore()
+
+    async def inner_timeout(_key: str, _record: SessionRecord) -> None:
+        raise asyncio.TimeoutError
+
+    store.set = inner_timeout  # type: ignore[method-assign]
+
+    events = await collect(
+        new_agent(fake, store, turn_timeout_s=300.0), base_input()
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "run_failed"
+    assert "300s" not in events[-1].message
+    # No interrupt: the turn never ran past its own limit.
+    assert {"type": "user.interrupt"} not in [
+        event for send in fake.sent for event in send["events"]
+    ]
+
+
+async def test_a_failed_tool_confirmation_delivery_reports_its_own_cause():
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.tool_use",
+                    "id": "tu_1",
+                    "name": "bash",
+                    "input": {},
+                    "evaluated_permission": "ask",
+                },
+                {
+                    "type": "session.status_idle",
+                    "id": "idle_1",
+                    "stop_reason": {"type": "requires_action", "event_ids": ["tu_1"]},
+                },
+            ]
+        ],
+        # Send 0 is the user message; send 1 is the confirmation.
+        send_failures={1: asyncio.TimeoutError()},
+    )
+
+    events = await collect(
+        new_agent(fake, tool_confirmation="allow", turn_timeout_s=300.0), base_input()
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "tool_confirmation_delivery_failed"
+    # The session is parked on the confirmation, so it is interrupted.
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
+
+
 async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     """Regression: once the tool results resume the session, they are recorded
     as delivered even if the follow-up messages then fail, so the next run

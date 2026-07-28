@@ -633,10 +633,26 @@ internal sealed class ManagedAgentsTurn
                 .Select(id => ManagedAgentsSessionEvents.ToolConfirmation(id, _toolConfirmation))
                 .ToList();
 
-            // Ignores the run's cancellation (the session is parked waiting on these
-            // answers) but bounded so a stalled connection cannot hang the turn.
-            using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
-            await _client.SendEventsAsync(_sessionId, events, sendTimeout.Token).ConfigureAwait(false);
+            // Ignores the run's cancellation (the session is parked waiting on these answers) but
+            // bounded so a stalled connection cannot hang the turn. A failed delivery leaves the
+            // session parked, so interrupt it and report that cause — in particular, the bound's
+            // own TaskCanceledException must not escape and degrade the run to run_failed.
+            try
+            {
+                using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
+                await _client.SendEventsAsync(_sessionId, events, sendTimeout.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Report("post_tool_confirmation", ex);
+                await InterruptAsync().ConfigureAwait(false);
+                Fail(
+                    "The tool confirmation could not be delivered to the session: "
+                        + (string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message),
+                    "tool_confirmation_delivery_failed");
+                return;
+            }
+
             foreach (var id in confirmations)
             {
                 _ackedToolUses.Add(id);
@@ -673,9 +689,12 @@ internal sealed class ManagedAgentsTurn
                 .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.Interrupt()], CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
-            // Best effort: the run is already failing.
+            // Best effort: the run is already failing and must still report why. The send does
+            // not observe the run's token, so an OperationCanceledException here is the HTTP
+            // client's own timeout — letting it escape would replace the real cause (a tool
+            // confirmation the caller cannot answer, an unsupported action) with run_failed.
             Report("interrupt", ex);
         }
     }

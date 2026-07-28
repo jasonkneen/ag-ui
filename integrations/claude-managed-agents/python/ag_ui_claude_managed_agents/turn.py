@@ -510,21 +510,34 @@ async def _consume(
                             "tool_confirmation_required",
                         )
                     # Bounded like tool-result posts: the session is parked
-                    # waiting on these answers.
-                    await asyncio.wait_for(
-                        client.beta.sessions.events.send(
-                            session_id,
-                            events=[
-                                {
-                                    "type": "user.tool_confirmation",
-                                    "tool_use_id": tool_use_id,
-                                    "result": tool_confirmation,
-                                }
-                                for tool_use_id in confirmations
-                            ],
-                        ),
-                        BEST_EFFORT_SEND_TIMEOUT_S,
-                    )
+                    # waiting on these answers. A failed delivery leaves it
+                    # parked, so interrupt it and report that cause rather than
+                    # letting the bound's TimeoutError surface as something else.
+                    try:
+                        await asyncio.wait_for(
+                            client.beta.sessions.events.send(
+                                session_id,
+                                events=[
+                                    {
+                                        "type": "user.tool_confirmation",
+                                        "tool_use_id": tool_use_id,
+                                        "result": tool_confirmation,
+                                    }
+                                    for tool_use_id in confirmations
+                                ],
+                            ),
+                            BEST_EFFORT_SEND_TIMEOUT_S,
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - reported as a terminal run error
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        report("post_tool_confirmation", exc)
+                        await interrupt()
+                        return fail(
+                            "The tool confirmation could not be delivered to the "
+                            f"session: {exc or exc.__class__.__name__}",
+                            "tool_confirmation_delivery_failed",
+                        )
                     acked_tool_uses.update(confirmations)
                     if len(confirmations) == len(blocked_on):
                         continue

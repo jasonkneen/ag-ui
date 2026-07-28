@@ -412,18 +412,31 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
                 "tool_confirmation_required",
               );
             }
-            // Bounded like tool-result posts: the session is parked on these answers.
-            await client.beta.sessions.events.send(
-              sessionId,
-              {
-                events: confirmations.map((tool_use_id) => ({
-                  type: "user.tool_confirmation" as const,
-                  tool_use_id,
-                  result: opts.toolConfirmation!,
-                })),
-              },
-              { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
-            );
+            // Bounded like tool-result posts: the session is parked on these
+            // answers. A failed delivery leaves it parked, so interrupt it and
+            // report that cause rather than letting the bound's abort surface as
+            // an unrelated failure.
+            try {
+              await client.beta.sessions.events.send(
+                sessionId,
+                {
+                  events: confirmations.map((tool_use_id) => ({
+                    type: "user.tool_confirmation" as const,
+                    tool_use_id,
+                    result: opts.toolConfirmation!,
+                  })),
+                },
+                { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
+              );
+            } catch (error) {
+              report("post_tool_confirmation", error);
+              await interrupt();
+              return fail(
+                "The tool confirmation could not be delivered to the session: " +
+                  (error instanceof Error && error.message ? error.message : String(error)),
+                "tool_confirmation_delivery_failed",
+              );
+            }
             for (const id of confirmations) ackedToolUses.add(id);
             if (confirmations.length === blockedOn.length) break;
           }

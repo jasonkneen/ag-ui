@@ -284,6 +284,26 @@ describe("runTurn", () => {
     expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
   });
 
+  it("reports its own cause when a tool confirmation cannot be delivered", async () => {
+    const { emitted, outcome, fake } = await collect(
+      [
+        { type: "agent.tool_use", id: "tu_1", name: "bash", input: {}, evaluated_permission: "ask" },
+        { type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["tu_1"] } },
+      ],
+      { toolConfirmation: "allow" },
+      // Send 0 is the user message; send 1 is the confirmation.
+      { sendResults: [undefined, new Error("send failed")] },
+    );
+
+    expect(outcome).toEqual({ status: "errored" });
+    expect(emitted.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      code: "tool_confirmation_delivery_failed",
+    });
+    // The session is parked on the confirmation, so it is interrupted.
+    expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
+  });
+
   it("reports a delivery failure for a tool nothing can execute", async () => {
     const { emitted, outcome, fake } = await collect(
       [{ type: "agent.custom_tool_use", id: "ctu_1", name: "mystery", input: {} }, idleEndTurn],

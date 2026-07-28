@@ -133,11 +133,26 @@ class ManagedAgentsAgent:
 
     async def _drive(self, input: RunAgentInput, emit: Emit, state: _RunState) -> None:  # noqa: A002
         try:
-            await asyncio.wait_for(
-                self._run_turn_for_input(input, emit, state),
-                timeout=self.turn_timeout_s,
-            )
+            # `asyncio.timeout` rather than `wait_for` so `expired()` can tell
+            # this deadline apart from an inner bounded operation that timed out
+            # on its own: both raise TimeoutError, but only one of them means
+            # the turn ran past its configured limit.
+            async with asyncio.timeout(self.turn_timeout_s) as turn_deadline:
+                await self._run_turn_for_input(input, emit, state)
         except asyncio.TimeoutError:
+            if not turn_deadline.expired():
+                # An inner bounded operation (a best-effort send) timed out.
+                # Report that, not the turn limit it never reached.
+                emit(
+                    RunErrorEvent(
+                        message=(
+                            "An operation timed out before the turn completed:"
+                            f" {BEST_EFFORT_SEND_TIMEOUT_S:g}s bound exceeded."
+                        ),
+                        code="run_failed",
+                    )
+                )
+                return
             await self._interrupt(state.session_id)
             emit(
                 RunErrorEvent(
