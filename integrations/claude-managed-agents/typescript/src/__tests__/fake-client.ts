@@ -40,6 +40,8 @@ export function createFakeClient(options: FakeClientOptions = {}) {
   const streams = [...(options.streams ?? [])];
   const sendResults = [...(options.sendResults ?? [])];
   const sent: { sessionId: string; events: unknown[] }[] = [];
+  /** Every send attempt, including ones rejected for an aborted signal. */
+  const sendOptions: { sessionId: string; signal?: AbortSignal; events: unknown[] }[] = [];
 
   const stream = vi.fn(async (_sessionId: string, _params?: unknown, requestOptions?: { signal?: AbortSignal }) => {
     const steps = streams.shift() ?? [];
@@ -63,12 +65,21 @@ export function createFakeClient(options: FakeClientOptions = {}) {
     };
   });
 
-  const send = vi.fn(async (sessionId: string, params: { events: unknown[] }) => {
-    const failure = sendResults.shift();
-    if (failure) throw failure;
-    sent.push({ sessionId, events: params.events });
-    return { data: params.events.map((event, i) => ({ ...(event as object), id: `sent_${sent.length}_${i}` })) };
-  });
+  const send = vi.fn(
+    async (sessionId: string, params: { events: unknown[] }, requestOptions?: { signal?: AbortSignal }) => {
+      const signal = requestOptions?.signal;
+      sendOptions.push({ sessionId, signal, events: params.events });
+      // A send whose signal is already aborted never reaches the API. Modelling
+      // that is what makes the "best-effort sends survive the run's abort"
+      // contract observable: a send that reuses the run's aborted signal —
+      // instead of its own bounded timeout — fails here rather than passing.
+      if (signal?.aborted) throw abortError();
+      const failure = sendResults.shift();
+      if (failure) throw failure;
+      sent.push({ sessionId, events: params.events });
+      return { data: params.events.map((event, i) => ({ ...(event as object), id: `sent_${sent.length}_${i}` })) };
+    },
+  );
 
   const create = vi.fn(async (_params: any) => {
     if (options.createError) throw options.createError;
@@ -93,5 +104,5 @@ export function createFakeClient(options: FakeClientOptions = {}) {
     },
   };
 
-  return { client: client as any, sent, spies: { stream, send, create, update, retrieve } };
+  return { client: client as any, sent, sendOptions, spies: { stream, send, create, update, retrieve } };
 }

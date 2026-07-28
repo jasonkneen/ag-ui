@@ -59,6 +59,17 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     public Task SendEventsAsync(string sessionId, IReadOnlyList<JsonElement> events, CancellationToken cancellationToken)
     {
         SendAttempts.Add(events);
+        SendTokens.Add(cancellationToken);
+
+        // A send whose token is already cancelled never reaches the API. Modelling
+        // that is what makes the "best-effort sends survive the run's abort"
+        // contract observable: a send that reuses the run's cancelled token —
+        // instead of its own bounded timeout — fails here rather than passing.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled(cancellationToken);
+        }
+
         var failure = SendGuard?.Invoke(events);
         if (failure is not null)
         {
@@ -71,6 +82,9 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
 
     /// <summary>Every send call, including the ones scripted to fail.</summary>
     public List<IReadOnlyList<JsonElement>> SendAttempts { get; } = [];
+
+    /// <summary>The cancellation token each send was made with, in call order.</summary>
+    public List<CancellationToken> SendTokens { get; } = [];
 
     /// <summary>Every stream opened, as (session, streamDeltas).</summary>
     public List<(string SessionId, bool StreamDeltas)> StreamRequests { get; } = [];
