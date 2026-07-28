@@ -472,7 +472,7 @@ internal sealed class ManagedAgentsTurn
         }
 
         // Nothing can execute this tool. Answer with an error so the agent recovers.
-        await PostCustomToolResultAsync(toolUseId, $"No handler is registered for tool \"{name}\".", isError: true).ConfigureAwait(false);
+        await AnswerCustomToolUseAsync(toolUseId, $"No handler is registered for tool \"{name}\".", isError: true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -532,23 +532,47 @@ internal sealed class ManagedAgentsTurn
             text = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
         }
 
-        await PostCustomToolResultAsync(toolUseId, text, isError).ConfigureAwait(false);
+        await AnswerCustomToolUseAsync(toolUseId, text, isError).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Reports a custom tool's result to the UI and posts it into the session. The post ignores
-    /// the run's cancellation — the tool already ran (or was answered) and the session is waiting
-    /// on the result — but is bounded by its own timeout so a stalled connection cannot hold the
-    /// thread's run gate open.
+    /// Posts a custom tool's result into the session. The post ignores the run's cancellation —
+    /// the tool already ran (or was answered) and the session is waiting on the result — but is
+    /// bounded by its own timeout so a stalled connection cannot hold the thread's run gate open.
     /// </summary>
     private async Task PostCustomToolResultAsync(string toolUseId, string text, bool isError)
     {
-        EmitToolResult(toolUseId, text);
         using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
         await _client
             .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.CustomToolResult(toolUseId, text, isError)], sendTimeout.Token)
             .ConfigureAwait(false);
         _ackedToolUses.Add(toolUseId);
+    }
+
+    /// <summary>
+    /// Answers a custom tool call: delivers the result into the session first, and only tells the
+    /// UI once it landed. A <c>TOOL_CALL_RESULT</c> the agent never received would report a
+    /// success that did not happen, so on a failed delivery the session — still parked on the
+    /// call — is interrupted best-effort and the run ends with an error instead.
+    /// </summary>
+    private async Task AnswerCustomToolUseAsync(string toolUseId, string text, bool isError)
+    {
+        try
+        {
+            await PostCustomToolResultAsync(toolUseId, text, isError).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Report("post_tool_result", ex);
+            await InterruptAsync().ConfigureAwait(false);
+            Fail(
+                $"The result of tool call {toolUseId} could not be delivered to the session: "
+                    + (string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message),
+                "tool_result_delivery_failed");
+            return;
+        }
+
+        EmitToolResult(toolUseId, text);
     }
 
     private void HandleSessionError(JsonElement error)

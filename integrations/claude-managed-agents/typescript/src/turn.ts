@@ -216,10 +216,33 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     ackedToolUses.add(toolUseId);
   };
 
-  /** Surface a custom tool result to the UI and answer it in the session. */
-  const answerCustomToolUse = async (toolUseId: string, text: string, isError: boolean) => {
+  /**
+   * Answer a custom tool call: deliver the result into the session first, and
+   * only tell the UI once it landed. A TOOL_CALL_RESULT the agent never
+   * received would report a success that did not happen, so on a failed
+   * delivery the session — still parked on the call — is interrupted
+   * best-effort and the run ends with an error instead.
+   *
+   * Returns the terminal outcome when delivery failed, otherwise `undefined`.
+   */
+  const answerCustomToolUse = async (
+    toolUseId: string,
+    text: string,
+    isError: boolean,
+  ): Promise<TurnOutcome | undefined> => {
+    try {
+      await postCustomToolResult(toolUseId, text, isError);
+    } catch (error) {
+      report("post_tool_result", error);
+      await interrupt();
+      return fail(
+        `The result of tool call ${toolUseId} could not be delivered to the session: ` +
+          (error instanceof Error && error.message ? error.message : String(error)),
+        "tool_result_delivery_failed",
+      );
+    }
     emitToolResult(toolUseId, text);
-    await postCustomToolResult(toolUseId, text, isError);
+    return undefined;
   };
 
   /**
@@ -227,8 +250,14 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
    * The handler races the turn's abort signal: on a timeout or disconnect
    * the tool is answered with an error (best-effort, non-cancellable) so
    * the session is never left parked, then the abort proceeds.
+   *
+   * Returns the terminal outcome when the result could not be delivered.
    */
-  const runBackendTool = async (id: string, tool: BackendCustomTool, input: unknown) => {
+  const runBackendTool = async (
+    id: string,
+    tool: BackendCustomTool,
+    input: unknown,
+  ): Promise<TurnOutcome | undefined> => {
     let text: string;
     let isError = false;
     try {
@@ -243,7 +272,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       text = err instanceof Error ? err.message : String(err);
       isError = true;
     }
-    await answerCustomToolUse(id, text, isError);
+    return answerCustomToolUse(id, text, isError);
   };
 
   const consume = async (): Promise<TurnOutcome> => {
@@ -310,11 +339,17 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           }
           const backend = opts.backendTools.get(event.name);
           if (backend) {
-            await runBackendTool(event.id, backend, event.input);
+            const undelivered = await runBackendTool(event.id, backend, event.input);
+            if (undelivered) return undelivered;
             break;
           }
           // Nothing can execute this tool. Answer with an error so the agent recovers.
-          await answerCustomToolUse(event.id, `No handler is registered for tool "${event.name}".`, true);
+          const undelivered = await answerCustomToolUse(
+            event.id,
+            `No handler is registered for tool "${event.name}".`,
+            true,
+          );
+          if (undelivered) return undelivered;
           break;
         }
 

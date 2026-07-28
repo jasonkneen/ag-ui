@@ -259,18 +259,68 @@ describe("runTurn", () => {
     ]);
   });
 
-  it("emits a single tool result even when posting it fails", async () => {
+  it("never reports a tool result the session did not receive, and interrupts", async () => {
+    // Regression: the result is delivered before the UI is told about it. A
+    // TOOL_CALL_RESULT the agent never saw would report a success that did not
+    // happen, and the session stays parked on the call — so it is interrupted.
     const backend = { name: "get_time", description: "", parameters: {}, handler: async () => "noon" };
-    const emitted: BaseEvent[] = [];
     // First send (the user message) succeeds; the result post fails.
-    const run = collect(
+    const { emitted, outcome, fake } = await collect(
       [{ type: "agent.custom_tool_use", id: "ctu_1", name: "get_time", input: {} }, idleEndTurn],
-      { backendTools: new Map([["get_time", backend]]), emit: (event) => emitted.push(event) },
+      { backendTools: new Map([["get_time", backend]]) },
       { sendResults: [undefined, new Error("send failed")] },
     );
-    await expect(run).rejects.toThrow("send failed");
-    // A failed post is not a handler failure: no duplicate result is emitted.
-    expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(1);
+
+    expect(outcome).toEqual({ status: "errored" });
+    expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(0);
+    expect(emitted.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      code: "tool_result_delivery_failed",
+      message: "The result of tool call ctu_1 could not be delivered to the session: send failed",
+    });
+    expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
+  });
+
+  it("reports a delivery failure for a tool nothing can execute", async () => {
+    const { emitted, outcome, fake } = await collect(
+      [{ type: "agent.custom_tool_use", id: "ctu_1", name: "mystery", input: {} }, idleEndTurn],
+      {},
+      { sendResults: [undefined, new Error("send failed")] },
+    );
+
+    expect(outcome).toEqual({ status: "errored" });
+    expect(emitted.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toHaveLength(0);
+    expect(emitted.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "tool_result_delivery_failed" });
+    expect(fake.sent.flatMap((send) => send.events)).toContainEqual({ type: "user.interrupt" });
+  });
+
+  it("emits the tool result only after the session accepted it", async () => {
+    const backend = { name: "get_time", description: "", parameters: {}, handler: async () => "noon" };
+    const order: string[] = [];
+    const fake = createFakeClient({
+      streams: [[{ type: "agent.custom_tool_use", id: "ctu_1", name: "get_time", input: {} }, idleEndTurn]],
+    });
+    const originalSend = fake.client.beta.sessions.events.send;
+    fake.client.beta.sessions.events.send = (async (sessionId: string, params: { events: { type?: string }[] }) => {
+      if (params.events.some((event) => event.type === "user.custom_tool_result")) order.push("sent");
+      return originalSend(sessionId, params as never);
+    }) as typeof originalSend;
+
+    await runTurn({
+      client: fake.client,
+      sessionId: "sesn_1",
+      outbound: [{ type: "user.message", content: [{ type: "text", text: "hi" }] }],
+      clientTools: new Map(),
+      backendTools: new Map([["get_time", backend]]),
+      toolConfirmation: undefined,
+      streamDeltas: true,
+      emit: (event) => {
+        if (event.type === EventType.TOOL_CALL_RESULT) order.push("emitted");
+      },
+      signal: new AbortController().signal,
+    });
+
+    expect(order).toEqual(["sent", "emitted"]);
   });
 
   it("posts an error result for a tool nothing can execute", async () => {

@@ -259,10 +259,37 @@ async def _consume(
         except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - the caller re-raises the original cancellation
             report("post_interrupted_tool_result", exc)
 
+    async def answer_custom_tool_use(
+        tool_use_id: str, text: str, is_error: bool
+    ) -> TurnOutcome | None:
+        """Answer a custom tool call: deliver the result into the session
+        first, and only tell the UI once it landed.
+
+        A TOOL_CALL_RESULT the agent never received would report a success that
+        did not happen, so on a failed delivery the session — still parked on
+        the call — is interrupted best-effort and the run ends with an error
+        instead. Returns the terminal outcome when delivery failed, else None.
+        """
+        try:
+            await send_custom_tool_result(tool_use_id, text, is_error)
+        except Exception as exc:  # noqa: BLE001 - reported as a terminal run error
+            report("post_tool_result", exc)
+            await interrupt()
+            return fail(
+                f"The result of tool call {tool_use_id} could not be delivered "
+                f"to the session: {exc or exc.__class__.__name__}",
+                "tool_result_delivery_failed",
+            )
+        emit_tool_result(tool_use_id, text)
+        return None
+
     async def run_backend_tool(
         tool_use_id: str, tool: BackendTool, tool_input: Any
-    ) -> None:
-        """Run a backend custom tool and post its result back into the session."""
+    ) -> TurnOutcome | None:
+        """Run a backend custom tool and post its result back into the session.
+
+        Returns the terminal outcome when the result could not be delivered.
+        """
         is_error = False
         try:
             text = str(await _call_backend_handler(tool.handler, tool_input))
@@ -280,8 +307,7 @@ async def _consume(
         except Exception as err:  # noqa: BLE001 - the tool's failure is reported to the agent
             is_error = True
             text = str(err) or err.__class__.__name__
-        emit_tool_result(tool_use_id, text)
-        await send_custom_tool_result(tool_use_id, text, is_error)
+        return await answer_custom_tool_use(tool_use_id, text, is_error)
 
     async def consume() -> TurnOutcome:
         async for event in stream:
@@ -391,12 +417,16 @@ async def _consume(
                     continue
                 backend = backend_tools.get(name)
                 if backend is not None:
-                    await run_backend_tool(event_id, backend, tool_input)
+                    undelivered = await run_backend_tool(event_id, backend, tool_input)
+                    if undelivered is not None:
+                        return undelivered
                     continue
                 # Nothing can execute this tool. Answer with an error so the agent recovers.
-                text = f'No handler is registered for tool "{name}".'
-                emit_tool_result(event_id, text)
-                await send_custom_tool_result(event_id, text, True)
+                undelivered = await answer_custom_tool_use(
+                    event_id, f'No handler is registered for tool "{name}".', True
+                )
+                if undelivered is not None:
+                    return undelivered
 
             elif event_type == "agent.tool_use":
                 event_id = get(event, "id")

@@ -986,43 +986,86 @@ async def test_follow_ups_give_up_after_the_last_retry(monkeypatch):
     assert fake.streams_opened[0].closed
 
 
-async def test_emits_a_single_tool_result_even_when_posting_it_fails() -> None:
-    """A failed result post is not a handler failure: the UI must not be told
-    about the same tool result twice."""
+CUSTOM_TOOL_USE = {
+    "type": "agent.custom_tool_use",
+    "id": "ctu_1",
+    "name": "get_time",
+    "input": {},
+}
+
+
+async def test_never_reports_a_tool_result_the_session_did_not_receive() -> None:
+    """Regression: the result is delivered before the UI is told about it. A
+    TOOL_CALL_RESULT the agent never saw would report a success that did not
+    happen, and the session stays parked on the call — so it is interrupted."""
     backend = BackendTool(
         name="get_time", description="", parameters={}, handler=lambda _: "noon"
     )
-    emitted: list[Any] = []
-    fake = FakeClient(
-        streams=[
-            [
-                {
-                    "type": "agent.custom_tool_use",
-                    "id": "ctu_1",
-                    "name": "get_time",
-                    "input": {},
-                },
-                IDLE_END_TURN,
-            ]
-        ],
+    emitted, outcome, fake = await collect(
+        [CUSTOM_TOOL_USE, IDLE_END_TURN],
         # The outbound user message posts fine; the result post fails.
-        send_failures={1: RuntimeError("send failed")},
+        {"send_failures": {1: RuntimeError("send failed")}},
+        backend_tools={"get_time": backend},
     )
 
-    with pytest.raises(RuntimeError, match="send failed"):
-        await run_turn(
-            client=fake,
-            session_id="sesn_1",
-            outbound=[{"type": "user.message", "content": [{"type": "text", "text": "hi"}]}],
-            client_tools={},
-            backend_tools={"get_time": backend},
-            tool_confirmation=None,
-            stream_deltas=True,
-            emit=emitted.append,
-        )
+    assert outcome == TurnOutcome(status="errored")
+    assert [e for e in emitted if isinstance(e, ToolCallResultEvent)] == []
+    assert isinstance(emitted[-1], RunErrorEvent)
+    assert emitted[-1].code == "tool_result_delivery_failed"
+    assert (
+        emitted[-1].message
+        == "The result of tool call ctu_1 could not be delivered to the session: send failed"
+    )
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
 
-    results = [e for e in emitted if isinstance(e, ToolCallResultEvent)]
-    assert len(results) == 1
+
+async def test_reports_a_delivery_failure_for_a_tool_nothing_can_execute() -> None:
+    emitted, outcome, fake = await collect(
+        [{**CUSTOM_TOOL_USE, "name": "mystery"}, IDLE_END_TURN],
+        {"send_failures": {1: RuntimeError("send failed")}},
+    )
+
+    assert outcome == TurnOutcome(status="errored")
+    assert [e for e in emitted if isinstance(e, ToolCallResultEvent)] == []
+    assert emitted[-1].code == "tool_result_delivery_failed"
+    assert {"type": "user.interrupt"} in [
+        event for send in fake.sent for event in send["events"]
+    ]
+
+
+async def test_emits_the_tool_result_only_after_the_session_accepted_it() -> None:
+    backend = BackendTool(
+        name="get_time", description="", parameters={}, handler=lambda _: "noon"
+    )
+    order: list[str] = []
+    fake = FakeClient(streams=[[CUSTOM_TOOL_USE, IDLE_END_TURN]])
+    original_send = fake.beta.sessions.events.send
+
+    async def tracking_send(session_id: str, *, events: list[Any]) -> Any:
+        if any(e.get("type") == "user.custom_tool_result" for e in events):
+            order.append("sent")
+        return await original_send(session_id, events=events)
+
+    fake.beta.sessions.events.send = tracking_send
+
+    def record(event: Any) -> None:
+        if isinstance(event, ToolCallResultEvent):
+            order.append("emitted")
+
+    await run_turn(
+        client=fake,
+        session_id="sesn_1",
+        outbound=[{"type": "user.message", "content": [{"type": "text", "text": "hi"}]}],
+        client_tools={},
+        backend_tools={"get_time": backend},
+        tool_confirmation=None,
+        stream_deltas=True,
+        emit=record,
+    )
+
+    assert order == ["sent", "emitted"]
 
 
 async def test_falls_back_to_a_stock_message_when_a_session_error_carries_none() -> None:

@@ -209,6 +209,108 @@ public class ManagedAgentsTurnTest
     }
 
     [Fact]
+    public async Task NeverReportsAToolResultTheSessionDidNotReceiveAndInterrupts()
+    {
+        // Regression: the result is delivered before the UI is told about it. A TOOL_CALL_RESULT
+        // the agent never saw would report a success that did not happen, and the session stays
+        // parked on the call — so it is interrupted.
+        var backend = new ManagedAgentsBackendTool
+        {
+            Name = "get_time",
+            Handler = _ => Task.FromResult("noon"),
+        };
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+            IdleEndTurn,
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.custom_tool_result")
+                ? new InvalidOperationException("send failed")
+                : null,
+        };
+
+        var run = await CollectAsync(
+            [],
+            fake,
+            backendTools: new Dictionary<string, ManagedAgentsBackendTool> { ["get_time"] = backend });
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        Assert.Empty(run.Emitted.OfType<ToolCallResultEvent>());
+        var error = Assert.IsType<RunErrorEvent>(run.Emitted[^1]);
+        Assert.Equal("tool_result_delivery_failed", error.Code);
+        Assert.Equal(
+            "The result of tool call ctu_1 could not be delivered to the session: send failed",
+            error.Message);
+        Assert.Contains("user.interrupt", run.Fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task ReportsADeliveryFailureForAToolNothingCanExecute()
+    {
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.custom_tool_use","id":"ctu_1","name":"mystery","input":{}}""",
+            IdleEndTurn,
+        ])
+        {
+            SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.custom_tool_result")
+                ? new InvalidOperationException("send failed")
+                : null,
+        };
+
+        var run = await CollectAsync([], fake);
+
+        Assert.Equal(ManagedAgentsTurnStatus.Errored, run.Outcome.Status);
+        Assert.Empty(run.Emitted.OfType<ToolCallResultEvent>());
+        Assert.Equal("tool_result_delivery_failed", Assert.IsType<RunErrorEvent>(run.Emitted[^1]).Code);
+        Assert.Contains("user.interrupt", run.Fake.SentTypes);
+    }
+
+    [Fact]
+    public async Task EmitsTheToolResultOnlyAfterTheSessionAcceptedIt()
+    {
+        var backend = new ManagedAgentsBackendTool
+        {
+            Name = "get_time",
+            Handler = _ => Task.FromResult("noon"),
+        };
+        var order = new List<string>();
+        var fake = new FakeManagedAgentsClient([
+            """{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""",
+            IdleEndTurn,
+        ])
+        {
+            SendGuard = batch =>
+            {
+                if (batch.Any(e => e.GetProperty("type").GetString() == "user.custom_tool_result"))
+                {
+                    order.Add("sent");
+                }
+
+                return null;
+            },
+        };
+
+        var turn = new ManagedAgentsTurn(
+            fake,
+            "sesn_1",
+            [ManagedAgentsSessionEvents.UserMessage("hi")],
+            new Dictionary<string, string>(),
+            new Dictionary<string, ManagedAgentsBackendTool> { ["get_time"] = backend },
+            null,
+            streamDeltas: true);
+
+        await foreach (var evt in turn.RunAsync())
+        {
+            if (evt is ToolCallResultEvent)
+            {
+                order.Add("emitted");
+            }
+        }
+
+        Assert.Equal(["sent", "emitted"], order);
+    }
+
+    [Fact]
     public async Task PostsAnErrorResultForAToolNothingCanExecute()
     {
         var run = await CollectAsync([
