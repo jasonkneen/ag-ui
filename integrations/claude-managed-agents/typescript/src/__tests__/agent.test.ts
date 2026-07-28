@@ -64,7 +64,7 @@ describe("ManagedAgentsAgent", () => {
     });
     const events = await collect(newAgent(fake), baseInput());
 
-    expect(fake.spies.create).toHaveBeenCalledWith({
+    expect(fake.spies.create.mock.calls[0]![0]).toEqual({
       agent: { type: "agent", id: "agent_1" },
       environment_id: "env_1",
       title: "AG-UI thread thread_1",
@@ -86,7 +86,7 @@ describe("ManagedAgentsAgent", () => {
     const fake = createFakeClient({ streams: [[idleEndTurn]] });
     await collect(newAgent(fake, undefined, { agentVersion: 3, sessionTitle: (id) => `Chat ${id}` }), baseInput());
 
-    expect(fake.spies.create).toHaveBeenCalledWith({
+    expect(fake.spies.create.mock.calls[0]![0]).toEqual({
       agent: { type: "agent", id: "agent_1", version: 3 },
       environment_id: "env_1",
       title: "Chat thread_1",
@@ -131,7 +131,7 @@ describe("ManagedAgentsAgent", () => {
       }),
     );
 
-    expect(fake.spies.create).toHaveBeenCalledWith(
+    expect(fake.spies.create.mock.calls[0]![0]).toEqual(
       expect.objectContaining({
         agent: {
           type: "agent_with_overrides",
@@ -737,14 +737,17 @@ describe("ManagedAgentsAgent", () => {
       }),
     );
 
-    expect(fake.spies.update).toHaveBeenCalledWith("sesn_1", {
-      agent: {
-        tools: [
-          { type: "agent_toolset_20260401", configs: [], default_config: {} },
-          { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object", properties: {}, required: [] } },
-        ],
+    expect(fake.spies.update.mock.calls[0]!.slice(0, 2)).toEqual([
+      "sesn_1",
+      {
+        agent: {
+          tools: [
+            { type: "agent_toolset_20260401", configs: [], default_config: {} },
+            { type: "custom", name: "show_chart", description: "Render a chart", input_schema: { type: "object", properties: {}, required: [] } },
+          ],
+        },
       },
-    });
+    ]);
   });
 
   it("deletes the thread record when the session ends and starts fresh next run", async () => {
@@ -937,6 +940,68 @@ describe("ManagedAgentsAgent", () => {
     const withDeltas = createFakeClient({ streams: [[idleEndTurn]] });
     await collect(newAgent(withDeltas), baseInput());
     expect(withDeltas.spies.stream.mock.calls[0]![1]).toEqual({ event_deltas: ["agent.message", "agent.thinking"] });
+  });
+
+  it("makes turnTimeoutMs a real bound on every call it holds the gate for", async () => {
+    // Regression: sessions.create, sessions.update, agents.retrieve and the
+    // outbound sends were issued without the run's signal, so a stalled API call
+    // held the thread's run gate open forever and turnTimeoutMs meant nothing.
+    const store = new InMemorySessionStore();
+    const created = createFakeClient({ streams: [[idleEndTurn]], createGate: new Promise<void>(() => {}) });
+    const createEvents = await collect(newAgent(created, store, { turnTimeoutMs: 30 }), baseInput());
+    expect(createEvents.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "turn_timeout" });
+
+    const retrieved = createFakeClient({ streams: [[idleEndTurn]], retrieveGate: new Promise<void>(() => {}) });
+    const retrieveEvents = await collect(
+      newAgent(retrieved, new InMemorySessionStore(), { turnTimeoutMs: 30 }),
+      baseInput({ tools: [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }] }),
+    );
+    expect(retrieveEvents.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "turn_timeout" });
+  });
+
+  it("passes the run signal to every session and agent call", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn], [idleEndTurn]] });
+    const store = new InMemorySessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    await collect(newAgent(fake, store), baseInput());
+    // A second run whose tool list changed, so sessions.update runs too.
+    await collect(
+      newAgent(fake, store),
+      baseInput({
+        runId: "run_2",
+        tools,
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "u2", role: "user", content: "Show me a chart" },
+        ],
+      }),
+    );
+
+    expect(fake.callSignals.map((call) => call.call)).toEqual([
+      "sessions.create",
+      "agents.retrieve",
+      "sessions.update",
+    ]);
+    for (const call of fake.callSignals) expect(call.signal, call.call).toBeInstanceOf(AbortSignal);
+    // Every outbound send is bound too: either to the run or to its own timeout.
+    for (const send of fake.sendOptions) expect(send.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("bounds the turn's best-effort interrupt", async () => {
+    // The interrupt runs while the gate is still held, so it must not reuse the
+    // run's (already aborted) signal, and must not be unbounded either.
+    const fake = createFakeClient({
+      streams: [[{ type: "session.status_idle", id: "idle_1", stop_reason: { type: "requires_action", event_ids: ["mystery_1"] } }]],
+    });
+    const events = await collect(newAgent(fake), baseInput());
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "unsupported_action" });
+    const interrupt = fake.sendOptions.find((send) =>
+      send.events.some((event) => (event as { type?: string }).type === "user.interrupt"),
+    );
+    expect(interrupt?.signal).toBeInstanceOf(AbortSignal);
+    expect(interrupt?.signal?.aborted).toBe(false);
   });
 
   it("surfaces a session-create failure as a run error", async () => {

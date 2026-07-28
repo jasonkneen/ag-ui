@@ -113,7 +113,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   const sendFollowUps = async () => {
     for (let attempt = 0; ; attempt++) {
       try {
-        await client.beta.sessions.events.send(sessionId, { events: followUps });
+        await client.beta.sessions.events.send(sessionId, { events: followUps }, { signal });
         return;
       } catch (err) {
         const delayMs = PARKED_RETRY_DELAYS_MS[attempt];
@@ -125,7 +125,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
 
   try {
     if (results.length > 0) {
-      await client.beta.sessions.events.send(sessionId, { events: results });
+      await client.beta.sessions.events.send(sessionId, { events: results }, { signal });
       await opts.onResultsSent?.();
     }
     if (followUps.length > 0) {
@@ -188,9 +188,19 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
     } as BaseEvent);
   };
 
+  /**
+   * Stop the session best-effort. Deliberately not tied to the run's abort
+   * signal — the point is to reach a session the run is walking away from — but
+   * bounded by its own timeout so a stalled connection cannot hold the thread's
+   * run gate open indefinitely.
+   */
   const interrupt = () =>
     client.beta.sessions.events
-      .send(sessionId, { events: [{ type: "user.interrupt" }] })
+      .send(
+        sessionId,
+        { events: [{ type: "user.interrupt" }] },
+        { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) },
+      )
       .catch((error: unknown) => report("interrupt", error));
 
   const fail = (message: string, code?: string): TurnOutcome => {

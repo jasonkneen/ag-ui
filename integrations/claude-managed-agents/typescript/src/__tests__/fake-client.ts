@@ -21,6 +21,14 @@ export interface FakeClientOptions {
   /** Make `sessions.create` / `sessions.update` reject with this error. */
   createError?: Error;
   updateError?: Error;
+  /**
+   * Hold `sessions.create` until this settles. A call given a signal rejects as
+   * soon as that signal aborts; one given none hangs, which is exactly what an
+   * unbounded call does to a run.
+   */
+  createGate?: Promise<void>;
+  /** As {@link createGate}, for `agents.retrieve`. */
+  retrieveGate?: Promise<void>;
 }
 
 const abortError = () => Object.assign(new Error("Request was aborted."), { name: "AbortError" });
@@ -81,17 +89,25 @@ export function createFakeClient(options: FakeClientOptions = {}) {
     },
   );
 
-  const create = vi.fn(async (_params: any) => {
+  /** The signal every non-send call was made with, keyed by call. */
+  const callSignals: { call: string; signal?: AbortSignal }[] = [];
+
+  const create = vi.fn(async (_params: any, requestOptions?: { signal?: AbortSignal }) => {
+    callSignals.push({ call: "sessions.create", signal: requestOptions?.signal });
+    if (options.createGate) await untilAborted(options.createGate, requestOptions?.signal);
     if (options.createError) throw options.createError;
     return { id: options.sessionId ?? "sesn_1" };
   });
-  const update = vi.fn(async (_sessionId: string, _params: any) => {
+  const update = vi.fn(async (_sessionId: string, _params: any, requestOptions?: { signal?: AbortSignal }) => {
+    callSignals.push({ call: "sessions.update", signal: requestOptions?.signal });
     if (options.updateError) throw options.updateError;
     return {};
   });
-  const retrieve = vi.fn(async (_agentId: string, _params?: any) => ({
-    tools: options.agentTools ?? [{ type: "agent_toolset_20260401", configs: [], default_config: {} }],
-  }));
+  const retrieve = vi.fn(async (_agentId: string, _params?: any, requestOptions?: { signal?: AbortSignal }) => {
+    callSignals.push({ call: "agents.retrieve", signal: requestOptions?.signal });
+    if (options.retrieveGate) await untilAborted(options.retrieveGate, requestOptions?.signal);
+    return { tools: options.agentTools ?? [{ type: "agent_toolset_20260401", configs: [], default_config: {} }] };
+  });
 
   const client = {
     beta: {
@@ -104,5 +120,5 @@ export function createFakeClient(options: FakeClientOptions = {}) {
     },
   };
 
-  return { client: client as any, sent, sendOptions, spies: { stream, send, create, update, retrieve } };
+  return { client: client as any, sent, sendOptions, callSignals, spies: { stream, send, create, update, retrieve } };
 }

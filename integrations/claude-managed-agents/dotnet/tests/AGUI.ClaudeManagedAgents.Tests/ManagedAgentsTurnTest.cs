@@ -268,6 +268,26 @@ public class ManagedAgentsTurnTest
     }
 
     [Fact]
+    public async Task BoundsTheBestEffortInterrupt()
+    {
+        // Regression: the interrupt was sent with CancellationToken.None, so a stalled connection
+        // held the thread's run gate open for as long as the socket did. It must not use the run's
+        // (already failing) token either — hence a bounded token of its own.
+        var run = await CollectAsync([
+            """{"type":"session.status_idle","id":"idle_1","stop_reason":{"type":"requires_action","event_ids":["mystery_1"]}}""",
+        ]);
+
+        Assert.Equal("unsupported_action", Assert.IsType<RunErrorEvent>(run.Emitted[^1]).Code);
+        var interruptIndex = run.Fake.SendAttempts
+            .Select(static (batch, index) => (batch, index))
+            .Single(static entry => entry.batch.Any(static e => e.GetProperty("type").GetString() == "user.interrupt"))
+            .index;
+        var token = run.Fake.SendTokens[interruptIndex];
+        Assert.True(token.CanBeCanceled, "the interrupt send must carry a bounded token");
+        Assert.False(token.IsCancellationRequested);
+    }
+
+    [Fact]
     public async Task AnInterruptThatTimesOutDoesNotReplaceTheRealCause()
     {
         // The interrupt is best-effort; its own timeout must not hijack the unsupported-action

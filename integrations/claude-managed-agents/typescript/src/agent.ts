@@ -163,13 +163,13 @@ export class ManagedAgentsAgent extends AbstractAgent {
     }
     this.busyThreads.add(key);
     try {
-      const record = await this.getOrCreateSession(key, threadId, input, emit);
+      const record = await this.getOrCreateSession(key, threadId, input, emit, signal);
       if (!record) {
         emit(runError("There is nothing to send: a tool result arrived for a thread with no session.", "tool_result_without_session"));
         return;
       }
       sessionId = record.sessionId;
-      await this.syncClientTools(record, input.tools);
+      await this.syncClientTools(record, input.tools, signal);
 
       const outbound = this.outboundEvents(record, input.messages);
       if (outbound.events.length === 0) {
@@ -343,6 +343,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
     threadId: string,
     input: RunAgentInput,
     emit: (event: BaseEvent) => void,
+    signal: AbortSignal,
   ): Promise<SessionRecord | undefined> {
     const existing = await this.store.get(key);
     if (existing) return existing;
@@ -352,7 +353,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
     if (!hasUserText(input.messages)) return undefined;
 
     // The busy-thread gate serializes runs per thread, so creation cannot race.
-    const record = await this.createSession(threadId, input.tools ?? []);
+    const record = await this.createSession(threadId, input.tools ?? [], signal);
     await this.store.set(key, record);
     emit({
       type: EventType.CUSTOM,
@@ -362,7 +363,12 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return record;
   }
 
-  private async createSession(threadId: string, clientTools: Tool[]): Promise<SessionRecord> {
+  /**
+   * Create the managed session for a thread. Every API call here takes the run's
+   * signal, so `turnTimeoutMs` (and a client disconnect) really do bound the
+   * work done while the thread's run gate is held.
+   */
+  private async createSession(threadId: string, clientTools: Tool[], signal: AbortSignal): Promise<SessionRecord> {
     const { managedAgentId, agentVersion, environmentId } = this.config;
     const customTools = this.customTools(clientTools);
     const title = this.config.sessionTitle?.(threadId) ?? `AG-UI thread ${threadId}`;
@@ -371,9 +377,12 @@ export class ManagedAgentsAgent extends AbstractAgent {
     const agent: SessionCreateParams["agent"] =
       customTools.length === 0
         ? { type: "agent", ...agentRef }
-        : { type: "agent_with_overrides", ...agentRef, tools: await this.mergedTools(customTools) };
+        : { type: "agent_with_overrides", ...agentRef, tools: await this.mergedTools(customTools, signal) };
 
-    const session = await this.client.beta.sessions.create({ agent, environment_id: environmentId, title });
+    const session = await this.client.beta.sessions.create(
+      { agent, environment_id: environmentId, title },
+      { signal },
+    );
     return {
       sessionId: session.id,
       toolNames: customTools.map((tool) => tool.name),
@@ -401,14 +410,16 @@ export class ManagedAgentsAgent extends AbstractAgent {
   }
 
   /** Keep the session's full replacement tool list aligned with this run. */
-  private async syncClientTools(record: SessionRecord, clientTools: Tool[]): Promise<void> {
+  private async syncClientTools(record: SessionRecord, clientTools: Tool[], signal: AbortSignal): Promise<void> {
     const desired = this.customTools(clientTools);
     const fingerprint = customToolsFingerprint(desired);
     if (record.toolDefinitionsFingerprint === fingerprint) return;
 
-    await this.client.beta.sessions.update(record.sessionId, {
-      agent: { tools: await this.mergedTools(desired) },
-    });
+    await this.client.beta.sessions.update(
+      record.sessionId,
+      { agent: { tools: await this.mergedTools(desired, signal) } },
+      { signal },
+    );
     record.toolNames = desired.map((tool) => tool.name);
     record.toolDefinitionsFingerprint = fingerprint;
   }
@@ -418,17 +429,18 @@ export class ManagedAgentsAgent extends AbstractAgent {
    * Overrides replace the whole list, so the agent's tools are carried
    * along, but a custom tool of the same name wins over the agent's copy.
    */
-  private async mergedTools(custom: CustomToolParams[]): Promise<OverrideTools> {
+  private async mergedTools(custom: CustomToolParams[], signal: AbortSignal): Promise<OverrideTools> {
     const names = new Set(custom.map((tool) => tool.name));
-    const base = (await this.baseTools()).filter((tool) => tool.type !== "custom" || !names.has(tool.name));
+    const base = (await this.baseTools(signal)).filter((tool) => tool.type !== "custom" || !names.has(tool.name));
     return [...base, ...custom];
   }
 
   /** The tools defined on the managed agent itself, fetched fresh so console edits apply. */
-  private async baseTools(): Promise<OverrideTools> {
+  private async baseTools(signal: AbortSignal): Promise<OverrideTools> {
     const agent = await this.client.beta.agents.retrieve(
       this.config.managedAgentId,
       this.config.agentVersion !== undefined ? { version: this.config.agentVersion } : undefined,
+      { signal },
     );
     // The read shape is structurally compatible with the params shape.
     return agent.tools as unknown as OverrideTools;

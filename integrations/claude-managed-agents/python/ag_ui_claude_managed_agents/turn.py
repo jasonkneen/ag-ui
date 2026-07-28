@@ -202,11 +202,20 @@ async def _consume(
             pass
 
     async def interrupt() -> None:
+        """Stop the session best-effort.
+
+        Bounded by its own timeout: this runs while the thread's run gate is
+        still held, so a stalled connection must not keep the thread's later
+        runs out.
+        """
         try:
-            await client.beta.sessions.events.send(
-                session_id, events=[{"type": "user.interrupt"}]
+            await asyncio.wait_for(
+                client.beta.sessions.events.send(
+                    session_id, events=[{"type": "user.interrupt"}]
+                ),
+                BEST_EFFORT_SEND_TIMEOUT_S,
             )
-        except Exception as exc:  # noqa: BLE001 - best-effort interrupt
+        except Exception as exc:  # noqa: BLE001 - best-effort interrupt, including its own bound
             report("interrupt", exc)
 
     def fail(message: str, code: str | None = None) -> TurnOutcome:

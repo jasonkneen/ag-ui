@@ -681,12 +681,18 @@ internal sealed class ManagedAgentsTurn
         }
     }
 
+    /// <summary>
+    /// Stops the session best-effort. Deliberately not tied to the run's cancellation — the point
+    /// is to reach a session the run is walking away from — but bounded by its own timeout so a
+    /// stalled connection cannot hold the thread's run gate open indefinitely.
+    /// </summary>
     private async Task InterruptAsync()
     {
         try
         {
+            using var sendTimeout = new CancellationTokenSource(ManagedAgentsLimits.BestEffortSendTimeout);
             await _client
-                .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.Interrupt()], CancellationToken.None)
+                .SendEventsAsync(_sessionId, [ManagedAgentsSessionEvents.Interrupt()], sendTimeout.Token)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

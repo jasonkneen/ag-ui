@@ -1092,3 +1092,56 @@ async def test_falls_back_to_a_stock_message_when_a_session_error_carries_none()
     assert isinstance(emitted[0], RunErrorEvent)
     assert emitted[0].message == "The session reported an error."
     assert emitted[0].code == "unknown_error"
+
+
+async def test_the_best_effort_interrupt_is_bounded(monkeypatch) -> None:  # noqa: PLR0915
+    """Regression: the turn's interrupt was unbounded, so a stalled connection
+    held the thread's run gate open for as long as the socket did."""
+    monkeypatch.setattr(turn_module, "BEST_EFFORT_SEND_TIMEOUT_S", 0.05)
+    stalled = asyncio.Event()
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "session.status_idle",
+                    "id": "idle_1",
+                    "stop_reason": {
+                        "type": "requires_action",
+                        "event_ids": ["mystery_1"],
+                    },
+                }
+            ]
+        ]
+    )
+    original_send = fake.beta.sessions.events.send
+
+    async def stalling_send(session_id: str, *, events: list[Any]) -> Any:
+        if any(e.get("type") == "user.interrupt" for e in events):
+            await stalled.wait()  # never set
+        return await original_send(session_id, events=events)
+
+    fake.beta.sessions.events.send = stalling_send
+
+    reported: list[dict[str, Any]] = []
+    events: list[Any] = []
+    # An outer deadline so a regression fails here instead of hanging the suite.
+    async with asyncio.timeout(2.0):
+        await run_turn(
+            client=fake,
+            session_id="sesn_1",
+            outbound=[
+                {"type": "user.message", "content": [{"type": "text", "text": "hi"}]}
+            ],
+            client_tools={},
+            backend_tools={},
+            tool_confirmation=None,
+            stream_deltas=True,
+            emit=events.append,
+            on_error=lambda _e, context: reported.append(context),
+        )
+
+    # The turn still reports the real cause, and the stalled interrupt is
+    # surfaced through the hook rather than swallowed.
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "unsupported_action"
+    assert "interrupt" in [context["operation"] for context in reported]

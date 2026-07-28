@@ -68,19 +68,19 @@ describe("dynamic frontend tools", () => {
     const showChart = tool("show_chart", "Render a chart");
     const fake = await runToolTransition([showChart, tool("export_csv", "Export a CSV")], [showChart]);
 
-    expect(fake.spies.update).toHaveBeenCalledWith("sesn_1", {
-      agent: {
-        tools: [baseAgentTool, customTool("show_chart", "Render a chart")],
-      },
-    });
+    expect(fake.spies.update.mock.calls[0]!.slice(0, 2)).toEqual([
+      "sesn_1",
+      { agent: { tools: [baseAgentTool, customTool("show_chart", "Render a chart")] } },
+    ]);
   });
 
   it("clears frontend tools when the next run has none", async () => {
     const fake = await runToolTransition([tool("show_chart", "Render a chart")], []);
 
-    expect(fake.spies.update).toHaveBeenCalledWith("sesn_1", {
-      agent: { tools: [baseAgentTool] },
-    });
+    expect(fake.spies.update.mock.calls[0]!.slice(0, 2)).toEqual([
+      "sesn_1",
+      { agent: { tools: [baseAgentTool] } },
+    ]);
   });
 
   it("updates a same-named tool when its definition changes", async () => {
@@ -93,16 +93,19 @@ describe("dynamic frontend tools", () => {
       ],
     );
 
-    expect(fake.spies.update).toHaveBeenCalledWith("sesn_1", {
-      agent: {
-        tools: [
-          baseAgentTool,
-          customTool("show_chart", "Render a visualization", {
-            series: { type: "array" },
-          }),
-        ],
+    expect(fake.spies.update.mock.calls[0]!.slice(0, 2)).toEqual([
+      "sesn_1",
+      {
+        agent: {
+          tools: [
+            baseAgentTool,
+            customTool("show_chart", "Render a visualization", {
+              series: { type: "array" },
+            }),
+          ],
+        },
       },
-    });
+    ]);
   });
 
   it("does not update the session when tool definitions are unchanged", async () => {
