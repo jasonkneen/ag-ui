@@ -14,6 +14,8 @@ export { customToolFrom, normalizeToolName } from "./tools";
 export type { CustomToolParams } from "./tools";
 export type {
   BackendCustomTool,
+  ManagedAgentsErrorContext,
+  ManagedAgentsErrorHandler,
   ManagedAgentsAgentConfig,
   SessionRecord,
   SessionStore,

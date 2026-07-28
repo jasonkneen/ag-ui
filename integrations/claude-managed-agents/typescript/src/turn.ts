@@ -9,7 +9,7 @@ import { EventType } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
 import { BEST_EFFORT_SEND_TIMEOUT_MS, PARKED_RETRY_DELAYS_MS, TOOL_RESULT_MAX_CHARS } from "./constants";
 import { describeToolResult, textOf } from "./text";
-import type { BackendCustomTool } from "./types";
+import type { BackendCustomTool, ManagedAgentsErrorHandler } from "./types";
 
 export interface TurnOptions {
   client: Anthropic;
@@ -23,6 +23,8 @@ export interface TurnOptions {
   /** How to answer built-in tools gated on confirmation; undefined = fail the run. */
   toolConfirmation: "allow" | "deny" | undefined;
   streamDeltas: boolean;
+  /** Notified when a best-effort operation fails. Never throws into the turn. */
+  onError?: ManagedAgentsErrorHandler;
   /** Called once the outbound events have been posted into the session. */
   onSent?: () => void | Promise<void>;
   emit: (event: BaseEvent) => void;
@@ -63,6 +65,15 @@ interface Preview {
  */
 export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   const { client, sessionId, emit, signal } = opts;
+
+  /** Report a swallowed failure. A broken hook must never break the turn. */
+  const report = (operation: string, error: unknown) => {
+    try {
+      opts.onError?.(error, { operation, sessionId });
+    } catch {
+      // ignored on purpose
+    }
+  };
 
   // Open the stream before sending so no early events are missed.
   const stream = await client.beta.sessions.events.stream(
@@ -160,7 +171,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   const interrupt = () =>
     client.beta.sessions.events
       .send(sessionId, { events: [{ type: "user.interrupt" }] })
-      .catch(() => {});
+      .catch((error: unknown) => report("interrupt", error));
 
   const fail = (message: string, code?: string): TurnOutcome => {
     closeAll();
@@ -204,7 +215,9 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
       text = await raceAbort(() => tool.handler(input), signal);
     } catch (err) {
       if (signal.aborted) {
-        await postCustomToolResult(id, INTERRUPTED_TOOL_TEXT, true).catch(() => {});
+        await postCustomToolResult(id, INTERRUPTED_TOOL_TEXT, true).catch((error: unknown) =>
+          report("post_interrupted_tool_result", error),
+        );
         throw err;
       }
       text = err instanceof Error ? err.message : String(err);
@@ -232,9 +245,10 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
           if (!preview) break; // best-effort; the buffered agent.message is canonical
           try {
             preview.snapshot = accumulateManagedAgentsEvent(preview.snapshot, event);
-          } catch {
+          } catch (error) {
             // A gapped or out-of-order delta: drop this preview and let the
             // buffered agent.message reconcile against what was emitted.
+            report("accumulate_preview", error);
             preview.snapshot = undefined;
             break;
           }

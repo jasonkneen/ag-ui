@@ -29,7 +29,7 @@ from .constants import (
     TOOL_RESULT_MAX_CHARS,
 )
 from .text import describe_tool_result, text_of
-from .types import BackendTool, TurnOutcome
+from .types import ErrorHandler, BackendTool, TurnOutcome
 
 INTERRUPTED_TOOL_RESULT_TEXT = "Tool execution was interrupted."
 """Posted for a backend tool cut off by a timeout or client disconnect, so
@@ -74,6 +74,7 @@ async def run_turn(
     emit: Emit,
     on_results_sent: SentCallback | None = None,
     on_follow_ups_sent: SentCallback | None = None,
+    on_error: ErrorHandler | None = None,
 ) -> TurnOutcome:
     """Open the event stream, post the outbound events, and translate the
     session's events into AG-UI events until the session goes idle.
@@ -180,13 +181,22 @@ async def _consume(
             )
         )
 
+    def report(operation: str, error: BaseException) -> None:
+        """Report a swallowed failure. A broken hook must not break the turn."""
+        if on_error is None:
+            return
+        try:
+            on_error(error, {"operation": operation, "session_id": session_id})
+        except Exception:  # noqa: BLE001 - a broken hook is not the turn's problem
+            pass
+
     async def interrupt() -> None:
         try:
             await client.beta.sessions.events.send(
                 session_id, events=[{"type": "user.interrupt"}]
             )
-        except Exception:  # noqa: BLE001 - best-effort interrupt
-            pass
+        except Exception as exc:  # noqa: BLE001 - best-effort interrupt
+            report("interrupt", exc)
 
     def fail(message: str, code: str | None = None) -> TurnOutcome:
         close_all()
@@ -235,8 +245,8 @@ async def _consume(
         task.add_done_callback(_finish_background_send)
         try:
             await asyncio.shield(task)
-        except (Exception, asyncio.CancelledError):  # noqa: BLE001 - the caller re-raises the original cancellation
-            pass
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - the caller re-raises the original cancellation
+            report("post_interrupted_tool_result", exc)
 
     async def run_backend_tool(
         tool_use_id: str, tool: BackendTool, tool_input: Any

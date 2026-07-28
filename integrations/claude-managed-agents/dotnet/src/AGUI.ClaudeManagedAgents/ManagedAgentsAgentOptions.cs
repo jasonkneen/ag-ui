@@ -68,4 +68,13 @@ public sealed class ManagedAgentsAgentOptions
     /// only. Defaults to <see langword="true"/>.
     /// </summary>
     public bool StreamDeltas { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets the handler notified when a best-effort operation fails (an interrupt that
+    /// could not be posted, a tool result that could not be delivered). These failures are
+    /// deliberately swallowed — they must not fail the run — but without a handler they are also
+    /// invisible, leaving an operator with a wedged thread and nothing in the logs. Exceptions
+    /// thrown by the handler itself are ignored.
+    /// </summary>
+    public Action<Exception, ManagedAgentsErrorContext>? OnError { get; set; }
 }

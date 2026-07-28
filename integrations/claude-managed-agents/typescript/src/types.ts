@@ -15,6 +15,22 @@ export interface BackendCustomTool {
   handler: (input: unknown) => Promise<string> | string;
 }
 
+/** What a swallowed failure was doing when it failed. */
+export type ManagedAgentsErrorContext = {
+  /** Stable identifier for the operation, e.g. `"interrupt"`. */
+  operation: string;
+  sessionId?: string;
+  threadId?: string;
+};
+
+/**
+ * Notified when a best-effort operation fails. These failures are deliberately
+ * swallowed — they must not fail the run — but without a hook they are also
+ * invisible, leaving an operator with a wedged thread and nothing in the logs.
+ * Exceptions thrown by the hook itself are ignored.
+ */
+export type ManagedAgentsErrorHandler = (error: unknown, context: ManagedAgentsErrorContext) => void;
+
 /** Persistent mapping between an AG-UI thread and a managed session. */
 export interface SessionRecord {
   sessionId: string;
@@ -73,6 +89,12 @@ export interface ManagedAgentsAgentConfig extends AgentConfig {
   toolConfirmation?: "allow" | "deny";
   /** Abort a turn that runs longer than this. Defaults to 5 minutes. */
   turnTimeoutMs?: number;
+  /**
+   * Notified when a best-effort operation fails (an interrupt that could not be
+   * posted, a tool result that could not be delivered, a preview that had to be
+   * dropped). Without it these are silent. See {@link ManagedAgentsErrorHandler}.
+   */
+  onError?: ManagedAgentsErrorHandler;
   /**
    * Request text and thinking previews so replies stream incrementally.
    * Set to false to receive each reply as a whole message only. Default true.

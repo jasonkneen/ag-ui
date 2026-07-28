@@ -28,6 +28,7 @@ internal sealed class ManagedAgentsTurn
     private readonly string? _toolConfirmation;
     private readonly bool _streamDeltas;
     private readonly Func<Task>? _onSent;
+    private readonly Action<Exception, ManagedAgentsErrorContext>? _onError;
 
     private readonly Queue<BaseEvent> _pending = new();
     private readonly Dictionary<string, StringBuilder> _previews = new(StringComparer.Ordinal);
@@ -50,6 +51,7 @@ internal sealed class ManagedAgentsTurn
     /// <param name="toolConfirmation">How to answer built-in tools gated on confirmation, or <see langword="null"/> to fail the run.</param>
     /// <param name="streamDeltas">Whether to request text and thinking previews.</param>
     /// <param name="onSent">Called once the outbound events have been posted into the session.</param>
+    /// <param name="onError">Notified when a best-effort operation fails. Never throws into the turn.</param>
     internal ManagedAgentsTurn(
         IManagedAgentsClient client,
         string sessionId,
@@ -58,7 +60,8 @@ internal sealed class ManagedAgentsTurn
         IReadOnlyDictionary<string, ManagedAgentsBackendTool> backendTools,
         string? toolConfirmation,
         bool streamDeltas,
-        Func<Task>? onSent = null)
+        Func<Task>? onSent = null,
+        Action<Exception, ManagedAgentsErrorContext>? onError = null)
     {
         _client = client;
         _sessionId = sessionId;
@@ -68,6 +71,22 @@ internal sealed class ManagedAgentsTurn
         _toolConfirmation = toolConfirmation;
         _streamDeltas = streamDeltas;
         _onSent = onSent;
+        _onError = onError;
+    }
+
+    /// <summary>
+    /// Reports a swallowed failure. A broken handler must never break the turn.
+    /// </summary>
+    private void Report(string operation, Exception error)
+    {
+        try
+        {
+            _onError?.Invoke(error, new ManagedAgentsErrorContext { Operation = operation, SessionId = _sessionId });
+        }
+        catch (Exception)
+        {
+            // ignored on purpose
+        }
     }
 
     /// <summary>
@@ -469,9 +488,10 @@ internal sealed class ManagedAgentsTurn
                 {
                     await PostCustomToolResultAsync(toolUseId, InterruptedToolResult, isError: true).ConfigureAwait(false);
                 }
-                catch (Exception)
+                catch (Exception postFailure)
                 {
                     // Best-effort: the run is already being torn down.
+                    Report("post_interrupted_tool_result", postFailure);
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 throw;
@@ -605,6 +625,7 @@ internal sealed class ManagedAgentsTurn
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Best effort: the run is already failing.
+            Report("interrupt", ex);
         }
     }
 

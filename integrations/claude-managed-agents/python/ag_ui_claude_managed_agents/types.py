@@ -22,6 +22,17 @@ class BackendTool:
     handler: Callable[[Any], Awaitable[str] | str]
 
 
+ErrorHandler = Callable[[BaseException, dict[str, Any]], None]
+"""Notified when a best-effort operation fails.
+
+These failures are deliberately swallowed — they must not fail the run — but
+without a hook they are also invisible, leaving an operator with a wedged
+thread and nothing in the logs. Receives the exception and a context dict
+carrying at least ``operation``, plus ``session_id``/``thread_id`` when known.
+Exceptions raised by the handler itself are ignored.
+"""
+
+
 @dataclass
 class SessionRecord:
     """Persistent mapping between an AG-UI thread and a managed session."""

@@ -83,6 +83,7 @@ class ManagedAgentsAgent:
         tool_confirmation: Literal["allow", "deny"] | None = None,
         turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         stream_deltas: bool = True,
+        on_error: ErrorHandler | None = None,
     ) -> None:
         self.managed_agent_id = managed_agent_id
         self.environment_id = environment_id
@@ -100,6 +101,7 @@ class ManagedAgentsAgent:
         self.tool_confirmation = tool_confirmation
         self.turn_timeout_s = turn_timeout_s
         self.stream_deltas = stream_deltas
+        self.on_error = on_error
         # Strong references to in-flight worker tasks so they are not collected.
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -173,7 +175,18 @@ class ManagedAgentsAgent:
                 ),
                 BEST_EFFORT_SEND_TIMEOUT_S,
             )
-        except Exception:  # noqa: BLE001 - best-effort interrupt
+        except Exception as exc:  # noqa: BLE001 - best-effort interrupt
+            self._report("interrupt", exc, session_id=session_id)
+
+    def _report(
+        self, operation: str, error: BaseException, **ids: Any
+    ) -> None:
+        """Report a swallowed failure. A broken hook must not break the run."""
+        if self.on_error is None:
+            return
+        try:
+            self.on_error(error, {"operation": operation, **ids})
+        except Exception:  # noqa: BLE001 - a broken hook is not the run's problem
             pass
 
     async def _run_turn_for_input(
@@ -275,6 +288,7 @@ class ManagedAgentsAgent:
             backend_tools=self.backend_tools,
             tool_confirmation=self.tool_confirmation,
             stream_deltas=self.stream_deltas,
+            on_error=self.on_error,
             emit=emit,
         )
 

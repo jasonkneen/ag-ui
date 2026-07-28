@@ -832,6 +832,63 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task ReportsAnInterruptThatCouldNotBePostedViaOnError()
+    {
+        // A swallowed best-effort failure must still be observable: without OnError the
+        // operator sees a wedged thread and nothing in the logs.
+        var reported = new List<(Exception Error, ManagedAgentsErrorContext Context)>();
+        var fake = new FakeManagedAgentsClient(
+            ["""{"type":"agent.custom_tool_use","id":"ctu_1","name":"get_time","input":{}}""", IdleEndTurn]);
+        fake.AgentTools = [];
+        fake.SendGuard = batch =>
+            batch.Any(e => e.GetProperty("type").GetString() == "user.interrupt")
+                ? new InvalidOperationException("interrupt rejected")
+                : null;
+
+        using var client = new CancellationTokenSource();
+        var agent = NewAgent(fake, configure: options =>
+        {
+            options.OnError = (error, context) => reported.Add((error, context));
+            options.BackendTools.Add(new ManagedAgentsBackendTool
+            {
+                Name = "get_time",
+                Handler = _ =>
+                {
+                    client.Cancel(); // the caller disconnects mid-turn
+                    return Task.FromResult("noon");
+                },
+            });
+        });
+
+        try
+        {
+            await foreach (var _ in agent.RunAsync(BaseInput(), client.Token))
+            {
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected: the caller left
+        }
+
+        var interrupt = Assert.Single(reported, r => r.Context.Operation == "interrupt");
+        Assert.Equal("interrupt rejected", interrupt.Error.Message);
+        Assert.Equal("sesn_1", interrupt.Context.SessionId);
+    }
+
+    [Fact]
+    public async Task ABrokenOnErrorHandlerDoesNotBreakTheRun()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var agent = NewAgent(fake, configure: options =>
+            options.OnError = (_, _) => throw new InvalidOperationException("handler is broken"));
+
+        var events = await CollectAsync(agent, BaseInput());
+
+        Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
+    }
+
+    [Fact]
     public async Task DoesNotRequestPreviewsWhenStreamDeltasIsDisabled()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

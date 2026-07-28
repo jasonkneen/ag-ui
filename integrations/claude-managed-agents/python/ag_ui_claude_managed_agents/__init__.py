@@ -40,6 +40,7 @@ __all__ = [
     "TOOL_NAME_MAX_LENGTH",
     "TOOL_RESULT_MAX_CHARS",
     "BackendTool",
+    "ErrorHandler",
     "InMemorySessionStore",
     "ManagedAgentsAgent",
     "SessionRecord",

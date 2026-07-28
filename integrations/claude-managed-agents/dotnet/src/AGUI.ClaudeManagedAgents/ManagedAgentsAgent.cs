@@ -263,7 +263,8 @@ public sealed class ManagedAgentsAgent
                 }
 
                 return PersistDeliveredAsync(threadKey, record);
-            });
+            },
+            onError: _options.OnError);
         run.Turn = turn;
 
         await foreach (var evt in turn.RunAsync(cancellationToken).ConfigureAwait(false))
@@ -457,6 +458,23 @@ public sealed class ManagedAgentsAgent
         return _client.GetAgentToolsAsync(_options.ManagedAgentId, _options.AgentVersion, cancellationToken);
     }
 
+    /// <summary>
+    /// Reports a swallowed failure. A broken handler must never break the run.
+    /// </summary>
+    private void Report(string operation, Exception error, string? sessionId = null, string? threadId = null)
+    {
+        try
+        {
+            _options.OnError?.Invoke(
+                error,
+                new ManagedAgentsErrorContext { Operation = operation, SessionId = sessionId, ThreadId = threadId });
+        }
+        catch (Exception)
+        {
+            // ignored on purpose
+        }
+    }
+
     private async Task InterruptAsync(string? sessionId)
     {
         if (sessionId is null)
@@ -473,9 +491,10 @@ public sealed class ManagedAgentsAgent
                 .SendEventsAsync(sessionId, [ManagedAgentsSessionEvents.Interrupt()], sendTimeout.Token)
                 .ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Best effort (including the send's own timeout): the run is already ending.
+            Report("interrupt", ex, sessionId);
         }
     }
 

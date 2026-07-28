@@ -73,6 +73,15 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return new ManagedAgentsAgent({ ...this.config, client: this.client, sessionStore: this.store });
   }
 
+  /** Report a swallowed failure. A broken hook must never break the run. */
+  private report(operation: string, error: unknown, ids: { sessionId?: string; threadId?: string } = {}) {
+    try {
+      this.config.onError?.(error, { operation, ...ids });
+    } catch {
+      // ignored on purpose
+    }
+  }
+
   public abortRun() {
     this.currentRunAbort?.abort();
   }
@@ -172,6 +181,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
         backendTools: this.backendTools,
         toolConfirmation: this.config.toolConfirmation,
         streamDeltas: this.config.streamDeltas ?? true,
+        onError: this.config.onError,
         emit,
         signal,
       });
@@ -186,7 +196,7 @@ export class ManagedAgentsAgent extends AbstractAgent {
       if (signal.aborted && sessionId) {
         await this.client.beta.sessions.events
           .send(sessionId, { events: [{ type: "user.interrupt" }] }, { signal: AbortSignal.timeout(BEST_EFFORT_SEND_TIMEOUT_MS) })
-          .catch(() => {});
+          .catch((error: unknown) => this.report("interrupt", error, { sessionId, threadId }));
       }
       throw err;
     } finally {
