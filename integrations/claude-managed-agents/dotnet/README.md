@@ -154,6 +154,7 @@ cd integrations/claude-managed-agents/dotnet/examples/AGUIDojoServer
 export ANTHROPIC_API_KEY=sk-ant-...   # or ANTHROPIC_AUTH_TOKEN
 dotnet run -- setup   # provisions an environment plus one agent per route (idempotent)
 dotnet run            # http://localhost:8026
+PORT=9000 dotnet run  # http://localhost:9000
 ```
 
 Setup writes the provisioned IDs to `.managed-agents.json` next to the built assembly (gitignored). It reuses existing agents by name and does not modify them: to apply prompt changes from `AgentSpecs.cs`, archive the agent and re-run setup.
