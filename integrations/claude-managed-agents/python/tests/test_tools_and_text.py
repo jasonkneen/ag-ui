@@ -1,9 +1,15 @@
 """Unit tests for the tool-definition and text helpers."""
 
+from types import SimpleNamespace
+
 from ag_ui_claude_managed_agents import (
     BackendTool,
     custom_tool_from,
     normalize_tool_name,
+)
+from ag_ui_claude_managed_agents.constants import (
+    SEARCH_RESULT_PREVIEW_CHARS,
+    TOOL_DESCRIPTION_MAX_LENGTH,
 )
 from ag_ui_claude_managed_agents.text import describe_tool_result, text_of
 
@@ -79,3 +85,39 @@ def test_describe_tool_result_decodes_entities_and_summarizes_blocks():
         described
         == "5 < 6 && \U0001f600 A\n[search result] T — https://x\ninner\n[document]"
     )
+
+
+def test_custom_tool_from_normalizes_name_and_caps_description() -> None:
+    """The API caps descriptions; a long one must be truncated, not rejected."""
+    tool = custom_tool_from(
+        SimpleNamespace(
+            name="show chart!", description="d" * (TOOL_DESCRIPTION_MAX_LENGTH + 50), parameters=None
+        )
+    )
+    assert tool["name"] == "show_chart_"
+    assert len(tool["description"]) == TOOL_DESCRIPTION_MAX_LENGTH
+
+
+def test_describe_tool_result_previews_a_long_search_result_body() -> None:
+    body = "x" * (SEARCH_RESULT_PREVIEW_CHARS + 200)
+    out = describe_tool_result(
+        [
+            {
+                "type": "search_result",
+                "title": "Docs",
+                "source": "https://example.com",
+                "content": [{"type": "text", "text": body}],
+            }
+        ]
+    )
+    header, preview = out.split("\n", 1)
+    assert "[search result] Docs" in header
+    assert "https://example.com" in header
+    # Only a readable prefix of the body is shown.
+    assert preview == "x" * SEARCH_RESULT_PREVIEW_CHARS
+
+
+def test_describe_tool_result_placeholders_unknown_blocks_and_handles_nothing() -> None:
+    assert describe_tool_result([{"type": "image"}]) == "[image]"
+    assert describe_tool_result([]) == ""
+    assert describe_tool_result(None) == ""

@@ -1122,3 +1122,40 @@ async def test_interrupts_backend_tool_and_answers_it_when_client_disconnects():
     assert agent._thread_key("thread_1") not in ManagedAgentsAgent._busy_threads.get(
         id(agent.store), set()
     )
+
+
+async def test_surfaces_a_session_create_failure_as_a_run_error() -> None:
+    """A failed sessions.create must reach the client as run_failed, not hang."""
+    fake = FakeClient(create_error=RuntimeError("quota exceeded"))
+
+    events = await collect(new_agent(fake), base_input())
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].message == "quota exceeded"
+    assert events[-1].code == "run_failed"
+
+
+async def test_input_without_messages_or_tools_fields_is_an_empty_run() -> None:
+    """RunAgentInput is not validated at runtime: a body missing these fields
+    must read as an empty run, not raise a TypeError."""
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    bare = RunAgentInput.model_construct(
+        thread_id="thread_1", run_id="run_1", state={}, context=[], forwarded_props={}
+    )
+
+    events = await collect(new_agent(fake), bare)
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "empty_run"
+    assert fake.create_calls == []
+
+
+async def test_deletes_thread_record_when_the_session_is_deleted() -> None:
+    fake = FakeClient(streams=[[{"type": "session.deleted", "id": "del_1"}]])
+    store = InMemorySessionStore()
+
+    events = await collect(new_agent(fake, store), base_input())
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "session_ended"
+    assert store.get("thread_1") is None

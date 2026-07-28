@@ -179,6 +179,12 @@ class ManagedAgentsAgent:
     async def _run_turn_for_input(
         self, input: RunAgentInput, emit: Emit, state: _RunState
     ) -> None:  # noqa: A002
+        # RunAgentInput is not validated at runtime; a body without `messages`
+        # or `tools` must read as an empty run, not an AttributeError surfaced
+        # as `run_failed`. `tools` was already defended at each use site; this
+        # covers `messages` the same way, matching the TypeScript reference.
+        if getattr(input, "messages", None) is None:
+            input = input.model_copy(update={"messages": []})
         thread_id, run_id = input.thread_id, input.run_id
         busy_key = self._thread_key(thread_id)
         emit(RunStartedEvent(thread_id=thread_id, run_id=run_id))

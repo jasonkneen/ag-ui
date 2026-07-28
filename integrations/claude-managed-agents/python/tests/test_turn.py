@@ -984,3 +984,62 @@ async def test_follow_ups_give_up_after_the_last_retry(monkeypatch):
         )
     assert fake.send_attempts == 2
     assert fake.streams_opened[0].closed
+
+
+async def test_emits_a_single_tool_result_even_when_posting_it_fails() -> None:
+    """A failed result post is not a handler failure: the UI must not be told
+    about the same tool result twice."""
+    backend = BackendTool(
+        name="get_time", description="", parameters={}, handler=lambda _: "noon"
+    )
+    emitted: list[Any] = []
+    fake = FakeClient(
+        streams=[
+            [
+                {
+                    "type": "agent.custom_tool_use",
+                    "id": "ctu_1",
+                    "name": "get_time",
+                    "input": {},
+                },
+                IDLE_END_TURN,
+            ]
+        ],
+        # The outbound user message posts fine; the result post fails.
+        send_failures={1: RuntimeError("send failed")},
+    )
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        await run_turn(
+            client=fake,
+            session_id="sesn_1",
+            outbound=[{"type": "user.message", "content": [{"type": "text", "text": "hi"}]}],
+            client_tools={},
+            backend_tools={"get_time": backend},
+            tool_confirmation=None,
+            stream_deltas=True,
+            emit=emitted.append,
+        )
+
+    results = [e for e in emitted if isinstance(e, ToolCallResultEvent)]
+    assert len(results) == 1
+
+
+async def test_falls_back_to_a_stock_message_when_a_session_error_carries_none() -> None:
+    emitted, _, _ = await collect(
+        [
+            {
+                "type": "session.error",
+                "id": "err_1",
+                "error": {
+                    "type": "unknown_error",
+                    "message": "",
+                    "retry_status": {"type": "terminal"},
+                },
+            }
+        ]
+    )
+    assert len(emitted) == 1
+    assert isinstance(emitted[0], RunErrorEvent)
+    assert emitted[0].message == "The session reported an error."
+    assert emitted[0].code == "unknown_error"

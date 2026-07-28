@@ -82,6 +82,7 @@ class FakeClient:
         session_id: str = "sesn_1",
         send_failures: dict[int, BaseException] | None = None,
         create_gate: asyncio.Event | None = None,
+        create_error: BaseException | None = None,
     ) -> None:
         self._streams = list(streams or [])
         self.agent_tools = (
@@ -95,6 +96,7 @@ class FakeClient:
         self.send_failures = dict(send_failures or {})
         self.send_attempts = 0
         self.create_gate = create_gate
+        self.create_error = create_error
         self.sent: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
         self.update_calls: list[tuple[str, dict[str, Any]]] = []
@@ -130,6 +132,8 @@ class FakeClient:
         self.create_calls.append(kwargs)
         if self.create_gate is not None:
             await self.create_gate.wait()
+        if self.create_error is not None:
+            raise self.create_error
         return SimpleNamespace(id=self.session_id)
 
     async def _update(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
