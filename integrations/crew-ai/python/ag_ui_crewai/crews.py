@@ -1,7 +1,8 @@
 import uuid
 import copy
 import json
-from typing import Any, cast
+import weakref
+from typing import Any, Optional, Protocol, cast, runtime_checkable
 from crewai import Crew, Flow
 from crewai.flow import start
 from crewai.cli.crew_chat import (
@@ -19,19 +20,122 @@ from .sdk import (
   copilotkit_emit_state,
 )
 
-# Cache of generated chat-input schemas, keyed by the *object identity*
-# (``id(crew)``) of the ``@CrewBase`` instance passed to
-# ``add_crewai_crew_fastapi_endpoint`` — NOT ``crew.name`` (CPK-7717
-# defect 4). ``crew.name`` is optional in CrewAI, so two distinct unnamed
-# crews both key on ``None`` and swap each other's chat-input schemas.
-# Object identity never collides between two distinct live crews: the
-# endpoint factory retains the crew object for the process lifetime (it
-# is captured in the ``add_crewai_crew_fastapi_endpoint`` closure), so its
-# ``id`` cannot be reused by a different crew while the cache entry is
-# live. This is the simplest correct key and preserves the caching
-# benefit for the same crew (a repeated construction reuses the entry
-# instead of re-issuing the LLM call in ``generate_crew_chat_inputs``).
-_CREW_INPUTS_CACHE = {}
+# Cache of generated chat-input schemas, keyed by the ``@CrewBase``
+# instance passed to ``add_crewai_crew_fastapi_endpoint`` (CPK-7717
+# review round 2, finding 3).
+#
+# The primary store is a ``WeakKeyDictionary`` keyed on the crew OBJECT
+# itself — NOT ``id(crew)``. Keying on ``id`` was unsafe: CPython reuses
+# ``id`` values once an object is garbage-collected, and now that
+# ``ChatWithCrewFlow`` is exported for direct construction the wrapper is
+# not necessarily retained for the process lifetime. A freshly allocated
+# crew wrapper could therefore inherit a collected wrapper's ``id`` and
+# silently be served the collected crew's schema. A ``WeakKeyDictionary``
+# keys on true object identity and auto-evicts an entry the moment its
+# crew is collected, so no stale schema can outlive its crew.
+#
+# ``_CREW_INPUTS_FALLBACK`` handles the unlikely crew object that is not
+# weak-referenceable (or not hashable): we key on ``id`` but store a
+# STRONG reference to the crew alongside the schema, which keeps the
+# object alive so its ``id`` cannot be reused while the entry is live,
+# and we verify the stored object *is* the crew before serving (dropping
+# the entry on mismatch). Either path preserves the caching win for a
+# repeated construction of the same crew (which otherwise re-issues the
+# LLM call in ``generate_crew_chat_inputs``).
+_CREW_INPUTS_CACHE: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary()
+)
+_CREW_INPUTS_FALLBACK: dict = {}
+
+
+def _crew_inputs_cache_get(crew: Any) -> Any:
+    """Return the cached chat-input schema for ``crew`` or ``None`` on miss.
+
+    ``None`` is an unambiguous miss sentinel: ``generate_crew_chat_inputs``
+    always returns a populated ``ChatInputs`` object, never ``None``.
+    """
+    try:
+        cached = _CREW_INPUTS_CACHE.get(crew)
+    except TypeError:
+        # ``crew`` is unhashable — cannot live in the WeakKeyDictionary.
+        cached = None
+    if cached is not None:
+        return cached
+    entry = _CREW_INPUTS_FALLBACK.get(id(crew))
+    if entry is not None:
+        stored_crew, schema = entry
+        if stored_crew is crew:
+            return schema
+        # ``id`` was reused by a DIFFERENT object; drop the stale entry so
+        # we regenerate rather than serve another crew's schema.
+        _CREW_INPUTS_FALLBACK.pop(id(crew), None)
+    return None
+
+
+def _crew_inputs_cache_set(crew: Any, schema: Any) -> None:
+    """Cache ``schema`` for ``crew`` in the identity-safe store."""
+    try:
+        _CREW_INPUTS_CACHE[crew] = schema
+        return
+    except TypeError:
+        # Not weak-referenceable (or unhashable): fall back to an id key
+        # with a STRONG crew reference so the id cannot be reused while
+        # live, plus an identity check on read.
+        _CREW_INPUTS_FALLBACK[id(crew)] = (crew, schema)
+
+
+@runtime_checkable
+class CrewBaseInstance(Protocol):
+    """Structural type for a ``@CrewBase``-decorated crew instance.
+
+    ``add_crewai_crew_fastapi_endpoint`` and ``ChatWithCrewFlow`` require a
+    class decorated with crewai's ``@CrewBase`` — NOT a bare
+    :class:`crewai.Crew`. The flow calls ``crew.crew()`` to build the
+    underlying ``Crew`` and reads the crew's name; a plain ``Crew`` has
+    neither a ``.crew()`` factory nor a name accessor, so annotating the
+    parameter as ``Crew`` was actively misleading (CPK-7717 defect 5).
+
+    Name accessor (CPK-7717 review round 2, finding 2): crewai's
+    ``@CrewBase`` decorator does NOT expose a public ``.name`` attribute —
+    it sets ``_crew_name`` on the wrapped class (to the decorated class'
+    ``__name__``). We therefore express the structural requirement as
+    ``crew()`` + ``_crew_name``. The runtime name reader
+    (:func:`_read_crew_name`) additionally accepts a hand-rolled ``.name``
+    for flexibility, but ``_crew_name`` is the canonical @CrewBase
+    accessor and the one the protocol pins.
+
+    ``@runtime_checkable`` lets callers/tests assert conformance via
+    ``isinstance`` (structural: method/attribute presence only).
+    """
+
+    _crew_name: str
+
+    def crew(self) -> Crew:  # pragma: no cover - structural protocol stub
+        ...
+
+
+def _read_crew_name(crew: Any) -> str:
+    """Return a non-empty crew name from a ``@CrewBase`` instance.
+
+    Accepts a hand-rolled ``.name`` OR crewai's canonical ``_crew_name``
+    (set by the ``@CrewBase`` decorator to the class name). crewai's
+    ``ChatInputs.crew_name`` is a required non-empty ``str`` and is used
+    as the crew tool's function name, so a missing/empty/non-string name
+    would raise a Pydantic validation error deep inside
+    ``generate_crew_chat_inputs``. Fail loudly here with an actionable
+    message instead (CPK-7717 review round 2, finding 2).
+    """
+    for attr in ("name", "_crew_name"):
+        value = getattr(crew, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise ValueError(
+        "Could not determine a crew name: the crew exposes neither a "
+        "non-empty ``name`` nor ``_crew_name`` attribute. Pass a "
+        "``@CrewBase``-decorated crew (crewai sets ``_crew_name`` to the "
+        "decorated class name) or set a non-empty ``name`` — crewai's "
+        "ChatInputs.crew_name requires a non-empty string."
+    )
 
 # Per-read idle guard (seconds) for LiteLLM streaming requests. LiteLLM
 # forwards this to the underlying HTTP client, where it acts as a
@@ -88,7 +192,7 @@ class ChatWithCrewFlow(Flow):
 
     def __init__(
             self, *,
-            crew: Crew
+            crew: "CrewBaseInstance"
         ):
         super().__init__()
 
@@ -98,55 +202,73 @@ class ChatWithCrewFlow(Flow):
         if self.crew.chat_llm is None:
             raise ValueError("Crew chat LLM is not set")
 
-        self.crew_name = crew.name
+        # Read the crew name from the real ``@CrewBase`` accessor
+        # (``_crew_name``) or a hand-rolled ``.name`` — never ``crew.name``
+        # unconditionally, which AttributeErrors on a real @CrewBase
+        # instance (CPK-7717 review round 2, finding 2). Fails loudly with
+        # an actionable message if neither yields a usable non-empty name,
+        # rather than passing ``None`` into ``ChatInputs`` (validation
+        # error deep in ``generate_crew_chat_inputs``).
+        self.crew_name = _read_crew_name(crew)
         self.chat_llm = crew_chat_initialize_chat_llm(self.crew)
 
-        # Key on object identity, not ``crew.name`` (defect 4): the name is
-        # optional, so unnamed crews would otherwise collide on ``None``.
-        cache_key = id(crew)
-        if cache_key not in _CREW_INPUTS_CACHE:
+        # Identity-safe cache keyed on the crew object itself (finding 3),
+        # not ``id(crew)`` which is reused after GC.
+        cached = _crew_inputs_cache_get(crew)
+        if cached is None:
             self.crew_chat_inputs = crew_chat_generate_crew_chat_inputs(
                 self.crew,
                 self.crew_name,
                 self.chat_llm
             )
-            _CREW_INPUTS_CACHE[cache_key] = self.crew_chat_inputs
+            _crew_inputs_cache_set(crew, self.crew_chat_inputs)
         else:
-            self.crew_chat_inputs = _CREW_INPUTS_CACHE[cache_key]
+            self.crew_chat_inputs = cached
 
         self.crew_tool_schema = crew_chat_generate_crew_tool_schema(self.crew_chat_inputs)
         self.system_message = crew_chat_build_system_message(self.crew_chat_inputs)
 
     def _completion_llm_kwargs(self) -> dict:
-        """Return the ``model`` / ``api_key`` / ``base_url`` kwargs for a
-        litellm ``acompletion`` call.
+        """Return the connection kwargs for a litellm ``acompletion`` call.
 
         Defect 1 (CPK-7717): the completion call sites previously passed
         the raw ``self.crew.chat_llm`` model STRING to ``acompletion``,
-        which drops the api_key and base_url that
-        ``initialize_chat_llm`` resolved. litellm reads only the model
-        string and falls back to environment/default credentials,
-        breaking local and self-hosted models (CopilotKit#2742). We
-        forward the fields off the resolved ``self.chat_llm`` object so
-        both completion call sites authenticate the same way
-        ``generate_crew_chat_inputs`` does (it drives the same LLM
-        object).
+        which drops the credentials/endpoint that ``initialize_chat_llm``
+        resolved. litellm then falls back to environment/default
+        credentials, breaking local and self-hosted models
+        (CopilotKit#2742).
 
-        Defensive: ``getattr`` with a fall back to the crew's model
-        string keeps the helper working if ``chat_llm`` was not resolved
-        (e.g. in unit tests that construct the flow via ``__new__``). We
-        only forward ``api_key`` / ``base_url`` when present so we never
-        override litellm's own resolution with ``None``.
+        Round-2 review finding 1: forwarding only ``model`` / ``api_key``
+        / ``base_url`` still dropped ``api_base`` / ``api_version`` and the
+        provider-specific ``additional_params`` — so Azure and other
+        custom-endpoint users still hit the wrong endpoint. crewai's own
+        ``LLM._prepare_completion_params`` forwards ``api_base``,
+        ``base_url``, ``api_version``, ``api_key`` AND spreads
+        ``additional_params`` (see ``crewai/llm.py``); we mirror that here
+        so both completion call sites authenticate exactly the way
+        ``generate_crew_chat_inputs`` does (it drives the same LLM object).
+
+        Defensive: ``getattr`` with a fall back to the crew's model string
+        keeps the helper working if ``chat_llm`` was not resolved (e.g. in
+        unit tests that construct the flow via ``__new__``). Every field is
+        forwarded only when present/non-None so we never override litellm's
+        own resolution with ``None``. ``additional_params`` is spread first
+        so the explicit connection fields win on any key collision.
         """
         llm = getattr(self, "chat_llm", None)
         model = getattr(llm, "model", None) or self.crew.chat_llm
         kwargs: dict = {"model": model}
-        api_key = getattr(llm, "api_key", None)
-        if api_key is not None:
-            kwargs["api_key"] = api_key
-        base_url = getattr(llm, "base_url", None)
-        if base_url is not None:
-            kwargs["base_url"] = base_url
+
+        additional = getattr(llm, "additional_params", None)
+        if isinstance(additional, dict):
+            for key, value in additional.items():
+                if value is not None:
+                    kwargs[key] = value
+
+        for attr in ("api_key", "base_url", "api_base", "api_version"):
+            value = getattr(llm, attr, None)
+            if value is not None:
+                kwargs[attr] = value
         return kwargs
 
     @start()

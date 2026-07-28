@@ -7,7 +7,6 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional, Protocol, runtime_checkable
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -51,7 +50,7 @@ from .events import (
 )
 from .context import flow_context
 from .sdk import litellm_messages_to_ag_ui_messages
-from .crews import ChatWithCrewFlow
+from .crews import ChatWithCrewFlow, CrewBaseInstance
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,31 +77,11 @@ __all__ = [
 ]
 
 
-@runtime_checkable
-class CrewBaseInstance(Protocol):
-    """Structural type for a ``@CrewBase``-decorated crew instance.
-
-    ``add_crewai_crew_fastapi_endpoint`` requires a class decorated with
-    crewai's ``@CrewBase`` — NOT a bare :class:`crewai.Crew` (CPK-7717
-    defect 5). ``ChatWithCrewFlow`` calls ``crew.crew()`` to build the
-    underlying ``Crew`` and reads ``crew.name``; a plain ``Crew`` has
-    neither a ``.crew()`` factory method nor participates in the
-    chat-input generation path, so annotating the parameter as ``Crew``
-    was actively misleading.
-
-    crewai's ``CrewBase`` is a class *decorator* that returns the original
-    (now-wrapped) type — there is no nominal base class to import and
-    annotate against — so we express the requirement structurally: any
-    object exposing a ``name`` and a zero-arg ``crew()`` factory
-    satisfies it. ``@runtime_checkable`` lets callers/tests assert
-    conformance via ``isinstance`` (structural: method/attribute presence
-    only).
-    """
-
-    name: Optional[str]
-
-    def crew(self) -> Crew:  # pragma: no cover - structural protocol stub
-        ...
+# ``CrewBaseInstance`` (the structural type for a ``@CrewBase`` crew) now
+# lives in ``crews.py`` alongside ``ChatWithCrewFlow`` — which also
+# annotates its constructor with it — and is imported above. It stays in
+# ``__all__`` so downstream callers keep importing it from
+# ``ag_ui_crewai.endpoint`` (CPK-7717 review round 2, finding 2).
 
 # Sentinel to distinguish "no item delivered" from a legitimate ``None``
 # queue payload (the happy-path stream-end sentinel). Used by the

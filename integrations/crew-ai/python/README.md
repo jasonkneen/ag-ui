@@ -60,8 +60,10 @@ package; override these only if your deployment has specific needs
 ### `AGUI_CREWAI_LLM_TIMEOUT_SECONDS`
 
 Per-read timeout forwarded to `litellm.acompletion` in
-`ChatWithCrewFlow.chat` (both the initial call and the post-`crew_exit`
-tool-choice=`"none"` call).
+`ChatWithCrewFlow.chat`. It applies to all three completion sites: the
+initial call, the post-crew-run follow-up (tool-choice=`"none"`) that
+lets the assistant speak about the crew result, and the post-`crew_exit`
+(tool-choice=`"none"`) call.
 
 - **Default:** `120` seconds.
 - **Non-positive** (e.g. `0`, `-1`): disables the per-read timeout —
