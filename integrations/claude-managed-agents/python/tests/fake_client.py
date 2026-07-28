@@ -9,6 +9,9 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx
+
 
 class FakeAPIError(Exception):
     """Shaped like an SDK API error: carries an HTTP status code."""
@@ -18,9 +21,28 @@ class FakeAPIError(Exception):
         self.status_code = status_code
 
 
-def parked_race_error() -> FakeAPIError:
-    """The 400 the API returns for a user message posted while still parked."""
-    return FakeAPIError(400, "session is waiting on responses to tool calls")
+def parked_race_error() -> anthropic.BadRequestError:
+    """The 400 the API returns for a user message posted while still parked.
+
+    Built from the real SDK error class rather than a stand-in, so the retry
+    matcher is exercised against the exception the default client actually
+    raises (`status_code` + the body wording), not an invented shape.
+    """
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "session is waiting on responses to events [ctu_1]",
+        },
+    }
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/sessions/sesn_1/events"),
+        json=body,
+    )
+    return anthropic.BadRequestError(
+        "session is waiting on responses to events [ctu_1]", response=response, body=body
+    )
 
 
 class FakeStream:

@@ -397,6 +397,48 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task RetriesTheParkedRaceWhenTheRealSdkClientThrows()
+    {
+        // The default client throws Anthropic's own AnthropicApiException, not
+        // ManagedAgentsSendException, so this covers the branch that actually runs in
+        // production. Note AnthropicApiException.Message is synthesised from StatusCode +
+        // ResponseBody and ignores the constructor message — the parked wording therefore has
+        // to be in the response body, exactly as the API returns it.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new InMemorySessionStore();
+        await store.SetAsync(
+            "thread_1",
+            new ManagedAgentsSessionRecord { SessionId = "sesn_1", ToolNames = [], PendingClientToolUseIds = ["ctu_1"], LastUserMessageId = "u1" },
+            default);
+
+        const string Body = """{"type":"error","error":{"type":"invalid_request_error","message":"session is waiting on responses to events [ctu_1]"}}""";
+        var parked = new Anthropic.Exceptions.AnthropicApiException(
+            "bad request",
+            new System.Net.Http.HttpRequestException("bad request", null, System.Net.HttpStatusCode.BadRequest))
+        {
+            StatusCode = System.Net.HttpStatusCode.BadRequest,
+            ResponseBody = Body,
+        };
+
+        var rejections = 0;
+        fake.SendGuard = batch =>
+        {
+            var isFollowUp = batch.Any(e => e.GetProperty("type").GetString() == "user.message");
+            return isFollowUp && rejections++ < 2 ? parked : null;
+        };
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "old" },
+            new AGUIUserMessage { Id = "u2", Content = "never mind" },
+        ]));
+
+        Assert.Equal(4, fake.SendAttempts.Count);
+        Assert.Equal(2, fake.Sent.Count);
+        Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
+    }
+
+    [Fact]
     public async Task ErrorsWithoutCreatingASessionWhenAFreshThreadCarriesOnlyAToolResult()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

@@ -1,5 +1,6 @@
 import { EventType } from "@ag-ui/client";
 import type { BaseEvent } from "@ag-ui/client";
+import { APIError } from "@anthropic-ai/sdk";
 import { describe, expect, it } from "vitest";
 import { TOOL_RESULT_MAX_CHARS } from "../constants";
 import { runTurn } from "../turn";
@@ -31,7 +32,15 @@ const collect = async (
 
 const types = (events: BaseEvent[]) => events.map((event) => event.type);
 
-const parkedError = () => Object.assign(new Error("session is waiting on responses to events"), { status: 400 });
+// Built from the real SDK error class rather than a stand-in, so the retry
+// matcher is exercised against the error the default client actually throws.
+const parkedError = () =>
+  new APIError(
+    400,
+    { type: "error", error: { type: "invalid_request_error", message: "session is waiting on responses to events [ctu_1]" } },
+    undefined,
+    undefined,
+  );
 
 describe("runTurn", () => {
   it("streams a text preview, tops it up from the buffered message, and finishes", async () => {
