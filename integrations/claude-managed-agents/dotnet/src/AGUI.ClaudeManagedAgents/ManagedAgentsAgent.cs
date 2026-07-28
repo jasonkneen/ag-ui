@@ -252,11 +252,16 @@ public sealed class ManagedAgentsAgent
             _backendTools,
             _options.ToolConfirmation,
             _options.StreamDeltas,
-            // Persist delivery as soon as the events land, so a timeout or disconnect later in
-            // the turn does not re-post them next run.
-            onSent: () =>
+            // Persist each delivery as soon as it lands, so a failure or interruption later in
+            // the turn does not re-post it next run: the tool results resume the session even
+            // if the follow-ups then fail.
+            onResultsSent: () =>
             {
                 record.PendingClientToolUseIds = [];
+                return PersistDeliveredAsync(threadKey, record);
+            },
+            onFollowUpsSent: () =>
+            {
                 if (outbound.LastUserMessageId is not null)
                 {
                     record.LastUserMessageId = outbound.LastUserMessageId;

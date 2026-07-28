@@ -25,8 +25,15 @@ export interface TurnOptions {
   streamDeltas: boolean;
   /** Notified when a best-effort operation fails. Never throws into the turn. */
   onError?: ManagedAgentsErrorHandler;
-  /** Called once the outbound events have been posted into the session. */
-  onSent?: () => void | Promise<void>;
+  /**
+   * Called once the tool-result batch has been posted into the session. Fires
+   * separately from {@link onFollowUpsSent} so a caller persists each delivery
+   * independently: the results resume the session even if the follow-ups then
+   * fail, and re-posting them on the next run would be rejected as stale.
+   */
+  onResultsSent?: () => void | Promise<void>;
+  /** Called once the follow-up messages have been posted into the session. */
+  onFollowUpsSent?: () => void | Promise<void>;
   emit: (event: BaseEvent) => void;
   signal: AbortSignal;
 }
@@ -109,13 +116,18 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
   };
 
   try {
-    if (results.length > 0) await client.beta.sessions.events.send(sessionId, { events: results });
-    if (followUps.length > 0) await sendFollowUps();
+    if (results.length > 0) {
+      await client.beta.sessions.events.send(sessionId, { events: results });
+      await opts.onResultsSent?.();
+    }
+    if (followUps.length > 0) {
+      await sendFollowUps();
+      await opts.onFollowUpsSent?.();
+    }
   } catch (err) {
     stream.controller.abort();
     throw err;
   }
-  await opts.onSent?.();
 
   const previews = new Map<string, Preview>();
   const closedMessages = new Set<string>();

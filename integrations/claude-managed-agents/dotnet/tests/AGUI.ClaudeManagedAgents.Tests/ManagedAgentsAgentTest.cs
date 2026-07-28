@@ -439,6 +439,61 @@ public class ManagedAgentsAgentTest
     }
 
     [Fact]
+    public async Task ClearsPendingToolIdsEvenWhenTheFollowUpSendThenFails()
+    {
+        // Regression: once the tool results resume the session they are recorded as delivered,
+        // even if the follow-up messages then fail. Re-posting a consumed result on the next run
+        // would be rejected by the API and leave the thread wedged. Asserted against an
+        // out-of-process-shaped store so only genuinely persisted state counts.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new RecordingSessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        store.Writes.Clear();
+
+        fake.SendGuard = batch => batch.Any(e => e.GetProperty("type").GetString() == "user.message")
+            ? new InvalidOperationException("server exploded")
+            : null;
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "done" },
+            new AGUIUserMessage { Id = "u2", Content = "and one more thing" },
+        ]));
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal(("server exploded", "run_failed"), (error.Message, error.Code));
+
+        var record = await store.GetAsync("thread_1", default);
+        Assert.NotNull(record);
+        Assert.Empty(record!.PendingClientToolUseIds);
+        // The follow-up never landed, so the user message stays undelivered.
+        Assert.Equal("u1", record.LastUserMessageId);
+    }
+
+    [Fact]
+    public async Task RecordsTheFollowUpDeliverySeparatelyFromTheToolResults()
+    {
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new RecordingSessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_1"]), default);
+        store.Writes.Clear();
+
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIToolMessage { Id = "t1", ToolCallId = "ctu_1", Content = "done" },
+            new AGUIUserMessage { Id = "u2", Content = "and one more thing" },
+        ]));
+
+        // Two persists: one per delivery, in send order.
+        Assert.Equal(2, store.Writes.Count);
+        Assert.Empty(store.Writes[0].Record.PendingClientToolUseIds);
+        Assert.Equal("u1", store.Writes[0].Record.LastUserMessageId);
+        Assert.Equal("u2", store.Writes[1].Record.LastUserMessageId);
+    }
+
+    [Fact]
     public async Task ErrorsWithoutCreatingASessionWhenAFreshThreadCarriesOnlyAToolResult()
     {
         var fake = new FakeManagedAgentsClient([IdleEndTurn]);

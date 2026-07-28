@@ -170,10 +170,14 @@ export class ManagedAgentsAgent extends AbstractAgent {
         client: this.client,
         sessionId: record.sessionId,
         outbound: outbound.events,
-        // Persist delivery as soon as the events land, so a timeout or
-        // disconnect later in the turn does not re-post them next run.
-        onSent: async () => {
+        // Persist each delivery as soon as it lands, so a failure or
+        // interruption later in the turn does not re-post it next run: the
+        // tool results resume the session even if the follow-ups then fail.
+        onResultsSent: async () => {
           record.pendingClientToolUseIds = [];
+          await this.store.set(threadId, record);
+        },
+        onFollowUpsSent: async () => {
           if (outbound.lastUserMessageId) record.lastUserMessageId = outbound.lastUserMessageId;
           await this.store.set(threadId, record);
         },

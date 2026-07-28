@@ -4,8 +4,9 @@ import { lastValueFrom, toArray } from "rxjs";
 import { describe, expect, it } from "vitest";
 import { ManagedAgentsAgent } from "../agent";
 import { InMemorySessionStore } from "../sessions";
-import type { BackendCustomTool, ManagedAgentsAgentConfig } from "../types";
+import type { BackendCustomTool, ManagedAgentsAgentConfig, SessionStore } from "../types";
 import { createFakeClient } from "./fake-client";
+import { RecordingSessionStore } from "./fake-store";
 
 const idleEndTurn = { type: "session.status_idle", id: "idle_1", stop_reason: { type: "end_turn" } };
 
@@ -27,7 +28,7 @@ const types = (events: BaseEvent[]) => events.map((event) => event.type);
 
 const newAgent = (
   fake: ReturnType<typeof createFakeClient>,
-  store: InMemorySessionStore = new InMemorySessionStore(),
+  store: SessionStore = new InMemorySessionStore(),
   extra: Partial<ManagedAgentsAgentConfig> = {},
 ) =>
   new ManagedAgentsAgent({
@@ -394,6 +395,62 @@ describe("ManagedAgentsAgent", () => {
     expect(fake.sent[1].events).toEqual([{ type: "user.message", content: [{ type: "text", text: "never mind" }] }]);
     expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
     expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u2" });
+  });
+
+  it("clears pending tool ids even when the follow-up send then fails", async () => {
+    // Regression: once the tool results resume the session they are recorded
+    // as delivered, even if the follow-up messages then fail. Re-posting a
+    // consumed result on the next run would be rejected by the API and leave
+    // the thread wedged. Asserted against an out-of-process-shaped store so
+    // only genuinely persisted state counts.
+    const fake = createFakeClient({
+      streams: [[idleEndTurn]],
+      // Send 0 (the tool results) succeeds; send 1 (the follow-up) fails.
+      sendResults: [undefined, new Error("server exploded")],
+    });
+    const store = new RecordingSessionStore();
+    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+
+    const events = await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "t1", role: "tool", toolCallId: "ctu_1", content: "done" },
+          { id: "u2", role: "user", content: "and one more thing" },
+        ],
+      }),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: "server exploded", code: "run_failed" });
+    // The results were persisted as delivered; the follow-up never landed, so
+    // the user message stays undelivered and is retried next run.
+    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
+    expect(store.writes.at(-1)?.record).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u1" });
+  });
+
+  it("records the follow-up delivery separately from the tool results", async () => {
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new RecordingSessionStore();
+    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_1"], lastUserMessageId: "u1" });
+    store.writes.length = 0;
+
+    await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "t1", role: "tool", toolCallId: "ctu_1", content: "done" },
+          { id: "u2", role: "user", content: "and one more thing" },
+        ],
+      }),
+    );
+
+    // Two persists: one per delivery, in send order.
+    expect(store.writes.map((write) => write.record)).toMatchObject([
+      { pendingClientToolUseIds: [], lastUserMessageId: "u1" },
+      { pendingClientToolUseIds: [], lastUserMessageId: "u2" },
+    ]);
   });
 
   it("abandons multiple parked tool calls in their original order", async () => {

@@ -27,7 +27,8 @@ internal sealed class ManagedAgentsTurn
     private readonly IReadOnlyDictionary<string, ManagedAgentsBackendTool> _backendTools;
     private readonly string? _toolConfirmation;
     private readonly bool _streamDeltas;
-    private readonly Func<Task>? _onSent;
+    private readonly Func<Task>? _onResultsSent;
+    private readonly Func<Task>? _onFollowUpsSent;
     private readonly Action<Exception, ManagedAgentsErrorContext>? _onError;
 
     private readonly Queue<BaseEvent> _pending = new();
@@ -50,7 +51,13 @@ internal sealed class ManagedAgentsTurn
     /// <param name="backendTools">Custom tools executed on this server, keyed by managed-agent (normalized) name.</param>
     /// <param name="toolConfirmation">How to answer built-in tools gated on confirmation, or <see langword="null"/> to fail the run.</param>
     /// <param name="streamDeltas">Whether to request text and thinking previews.</param>
-    /// <param name="onSent">Called once the outbound events have been posted into the session.</param>
+    /// <param name="onResultsSent">
+    /// Called once the tool-result batch has been posted into the session. Fires separately from
+    /// <paramref name="onFollowUpsSent"/> so the caller persists each delivery independently: the
+    /// results resume the session even if the follow-ups then fail, and re-posting them on the
+    /// next run would be rejected as stale.
+    /// </param>
+    /// <param name="onFollowUpsSent">Called once the follow-up messages have been posted into the session.</param>
     /// <param name="onError">Notified when a best-effort operation fails. Never throws into the turn.</param>
     internal ManagedAgentsTurn(
         IManagedAgentsClient client,
@@ -60,7 +67,8 @@ internal sealed class ManagedAgentsTurn
         IReadOnlyDictionary<string, ManagedAgentsBackendTool> backendTools,
         string? toolConfirmation,
         bool streamDeltas,
-        Func<Task>? onSent = null,
+        Func<Task>? onResultsSent = null,
+        Func<Task>? onFollowUpsSent = null,
         Action<Exception, ManagedAgentsErrorContext>? onError = null)
     {
         _client = client;
@@ -70,7 +78,8 @@ internal sealed class ManagedAgentsTurn
         _backendTools = backendTools;
         _toolConfirmation = toolConfirmation;
         _streamDeltas = streamDeltas;
-        _onSent = onSent;
+        _onResultsSent = onResultsSent;
+        _onFollowUpsSent = onFollowUpsSent;
         _onError = onError;
     }
 
@@ -105,10 +114,6 @@ internal sealed class ManagedAgentsTurn
         await using (((IAsyncDisposable)stream).ConfigureAwait(false))
         {
             await SendOutboundAsync(cancellationToken).ConfigureAwait(false);
-            if (_onSent is not null)
-            {
-                await _onSent().ConfigureAwait(false);
-            }
 
             await foreach (var streamEvent in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
@@ -144,6 +149,7 @@ internal sealed class ManagedAgentsTurn
     /// Posts the outbound events. A parked session accepts only tool results, so those go
     /// first (which resumes it) and any user messages follow in a second call: the API
     /// validates a whole batch against the session's current state, so mixing them fails.
+    /// Each delivery is reported to its own callback as soon as it lands.
     /// </summary>
     private async Task SendOutboundAsync(CancellationToken cancellationToken)
     {
@@ -153,11 +159,19 @@ internal sealed class ManagedAgentsTurn
         if (results.Count > 0)
         {
             await _client.SendEventsAsync(_sessionId, results, cancellationToken).ConfigureAwait(false);
+            if (_onResultsSent is not null)
+            {
+                await _onResultsSent().ConfigureAwait(false);
+            }
         }
 
         if (followUps.Count > 0)
         {
             await SendFollowUpsAsync(followUps, cancellationToken).ConfigureAwait(false);
+            if (_onFollowUpsSent is not null)
+            {
+                await _onFollowUpsSent().ConfigureAwait(false);
+            }
         }
     }
 

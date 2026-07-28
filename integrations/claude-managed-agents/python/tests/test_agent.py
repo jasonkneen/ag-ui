@@ -12,7 +12,10 @@ from ag_ui_claude_managed_agents import (
     SessionRecord,
 )
 
+from ag_ui_claude_managed_agents.types import SessionStore
+
 from .fake_client import FakeAPIError, FakeClient
+from .fake_store import RecordingSessionStore
 
 IDLE_END_TURN = {
     "type": "session.status_idle",
@@ -44,7 +47,7 @@ def types(events: list[Any]) -> list[str]:
 
 
 def new_agent(
-    fake: FakeClient, store: InMemorySessionStore | None = None, **kwargs: Any
+    fake: FakeClient, store: SessionStore | None = None, **kwargs: Any
 ) -> ManagedAgentsAgent:
     return ManagedAgentsAgent(
         managed_agent_id="agent_1",
@@ -924,14 +927,15 @@ async def test_timeout_before_session_exists_does_not_interrupt():
 async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     """Regression: once the tool results resume the session, they are recorded
     as delivered even if the follow-up messages then fail, so the next run
-    never re-posts consumed results."""
+    never re-posts consumed results. Asserted against an out-of-process-shaped
+    store so only genuinely persisted state counts."""
     fake = FakeClient(
         streams=[[IDLE_END_TURN]],
         # Send 0 (the tool results) succeeds; send 1 (the follow-up) fails
         # with a non-retryable error.
         send_failures={1: FakeAPIError(500, "server exploded")},
     )
-    store = InMemorySessionStore()
+    store = RecordingSessionStore()
     store.set(
         "thread_1",
         SessionRecord(
@@ -959,6 +963,38 @@ async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     assert record.pending_client_tool_use_ids == []
     # The follow-up never landed, so the user message stays undelivered.
     assert record.last_user_message_id == "u1"
+
+
+async def test_records_the_follow_up_delivery_separately_from_the_results():
+    """Each delivery persists on its own, in send order."""
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = RecordingSessionStore()
+    store.set(
+        "thread_1",
+        SessionRecord(
+            session_id="sesn_1",
+            tool_names=[],
+            pending_client_tool_use_ids=["ctu_1"],
+            last_user_message_id="u1",
+        ),
+    )
+    store.writes.clear()
+
+    await collect(
+        new_agent(fake, store),
+        base_input(
+            messages=[
+                {"id": "u1", "role": "user", "content": "Hello"},
+                {"id": "t1", "role": "tool", "toolCallId": "ctu_1", "content": "done"},
+                {"id": "u2", "role": "user", "content": "and one more thing"},
+            ]
+        ),
+    )
+
+    assert [
+        (record.pending_client_tool_use_ids, record.last_user_message_id)
+        for _key, record in store.writes
+    ] == [([], "u1"), ([], "u2")]
 
 
 async def test_abandons_multiple_pending_calls_in_original_order():
