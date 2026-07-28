@@ -37,6 +37,7 @@ the session is never left parked on a call nothing will answer."""
 
 Emit = Callable[[BaseEvent], None]
 SentCallback = Callable[[], Awaitable[None] | None]
+ParkCallback = Callable[[str], Awaitable[None] | None]
 
 # Best-effort sends that must outlive a cancelled run (see
 # post_interrupted_result). Strong references only: asyncio keeps weak ones.
@@ -74,6 +75,7 @@ async def run_turn(
     emit: Emit,
     on_results_sent: SentCallback | None = None,
     on_follow_ups_sent: SentCallback | None = None,
+    on_client_park: ParkCallback | None = None,
     on_error: ErrorHandler | None = None,
 ) -> TurnOutcome:
     """Open the event stream, post the outbound events, and translate the
@@ -87,6 +89,11 @@ async def run_turn(
     `on_follow_ups_sent` once the follow-up messages are, so callers persist
     each delivery independently: the results resume the session even if the
     follow-ups later fail.
+
+    `on_client_park` fires as soon as a frontend tool call is handed to the UI
+    unanswered. The turn can still fail (or be torn down) before the session
+    confirms the park, and the ID has to survive that: nothing else can tell
+    the next run which call the remote session is waiting on.
 
     Invariant: no TEXT_MESSAGE or REASONING block is left open when this returns
     or raises. Every exit path closes them.
@@ -125,6 +132,8 @@ async def run_turn(
             backend_tools=backend_tools,
             tool_confirmation=tool_confirmation,
             emit=emit,
+            on_client_park=on_client_park,
+            on_error=on_error,
         )
     finally:
         await _close_stream(stream)
@@ -139,6 +148,8 @@ async def _consume(
     backend_tools: Mapping[str, BackendTool],
     tool_confirmation: str | None,
     emit: Emit,
+    on_client_park: ParkCallback | None = None,
+    on_error: ErrorHandler | None = None,
 ) -> TurnOutcome:
     previews: dict[str, str] = {}
     closed_messages: set[str] = set()
@@ -375,6 +386,8 @@ async def _consume(
                     # The frontend executes this tool. Leave it unanswered; the
                     # session parks on it and the next run supplies the result.
                     client_parks.add(event_id)
+                    if on_client_park is not None:
+                        await maybe_await(on_client_park(event_id))
                     continue
                 backend = backend_tools.get(name)
                 if backend is not None:

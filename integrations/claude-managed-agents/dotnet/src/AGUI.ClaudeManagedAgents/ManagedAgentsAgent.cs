@@ -269,6 +269,19 @@ public sealed class ManagedAgentsAgent
 
                 return PersistDeliveredAsync(threadKey, record);
             },
+            // Persist a park the moment the call is handed to the UI. A later event can fail the
+            // turn before the session confirms the park, and the remote session would then wait
+            // on an id nothing remembers.
+            onClientPark: toolUseId =>
+            {
+                if (record.PendingClientToolUseIds.Contains(toolUseId))
+                {
+                    return Task.CompletedTask;
+                }
+
+                record.PendingClientToolUseIds = [.. record.PendingClientToolUseIds, toolUseId];
+                return PersistDeliveredAsync(threadKey, record);
+            },
             onError: _options.OnError);
         run.Turn = turn;
 
@@ -288,22 +301,34 @@ public sealed class ManagedAgentsAgent
     /// <summary>
     /// Records the turn's outcome once the turn has ended. Non-cancellable: what happened in
     /// the session has already happened, so the record must reflect it even if the client left.
+    /// An errored turn keeps whatever the park callback already persisted: the remote session is
+    /// still parked on those calls and the next run has to answer them.
     /// </summary>
     private async Task RecordOutcomeAsync(string threadKey, ManagedAgentsSessionRecord record, ManagedAgentsTurnOutcome outcome)
     {
-        if (outcome.Status == ManagedAgentsTurnStatus.Errored && outcome.SessionEnded)
+        if (outcome.Status == ManagedAgentsTurnStatus.Errored)
         {
-            await _store.DeleteAsync(threadKey, CancellationToken.None).ConfigureAwait(false);
+            if (outcome.SessionEnded)
+            {
+                await _store.DeleteAsync(threadKey, CancellationToken.None).ConfigureAwait(false);
+            }
+
             return;
         }
 
-        if (outcome.Status != ManagedAgentsTurnStatus.Parked)
+        if (outcome.Status == ManagedAgentsTurnStatus.Parked)
         {
+            record.PendingClientToolUseIds = [.. outcome.ClientToolUseIds];
+            await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
             return;
         }
 
-        record.PendingClientToolUseIds = outcome.ClientToolUseIds;
-        await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
+        // The session went idle on end_turn: nothing is awaited any more.
+        if (record.PendingClientToolUseIds.Count > 0)
+        {
+            record.PendingClientToolUseIds = [];
+            await PersistDeliveredAsync(threadKey, record).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

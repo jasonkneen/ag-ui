@@ -13,7 +13,7 @@ public class ManagedAgentsTurnTest
     {
         internal List<BaseEvent> Emitted { get; } = [];
 
-        internal ManagedAgentsTurnOutcome Outcome { get; set; } = new();
+        internal ManagedAgentsTurnOutcome Outcome { get; set; } = ManagedAgentsTurnOutcome.Errored;
 
         internal FakeManagedAgentsClient Fake { get; set; } = null!;
     }
@@ -53,6 +53,18 @@ public class ManagedAgentsTurnTest
         Assert.True(
             JsonElement.DeepEquals(expectedElement, actual),
             $"Expected {expectedElement.GetRawText()}\nActual   {actual.GetRawText()}");
+    }
+
+    [Fact]
+    public void AParkedOutcomeWithNoToolCallsIsUnrepresentable()
+    {
+        // A park with nothing to answer would leave the session waiting on a call the next run
+        // cannot identify, so the outcome type refuses to model it at all.
+        Assert.Throws<ArgumentException>(() => ManagedAgentsTurnOutcome.Parked([]));
+        Assert.Empty(ManagedAgentsTurnOutcome.Finished.ClientToolUseIds);
+        Assert.Empty(ManagedAgentsTurnOutcome.Errored.ClientToolUseIds);
+        Assert.False(ManagedAgentsTurnOutcome.Errored.SessionEnded);
+        Assert.True(ManagedAgentsTurnOutcome.ErroredSessionEnded.SessionEnded);
     }
 
     [Fact]

@@ -181,6 +181,14 @@ export class ManagedAgentsAgent extends AbstractAgent {
           if (outbound.lastUserMessageId) record.lastUserMessageId = outbound.lastUserMessageId;
           await this.store.set(threadId, record);
         },
+        // Persist a park the moment the call is handed to the UI. A later
+        // event can fail the turn before the session confirms the park, and
+        // the remote session would then wait on an ID nothing remembers.
+        onClientPark: async (toolUseId) => {
+          if (record.pendingClientToolUseIds.includes(toolUseId)) return;
+          record.pendingClientToolUseIds = [...record.pendingClientToolUseIds, toolUseId];
+          await this.store.set(threadId, record);
+        },
         clientTools: new Map((input.tools ?? []).map((tool) => [normalizeToolName(tool.name), tool.name])),
         backendTools: this.backendTools,
         toolConfirmation: this.config.toolConfirmation,
@@ -218,14 +226,26 @@ export class ManagedAgentsAgent extends AbstractAgent {
     return `${this.config.managedAgentId}:${threadId}`;
   }
 
+  /**
+   * Reconcile the record with how the turn ended. An errored turn keeps
+   * whatever `onClientPark` already persisted: the remote session is still
+   * parked on those calls and the next run has to answer them.
+   */
   private async recordOutcome(threadId: string, record: SessionRecord, outcome: TurnOutcome): Promise<void> {
-    if (outcome.status === "errored" && outcome.sessionEnded) {
-      await this.store.delete(threadId);
+    if (outcome.status === "errored") {
+      if (outcome.sessionEnded) await this.store.delete(threadId);
       return;
     }
-    if (outcome.status !== "parked") return;
-    record.pendingClientToolUseIds = outcome.clientToolUseIds;
-    await this.store.set(threadId, record);
+    if (outcome.status === "parked") {
+      record.pendingClientToolUseIds = outcome.clientToolUseIds;
+      await this.store.set(threadId, record);
+      return;
+    }
+    // The session went idle on end_turn: nothing is awaited any more.
+    if (record.pendingClientToolUseIds.length > 0) {
+      record.pendingClientToolUseIds = [];
+      await this.store.set(threadId, record);
+    }
   }
 
   /**

@@ -29,6 +29,7 @@ internal sealed class ManagedAgentsTurn
     private readonly bool _streamDeltas;
     private readonly Func<Task>? _onResultsSent;
     private readonly Func<Task>? _onFollowUpsSent;
+    private readonly Func<string, Task>? _onClientPark;
     private readonly Action<Exception, ManagedAgentsErrorContext>? _onError;
 
     private readonly Queue<BaseEvent> _pending = new();
@@ -58,6 +59,12 @@ internal sealed class ManagedAgentsTurn
     /// next run would be rejected as stale.
     /// </param>
     /// <param name="onFollowUpsSent">Called once the follow-up messages have been posted into the session.</param>
+    /// <param name="onClientPark">
+    /// Called as soon as a frontend tool call is handed to the UI unanswered, so the caller can
+    /// record that the remote session is about to park on it. The turn can still fail (or be torn
+    /// down) before the session confirms the park, and the ID has to survive that: nothing else
+    /// can tell the next run which call the remote session is waiting on.
+    /// </param>
     /// <param name="onError">Notified when a best-effort operation fails. Never throws into the turn.</param>
     internal ManagedAgentsTurn(
         IManagedAgentsClient client,
@@ -69,6 +76,7 @@ internal sealed class ManagedAgentsTurn
         bool streamDeltas,
         Func<Task>? onResultsSent = null,
         Func<Task>? onFollowUpsSent = null,
+        Func<string, Task>? onClientPark = null,
         Action<Exception, ManagedAgentsErrorContext>? onError = null)
     {
         _client = client;
@@ -80,6 +88,7 @@ internal sealed class ManagedAgentsTurn
         _streamDeltas = streamDeltas;
         _onResultsSent = onResultsSent;
         _onFollowUpsSent = onFollowUpsSent;
+        _onClientPark = onClientPark;
         _onError = onError;
     }
 
@@ -102,7 +111,7 @@ internal sealed class ManagedAgentsTurn
     /// The outcome of the turn. Valid once <see cref="RunAsync"/> completes; a turn that
     /// throws leaves the default errored outcome.
     /// </summary>
-    internal ManagedAgentsTurnOutcome Outcome { get; } = new();
+    internal ManagedAgentsTurnOutcome Outcome { get; private set; } = ManagedAgentsTurnOutcome.Errored;
 
     /// <summary>
     /// Runs the turn, yielding the translated AG-UI events.
@@ -352,7 +361,7 @@ internal sealed class ManagedAgentsTurn
                 Message = "The managed session ended on the server. Send another message to start a fresh one.",
                 Code = "session_ended",
             });
-            Finish(ManagedAgentsTurnStatus.Errored, sessionEnded: true);
+            Finish(ManagedAgentsTurnOutcome.ErroredSessionEnded);
             return;
         }
 
@@ -448,6 +457,11 @@ internal sealed class ManagedAgentsTurn
             // The frontend executes this tool. Leave it unanswered; the session will park on
             // it and the next run supplies the result.
             _clientParks.Add(toolUseId);
+            if (_onClientPark is not null)
+            {
+                await _onClientPark(toolUseId).ConfigureAwait(false);
+            }
+
             return;
         }
 
@@ -556,7 +570,7 @@ internal sealed class ManagedAgentsTurn
         if (stopReason.TryPickBetaManagedAgentsSessionEndTurn(out _))
         {
             CloseAll();
-            Finish(ManagedAgentsTurnStatus.Finished);
+            Finish(ManagedAgentsTurnOutcome.Finished);
             return;
         }
 
@@ -623,8 +637,7 @@ internal sealed class ManagedAgentsTurn
         {
             // Hand control back to the frontend to execute its tools.
             CloseAll();
-            Outcome.ClientToolUseIds = clientToolUseIds;
-            Finish(ManagedAgentsTurnStatus.Parked);
+            Finish(ManagedAgentsTurnOutcome.Parked(clientToolUseIds));
         }
     }
 
@@ -665,13 +678,12 @@ internal sealed class ManagedAgentsTurn
     {
         CloseAll();
         Emit(new RunErrorEvent { Message = message, Code = code });
-        Finish(ManagedAgentsTurnStatus.Errored);
+        Finish(ManagedAgentsTurnOutcome.Errored);
     }
 
-    private void Finish(ManagedAgentsTurnStatus status, bool sessionEnded = false)
+    private void Finish(ManagedAgentsTurnOutcome outcome)
     {
-        Outcome.Status = status;
-        Outcome.SessionEnded = sessionEnded;
+        Outcome = outcome;
         _done = true;
     }
 

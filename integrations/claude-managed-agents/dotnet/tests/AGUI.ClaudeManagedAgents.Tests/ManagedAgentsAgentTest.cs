@@ -438,6 +438,67 @@ public class ManagedAgentsAgentTest
         Assert.Equal(AGUIEventTypes.RunFinished, events[^1].Type);
     }
 
+    private const string ParkingCall =
+        """{"type":"agent.custom_tool_use","id":"ctu_1","name":"show_chart","input":{}}""";
+
+    private static AGUITool ShowChartTool() => Tool("show_chart", "Render a chart", """{"type":"object"}""");
+
+    [Fact]
+    public async Task KeepsAParkedToolIdWhenALaterSessionEventFailsTheTurn()
+    {
+        // Regression: the session has already parked on ctu_1 by the time the error arrives.
+        // Without the id the next run cannot answer that call, so the remote session stays
+        // parked forever.
+        var fake = new FakeManagedAgentsClient([
+            ParkingCall,
+            """{"type":"session.error","id":"err_1","error":{"type":"overloaded_error","message":"upstream is busy","retry_status":{"type":"exhausted"}}}""",
+        ]);
+        var store = new RecordingSessionStore();
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Tools = [ShowChartTool()]));
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("overloaded_error", error.Code);
+        var record = await store.GetAsync("thread_1", default);
+        Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
+    }
+
+    [Fact]
+    public async Task KeepsAParkedToolIdWhenTheStreamThrowsAfterThePark()
+    {
+        var fake = new FakeManagedAgentsClient([ParkingCall])
+        {
+            StreamFailure = new InvalidOperationException("connection reset"),
+        };
+        var store = new RecordingSessionStore();
+
+        var events = await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Tools = [ShowChartTool()]));
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("run_failed", error.Code);
+        var record = await store.GetAsync("thread_1", default);
+        Assert.Equal(["ctu_1"], record!.PendingClientToolUseIds);
+    }
+
+    [Fact]
+    public async Task ClearsAStaleParkedIdWhenTheSessionGoesIdleOnEndTurn()
+    {
+        // Defensive: end_turn means nothing is awaited, so no pending id may survive into the
+        // next run and be answered against a resumed session.
+        var fake = new FakeManagedAgentsClient([IdleEndTurn]);
+        var store = new RecordingSessionStore();
+        await store.SetAsync("thread_1", Record(["ctu_stale"]), default);
+
+        await CollectAsync(NewAgent(fake, store), BaseInput(input => input.Messages =
+        [
+            new AGUIUserMessage { Id = "u1", Content = "Hello" },
+            new AGUIUserMessage { Id = "u2", Content = "never mind" },
+        ]));
+
+        var record = await store.GetAsync("thread_1", default);
+        Assert.Empty(record!.PendingClientToolUseIds);
+    }
+
     [Fact]
     public async Task ClearsPendingToolIdsEvenWhenTheFollowUpSendThenFails()
     {

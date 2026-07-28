@@ -34,6 +34,14 @@ export interface TurnOptions {
   onResultsSent?: () => void | Promise<void>;
   /** Called once the follow-up messages have been posted into the session. */
   onFollowUpsSent?: () => void | Promise<void>;
+  /**
+   * Called as soon as a frontend tool call is handed to the UI unanswered, so
+   * the caller can record that the remote session is about to park on it. The
+   * turn can still fail (or be torn down) before the session confirms the park,
+   * and the ID has to survive that: nothing else can tell the next run which
+   * call the remote session is waiting on.
+   */
+  onClientPark?: (toolUseId: string) => void | Promise<void>;
   emit: (event: BaseEvent) => void;
   signal: AbortSignal;
 }
@@ -297,6 +305,7 @@ export async function runTurn(opts: TurnOptions): Promise<TurnOutcome> {
             // The frontend executes this tool. Leave it unanswered; the session
             // will park on it and the next run supplies the result.
             clientParks.add(event.id);
+            await opts.onClientPark?.(event.id);
             break;
           }
           const backend = opts.backendTools.get(event.name);

@@ -33,6 +33,9 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     /// <summary>When set, streams wait for this to complete before yielding their events.</summary>
     public TaskCompletionSource? Gate { get; set; }
 
+    /// <summary>When set, a stream throws this after yielding its scripted events.</summary>
+    public Exception? StreamFailure { get; set; }
+
     /// <summary>
     /// Optional hook consulted on every send: return an exception to make that send fail,
     /// or <see langword="null"/> to record it as sent.
@@ -99,7 +102,7 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     {
         StreamRequests.Add((sessionId, streamDeltas));
         var events = _streams.TryDequeue(out var scripted) ? scripted : [];
-        return Task.FromResult(new ManagedAgentsEventStream(Enumerate(events, Gate, cancellationToken)));
+        return Task.FromResult(new ManagedAgentsEventStream(Enumerate(events, Gate, StreamFailure, cancellationToken)));
     }
 
     /// <summary>Parses a JSON literal into a detached element.</summary>
@@ -112,6 +115,7 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
     private static async IAsyncEnumerable<BetaManagedAgentsStreamSessionEvents> Enumerate(
         IReadOnlyList<string> events,
         TaskCompletionSource? gate,
+        Exception? failure,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (gate is not null)
@@ -125,6 +129,11 @@ public sealed class FakeManagedAgentsClient : IManagedAgentsClient
             await Task.Yield();
             yield return JsonSerializer.Deserialize<BetaManagedAgentsStreamSessionEvents>(json)
                 ?? throw new InvalidOperationException($"Could not parse event: {json}");
+        }
+
+        if (failure is not null)
+        {
+            throw failure;
         }
     }
 }

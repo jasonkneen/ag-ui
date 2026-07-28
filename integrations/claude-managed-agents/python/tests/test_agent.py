@@ -924,6 +924,92 @@ async def test_timeout_before_session_exists_does_not_interrupt():
     gate.set()
 
 
+SHOW_CHART_TOOL = {
+    "name": "show_chart",
+    "description": "Render a chart",
+    "parameters": {"type": "object"},
+}
+
+PARKING_CALL = {
+    "type": "agent.custom_tool_use",
+    "id": "ctu_1",
+    "name": "show_chart",
+    "input": {},
+}
+
+
+async def test_keeps_a_parked_tool_id_when_a_later_event_fails_the_turn():
+    """Regression: the session has already parked on ctu_1 by the time the
+    error arrives. Without the id the next run cannot answer that call, so the
+    remote session stays parked forever."""
+    fake = FakeClient(
+        streams=[
+            [
+                PARKING_CALL,
+                {
+                    "type": "session.error",
+                    "id": "err_1",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "upstream is busy",
+                        "retry_status": {"type": "exhausted"},
+                    },
+                },
+            ]
+        ]
+    )
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store), base_input(tools=[SHOW_CHART_TOOL])
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "overloaded_error"
+    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_1"]
+
+
+async def test_keeps_a_parked_tool_id_when_the_stream_raises_after_the_park():
+    fake = FakeClient(streams=[[PARKING_CALL, RuntimeError("connection reset")]])
+    store = RecordingSessionStore()
+
+    events = await collect(
+        new_agent(fake, store), base_input(tools=[SHOW_CHART_TOOL])
+    )
+
+    assert isinstance(events[-1], RunErrorEvent)
+    assert events[-1].code == "run_failed"
+    assert store.get("thread_1").pending_client_tool_use_ids == ["ctu_1"]
+
+
+async def test_clears_a_stale_parked_id_when_the_session_goes_idle_on_end_turn():
+    """Defensive: end_turn means nothing is awaited, so no pending id may
+    survive into the next run and be answered against a resumed session."""
+    fake = FakeClient(streams=[[IDLE_END_TURN]])
+    store = RecordingSessionStore()
+    store.set(
+        "thread_1",
+        SessionRecord(
+            session_id="sesn_1",
+            tool_names=[],
+            pending_client_tool_use_ids=["ctu_stale"],
+            last_user_message_id="u1",
+        ),
+    )
+
+    await collect(
+        new_agent(fake, store),
+        base_input(
+            messages=[
+                {"id": "u1", "role": "user", "content": "Hello"},
+                {"id": "u2", "role": "user", "content": "never mind"},
+            ]
+        ),
+    )
+
+    assert store.get("thread_1").pending_client_tool_use_ids == []
+
+
 async def test_clears_pending_tool_ids_even_when_follow_ups_fail():
     """Regression: once the tool results resume the session, they are recorded
     as delivered even if the follow-up messages then fail, so the next run

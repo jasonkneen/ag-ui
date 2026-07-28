@@ -284,12 +284,25 @@ class ManagedAgentsAgent:
                 record.last_user_message_id = outbound.last_user_message_id
             await maybe_await(self.store.set(store_key, record))
 
+        async def on_client_park(tool_use_id: str) -> None:
+            # Persist a park the moment the call is handed to the UI. A later
+            # event can fail the turn before the session confirms the park, and
+            # the remote session would then wait on an ID nothing remembers.
+            if tool_use_id in record.pending_client_tool_use_ids:
+                return
+            record.pending_client_tool_use_ids = [
+                *record.pending_client_tool_use_ids,
+                tool_use_id,
+            ]
+            await maybe_await(self.store.set(store_key, record))
+
         outcome = await run_turn(
             client=self.client,
             session_id=record.session_id,
             outbound=outbound.events,
             on_results_sent=on_results_sent,
             on_follow_ups_sent=on_follow_ups_sent,
+            on_client_park=on_client_park,
             client_tools=self._client_tools(input.tools or []),
             backend_tools=self.backend_tools,
             tool_confirmation=self.tool_confirmation,
@@ -326,13 +339,24 @@ class ManagedAgentsAgent:
     async def _record_outcome(
         self, thread_id: str, record: SessionRecord, outcome: TurnOutcome
     ) -> None:
-        if outcome.status == "errored" and outcome.session_ended:
-            await maybe_await(self.store.delete(thread_id))
+        """Reconcile the record with how the turn ended.
+
+        An errored turn keeps whatever `on_client_park` already persisted: the
+        remote session is still parked on those calls and the next run has to
+        answer them.
+        """
+        if outcome.status == "errored":
+            if outcome.session_ended:
+                await maybe_await(self.store.delete(thread_id))
             return
-        if outcome.status != "parked":
+        if outcome.status == "parked":
+            record.pending_client_tool_use_ids = list(outcome.client_tool_use_ids)
+            await maybe_await(self.store.set(thread_id, record))
             return
-        record.pending_client_tool_use_ids = list(outcome.client_tool_use_ids)
-        await maybe_await(self.store.set(thread_id, record))
+        # The session went idle on end_turn: nothing is awaited any more.
+        if record.pending_client_tool_use_ids:
+            record.pending_client_tool_use_ids = []
+            await maybe_await(self.store.set(thread_id, record))
 
     def _outbound_events(
         self, record: SessionRecord, messages: Sequence[Any]

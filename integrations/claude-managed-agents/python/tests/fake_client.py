@@ -47,7 +47,8 @@ def parked_race_error() -> anthropic.BadRequestError:
 
 class FakeStream:
     """An async-iterable of scripted events. An `asyncio.Event` entry blocks
-    the stream until it is set (used to keep a run in flight)."""
+    the stream until it is set (used to keep a run in flight); a `BaseException`
+    entry is raised at that point (a mid-stream failure)."""
 
     def __init__(self, events: list[Any]) -> None:
         self._events = list(events)
@@ -63,6 +64,8 @@ class FakeStream:
             if isinstance(event, asyncio.Event):
                 await event.wait()
                 continue
+            if isinstance(event, BaseException):
+                raise event
             yield event
 
     async def close(self) -> None:

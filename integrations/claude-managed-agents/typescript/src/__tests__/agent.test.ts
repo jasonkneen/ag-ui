@@ -397,6 +397,65 @@ describe("ManagedAgentsAgent", () => {
     expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [], lastUserMessageId: "u2" });
   });
 
+  it("keeps a parked tool id when a later session event fails the turn", async () => {
+    // Regression: the session has already parked on ctu_1 by the time the
+    // error arrives. Without the id the next run cannot answer that call, so
+    // the remote session stays parked forever.
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          { type: "session.error", id: "err_1", error: { type: "overloaded_error", message: "upstream is busy", retry_status: { type: "exhausted" } } },
+        ],
+      ],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "overloaded_error" });
+    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+  });
+
+  it("keeps a parked tool id when the stream throws after the park", async () => {
+    const fake = createFakeClient({
+      streams: [
+        [
+          { type: "agent.custom_tool_use", id: "ctu_1", name: "show_chart", input: {} },
+          new Error("connection reset"),
+        ],
+      ],
+    });
+    const store = new RecordingSessionStore();
+    const tools = [{ name: "show_chart", description: "Render a chart", parameters: { type: "object" } }];
+
+    const events = await collect(newAgent(fake, store), baseInput({ tools }));
+
+    expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, code: "run_failed" });
+    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: ["ctu_1"] });
+  });
+
+  it("clears a stale parked id when the session goes idle on end_turn", async () => {
+    // Defensive: end_turn means nothing is awaited, so no pending id may
+    // survive into the next run and be answered against a resumed session.
+    const fake = createFakeClient({ streams: [[idleEndTurn]] });
+    const store = new RecordingSessionStore();
+    await store.set("thread_1", { sessionId: "sesn_1", toolNames: [], pendingClientToolUseIds: ["ctu_stale"], lastUserMessageId: "u1" });
+
+    await collect(
+      newAgent(fake, store),
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "Hello" },
+          { id: "u2", role: "user", content: "never mind" },
+        ],
+      }),
+    );
+
+    expect(await store.get("thread_1")).toMatchObject({ pendingClientToolUseIds: [] });
+  });
+
   it("clears pending tool ids even when the follow-up send then fails", async () => {
     // Regression: once the tool results resume the session they are recorded
     // as delivered, even if the follow-up messages then fail. Re-posting a
