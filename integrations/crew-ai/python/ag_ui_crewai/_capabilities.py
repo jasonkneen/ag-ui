@@ -25,7 +25,34 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ag_ui.core import EventType
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def _safe_getattr(obj: Any, name: str) -> Any:
+    """``getattr`` that cannot propagate a caller's property exception.
+
+    Capability probing walks arbitrary user objects, where a raising property must
+    read as "absent" rather than failing the query.
+    """
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - a raising property is "not present"
+        return None
+
+
+def _safe_hasattr(obj: Any, name: str) -> bool:
+    """``hasattr`` that cannot propagate a caller's property exception.
+
+    Presence, not truthiness: ``GeminiCompletion`` declares
+    ``thinking_config: Any = None``, so an "is not None" check would report the
+    native provider as absent.
+    """
+    try:
+        return hasattr(obj, name)
+    except Exception:  # noqa: BLE001 - a raising property is "not usable"
+        return False
 
 
 def _crewai_version() -> str:
@@ -391,7 +418,10 @@ class _Capabilities:
     missing: tuple[str, ...] = field(default_factory=tuple)
 
     def warn_on_gaps(self) -> None:
-        """Emit one WARNING per missing capability, naming the fix.
+        """Emit one message per missing capability, naming the fix.
+
+        WARNING for a real gap; INFO for the StreamFrame transport, whose absence
+        only downgrades the bridge to the legacy path (see the last branch).
 
         Kept idempotent-friendly (call once at import). Each message names the
         crewai version / extra that unlocks the missing capability so operators
@@ -466,3 +496,299 @@ def _detect() -> _Capabilities:
 
 # Run the probe ONCE at import time and cache the result.
 CAPABILITIES = _detect()
+
+
+# --------------------------------------------------------------------------
+# Reasoning / thinking-chunk resolution
+# --------------------------------------------------------------------------
+# crewai emits ``LLMThinkingChunkEvent`` for thinking models. The class living
+# at ``<events>.types.llm_events`` is NOT evidence that a given run will produce
+# reasoning: verified against the crewai 1.15.7 wheel, the ONLY call site of
+# ``BaseLLM._emit_thinking_chunk_event`` is
+# ``crewai/llms/providers/gemini/completion.py`` - the native Google Gen AI
+# provider. Anthropic's native provider carries a ``thinking`` config and
+# extracts thinking blocks, but never emits the event; every LiteLLM-routed model
+# (including ``vertex_ai/gemini-*``, which falls back to LiteLLM) emits nothing.
+#
+# So ``get_capabilities`` requires BOTH the class AND a resolved native-Gemini
+# LLM before it advertises reasoning. Advertising off the bare class probe would
+# claim reasoning support for every OpenAI / Anthropic / Ollama run.
+_LLM_EVENTS_MODULE, _ = _first_module(
+    ["crewai.events.types.llm_events", "crewai.utilities.events.llm_events"]
+)
+LLMThinkingChunkEvent = (
+    getattr(_LLM_EVENTS_MODULE, "LLMThinkingChunkEvent", None)
+    if _LLM_EVENTS_MODULE is not None
+    else None
+)
+_thinking_event_available = LLMThinkingChunkEvent is not None
+
+# crewai's canonical name for the native Google Gen AI provider. ``LLM.__new__``
+# maps both the ``gemini/`` and ``google/`` model prefixes onto it and stamps it
+# on the constructed instance as ``.provider``.
+# crewai stamps EITHER name on a native Google Gen AI completion: ``gemini/...``
+# resolves to "gemini" and ``google/...`` keeps "google" (verified on 1.15.7 - a
+# ``provider="google"`` LLM is a real GeminiCompletion), so both must count.
+_NATIVE_GEMINI_PROVIDERS = frozenset({"gemini", "google"})
+
+
+# Depth cap for ``_resolve_llm``: an object graph with a cycle (an Agent whose
+# ``.llm`` points back at itself, or a wrapper pair that references each other)
+# would otherwise recurse until RecursionError inside a capability QUERY.
+
+_LLM_RESOLVE_MAX_DEPTH = 8
+
+
+def _resolve_llm(
+    candidate: Any, _depth: int = 0, _path: frozenset[int] = frozenset()
+) -> Any:
+    """Best-effort unwrap of an object into the crewai LLM instance it holds.
+
+    Accepts an LLM directly, or anything carrying one on a conventional attribute:
+    an Agent's ``.llm``, a Crew's ``.agents[*].llm`` / ``.chat_llm`` /
+    ``.manager_llm``, a Flow / ``ChatWithCrewFlow`` holding either. Returns ``None``
+    when no LLM can be found - the caller reports "not resolvable" rather than
+    guessing. Read-only: a callable (a ``@CrewBase`` ``crew`` factory) is never
+    invoked, and a property that raises is treated as absent.
+
+    A native-Gemini LLM WINS over any other candidate, because reasoning support is
+    the one capability that turns on it. The search is otherwise first-match.
+
+    Cycle safety tracks the ancestor PATH, not a shared visited set: a shared set is
+    never unwound, so a node reached down a dead-end branch would stay poisoned for
+    every other branch.
+    """
+    if candidate is None or _depth > _LLM_RESOLVE_MAX_DEPTH:
+        return None
+    marker = id(candidate)
+    if marker in _path:
+        return None
+    _path = _path | {marker}
+
+    if callable(candidate) and not _safe_hasattr(candidate, "provider"):
+        # A ``@CrewBase``'s ``crew`` is a factory method; calling it would execute
+        # user code inside a capability query.
+        return None
+    # A crewai 1.x LLM declares ``provider`` (native classes and the LiteLLM
+    # fallback alike), so that is the strongest "this IS the LLM" signal. Older 0.x
+    # LLMs may not, which is why the ``model`` fallback below still exists.
+    if _safe_hasattr(candidate, "provider"):
+        return candidate
+
+    # Otherwise unwrap before falling back to the weaker ``model`` signal: an
+    # Agent / Crew / Flow can itself carry a ``model`` attribute, and returning the
+    # wrapper would report "not native Gemini" for an LLM we never looked at.
+    fallback = None
+    agents = _safe_getattr(candidate, "agents")
+    candidates: list[Any] = []
+    if isinstance(agents, (list, tuple)):
+        # ``agents`` first: a Crew keeps its LLMs there, and ``chat_llm`` /
+        # ``manager_llm`` are None on a plain Crew.
+        candidates.extend(agents)
+    for attr in ("llm", "chat_llm", "manager_llm", "crew"):
+        nested = _safe_getattr(candidate, attr)
+        if nested is not None and nested is not candidate:
+            candidates.append(nested)
+    for nested in candidates:
+        resolved = _resolve_llm(nested, _depth + 1, _path)
+        if resolved is None:
+            continue
+        if _is_native_gemini(resolved):
+            # Search EVERY branch for a native-Gemini LLM before settling: an
+            # earlier revision returned the first agent's LLM without ever looking
+            # at chat_llm / manager_llm.
+            return resolved
+        if fallback is None:
+            fallback = resolved
+    if fallback is not None:
+        return fallback
+
+    if _safe_hasattr(candidate, "model") and not any(
+        _safe_hasattr(candidate, attr)
+        for attr in ("agents", "llm", "chat_llm", "manager_llm", "crew")
+    ):
+        # ``model`` alone is the crewai 0.x LLM signal, but an Agent / Crew / Flow can
+        # carry one too; returning such a wrapper would report
+        # ``provider_not_native_gemini`` for something that is not an LLM.
+        return candidate
+    return None
+
+
+def _is_native_gemini(llm: Any) -> bool:
+    """Whether ``llm`` is crewai's NATIVE Google Gen AI completion instance.
+
+    Two structural probes, no version gate and no module-name string match:
+
+    * ``provider == "gemini"`` - stamped by ``LLM.__new__`` only when it routes
+      to a native provider class.
+    * ``hasattr(llm, "thinking_config")`` - a field declared ONLY on
+      ``crewai.llms.providers.gemini.completion.GeminiCompletion`` (verified by
+      grep across ``crewai/llms/providers/`` on the 1.15.7 wheel). The LiteLLM
+      fallback ``LLM`` and every other native provider lack it.
+
+    Both are needed: a LiteLLM-routed ``gemini/<unlisted-model>`` can still carry
+    a gemini-ish provider string but has no thinking plumbing, and a future
+    provider could grow a ``thinking_config`` without being Gemini.
+    """
+    if llm is None:
+        return False
+    provider = _safe_getattr(llm, "provider")
+    if (
+        not isinstance(provider, str)
+        or provider.strip().casefold() not in _NATIVE_GEMINI_PROVIDERS
+    ):
+        return False
+    return _safe_hasattr(llm, "thinking_config")
+
+
+def _reasoning_capability(llm: Any, *, raw_enabled: bool = False) -> dict:
+    """Build the ``reasoning`` block of the capability declaration.
+
+    ``supported`` is True only when the thinking-chunk event class resolves, the
+    RAW transport exists (StreamFrame, crewai >= 1.6, the only channel carrying
+    reasoning today), and the passed object resolves to a native-Gemini LLM.
+
+    Caveat: on the crew-serving path ``crews.py`` calls ``litellm.acompletion``
+    directly, so crewai's native Gemini provider never runs and reasoning does not
+    surface there even when this reports it supported. When no LLM is passed we
+    report ``supported: False`` with ``reason: "llm_not_provided"`` - the honest
+    answer, since reasoning availability is a per-LLM fact and cannot be derived
+    from the installed crewai alone.
+    """
+    resolved = _resolve_llm(llm)
+    native_gemini = _is_native_gemini(resolved)
+    # Reasoning only reaches the wire through RAW passthrough, which needs the
+    # StreamFrame transport's scoped sink. Claiming support on crewai 1.0-1.5 would
+    # contradict ``rawEvents.supported: False`` in the same declaration.
+    if not _thinking_event_available:
+        reason = "thinking_event_missing"
+    elif not CAPABILITIES.stream_frame_available:
+        reason = "raw_transport_unavailable"
+    elif resolved is None:
+        # Distinguish the two: a caller who passed something deserves to know the
+        # probe could not find an LLM inside it, not that they passed nothing.
+        reason = "llm_not_provided" if llm is None else "llm_not_resolvable"
+    elif not native_gemini:
+        reason = "provider_not_native_gemini"
+    else:
+        reason = None
+    return {
+        "supported": reason is None,
+        "thinkingEventAvailable": _thinking_event_available,
+        "nativeGeminiProvider": native_gemini,
+        # A caller object: a raising property here would escape the whole query.
+        "resolvedProvider": _safe_getattr(resolved, "provider"),
+        # Reasoning reaches the wire through RAW passthrough today (there is no
+        # dedicated CrewAI -> REASONING_* mapping yet), so a caller that wants it
+        # must ALSO enable ``emit_raw_events`` - hence the explicit flag below
+        # rather than a bare "supported: true" that would over-promise.
+        "transport": "raw" if reason is None else None,
+        # Always required for reasoning to reach the wire; ``rawEventsEnabled`` says
+        # whether this configuration actually has it on.
+        "requiresEmitRawEvents": True,
+        "rawEventsEnabled": bool(
+            raw_enabled and CAPABILITIES.stream_frame_available
+        ),
+        "reason": reason,
+    }
+
+
+def get_capabilities(
+    *,
+    llm: Any = None,
+    emit_raw_events: bool | None = None,
+) -> dict:
+    """Return the CrewAI bridge's capability declaration.
+
+    Mirrors the shape of ``ag_ui_langgraph.LangGraphAgent.get_capabilities``
+    (``identity`` / ``humanInTheLoop`` / ``state`` / ``transport``) and adds the
+    CrewAI-specific blocks the parity lane needs: the resolved wire shape, RAW
+    passthrough, and reasoning.
+
+    No field is derived from ``crewai.__version__`` - the version string appears
+    only as informational ``crewaiVersion`` metadata (same rule as the rest of this
+    module). Within that, ``transport`` / ``rawEvents`` / ``reasoning`` / ``crewChat``
+    come from runtime probes, while ``humanInTheLoop`` and ``state`` are static
+    declarations of what the bridge implements today.
+
+    ``emission_shape`` / ``emit_raw_events`` default to re-reading the environment,
+    so a declaration fetched without arguments can disagree with an endpoint that
+    was registered with explicit ones. Pass the same values the endpoint was
+    registered with to describe THAT endpoint.
+
+    Raises
+    ------
+    ValueError
+        If ``emission_shape`` names an unknown shape, or ``emit_raw_events`` is not
+        a bool. Both are caller mistakes rather than environment conditions.
+
+    Parameters
+    ----------
+    llm:
+        The LLM, or an object carrying one: an Agent (``.llm``), a Crew
+        (``.agents[*].llm``, or ``chat_llm`` / ``manager_llm`` when set), or a Flow
+        holding either. Resolution is read-only and never calls a factory. Required for a meaningful ``reasoning`` answer: reasoning is
+        native-Gemini-only in crewai, so without an LLM to resolve we report
+        ``supported: False`` with ``reason: "llm_not_provided"`` rather than
+        advertising support off the bare event-class probe.
+    emission_shape / emit_raw_events:
+        The values the endpoint was configured with. Defaults (``None``) resolve
+        the same way the endpoint factories resolve them, so a caller that
+        configured nothing sees what the endpoint will actually emit.
+    """
+    # ``_config`` is a leaf (``_env`` + stdlib only), imported locally purely to
+    # keep this module's "crewai / litellm / stdlib only" property for every path
+    # that never calls ``get_capabilities``.
+    from ._config import DEFAULT_EMIT_RAW_EVENTS, resolve_emit_raw_events
+
+    resolved_raw = resolve_emit_raw_events(emit_raw_events)
+    return {
+        "identity": {"type": "crewai", "crewaiVersion": CAPABILITIES.crewai_version},
+        "humanInTheLoop": {
+            # True because the shipped ``human_in_the_loop`` example round-trips a
+            # frontend tool call. What is missing is the interrupt mechanism
+            # (crewai's ``@human_feedback`` / flow-level pause), below.
+            "supported": True,
+            "mechanism": "frontend-tool-calls",
+            "interrupts": False,
+            "approveWithEdits": False,
+        },
+        "state": {
+            # STATE_SNAPSHOT on every method finish plus progressive snapshots via
+            # ``copilotkit_emit_state``; no JSON-Patch deltas, and no server-side
+            # persistence across runs.
+            "snapshots": True,
+            "deltas": False,
+            "persistentState": False,
+        },
+        "transport": {
+            "streaming": True,
+            # crewai >= 1.6 ordered StreamFrame envelopes, else the legacy
+            # event-bus-listener fallback.
+            "streamFrames": CAPABILITIES.stream_frame_available,
+        },
+        "wireShape": {
+            # This build streams LLM text / tool calls as CHUNK events. MCP tool
+            # executions are the exception: their name, args and result arrive
+            # together, so they already emit canonical TOOL_CALL_* triples.
+            "emissionShape": "chunks",
+            "textMessages": [EventType.TEXT_MESSAGE_CHUNK.value],
+            "toolCalls": [EventType.TOOL_CALL_CHUNK.value],
+            "mcpToolCalls": [
+                EventType.TOOL_CALL_START.value,
+                EventType.TOOL_CALL_ARGS.value,
+                EventType.TOOL_CALL_END.value,
+                EventType.TOOL_CALL_RESULT.value,
+            ],
+        },
+        "rawEvents": {
+            # RAW needs the StreamFrame transport's scoped sink. This is the
+            # process-level probe; the driver also probes each flow for ``astream``,
+            # so a flow without it takes the legacy path and emits no RAW.
+            "supported": CAPABILITIES.stream_frame_available,
+            "enabled": bool(resolved_raw and CAPABILITIES.stream_frame_available),
+            "default": DEFAULT_EMIT_RAW_EVENTS,
+        },
+        "reasoning": _reasoning_capability(llm, raw_enabled=resolved_raw),
+        "crewChat": {"supported": CAPABILITIES.crew_chat_available},
+    }

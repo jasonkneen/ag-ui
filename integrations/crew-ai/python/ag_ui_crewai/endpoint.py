@@ -33,6 +33,8 @@ from ._capabilities import (
 )
 from ._checkpoint import build_checkpoint_kwargs
 from ._frames import StreamFrameTranslator
+from ._config import resolve_emit_raw_events as _resolve_emit_raw_events
+from ._frames import is_recognized_event, log_raw_loss, raw_event_for
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from crewai.flow.flow import Flow
 
@@ -190,6 +192,18 @@ _CANCEL_JOIN_TIMEOUT_SECONDS = 10.0
 # ceiling that short-circuits the loop when the budget is exhausted mid-pass.
 # Kept at module scope alongside the other tuning constants so operators
 # grepping for tunables find them all in one place.
+
+# Cap on both RAW buffers in ``_run_flow_frame_stream``. At the cap the oldest entry
+# is evicted (and logged) so the buffer self-heals: crewai raises some events that
+# never produce a frame, and refusing new entries would wedge it for the whole run.
+_FOREIGN_EVENT_BUFFER_MAX = 512
+
+# One-shot guard for the "emit_raw_events on the legacy transport" warning. A module
+# global, so the latch is per-process: a process serving several endpoints warns only
+# for the first one that asks. Deliberate trade against per-request log spam, since
+# the message names a transport limitation rather than a per-endpoint defect.
+_LEGACY_RAW_WARNING_EMITTED = False
+
 _DRAIN_MAX_PASSES = 10
 _DRAIN_BUDGET_SECONDS = 0.050
 
@@ -1141,6 +1155,7 @@ async def _run_flow_event_stream(
     inputs: dict,
     timeout: float | None,
     checkpoint_kwargs: dict | None = None,
+    emit_raw_events: bool = False,
 ):
     """Drive a single flow kickoff and yield encoded AG-UI events.
 
@@ -1156,6 +1171,19 @@ async def _run_flow_event_stream(
     * on exit, cancels the kickoff task, drops the queue, and resets the
       context var — unconditionally, even if the outer scope is cancelled.
     """
+    global _LEGACY_RAW_WARNING_EMITTED  # pylint: disable=global-statement
+    if emit_raw_events and not _LEGACY_RAW_WARNING_EMITTED:
+        # This listener only receives the event types it registers, so there is
+        # nothing unmapped here to mirror. Say so rather than ignoring the flag,
+        # once per process since the condition never changes between requests.
+        _LEGACY_RAW_WARNING_EMITTED = True
+        _LOGGER.warning(
+            "ag-ui-crewai ignored emit_raw_events=True: RAW passthrough requires the "
+            "crewai StreamFrame transport (crewai >= 1.6 and a flow exposing "
+            "astream); this run is on the legacy event-bus listener, which never sees "
+            "the unmapped events"
+        )
+
     # ``create_queue`` registers an entry in the module-level ``QUEUES``
     # mapping. If ``flow_context.set`` raises between ``create_queue`` and the
     # main ``try:`` block, the registered queue is orphaned — nothing deletes
@@ -1725,6 +1753,7 @@ async def _run_flow_frame_stream(
     inputs: dict,
     timeout: float | None,
     checkpoint_kwargs: dict | None = None,
+    emit_raw_events: bool = False,
 ):
     """StreamFrame-path driver: drive ``flow.astream`` and yield encoded AG-UI
     events.
@@ -1777,6 +1806,40 @@ async def _run_flow_frame_stream(
     # here (source gate), which is exactly the nested-flow filter: nested
     # frames find nothing here and are dropped.
     raw_events: dict[str, Any] = {}
+    # Second buffer for foreign-source events, populated only when RAW is enabled.
+    # crewai emits its llm / agent / task / tool events with the EMITTER as source
+    # (``crewai_event_bus.emit(self, event=...)``), never the flow, so the outer-flow
+    # gate below drops all of them - including ``llm_thinking_chunk``. Parking them
+    # separately keeps the translation gate intact, so a foreign event can never
+    # synthesize a run lifecycle event or a state snapshot.
+    foreign_events: dict[str, Any] = {}
+    # RAW mirrors that arrived BEFORE RUN_STARTED, from either source. Released in
+    # order right after the run opens: crewai raises some events before the flow
+    # starts, and a RAW first event makes @ag-ui/client's verifyEvents throw
+    # "First event must be 'RUN_STARTED'".
+    pending_raw: list[Any] = []
+
+    def _hold_pending_raw(raw_mirror: Any) -> None:
+        """Park a RAW mirror until the run has opened, logging an overflow drop."""
+        if len(pending_raw) >= _FOREIGN_EVENT_BUFFER_MAX:
+            log_raw_loss(
+                "ag-ui-crewai RAW passthrough dropped a pre-RUN_STARTED mirror (hold "
+                "buffer full at %d) thread=%s run=%s",
+                _FOREIGN_EVENT_BUFFER_MAX,
+                input_data.thread_id,
+                input_data.run_id,
+            )
+            return
+        pending_raw.append(raw_mirror)
+
+    def _emit_raw(raw_mirror: Any) -> Any:
+        """Correlate and encode a RAW mirror for the wire."""
+        _stamp_correlation_ids(
+            raw_mirror,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+        )
+        return encoder.encode(raw_mirror)
 
     def _sink(source: Any, event: Any) -> None:
         # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
@@ -1789,10 +1852,32 @@ async def _run_flow_frame_stream(
         # only THIS run's MCP events (including those from nested crews) reach it
         # -- no cross-run leakage -- and the type gate keeps nested-flow LIFECYCLE
         # events (still source != flow_copy) filtered out as before.
+        event_id = getattr(event, "event_id", None)
+        if event_id is None:
+            return
         if source is flow_copy or is_mcp_event(event):
-            event_id = getattr(event, "event_id", None)
-            if event_id is not None:
-                raw_events[event_id] = event
+            raw_events[event_id] = event
+        elif emit_raw_events:
+            if len(foreign_events) >= _FOREIGN_EVENT_BUFFER_MAX:
+                evicted = next(iter(foreign_events), None)
+                if evicted is None:
+                    log_raw_loss(
+                        "ag-ui-crewai RAW passthrough is disabled by a buffer cap of "
+                        "%d thread=%s run=%s",
+                        _FOREIGN_EVENT_BUFFER_MAX,
+                        input_data.thread_id,
+                        input_data.run_id,
+                    )
+                    return
+                del foreign_events[evicted]
+                log_raw_loss(
+                    "ag-ui-crewai RAW passthrough evicted the oldest parked foreign "
+                    "event (buffer full at %d) thread=%s run=%s; its RAW mirror is lost",
+                    _FOREIGN_EVENT_BUFFER_MAX,
+                    input_data.thread_id,
+                    input_data.run_id,
+                )
+            foreign_events[event_id] = event
 
     # Predeclared before the ``try`` so the ``finally`` teardown is always safe
     # to reference even if sink registration or ``astream``/``__aiter__`` raises
@@ -1886,7 +1971,31 @@ async def _run_flow_frame_stream(
                 # the outer run's wire shape stays identical to the legacy path.
                 raw_event = raw_events.pop(frame.id, None)
                 if raw_event is None:
+                    # Not an outer-flow (or MCP) event. With RAW passthrough on, mirror
+                    # it if we parked it: crewai's llm / agent / task / tool channels
+                    # and nested-flow lifecycle events all land here.
+                    foreign_event = foreign_events.pop(frame.id, None)
+                    if foreign_event is None:
+                        continue
+                    raw_mirror = raw_event_for(foreign_event)
+                    if raw_mirror is None:
+                        continue
+                    if not translator.run_started:
+                        _hold_pending_raw(raw_mirror)
+                        continue
+                    yield _emit_raw(raw_mirror)
                     continue
+
+                if emit_raw_events and not is_recognized_event(raw_event):
+                    # An OUTER-flow event the translator does not map. Mirrored here
+                    # rather than through ``translate`` so the translator keeps one
+                    # responsibility, and gated the same way as the foreign path.
+                    raw_mirror = raw_event_for(raw_event)
+                    if raw_mirror is not None:
+                        if translator.run_started:
+                            yield _emit_raw(raw_mirror)
+                        else:
+                            _hold_pending_raw(raw_mirror)
 
                 for event in translator.translate(raw_event):
                     _stamp_correlation_ids(
@@ -1895,6 +2004,13 @@ async def _run_flow_frame_stream(
                         run_id=input_data.run_id,
                     )
                     yield encoder.encode(event)
+
+                if pending_raw and translator.run_started:
+                    # The run just opened: flush the mirrors held back so they land
+                    # AFTER RUN_STARTED, in arrival order.
+                    held, pending_raw = pending_raw, []
+                    for raw_mirror in held:
+                        yield _emit_raw(raw_mirror)
 
                 if translator.run_finished:
                     # RUN_FINISHED just emitted. Do NOT break-then-aclose(): that
@@ -2011,6 +2127,7 @@ def _run_flow_stream(
     inputs: dict,
     timeout: float | None,
     checkpoint_kwargs: dict | None = None,
+    emit_raw_events: bool = False,
 ):
     """Select the StreamFrame path (crewai >= 1.6 + a real ``astream`` flow) or
     the legacy bus-listener path, returning the chosen async generator.
@@ -2031,6 +2148,7 @@ def _run_flow_stream(
             inputs=inputs,
             timeout=timeout,
             checkpoint_kwargs=checkpoint_kwargs,
+            emit_raw_events=emit_raw_events,
         )
     return _run_flow_event_stream(
         flow_copy=flow_copy,
@@ -2039,11 +2157,25 @@ def _run_flow_stream(
         inputs=inputs,
         timeout=timeout,
         checkpoint_kwargs=checkpoint_kwargs,
+        emit_raw_events=emit_raw_events,
     )
 
 
-def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
-    """Adds a CrewAI endpoint to the FastAPI app."""
+def add_crewai_flow_fastapi_endpoint(
+    app: FastAPI,
+    flow: Flow,
+    path: str = "/",
+    *,
+    emit_raw_events: bool | None = None,
+):
+    """Adds a CrewAI endpoint to the FastAPI app.
+
+    ``emit_raw_events`` opts into RAW passthrough: the crewai events this bridge does
+    not map (its llm / agent / task / tool channels, nested-flow lifecycle, internals)
+    are mirrored onto AG-UI ``RAW`` events. Off by default. Resolved at registration,
+    so a non-bool raises here rather than per request; ``None`` reads
+    ``AGUI_CREWAI_EMIT_RAW_EVENTS``.
+    """
     global GLOBAL_EVENT_LISTENER # pylint: disable=global-statement
 
     # Set up the global event listener singleton
@@ -2063,6 +2195,10 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
     # registered as before.
     if GLOBAL_EVENT_LISTENER is None and not CAPABILITIES.stream_frame_available:
         GLOBAL_EVENT_LISTENER = FastAPICrewFlowEventListener()
+
+    # Resolved HERE, not per request: a wrong-typed argument should fail once at
+    # startup rather than on every call.
+    resolved_emit_raw_events = _resolve_emit_raw_events(emit_raw_events)
 
     @app.post(path)
     async def agentic_chat_endpoint(input_data: RunAgentInput, request: Request):
@@ -2099,13 +2235,18 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
                 inputs=inputs,
                 timeout=timeout,
                 checkpoint_kwargs=checkpoint_kwargs,
+                emit_raw_events=resolved_emit_raw_events,
             ),
             media_type=encoder.get_content_type(),
         )
 
 
 def add_crewai_crew_fastapi_endpoint(
-    app: FastAPI, crew: CrewBaseInstance, path: str = "/"
+    app: FastAPI,
+    crew: CrewBaseInstance,
+    path: str = "/",
+    *,
+    emit_raw_events: bool | None = None,
 ):
     """Adds a CrewAI crew endpoint to the FastAPI app.
 
@@ -2125,6 +2266,8 @@ def add_crewai_crew_fastapi_endpoint(
     # in ``add_crewai_flow_fastapi_endpoint``).
     if GLOBAL_EVENT_LISTENER is None and not CAPABILITIES.stream_frame_available:
         GLOBAL_EVENT_LISTENER = FastAPICrewFlowEventListener()
+
+    resolved_emit_raw_events = _resolve_emit_raw_events(emit_raw_events)
 
     _cached_flow = None
     # Dedicated per-endpoint lock so two concurrent first-requests cannot
@@ -2174,6 +2317,7 @@ def add_crewai_crew_fastapi_endpoint(
                 inputs=inputs,
                 timeout=timeout,
                 checkpoint_kwargs=checkpoint_kwargs,
+                emit_raw_events=resolved_emit_raw_events,
             ),
             media_type=encoder.get_content_type(),
         )

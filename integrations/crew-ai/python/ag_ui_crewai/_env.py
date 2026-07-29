@@ -57,6 +57,11 @@ def _parse_env_float(
 # unset) is "off": a conservative default for opt-in features.
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
 
+# The mirror set. Not used by the parser (anything outside ``_TRUE_VALUES`` is
+# already false); it exists so a caller can tell an explicit "off" from an
+# unrecognised value and report the latter as a probable typo.
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", "n", "f"})
+
 
 def _parse_env_bool(name: str, default: bool = False) -> bool:
     """Parse a boolean env var with a permissive true-set.
