@@ -67,7 +67,7 @@ from .events import (
   BridgedStateSnapshotEvent
 )
 from .context import flow_context
-from .utils import camel_to_snake
+from .utils import camel_to_snake, dump_agui_message
 from .sdk import (
   litellm_messages_to_ag_ui_messages,
   consume_node_exit_snapshot_suppression,
@@ -2399,23 +2399,9 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
     if not isinstance(state, dict):
         state = {}
 
-    # Multimodal / non-text content passes through RAW here.
-    #
-    # ``message.model_dump()`` serializes each message verbatim, including any
-    # AG-UI content PARTS (e.g. ``{"type": "image", "source": {...}}``) carried
-    # on ``content`` as an array. These flow straight into the flow state /
-    # LiteLLM, which expects OpenAI's ``{"type": "image_url", "image_url": {...}}``
-    # shape — so a multimodal input can hard-fail downstream.
-    #
-    # This is NEW exposure as of the TS ``maxVersion`` bump to 0.0.57: the older
-    # compat middleware FLATTENED array content to a plain string before it
-    # reached the bridge (multimodal worked, but degraded to text). At 0.0.57
-    # that middleware is off, so the parts arrive un-normalized.
-    #
-    # Converting content parts to LiteLLM's shape is a parity-lane concern, NOT
-    # this migration — do not add image normalization here. Left as a
-    # documented passthrough until the parity lane owns it.
-    messages = [message.model_dump() for message in messages]
+    # Serialize messages, converting multimodal parts to LiteLLM's image_url
+    # shape so litellm.acompletion does not fail on them.
+    messages = [dump_agui_message(message) for message in messages]
 
     if len(messages) > 0:
         if "role" in messages[0] and messages[0]["role"] == "system":

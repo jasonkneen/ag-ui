@@ -37,7 +37,7 @@ from .events import (
   BridgedCustomEvent,
   BridgedStateSnapshotEvent
 )
-from .utils import yield_control
+from .utils import yield_control, convert_litellm_multimodal_to_agui
 
 class CopilotKitProperties(BaseModel):
     """CopilotKit properties"""
@@ -439,6 +439,11 @@ def litellm_messages_to_ag_ui_messages(messages: List[LiteLLMMessage]) -> List[M
             message_dict["id"] = str(uuid.uuid4())
         # remove all None values
         message_dict = {k: v for k, v in message_dict.items() if v is not None}
+
+        # List content is stored in LiteLLM's image_url shape; convert back to
+        # AG-UI parts so the Message validator accepts it (else the snapshot drops).
+        if isinstance(message_dict.get("content"), list):
+            message_dict["content"] = convert_litellm_multimodal_to_agui(message_dict["content"])
 
         if "tool_calls" in message_dict:
             for tool_call in message_dict["tool_calls"]:

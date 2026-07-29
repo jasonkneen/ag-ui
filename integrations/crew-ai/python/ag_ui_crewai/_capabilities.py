@@ -20,6 +20,7 @@ module-load time without a circular dependency (mirrors ``_env``).
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -388,6 +389,42 @@ def supported_checkpoint_kwargs(method: Any, kwargs: dict[str, Any]) -> dict[str
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+# --------------------------------------------------------------------------
+# crewai-files multimodal input resolution
+# --------------------------------------------------------------------------
+# crewai's ``input_files=`` (1.9.0+) is inert without the separate
+# ``crewai-files`` distribution (the ``crewai[file-processing]`` extra). Probe
+# the distribution, not ``crewai.__version__``; ``find_spec`` is side-effect free.
+try:
+    _crewai_files_available = importlib.util.find_spec("crewai_files") is not None
+except (ImportError, ValueError):  # pragma: no cover - defensive
+    _crewai_files_available = False
+
+# One-shot dedup guard for the lazy multimodal warning (reset in tests).
+_multimodal_files_gap_warned = False
+
+
+def warn_multimodal_files_gap() -> None:
+    """Warn once when non-image media arrives without the crewai-files extra.
+
+    Images ride ``image_url`` and work on any vision provider, so this is not
+    fired for them. Audio/video/document are forwarded as ``image_url`` too,
+    which many providers reject; native support needs the extra.
+    """
+    global _multimodal_files_gap_warned
+    if CAPABILITIES.crewai_files_available or _multimodal_files_gap_warned:
+        return
+    _multimodal_files_gap_warned = True
+    _LOGGER.warning(
+        "ag-ui-crewai received non-image media (audio/video/document) but the "
+        "optional 'crewai-files' distribution is not installed (crewai %s). It "
+        "is forwarded to the chat LLM as an image_url block, which many "
+        "providers reject; native support needs crewai>=1.9 with the "
+        "'crewai[file-processing]' extra.",
+        CAPABILITIES.crewai_version,
+    )
+
+
 @dataclass(frozen=True)
 class _Capabilities:
     """Cached, immutable snapshot of the detected crewai capabilities.
@@ -415,6 +452,7 @@ class _Capabilities:
     checkpoint_fork_supported: bool = False
     checkpoint_events_available: bool = False
     checkpoint_state_module: str | None = None
+    crewai_files_available: bool = False
     missing: tuple[str, ...] = field(default_factory=tuple)
 
     def warn_on_gaps(self) -> None:
@@ -488,6 +526,7 @@ def _detect() -> _Capabilities:
         checkpoint_fork_supported=_checkpoint_fork_supported,
         checkpoint_events_available=_checkpoint_events_available,
         checkpoint_state_module=_CKPT_STATE_MODULE_NAME,
+        crewai_files_available=_crewai_files_available,
         missing=tuple(missing),
     )
     caps.warn_on_gaps()
