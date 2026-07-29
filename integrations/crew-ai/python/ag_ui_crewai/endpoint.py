@@ -1813,14 +1813,33 @@ async def _run_flow_frame_stream(
             )
             while True:
                 # Enforce the wall-clock ceiling per frame read via
-                # ``asyncio.wait_for``. On timeout it cancels the in-flight
-                # ``__anext__`` AND awaits its unwind before raising, so
-                # crewai's scoped stream sink / background kickoff task tear
-                # down cleanly on the current loop (a wrapper ``ensure_future``
-                # + ``asyncio.wait`` would instead copy the context per read
-                # and break crewai's sink token reset — verified against the
-                # 1.15.7 wheel). ``aclose()`` in the ``finally`` then fully
-                # drains the background task.
+                # ``asyncio.wait_for``: on timeout it cancels the in-flight
+                # ``__anext__`` AND awaits its unwind before raising, so crewai's
+                # scoped stream sink / background kickoff task tear down cleanly;
+                # ``aclose()`` in the ``finally`` then fully drains the task.
+                #
+                # CPK-7721 review #8 — cross-version note (``requires-python``
+                # floor is 3.10). ``wait_for`` internals differ:
+                #   * 3.12+: for ``timeout > 0`` it ``await``s the coroutine
+                #     INLINE (``async with timeouts.timeout(...)``), no Task wrap,
+                #     no context copy. (The ``ensure_future`` wrap survives only
+                #     on the ``timeout <= 0`` branch, which we never reach — the
+                #     ``remaining <= 0`` guard above raises first.)
+                #   * 3.10/3.11: ``wait_for`` UNCONDITIONALLY does
+                #     ``fut = ensure_future(fut)``, wrapping ``__anext__`` in a
+                #     Task and copying the current context per read.
+                # The per-read context copy on 3.10/3.11 is HARMLESS here: our
+                # ``_sink`` is registered (above) BEFORE this loop, so every
+                # per-read context copy inherits it and crewai's ``publish_stream_event``
+                # still reaches it; and both our own and crewai's sink-token
+                # ``reset``s happen OUTSIDE the wrapped ``__anext__`` boundary, so
+                # no token is reset in a foreign context. Verified against the
+                # 1.15.7 wheel on 3.12 and by emulating the 3.10/3.11
+                # ``ensure_future`` wrap (identical wire output, clean
+                # ``flow_context`` reset). Do NOT swap this for a hand-rolled
+                # ``ensure_future`` + ``asyncio.wait``: that would lose the
+                # cancel-and-await-unwind semantics ``wait_for`` gives us on
+                # timeout.
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -2124,6 +2143,23 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
     tools: list[Tool],
 ):
     """Default merge state for CrewAI"""
+    # CPK-7721 review #7 — multimodal / non-text content passes through RAW here.
+    #
+    # ``message.model_dump()`` serializes each message verbatim, including any
+    # AG-UI content PARTS (e.g. ``{"type": "image", "source": {...}}``) carried
+    # on ``content`` as an array. These flow straight into the flow state /
+    # LiteLLM, which expects OpenAI's ``{"type": "image_url", "image_url": {...}}``
+    # shape — so a multimodal input can hard-fail downstream.
+    #
+    # This is NEW exposure as of the TS ``maxVersion`` bump to 0.0.57 (this PR):
+    # the older compat middleware FLATTENED array content to a plain string
+    # before it reached the bridge (multimodal worked, but degraded to text). At
+    # 0.0.57 that middleware is off, so the parts arrive un-normalized.
+    #
+    # Converting content parts to LiteLLM's shape is a PARITY-LANE concern
+    # (CPK-7718 / CPK-7721 parity tickets), NOT this migration — do not add image
+    # normalization here. Left as a documented passthrough until the Parity lane
+    # owns it.
     messages = [message.model_dump() for message in messages]
 
     if len(messages) > 0:
