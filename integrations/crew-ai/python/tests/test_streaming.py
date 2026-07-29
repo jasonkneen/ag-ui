@@ -1098,3 +1098,70 @@ async def test_frame_path_does_not_cancel_kickoff_after_finish():
     # The kickoff task completed normally rather than being cancelled by aclose.
     assert session.is_cancelled is False
     assert session.result == "RESULT"
+
+
+# -- PNI-130: MCP events surface through the SHIPPED frame-path sink ----------
+
+class _MCPEmittingFlow(Flow):
+    """Emits crewai MCP events (connection lifecycle + a tool execution) with a
+    NON-flow source, exactly as crewai core does. The frame-path ``_sink`` must
+    therefore park them by TYPE (``is_mcp_event``), not by ``source is flow``."""
+
+    @start()
+    def go(self):
+        from ag_ui_crewai._capabilities import crewai_event_bus
+        from crewai.events import (
+            MCPConnectionStartedEvent,
+            MCPToolExecutionCompletedEvent,
+        )
+
+        agent = SimpleNamespace()  # non-flow source, like a crew/agent
+        crewai_event_bus.emit(
+            agent,
+            MCPConnectionStartedEvent(server_name="files", transport_type="stdio"),
+        )
+        crewai_event_bus.emit(
+            agent,
+            MCPToolExecutionCompletedEvent(
+                server_name="files",
+                tool_name="read_file",
+                tool_args={"path": "/x"},
+                result="hello",
+            ),
+        )
+        return "done"
+
+
+@requires_stream_frames
+async def test_frame_path_surfaces_mcp_tool_calls():
+    """PNI-130: agent-sourced MCP events surface through the real
+    ``_run_flow_frame_stream`` sink as TOOL_CALL_* (tool executions) and CUSTOM
+    (connection lifecycle), inside a single RUN_STARTED/RUN_FINISHED envelope."""
+    from ag_ui.encoder import EventEncoder
+
+    pytest.importorskip("crewai.mcp")
+
+    flow = _MCPEmittingFlow()
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=flow,
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    types = [p["type"] for p in payloads]
+
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+    assert types.count("RUN_STARTED") == 1
+    assert types.count("RUN_FINISHED") == 1
+    for expected in (
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ):
+        assert expected in types, (expected, types)
+    customs = [p for p in payloads if p["type"] == "CUSTOM"]
+    assert any(c.get("name") == "mcp_connection_started" for c in customs)

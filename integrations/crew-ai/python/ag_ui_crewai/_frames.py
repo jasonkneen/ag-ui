@@ -37,11 +37,19 @@ SWAPPABLE EMISSION SHAPE (cross-lane constraint, CPK-7719): CrewAI is currently
 the only integration emitting TEXT_MESSAGE_CHUNK / TOOL_CALL_CHUNK (chunks)
 rather than the START/CONTENT/END triples the six other integrations emit. That
 final choice belongs to a Parity-lane ticket, not this migration. The translator
-therefore routes text / tool-call emission through a single ``emission_shape``
-strategy that DEFAULTS to ``"chunks"`` so this change is byte-for-byte
-behavior-preserving on the wire. The ``"triples"`` strategy is a deliberate
-NotImplementedError placeholder — the Parity ticket owns wiring it up and
-flipping the default.
+therefore routes LLM text / LLM-tool-call emission through a single
+``emission_shape`` strategy that DEFAULTS to ``"chunks"`` so this migration is
+byte-for-byte behavior-preserving on that channel. The ``"triples"`` strategy is
+a deliberate NotImplementedError placeholder — the Parity ticket owns wiring it
+up and flipping the default.
+
+MCP EVENTS (PNI-130) are the ONE exception to "chunks-only": crewai's discrete
+MCP tool executions (name + full args + result arrive together, not streamed)
+map to canonical ``TOOL_CALL_START/ARGS/END/RESULT`` triples via the shared
+``mcp.translate_mcp_event`` seam, and MCP lifecycle events map to ``CUSTOM``.
+This is independent of the ``emission_shape`` strategy above (which governs only
+the streaming LLM text / tool-call channel); see the wire-shape note in
+``mcp.py`` for why discrete MCP calls use triples regardless of PNI-136.
 """
 
 from __future__ import annotations
@@ -65,6 +73,7 @@ from ag_ui.core.events import (
 )
 
 from .sdk import litellm_messages_to_ag_ui_messages
+from .mcp import is_mcp_event, translate_mcp_event
 
 # crewai lifecycle-event ``type`` strings. Pinned as constants so a rename
 # upstream surfaces here rather than silently producing no wire events.
@@ -166,6 +175,13 @@ class StreamFrameTranslator:
             ]
         if event_type == _METHOD_FINISHED:
             return self._method_finished_events(event)
+
+        # PNI-130: crewai's first-class MCP events (crewai >= 1.4). Emitted with
+        # the agent/crew as source (not the flow), so the driver's sink parks
+        # them by TYPE rather than source identity; here they map to TOOL_CALL_*
+        # (tool executions) and CUSTOM (lifecycle) via the shared translator.
+        if is_mcp_event(event):
+            return translate_mcp_event(event)
 
         # Bridge-emitted events carry the AG-UI EventType string as ``.type``
         # and the verbatim payload on typed attributes (no ``to_serializable``).

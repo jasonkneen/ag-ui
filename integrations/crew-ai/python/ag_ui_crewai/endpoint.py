@@ -31,6 +31,7 @@ from ._capabilities import (
     reset_stream_sinks,
 )
 from ._frames import StreamFrameTranslator
+from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from crewai.flow.flow import Flow
 
 from ag_ui.core import (
@@ -40,7 +41,8 @@ from ag_ui.core import (
     RunFinishedEvent,
     RunErrorEvent,
     Message,
-    Tool
+    Tool,
+    Context
 )
 from ag_ui.core.events import (
   TextMessageChunkEvent,
@@ -60,6 +62,7 @@ from .events import (
   BridgedStateSnapshotEvent
 )
 from .context import flow_context
+from .utils import camel_to_snake
 from .sdk import (
   litellm_messages_to_ag_ui_messages,
   consume_node_exit_snapshot_suppression,
@@ -879,6 +882,10 @@ GLOBAL_EVENT_LISTENER = None
 # last node already emitted).
 _LAST_NODE_SUPPRESSED_ATTR = "_ag_ui_last_node_suppressed"
 
+# PNI-130: process-wide warn-once guard for the "MCP event with no active flow
+# in context" legacy-path drop (see ``_on_mcp_event`` in ``setup_listeners``).
+_MCP_NO_FLOW_WARNED = False
+
 
 def _flow_state_snapshot(state: object) -> dict:
     """Coerce a flow's ``state`` (Pydantic model or plain dict) to a snapshot dict.
@@ -898,7 +905,6 @@ def _flow_state_snapshot(state: object) -> dict:
     if hasattr(state, "model_dump"):
         return state.model_dump()
     return {}
-
 
 class FastAPICrewFlowEventListener(BaseEventListener):
     """FastAPI CrewFlow event listener.
@@ -1073,6 +1079,49 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                     snapshot=event.snapshot
                 )
             )
+
+        # PNI-130: surface crewai's first-class MCP events (crewai >= 1.4) on the
+        # LEGACY bus-listener transport (crewai 1.4-1.5, StreamFrame absent).
+        # crewai emits MCP events with the agent/crew as ``source`` (NOT the
+        # Flow), so we resolve the active run via ``flow_context`` -- the same
+        # contextvar the run driver sets -- and enqueue thread-safely through
+        # ``_enqueue`` (CPK-7718 #2: handlers run on a ThreadPoolExecutor worker
+        # thread under crewai 1.x). On the StreamFrame path (crewai >= 1.6) no
+        # per-run queue is created, so ``_enqueue`` finds no queue and this is an
+        # inert no-op there; that path surfaces MCP events via the frame sink +
+        # StreamFrameTranslator instead. Below 1.4 (no ``crewai.mcp``) this logs
+        # one warning and registers nothing.
+        def _on_mcp_event(event):
+            # Receives the RAW crewai MCP event. Resolve the active run via
+            # ``flow_context`` (crewai copies the emitting context -- incl. this
+            # package's ``flow_context``, set by the run driver before the
+            # kickoff task -- into the handler's worker thread) and enqueue only
+            # when that run has a live queue.
+            flow = flow_context.get(None)
+            if flow is None:
+                # crewai's context copy makes this unexpected under the FastAPI
+                # bridge; a genuinely context-less emit (a stray event outside a
+                # run, or a future propagation regression) would otherwise vanish
+                # silently. Warn ONCE (naming the raw crewai type), not per event.
+                global _MCP_NO_FLOW_WARNED  # pylint: disable=global-statement
+                if not _MCP_NO_FLOW_WARNED:
+                    _MCP_NO_FLOW_WARNED = True
+                    _LOGGER.warning(
+                        "ag-ui-crewai: crewai MCP event %s emitted with no active "
+                        "flow in context; dropping. MCP tool calls will not "
+                        "surface on the legacy transport if this recurs.",
+                        getattr(event, "type", None),
+                    )
+                return
+            # On the StreamFrame path (crewai >= 1.6) no per-run queue exists --
+            # MCP is surfaced via the frame sink there -- so skip translation
+            # entirely rather than translate-and-discard.
+            if get_queue(flow) is None:
+                return
+            for agui_event in translate_mcp_event(event):
+                _enqueue(flow, agui_event)
+
+        register_mcp_listeners(crewai_event_bus, _on_mcp_event)
 
 
 def _format_timeout_message(timeout: float | None) -> str:
@@ -1848,7 +1897,14 @@ async def _run_flow_frame_stream(
         # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
         # flows emit with a DIFFERENT source (verified on the 1.15.7 wheel), and
         # our own ``Bridged*`` events are emitted with ``flow_copy`` as source.
-        if source is flow_copy:
+        #
+        # PNI-130: crewai's MCP events are emitted with the agent/crew as source
+        # (NOT flow_copy), so the source gate alone would drop them. Park them by
+        # TYPE too. This sink is context-scoped (crewai.events.stream_context), so
+        # only THIS run's MCP events (including those from nested crews) reach it
+        # -- no cross-run leakage -- and the type gate keeps nested-flow LIFECYCLE
+        # events (still source != flow_copy) filtered out as before.
+        if source is flow_copy or is_mcp_event(event):
             event_id = getattr(event, "event_id", None)
             if event_id is not None:
                 raw_events[event_id] = event
@@ -2117,6 +2173,8 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
             state=input_data.state,
             messages=input_data.messages,
             tools=input_data.tools,
+            context=input_data.context,
+            forwarded_props=input_data.forwarded_props,
         )
         inputs["id"] = input_data.thread_id
 
@@ -2186,6 +2244,8 @@ def add_crewai_crew_fastapi_endpoint(
             state=input_data.state,
             messages=input_data.messages,
             tools=input_data.tools,
+            context=input_data.context,
+            forwarded_props=input_data.forwarded_props,
         )
         inputs["id"] = input_data.thread_id
 
@@ -2208,8 +2268,20 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
     state: dict,
     messages: list[Message],
     tools: list[Tool],
+    context: list[Context] | None = None,
+    forwarded_props: Any = None,
 ):
     """Default merge state for CrewAI"""
+    # PNI-139 review — ``RunAgentInput.state`` is typed ``Any`` and required, so
+    # a client may legally send ``state: null`` or a non-mapping value. The
+    # ``{**state}`` spread below would raise ``TypeError`` on such input, and
+    # because this helper runs in the endpoint body BEFORE the
+    # ``StreamingResponse`` is constructed, that crash escapes the RUN_ERROR
+    # taxonomy as an uncorrelated 500. Coerce a non-mapping state to an empty
+    # dict so the run proceeds instead of dying opaquely.
+    if not isinstance(state, dict):
+        state = {}
+
     # CPK-7721 review #7 — multimodal / non-text content passes through RAW here.
     #
     # ``message.model_dump()`` serializes each message verbatim, including any
@@ -2240,9 +2312,42 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
         }
     } for tool in tools]
 
+    # PNI-139 — thread ``forwardedProps`` into the run.
+    #
+    # Frontend callers send these keys in camelCase; downstream flow / tool
+    # code reads snake_case, so normalize before merging (parity with the
+    # LangGraph adapter's ``camel_to_snake`` pass). These are transient
+    # per-request streaming hints, so they carry the LOWEST precedence: spread
+    # FIRST, so both the agent's persisted ``state`` and the reserved keys
+    # below (``messages`` / ``tools`` / ``context`` / ``copilotkit``) win on a
+    # name collision. This mirrors the LangGraph adapter, where the run payload
+    # is spread AFTER forwarded_props (``{**forwarded_props, **payload_input}``)
+    # so a forwarded key can never silently overwrite persisted agent state.
+    normalized_forwarded_props: dict = {}
+    if isinstance(forwarded_props, dict):
+        normalized_forwarded_props = {
+            camel_to_snake(k): v for k, v in forwarded_props.items()
+        }
+
+    # PNI-139 — thread ``input.context`` into the run so agent code and tools
+    # can read it from state. Serialize each entry to a plain dict so the flow
+    # state stays JSON-safe and tools can read ``entry["value"]`` directly.
+    context_list = [entry.model_dump() for entry in context] if context else []
+
     new_state = {
+        # Lowest precedence first: transient forwarded hints, then persisted
+        # state, then the reserved AG-UI keys (spread last, always win).
+        **normalized_forwarded_props,
         **state,
         "messages": messages,
+        # PNI-139 — expose frontend tools at a top-level ``tools`` key too.
+        # crewai has historically only surfaced them under
+        # ``copilotkit.actions``; the top-level key gives framework-neutral
+        # agent code a stable place to read them (parity with LangGraph's
+        # ``ag_ui_state["tools"]``). ``copilotkit.actions`` is kept for
+        # backward compatibility.
+        "tools": actions,
+        "context": context_list,
         "copilotkit": {
             "actions": actions
         }
