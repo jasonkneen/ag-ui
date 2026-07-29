@@ -12,6 +12,14 @@ from .sdk import (
   copilotkit_stream,
   copilotkit_exit,
 )
+from .a2ui_tool import (
+  A2UITool,
+  get_a2ui_tools,
+  plan_a2ui_injection,
+  apply_a2ui_plan_to_tools,
+  is_auto_injected_a2ui_tool,
+  A2UI_STREAM_KEY,
+)
 # from .enterprise import CrewEnterpriseEventListener
 
 from ._capabilities import get_capabilities
@@ -34,4 +42,10 @@ __all__ = [
   "copilotkit_emit_state",
   "copilotkit_stream",
   "copilotkit_exit",
+  "A2UITool",
+  "get_a2ui_tools",
+  "plan_a2ui_injection",
+  "apply_a2ui_plan_to_tools",
+  "is_auto_injected_a2ui_tool",
+  "A2UI_STREAM_KEY",
 ]
