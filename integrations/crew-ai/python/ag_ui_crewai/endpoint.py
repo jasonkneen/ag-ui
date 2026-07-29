@@ -30,6 +30,7 @@ from ._capabilities import (
     reset_stream_sinks,
 )
 from ._frames import StreamFrameTranslator
+from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from crewai.flow.flow import Flow
 
 from ag_ui.core import (
@@ -868,6 +869,10 @@ async def _flush_event_bus() -> None:
 
 GLOBAL_EVENT_LISTENER = None
 
+# PNI-130: process-wide warn-once guard for the "MCP event with no active flow
+# in context" legacy-path drop (see ``_on_mcp_event`` in ``setup_listeners``).
+_MCP_NO_FLOW_WARNED = False
+
 class FastAPICrewFlowEventListener(BaseEventListener):
     """FastAPI CrewFlow event listener.
 
@@ -1006,6 +1011,49 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                     snapshot=event.snapshot
                 )
             )
+
+        # PNI-130: surface crewai's first-class MCP events (crewai >= 1.4) on the
+        # LEGACY bus-listener transport (crewai 1.4-1.5, StreamFrame absent).
+        # crewai emits MCP events with the agent/crew as ``source`` (NOT the
+        # Flow), so we resolve the active run via ``flow_context`` -- the same
+        # contextvar the run driver sets -- and enqueue thread-safely through
+        # ``_enqueue`` (CPK-7718 #2: handlers run on a ThreadPoolExecutor worker
+        # thread under crewai 1.x). On the StreamFrame path (crewai >= 1.6) no
+        # per-run queue is created, so ``_enqueue`` finds no queue and this is an
+        # inert no-op there; that path surfaces MCP events via the frame sink +
+        # StreamFrameTranslator instead. Below 1.4 (no ``crewai.mcp``) this logs
+        # one warning and registers nothing.
+        def _on_mcp_event(event):
+            # Receives the RAW crewai MCP event. Resolve the active run via
+            # ``flow_context`` (crewai copies the emitting context -- incl. this
+            # package's ``flow_context``, set by the run driver before the
+            # kickoff task -- into the handler's worker thread) and enqueue only
+            # when that run has a live queue.
+            flow = flow_context.get(None)
+            if flow is None:
+                # crewai's context copy makes this unexpected under the FastAPI
+                # bridge; a genuinely context-less emit (a stray event outside a
+                # run, or a future propagation regression) would otherwise vanish
+                # silently. Warn ONCE (naming the raw crewai type), not per event.
+                global _MCP_NO_FLOW_WARNED  # pylint: disable=global-statement
+                if not _MCP_NO_FLOW_WARNED:
+                    _MCP_NO_FLOW_WARNED = True
+                    _LOGGER.warning(
+                        "ag-ui-crewai: crewai MCP event %s emitted with no active "
+                        "flow in context; dropping. MCP tool calls will not "
+                        "surface on the legacy transport if this recurs.",
+                        getattr(event, "type", None),
+                    )
+                return
+            # On the StreamFrame path (crewai >= 1.6) no per-run queue exists --
+            # MCP is surfaced via the frame sink there -- so skip translation
+            # entirely rather than translate-and-discard.
+            if get_queue(flow) is None:
+                return
+            for agui_event in translate_mcp_event(event):
+                _enqueue(flow, agui_event)
+
+        register_mcp_listeners(crewai_event_bus, _on_mcp_event)
 
 
 def _format_timeout_message(timeout: float | None) -> str:
@@ -1781,7 +1829,14 @@ async def _run_flow_frame_stream(
         # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
         # flows emit with a DIFFERENT source (verified on the 1.15.7 wheel), and
         # our own ``Bridged*`` events are emitted with ``flow_copy`` as source.
-        if source is flow_copy:
+        #
+        # PNI-130: crewai's MCP events are emitted with the agent/crew as source
+        # (NOT flow_copy), so the source gate alone would drop them. Park them by
+        # TYPE too. This sink is context-scoped (crewai.events.stream_context), so
+        # only THIS run's MCP events (including those from nested crews) reach it
+        # -- no cross-run leakage -- and the type gate keeps nested-flow LIFECYCLE
+        # events (still source != flow_copy) filtered out as before.
+        if source is flow_copy or is_mcp_event(event):
             event_id = getattr(event, "event_id", None)
             if event_id is not None:
                 raw_events[event_id] = event
