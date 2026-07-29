@@ -93,7 +93,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 ### 🤝 Partnerships
 | Framework | Status | AG-UI Resources |
 | ---------- | ------- | ---------------- |
-| [LangGraph](https://www.langchain.com/langgraph) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/langgraph/) 🎮 [Demos](https://dojo.ag-ui.com/langgraph-fastapi/feature/shared_state) |
+| [LangChain](https://www.langchain.com/langgraph) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/langgraph/) 🎮 [Demos](https://dojo.ag-ui.com/langgraph-fastapi/feature/shared_state) |
 | [CrewAI](https://crewai.com/) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/crewai-flows) 🎮 [Demos](https://dojo.ag-ui.com/crewai/feature/shared_state) |
 
 ### 🧩 1st Party
@@ -125,7 +125,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 
 | Protocols | Status | AG-UI Resources | Integrations |
 | ---------- | ------- | ---------------- | ------------- |
-| [A2A]() | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/a2a-protocol) | Partnership |
+| [A2A](https://a2a-protocol.org/latest/) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/a2a-protocol) | Partnership |
 
 
 ## Infrastructure / Deployment
@@ -167,7 +167,15 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 | --- | ------- | ---------------- | ------------- |
 | [CopilotKit](https://github.com/CopilotKit/CopilotKit) | ✅ Supported | ➡️ [Getting Started](https://docs.copilotkit.ai/direct-to-llm/guides/quickstart) | 1st Party |
 | [Terminal + Agent]() | ✅ Supported | ➡️ [Getting Started](https://docs.ag-ui.com/quickstart/clients) | Community |
-| [React Native]() | 🛠️ Help Wanted | ➡️ [GitHub Source](https://github.com/ag-ui-protocol/ag-ui/issues/510) | Community |
+| [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [GitHub Source](https://github.com/ag-ui-protocol/ag-ui/issues/510) | Community |
+| [Slack]() | ✅ Supported | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-slack) | Community |
+| [MS Teams Chat]() | ✅ Supported | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-teams) | Community |
+| [WhatsApp]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-whatsapp) | Community |
+| [Telegram]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-telegram) | Community |
+| [Discord]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-discord) | Community |
+| [iMessage]() | 🛠️ In Progress | ➡️ [Coming soon]() | Community |
+| [SMS]() | 🛠️ In Progress | ➡️ [Coming soon]() | Community |
+
 
 [View all supported integrations →](https://docs.ag-ui.com/introduction#supported-integrations)
 
@@ -195,7 +203,7 @@ https://github.com/user-attachments/assets/c298eea8-3f39-4a94-b968-7712429b0c49
 
 Check out the [Contributing guide](https://github.com/ag-ui-protocol/ag-ui/blob/main/CONTRIBUTING.md)
 
-- **[Bi-Weekely AG-UI Working Group](https://lu.ma/CopilotKit?k=c)**
+- **[Bi-Weekely AG-UI Webinar](https://lu.ma/CopilotKit?k=c)**
   📅 Follow the CopilotKit Luma Events Calendar
 
 ## Roadmap
