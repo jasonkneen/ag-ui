@@ -11,6 +11,7 @@ from .examples.agentic_generative_ui import AgenticGenerativeUIFlow
 from .examples.shared_state import SharedStateFlow
 from .examples.predictive_state_updates import PredictiveStateUpdatesFlow
 from .examples.error_flow import ErrorFlow
+from .examples.interrupt_flow import InterruptFlow
 
 app = FastAPI(title="CrewAI Dojo Example Server")
 
@@ -60,6 +61,12 @@ add_crewai_flow_fastapi_endpoint(
     app=app,
     flow=ErrorFlow(),
     path="/error_flow",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=InterruptFlow(),
+    path="/interrupt",
 )
 
 def main():
