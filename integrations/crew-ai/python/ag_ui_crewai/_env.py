@@ -54,3 +54,52 @@ def _parse_env_float(
     if value <= 0:
         return None if allow_disable else default
     return value
+
+
+# Values that read as "on" for a boolean env var. Anything else (including
+# unset) is "off": a conservative default for opt-in features.
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def _parse_env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var with a permissive true-set.
+
+    Unset -> ``default``. Otherwise case-insensitively true for
+    ``1/true/yes/on/y/t`` and false for everything else (so a typo fails
+    safe to "off" rather than silently enabling an opt-in feature).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_VALUES
+
+
+def _parse_env_str(name: str, default: str) -> str:
+    """Parse a string env var, treating unset OR empty/whitespace as unset.
+
+    An operator who exports ``CREWAI_CHECKPOINT_DIR=`` (empty) means "use the
+    default", not "checkpoint to the current directory root".
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip()
+
+
+def _parse_env_int(name: str, default: int | None) -> int | None:
+    """Parse an optional positive-int env var.
+
+    Unset / unparseable / non-positive -> ``default`` (``None`` disables the
+    associated bound). Mirrors ``_parse_env_float``'s fail-safe-to-default
+    policy so a bad value never silently changes behaviour.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return value

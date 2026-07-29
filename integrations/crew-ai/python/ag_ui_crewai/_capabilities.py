@@ -20,6 +20,7 @@ module-load time without a circular dependency (mirrors ``_env``).
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -219,6 +220,139 @@ except Exception:  # pragma: no cover - litellm is a declared direct dep
     _litellm_available = False
 
 
+# --------------------------------------------------------------------------
+# Checkpointing resolution
+# --------------------------------------------------------------------------
+# crewai's checkpointing pieces landed in different releases, so each is
+# resolved/probed independently (never gated on ``__version__``) and its
+# enabling version named in the warning text. ``from_checkpoint`` (1.13)
+# predates ``CheckpointConfig`` (1.14), so the two are probed separately: on
+# 1.13.x the kwarg exists but no config can be built, and the bridge stays on
+# the no-checkpoint path.
+CHECKPOINT_ENABLING_VERSIONS: dict[str, str] = {
+    "from_checkpoint": "1.13.0",
+    "checkpoint_config": "1.14.0",
+    "fork": "1.14.2",
+    "checkpoint_events": "1.14.3",
+    "restore_from_state_id": "1.14.5",
+}
+
+_CREWAI_MODULE, _ = _first_module(["crewai"])
+_Flow = getattr(_CREWAI_MODULE, "Flow", None) if _CREWAI_MODULE else None
+_Crew = getattr(_CREWAI_MODULE, "Crew", None) if _CREWAI_MODULE else None
+
+
+def _kwarg_in_signature(func: Any, name: str) -> bool:
+    """True when ``func`` declares a parameter ``name`` (or accepts ``**kwargs``).
+
+    Used to probe whether a crewai release grew a given keyword argument
+    without gating on the version string. A ``**kwargs`` catch-all counts as
+    "accepts it": passing an unknown kwarg through ``**kwargs`` is safe.
+    """
+    if func is None:
+        return False
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C builtins etc.
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# ``CheckpointConfig`` is re-exported at the crewai root (1.14+); its canonical
+# home is ``crewai.state.checkpoint_config``. Try the root first, then the
+# module, so a partial / future re-org still resolves.
+CheckpointConfig = getattr(_CREWAI_MODULE, "CheckpointConfig", None) if _CREWAI_MODULE else None
+_CKPT_STATE_MODULE, _CKPT_STATE_MODULE_NAME = _first_module(["crewai.state"])
+if CheckpointConfig is None and _CKPT_STATE_MODULE is not None:
+    CheckpointConfig = getattr(_CKPT_STATE_MODULE, "CheckpointConfig", None)
+
+# ``JsonProvider`` / ``SqliteProvider`` live on ``crewai.state`` (NOT the crewai
+# root, verified on the 1.15.7 wheel).
+JsonProvider = getattr(_CKPT_STATE_MODULE, "JsonProvider", None) if _CKPT_STATE_MODULE else None
+SqliteProvider = getattr(_CKPT_STATE_MODULE, "SqliteProvider", None) if _CKPT_STATE_MODULE else None
+
+# The Checkpoint*Event lifecycle types live at
+# ``crewai.events.types.checkpoint_events`` (not re-exported at the
+# ``crewai.events`` root on 1.15.x). Resolved for callers that surface them;
+# the persistence wiring here does not depend on them.
+_CKPT_EVENTS_MODULE, _CKPT_EVENTS_MODULE_NAME = _first_module(
+    ["crewai.events.types.checkpoint_events"]
+)
+_checkpoint_events_available = _CKPT_EVENTS_MODULE is not None and (
+    getattr(_CKPT_EVENTS_MODULE, "CheckpointCompletedEvent", None) is not None
+)
+
+# ``from_checkpoint`` / ``restore_from_state_id`` are probed on ``Flow`` (the
+# bridge only checkpoints flows; the crew endpoint wraps its crew in a
+# ``ChatWithCrewFlow``). These are the CLASS-level probes for the capability
+# table / warnings; the per-flow guard below re-probes the SPECIFIC instance so
+# test doubles that implement only ``kickoff_async(self, inputs=None)`` stay on
+# the no-checkpoint path.
+_flow_from_checkpoint_supported = _kwarg_in_signature(
+    getattr(_Flow, "kickoff_async", None), "from_checkpoint"
+)
+_flow_restore_from_state_id_supported = _kwarg_in_signature(
+    getattr(_Flow, "kickoff_async", None), "restore_from_state_id"
+)
+_checkpoint_fork_supported = callable(getattr(_Flow, "fork", None)) or callable(
+    getattr(_Crew, "fork", None)
+)
+# Checkpointing needs a config type AND at least one provider to build one. The
+# ``from_checkpoint`` kwarg alone (crewai 1.13) is inert without them.
+_checkpoint_config_available = CheckpointConfig is not None and (
+    JsonProvider is not None or SqliteProvider is not None
+)
+# The full persistence path is usable when we can both build a config and pass
+# it: i.e. the config type, a provider, and the kwarg are all present.
+_checkpointing_available = _checkpoint_config_available and _flow_from_checkpoint_supported
+
+
+def flow_supports_checkpointing(flow: Any) -> bool:
+    """Return True when THIS flow can be checkpointed via ``from_checkpoint``.
+
+    Two conditions, both required (mirrors ``flow_supports_stream_frames``):
+
+    * the installed crewai can build a ``CheckpointConfig`` and exposes the
+      ``from_checkpoint`` kwarg (crewai >= 1.14 for both), and
+    * this SPECIFIC flow object exposes a driving method (``astream`` or
+      ``kickoff_async``) whose signature actually accepts ``from_checkpoint``.
+
+    The per-flow re-probe is what keeps the cancellation test doubles in
+    ``tests/test_task_cancellation.py`` (which implement only
+    ``kickoff_async(self, inputs=None)``) on the no-checkpoint path, so their
+    27 cancellation / timeout tests are unaffected.
+    """
+    if not _checkpointing_available:
+        return False
+    for method_name in ("astream", "kickoff_async"):
+        if _kwarg_in_signature(getattr(flow, method_name, None), "from_checkpoint"):
+            return True
+    return False
+
+
+def supported_checkpoint_kwargs(method: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter ``kwargs`` to those the bound ``method`` actually declares.
+
+    The last line of defence at the call site: even after
+    ``flow_supports_checkpointing`` gates the build, the frame path calls
+    ``astream`` and the legacy path calls ``kickoff_async`` (different methods).
+    Filtering per-method means a flow that grew one kwarg but not the other (or
+    a test double that grew neither) degrades to a no-op instead of raising
+    ``TypeError: unexpected keyword argument``.
+    """
+    if not kwargs:
+        return {}
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C builtins etc.
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 @dataclass(frozen=True)
 class _Capabilities:
     """Cached, immutable snapshot of the detected crewai capabilities.
@@ -237,6 +371,15 @@ class _Capabilities:
     crew_chat_available: bool
     litellm_available: bool
     stream_frame_available: bool = False
+    # Checkpointing: informational; the wiring keys off the resolved
+    # symbols / ``flow_supports_checkpointing`` per-flow probe, not these fields.
+    checkpoint_config_available: bool = False
+    checkpointing_available: bool = False
+    flow_from_checkpoint_supported: bool = False
+    flow_restore_from_state_id_supported: bool = False
+    checkpoint_fork_supported: bool = False
+    checkpoint_events_available: bool = False
+    checkpoint_state_module: str | None = None
     missing: tuple[str, ...] = field(default_factory=tuple)
 
     def warn_on_gaps(self) -> None:
@@ -300,6 +443,13 @@ def _detect() -> _Capabilities:
         crew_chat_available=_crew_chat_available,
         litellm_available=_litellm_available,
         stream_frame_available=_stream_frame_available,
+        checkpoint_config_available=_checkpoint_config_available,
+        checkpointing_available=_checkpointing_available,
+        flow_from_checkpoint_supported=_flow_from_checkpoint_supported,
+        flow_restore_from_state_id_supported=_flow_restore_from_state_id_supported,
+        checkpoint_fork_supported=_checkpoint_fork_supported,
+        checkpoint_events_available=_checkpoint_events_available,
+        checkpoint_state_module=_CKPT_STATE_MODULE_NAME,
         missing=tuple(missing),
     )
     caps.warn_on_gaps()
