@@ -1,17 +1,14 @@
 """Shared env-var parse helpers for ag_ui_crewai.
 
-CR8 MEDIUM — circular import: prior to this module, ``crews.py``
-imported ``_parse_env_float`` from ``endpoint.py`` via a function-local
-import to sidestep the module-load cycle (``endpoint`` imports
-``ChatWithCrewFlow`` from ``crews`` at the top level). The function-local
-workaround is fragile — on a cold ``__pycache__`` the first-run import
-can fail if both modules try to resolve each other simultaneously — and
-leaks import plumbing into a hot path.
-
-Extracting the shared helper here gives both ``endpoint`` and ``crews``
-a neutral third module to import from at module load time, eliminating
-the cycle entirely. This module intentionally has NO imports from
-``endpoint`` or ``crews``; it must remain a leaf.
+Prior to this module, ``crews.py`` imported ``_parse_env_float`` from
+``endpoint.py`` via a function-local import to sidestep the module-load cycle
+(``endpoint`` imports ``ChatWithCrewFlow`` from ``crews`` at the top level).
+That workaround was fragile (a cold-``__pycache__`` first run could fail when
+both modules resolve each other simultaneously) and leaked import plumbing into
+a hot path. Extracting the shared helper here gives both ``endpoint`` and
+``crews`` a neutral third module to import from at load time, eliminating the
+cycle. This module intentionally has NO imports from ``endpoint`` or ``crews``;
+it must remain a leaf.
 """
 
 import math

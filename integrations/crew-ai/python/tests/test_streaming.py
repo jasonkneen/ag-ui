@@ -34,7 +34,7 @@ from ag_ui_crewai.sdk import (
 async def _settle_bus(emit_result=None):
     """Let off-thread crewai 1.x event-bus handlers land on the queue.
 
-    CPK-7718 #2: crewai 1.x dispatches our sync listener callbacks on a
+    crewai 1.x dispatches our sync listener callbacks on a
     ThreadPoolExecutor worker thread, and ``_enqueue`` hops the result back
     onto the loop via ``call_soon_threadsafe``. A test that emits then drains
     synchronously must wait for the handler to finish AND give the loop one
@@ -332,7 +332,7 @@ async def test_listener_emits_messages_and_state_snapshot_on_method_finish():
 
 
 # --------------------------------------------------------------------------
-# StreamFrame path (CPK-7719): flow.astream() -> frame translator -> wire
+# StreamFrame path: flow.astream() -> frame translator -> wire
 # --------------------------------------------------------------------------
 
 # Tests that drive a REAL crewai ``Flow.astream`` require the StreamFrame
@@ -365,7 +365,7 @@ async def _collect(agen):
 def _ev(type, event_id=None, **attrs):  # noqa: A002 - mirror event.type
     """A RAW crewai/bridge event stand-in the translator reads by attribute.
 
-    The translator now consumes raw event objects (CPK-7719 blocker 1), so a
+    The translator now consumes raw event objects, so a
     lifecycle event is any object exposing ``.type`` (+ ``.method_name`` etc.)
     and a bridge event exposes its typed payload attributes directly — no
     ``to_serializable`` ``frame.data`` in the loop."""
@@ -389,7 +389,7 @@ class _FakeStreamSession:
         self._source = source
         self._hang = hang
         self.aclosed = False
-        # CPK-7719 #5 instrumentation: how many frames the driver actually
+        # Instrumentation: how many frames the driver actually
         # consumed, and whether the iterator was drained to natural exhaustion
         # (vs stopped early via break + aclose).
         self.frames_yielded = 0
@@ -593,7 +593,7 @@ def _make_run_input(thread_id="t-1", run_id="r-1"):
     )
 
 
-# -- CPK-7719: ONE RUN_STARTED / ONE RUN_FINISHED per HTTP run --------------
+# -- ONE RUN_STARTED / ONE RUN_FINISHED per HTTP run --------------
 
 class _InnerKickoffFlow(Flow):
     """Stands in for the ``crew.kickoff`` a ``ChatWithCrewFlow.chat`` runs
@@ -610,7 +610,7 @@ class _InnerKickoffFlow(Flow):
 class _TwoCompletionCrewFlow(Flow):
     """A real Flow that performs TWO internal operations in ONE run — exactly
     the crew-tool path shape (``crew.kickoff`` off the event loop, then a
-    defect-2 follow-up completion). The nested kickoff runs via
+    follow-up completion). The nested kickoff runs via
     ``asyncio.to_thread`` (as the bridge offloads ``crew.kickoff``), which
     copies the scoped stream-sink contextvar, so the inner flow's
     ``flow_started`` / ``flow_finished`` frames land on THIS run's sink."""
@@ -620,7 +620,7 @@ class _TwoCompletionCrewFlow(Flow):
         # Completion #1 surrogate: the nested (crew) kickoff. Off the loop, as
         # ``crews.py`` runs ``crew_function`` via ``asyncio.to_thread``.
         await asyncio.to_thread(lambda: _InnerKickoffFlow().kickoff())
-        # Completion #2 (CPK-7717 defect 2): the follow-up completion that
+        # Completion #2: the follow-up completion that
         # makes the assistant speak about the crew result. ``copilotkit_stream``
         # emits this as a bridged TEXT_MESSAGE_CHUNK on the same sink.
         f = flow_context.get(None)
@@ -634,8 +634,8 @@ class _TwoCompletionCrewFlow(Flow):
 
 @requires_stream_frames
 async def test_frame_path_two_completions_emit_single_run_lifecycle():
-    """CPK-7719: a run whose flow method performs two internal completions —
-    a nested (crew) kickoff plus a defect-2 follow-up — must emit EXACTLY ONE
+    """A run whose flow method performs two internal completions —
+    a nested (crew) kickoff plus a follow-up — must emit EXACTLY ONE
     RUN_STARTED (first) and ONE RUN_FINISHED (last), with the follow-up text
     streaming in between.
 
@@ -661,14 +661,14 @@ async def test_frame_path_two_completions_emit_single_run_lifecycle():
     assert types[0] == "RUN_STARTED"
     assert types[-1] == "RUN_FINISHED"
 
-    # The defect-2 follow-up text reaches the client, inside the run.
+    # The follow-up text reaches the client, inside the run.
     assert "TEXT_MESSAGE_CHUNK" in types, types
     follow = next(p for p in payloads if p["type"] == "TEXT_MESSAGE_CHUNK")
     assert follow["delta"] == "Crew is done."
     assert types.index("TEXT_MESSAGE_CHUNK") < types.index("RUN_FINISHED")
 
 
-# -- CPK-7719 review blockers: raw-payload fidelity, nested non-leak, terminal
+# -- Review invariants: raw-payload fidelity, nested non-leak, terminal
 
 
 class _ProgressiveStateFlow(Flow):
@@ -690,7 +690,7 @@ class _ProgressiveStateFlow(Flow):
 
 @requires_stream_frames
 async def test_frame_path_progressive_state_snapshot_is_verbatim():
-    """CPK-7719 blocker 1: the intermediate STATE_SNAPSHOT must equal the LIVE
+    """The intermediate STATE_SNAPSHOT must equal the LIVE
     state ``copilotkit_emit_state`` was given — no ``repr()`` quoting of strings
     at depth >= 5, no dropping of user keys named ``type`` / ``timestamp``.
 
@@ -738,7 +738,7 @@ class _NestedNoLeakFlow(Flow):
 
 @requires_stream_frames
 async def test_frame_path_nested_flow_frames_do_not_leak():
-    """CPK-7719 blocker 2: a nested kickoff must NOT inject a second
+    """A nested kickoff must NOT inject a second
     STEP_STARTED / MESSAGES_SNAPSHOT / STATE_SNAPSHOT / STEP_FINISHED built from
     the OUTER flow's state. The outer run has exactly ONE method, so each of
     those appears exactly once — matching the legacy (``source is flow_copy``)
@@ -791,7 +791,7 @@ class _OuterCatchesNestedErrorFlow(Flow):
 
 @requires_stream_frames
 async def test_frame_path_nested_error_still_terminates_run():
-    """CPK-7719 blocker 3: a nested flow that raises (so its ``flow_finished``
+    """A nested flow that raises (so its ``flow_finished``
     is never emitted) while the outer method catches and continues must STILL
     terminate the run — exactly one RUN_STARTED and a final RUN_FINISHED (or
     RUN_ERROR), never a run that ends with neither.
@@ -819,7 +819,7 @@ async def test_frame_path_nested_error_still_terminates_run():
     assert "RUN_FINISHED" in types or "RUN_ERROR" in types, types
 
 
-# -- CPK-7718 #11: per-request flow COPY seeds state before @start runs ------
+# -- per-request flow COPY seeds state before @start runs ------
 
 class _StateReadingFlow(Flow[CopilotKitState]):
     """A real crewai Flow shaped like the served example flows
@@ -841,7 +841,7 @@ class _StateReadingFlow(Flow[CopilotKitState]):
 
 @requires_stream_frames
 async def test_copied_example_flow_astream_seeds_state_before_start_runs():
-    """CPK-7718 #11 (flow-demo path): a per-request COPY of an example-shaped
+    """Flow-demo path: a per-request COPY of an example-shaped
     ``Flow[CopilotKitState]``, driven through the REAL
     ``crewai_prepare_inputs`` -> ``flow.astream(inputs=...)`` seam
     ``add_crewai_flow_fastapi_endpoint`` uses on crewai 1.6+, must seed
@@ -980,10 +980,10 @@ async def test_frame_path_aclose_called_on_early_generator_close():
     assert session.aclosed is True
 
 
-# -- CPK-7719 #4: raising astream is mapped to RUN_ERROR + no contextvar leak --
+# -- raising astream is mapped to RUN_ERROR + no contextvar leak --
 
 async def test_frame_path_raising_astream_emits_run_error_and_resets_context():
-    """CPK-7719 #4: if ``astream`` (or ``__aiter__``) raises, the driver must
+    """If ``astream`` (or ``__aiter__``) raises, the driver must
     (a) map it through the RUN_ERROR taxonomy — not let it escape the generator
     with no terminal event — and (b) never leak the ``flow_context`` token into
     the caller's context. Pre-fix, ``astream()``/``__aiter__()`` sat before the
@@ -1018,10 +1018,10 @@ async def test_frame_path_raising_astream_emits_run_error_and_resets_context():
     assert flow_context.get(None) is None
 
 
-# -- CPK-7719 #5: drain the terminal tail; don't cancel kickoff mid-finalize ---
+# -- drain the terminal tail; don't cancel kickoff mid-finalize ---
 
 async def test_frame_path_drains_tail_after_run_finished():
-    """CPK-7719 #5: after RUN_FINISHED the driver drains the frame stream to
+    """After RUN_FINISHED the driver drains the frame stream to
     natural exhaustion (so crewai's kickoff task finishes finalization) instead
     of breaking immediately and letting aclose() cancel it. A frame arriving
     AFTER flow_finished is consumed (drained) but produces no wire event."""
@@ -1063,7 +1063,7 @@ async def test_frame_path_drains_tail_after_run_finished():
 
 @requires_stream_frames
 async def test_frame_path_does_not_cancel_kickoff_after_finish():
-    """CPK-7719 #5 (real Flow): on the happy path the kickoff task must finish
+    """Real Flow: on the happy path the kickoff task must finish
     finalization — result recorded, not cancelled. Pre-fix the driver broke on
     RUN_FINISHED and the finally's aclose() cancelled the still-finalizing task
     on EVERY run (session ended is_cancelled=True with no result); verified
@@ -1100,7 +1100,7 @@ async def test_frame_path_does_not_cancel_kickoff_after_finish():
     assert session.result == "RESULT"
 
 
-# -- PNI-130: MCP events surface through the SHIPPED frame-path sink ----------
+# -- MCP events surface through the SHIPPED frame-path sink ----------
 
 class _MCPEmittingFlow(Flow):
     """Emits crewai MCP events (connection lifecycle + a tool execution) with a
@@ -1134,7 +1134,7 @@ class _MCPEmittingFlow(Flow):
 
 @requires_stream_frames
 async def test_frame_path_surfaces_mcp_tool_calls():
-    """PNI-130: agent-sourced MCP events surface through the real
+    """Agent-sourced MCP events surface through the real
     ``_run_flow_frame_stream`` sink as TOOL_CALL_* (tool executions) and CUSTOM
     (connection lifecycle), inside a single RUN_STARTED/RUN_FINISHED envelope."""
     from ag_ui.encoder import EventEncoder

@@ -1,4 +1,4 @@
-"""Safe deep-copy of crewai objects (CPK-7718 #10).
+"""Safe deep-copy of crewai objects.
 
 crewai 1.13+ made ``Flow`` (and ``Crew``) Pydantic ``BaseModel``s that now
 carry non-deep-copyable runtime state — a ``memory`` (``UnifiedMemory``) field
@@ -60,17 +60,53 @@ def _deepcopy_pinning_uncopyable(obj: object) -> object:
     return copy.deepcopy(obj, memo)
 
 
+def _assert_state_isolated(original: object, copied: object, what: str) -> None:
+    """Fail loudly if the per-request conversation ``_state`` was NOT isolated.
+
+    :func:`_deepcopy_pinning_uncopyable` pins uncopyable values by reference at
+    TOP-LEVEL-FIELD granularity. If a single field/private-attr
+    value transitively holds BOTH the conversation ``_state`` AND some
+    uncopyable object (a lock, a thread pool), the whole field is pinned — so
+    the copy would SHARE ``_state`` with the original and per-request isolation
+    would be SILENTLY lost (every concurrent request mutating one shared state).
+    The entire reason ``safe_deepcopy`` exists is to isolate that ``_state``, so
+    assert it post-copy and fail loud rather than serve cross-request bleed.
+
+    Only checked when BOTH objects actually carry a non-None ``_state`` (crewai
+    ``Flow`` instances do; a copied ``Crew`` or a test stub may not) — absent or
+    ``None`` ``_state`` is nothing to isolate and is left alone.
+    """
+    original_state = getattr(original, "_state", None)
+    copied_state = getattr(copied, "_state", None)
+    if original_state is None or copied_state is None:
+        return
+    if copied_state is original_state:
+        raise RuntimeError(
+            f"ag-ui-crewai: safe_deepcopy of a {what} did NOT isolate its "
+            "conversation `_state` (copy._state is original._state). A "
+            "top-level field pinned by the deep-copy fallback transitively "
+            "held both `_state` and an uncopyable object, collapsing "
+            "per-request isolation — concurrent requests would share and "
+            "corrupt one another's state. This is a hard correctness failure, "
+            "not a degradation; refusing to serve a non-isolated copy."
+        )
+
+
 def safe_deepcopy(obj: object, *, what: str = "crewai object") -> object:
     """Return an isolated deep-copy of ``obj``, tolerating crewai's copy bugs.
 
     Uses plain ``copy.deepcopy`` on healthy builds; on the first failure it
-    latches to the pin-and-share fallback and warns once.
+    latches to the pin-and-share fallback and warns once. Either way the
+    per-request conversation ``_state`` MUST end up isolated — asserted
+    fail-loud post-copy.
     """
     global _NEEDS_PIN  # pylint: disable=global-statement
     if _NEEDS_PIN:
-        return _deepcopy_pinning_uncopyable(obj)
+        copied = _deepcopy_pinning_uncopyable(obj)
+        _assert_state_isolated(obj, copied, what)
+        return copied
     try:
-        return copy.deepcopy(obj)
+        copied = copy.deepcopy(obj)
     except Exception:  # noqa: BLE001 - fall back to the pin-and-share path
         _NEEDS_PIN = True
         _LOGGER.warning(
@@ -81,13 +117,15 @@ def safe_deepcopy(obj: object, *, what: str = "crewai object") -> object:
             "silenced.",
             what,
         )
-        return _deepcopy_pinning_uncopyable(obj)
+        copied = _deepcopy_pinning_uncopyable(obj)
+    _assert_state_isolated(obj, copied, what)
+    return copied
 
 
 def rebind_bound_methods(target: object, attr: str = "_methods") -> None:
     """Rebind the bound callables in ``target.<attr>`` to ``target`` itself.
 
-    CPK-7718 #11 (crewai 1.15 per-request isolation bug). crewai 1.x drives a
+    crewai 1.15 per-request isolation bug. crewai 1.x drives a
     Flow's ``@start`` / ``@listen`` methods through a ``_methods`` dict of
     BOUND methods, each captured against the instance at construction time
     (``method.__get__(self, type(self))`` in ``_class_bound_methods``). The

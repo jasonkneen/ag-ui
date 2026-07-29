@@ -1,4 +1,4 @@
-"""Translate crewai stream events into AG-UI wire events (CPK-7719).
+"""Translate crewai stream events into AG-UI wire events.
 
 crewai's public streaming contract (``StreamFrame`` / ``AsyncStreamSession``,
 landed 1.6.0) emits one ordered frame per event a flow raises. The frame gives
@@ -7,7 +7,7 @@ by our scoped stream sink, keyed by ``event.event_id == StreamFrame.id``) gives
 us the EXACT payload. This module is the SINGLE translation seam that maps the
 raw events the bridge cares about onto AG-UI events.
 
-Why raw events, not ``frame.data`` (CPK-7719 review blocker 1):
+Why raw events, not ``frame.data``:
 ``StreamFrame.data`` is ``event.to_json(exclude=...)`` -> crewai's
 ``to_serializable(max_depth=5)``, which (a) ``repr()``-quotes anything at depth
 >= 5 (plain strings become ``"'text'"``) and (b) recursively drops any dict key
@@ -26,14 +26,26 @@ Two raw event sources feed us (verified against the 1.15.7 wheel):
   ``EventType`` string and whose typed attributes (``snapshot`` / ``delta`` /
   ``message_id`` / ...) carry the verbatim, un-serialized payload.
 
-OUTER-flow filtering (CPK-7719 review blockers 2 + 3): a ``crew.kickoff`` inside
+OUTER-flow filtering: a ``crew.kickoff`` inside
 a flow method drives a NESTED flow whose own lifecycle/method events leak onto
 the same scoped sink. The driver filters those out by source identity BEFORE
 they reach this translator (only events whose ``source is flow_copy`` are parked
 in the lookup buffer), so the translator never sees nested frames. This mirrors
 the legacy listener's ``source is flow_copy`` gate and needs no depth counter.
 
-SWAPPABLE EMISSION SHAPE (cross-lane constraint, CPK-7719): CrewAI is currently
+UPSTREAM FRAME RETENTION: crewai's ``AsyncStreamSession``
+(``crewai.types.streaming.StreamSessionBase``) appends EVERY iterated frame to
+its ``self._frames`` list and keeps them for the session's life (to back its
+``.frames`` / ``.result`` replay accessors) — we cannot drop consumed frames
+without forking upstream, and doing so would break those accessors. The growth
+is bounded per-request (one session per run, torn down when the request ends),
+NOT a cross-request leak. The bridge's OWN raw-event lookup buffer does not
+share this behavior: ``endpoint._run_flow_frame_stream`` ``pop``s each parked
+raw event by ``frame.id`` the moment its frame is consumed, so our buffer stays
+proportional to in-flight (not total) frames. If a future crewai release makes
+frame retention opt-out, revisit the session consumption in ``endpoint.py``.
+
+SWAPPABLE EMISSION SHAPE: CrewAI is currently
 the only integration emitting TEXT_MESSAGE_CHUNK / TOOL_CALL_CHUNK (chunks)
 rather than the START/CONTENT/END triples the six other integrations emit. That
 final choice belongs to a Parity-lane ticket, not this migration. The translator
@@ -43,13 +55,13 @@ byte-for-byte behavior-preserving on that channel. The ``"triples"`` strategy is
 a deliberate NotImplementedError placeholder — the Parity ticket owns wiring it
 up and flipping the default.
 
-MCP EVENTS (PNI-130) are the ONE exception to "chunks-only": crewai's discrete
+MCP EVENTS are the ONE exception to "chunks-only": crewai's discrete
 MCP tool executions (name + full args + result arrive together, not streamed)
 map to canonical ``TOOL_CALL_START/ARGS/END/RESULT`` triples via the shared
 ``mcp.translate_mcp_event`` seam, and MCP lifecycle events map to ``CUSTOM``.
 This is independent of the ``emission_shape`` strategy above (which governs only
 the streaming LLM text / tool-call channel); see the wire-shape note in
-``mcp.py`` for why discrete MCP calls use triples regardless of PNI-136.
+``mcp.py`` for why discrete MCP calls use triples.
 """
 
 from __future__ import annotations
@@ -116,7 +128,7 @@ class StreamFrameTranslator:
         self._run_id = run_id
         self._state_provider = state_provider
         self.emission_shape = emission_shape
-        # Run-lifecycle idempotency (CPK-7719). A single AG-UI HTTP run must
+        # Run-lifecycle idempotency. A single AG-UI HTTP run must
         # emit EXACTLY ONE ``RUN_STARTED`` (first) and ONE ``RUN_FINISHED``
         # (last). Nested-flow lifecycle events are already filtered out by the
         # driver's source gate, so no depth counter is needed; these flags are
@@ -176,7 +188,7 @@ class StreamFrameTranslator:
         if event_type == _METHOD_FINISHED:
             return self._method_finished_events(event)
 
-        # PNI-130: crewai's first-class MCP events (crewai >= 1.4). Emitted with
+        # crewai's first-class MCP events (crewai >= 1.4). Emitted with
         # the agent/crew as source (not the flow), so the driver's sink parks
         # them by TYPE rather than source identity; here they map to TOOL_CALL_*
         # (tool executions) and CUSTOM (lifecycle) via the shared translator.
@@ -212,7 +224,7 @@ class StreamFrameTranslator:
         return []
 
     def finalize(self) -> list[Any]:
-        """Belt-and-braces terminal (CPK-7719 review blocker 3).
+        """Belt-and-braces terminal.
 
         Called once when the frame stream exhausts cleanly. If the run opened
         (RUN_STARTED) but no outer ``flow_finished`` closed it — e.g. the outer
@@ -283,10 +295,10 @@ class StreamFrameTranslator:
                     delta=getattr(event, "delta", None),
                 )
             ]
-        # TODO(CPK Parity lane): emit TEXT_MESSAGE_START / _CONTENT / _END
-        # triples here to match the other six integrations. That cross-lane
-        # decision is owned by the Parity ticket; do NOT flip the default in
-        # this migration (it must stay behavior-preserving on the wire).
+        # TODO(Parity lane): emit TEXT_MESSAGE_START / _CONTENT / _END
+        # triples here to match the other six integrations. Do NOT flip the
+        # default in this migration (it must stay behavior-preserving on the
+        # wire).
         raise NotImplementedError(
             "emission_shape='triples' is a Parity-lane placeholder; "
             "the StreamFrame migration ships the behavior-preserving "
@@ -303,7 +315,7 @@ class StreamFrameTranslator:
                     delta=getattr(event, "delta", None),
                 )
             ]
-        # TODO(CPK Parity lane): TOOL_CALL_START / _ARGS / _END triples — see
+        # TODO(Parity lane): TOOL_CALL_START / _ARGS / _END triples — see
         # the note in ``_text_events``.
         raise NotImplementedError(
             "emission_shape='triples' is a Parity-lane placeholder; "
