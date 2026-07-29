@@ -243,15 +243,6 @@ export const agentsIntegrations = {
         subgraphs: "subgraphs",
       },
     ),
-    // A2UI Chat with middleware
-    a2ui_chat: (() => {
-      const agent = new LangGraphAgent({
-        deploymentUrl: envVars.langgraphPythonUrl,
-        graphId: "a2ui_chat",
-      });
-      agent.use(new A2UIMiddleware({ injectA2UITool: true }));
-      return agent;
-    })(),
     a2ui_dynamic_schema: new LangGraphAgent({
       deploymentUrl: envVars.langgraphPythonUrl,
       graphId: "a2ui_dynamic_schema",
@@ -655,6 +646,48 @@ export const agentsIntegrations = {
         agentic_chat: "agentic_chat",
         backend_tool_rendering: "backend_tool_rendering",
         shared_state: "shared_state",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
+  "claude-managed-agents-dotnet": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsDotnetUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
+  "claude-managed-agents-python": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsPythonUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
+  "claude-managed-agents-typescript": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.claudeManagedAgentsTypescriptUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
         human_in_the_loop: "human_in_the_loop",
         tool_based_generative_ui: "tool_based_generative_ui",
       },

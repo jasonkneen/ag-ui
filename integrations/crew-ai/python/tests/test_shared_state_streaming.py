@@ -14,10 +14,15 @@ The mechanism mirrors LangGraph: a node that streams a predicted tool call
 so the snapshot rebuilt from ``flow.state`` at node exit must not clobber it.
 """
 
+import asyncio
+import concurrent.futures
+
 import pytest
 from pydantic import BaseModel
 
-from crewai.utilities.events import (
+# CPK-7718: crewai 1.x deleted ``crewai.utilities.events``; resolve the bus and
+# lifecycle events through the version-agnostic capability shim.
+from ag_ui_crewai._capabilities import (
     FlowFinishedEvent,
     MethodExecutionFinishedEvent,
     MethodExecutionStartedEvent,
@@ -194,18 +199,53 @@ def _names(events):
     return [type(e).__name__ for e in events]
 
 
+async def _await_future(fut):
+    """Await whatever crewai's bus.emit returns.
+
+    CPK-7718: crewai 1.x runs sync bus handlers in a ThreadPoolExecutor and
+    ``emit`` returns a ``concurrent.futures.Future`` (or an asyncio future for
+    async/dependency handlers, or ``None`` when there are no handlers). Awaiting
+    it guarantees the handler ran before we inspect the queue.
+    """
+    if fut is None:
+        return
+    if isinstance(fut, concurrent.futures.Future):
+        await asyncio.wrap_future(fut)
+    else:
+        await fut
+
+
+async def _settle():
+    """Drain off-thread handler work onto the queue.
+
+    ``flush`` blocks until every pending handler future completes (so their
+    ``call_soon_threadsafe`` queue puts are scheduled on this loop); the ticks
+    then let those scheduled puts actually run.
+    """
+    crewai_event_bus.flush()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+async def _emit(source, event):
+    """Emit one event and wait for its handler to finish (keeps put order)."""
+    await _await_future(crewai_event_bus.emit(source, event))
+    await asyncio.sleep(0)
+
+
 async def _run_node(source, *, method_name="chat", body=None, flow_finished=False):
     """Simulate one flow node end to end over the real event bus.
 
     Registers the listener, fires MethodExecutionStarted, runs ``body`` (with
     flow_context set so the SDK hooks target ``source``), fires
-    MethodExecutionFinished, then optionally FlowFinished. Returns the drained
-    queue events (newest listener output for this node).
+    MethodExecutionFinished, then optionally FlowFinished. Awaits/flushes the
+    off-thread bus between steps so the drained queue reflects a settled,
+    ordered stream. Returns the drained queue events for this node.
     """
     queue = ep.get_queue(source) or await ep.create_queue(source)
     with crewai_event_bus.scoped_handlers():
         ep.FastAPICrewFlowEventListener()
-        crewai_event_bus.emit(
+        await _emit(
             source,
             MethodExecutionStartedEvent(
                 flow_name="TestFlow", method_name=method_name, state=source.state
@@ -217,14 +257,20 @@ async def _run_node(source, *, method_name="chat", body=None, flow_finished=Fals
                 await body()
         finally:
             flow_context.reset(token)
-        crewai_event_bus.emit(
+        # Flush the body's bridged predict/emit events onto the queue before the
+        # node-exit events so the stream stays ordered.
+        await _settle()
+        await _emit(
             source,
             MethodExecutionFinishedEvent(
                 flow_name="TestFlow", method_name=method_name, state=source.state
             ),
         )
         if flow_finished:
-            crewai_event_bus.emit(source, FlowFinishedEvent(flow_name="TestFlow"))
+            await _emit(
+                source, FlowFinishedEvent(flow_name="TestFlow", state=source.state)
+            )
+        await _settle()
     return _drain(queue)
 
 
@@ -420,7 +466,7 @@ async def test_node_entry_reset_clears_stale_predicted_tools():
     with crewai_event_bus.scoped_handlers():
         ep.FastAPICrewFlowEventListener()
         # Node A: entry, declare predict_state + stream, then "crash" (no finish).
-        crewai_event_bus.emit(
+        await _emit(
             source,
             MethodExecutionStartedEvent(
                 flow_name="TestFlow", method_name="a", state=source.state
@@ -435,21 +481,23 @@ async def test_node_entry_reset_clears_stale_predicted_tools():
         finally:
             flow_context.reset(token)
 
+        await _settle()
         _drain(queue)  # discard node A's partial output
 
         # Node B: entry resets stale flags, exit emits the snapshot.
-        crewai_event_bus.emit(
+        await _emit(
             source,
             MethodExecutionStartedEvent(
                 flow_name="TestFlow", method_name="b", state=source.state
             ),
         )
-        crewai_event_bus.emit(
+        await _emit(
             source,
             MethodExecutionFinishedEvent(
                 flow_name="TestFlow", method_name="b", state=source.state
             ),
         )
+        await _settle()
         events = _drain(queue)
 
     assert _names(events) == [
