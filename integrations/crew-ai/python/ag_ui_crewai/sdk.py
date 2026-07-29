@@ -301,7 +301,10 @@ async def copilotkit_stream(response):
         return _copilotkit_stream_response(response)
     if isinstance(response, CustomStreamWrapper):
         return await _copilotkit_stream_custom_stream_wrapper(response)
-    raise ValueError("Invalid response type")
+    raise ValueError(
+        f"Invalid response type {type(response)!r}; "
+        f"expected {ModelResponse.__name__} or {CustomStreamWrapper.__name__}"
+    )
 
 
 async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper):
@@ -430,7 +433,9 @@ def litellm_messages_to_ag_ui_messages(messages: List[LiteLLMMessage]) -> List[M
         # whitelist the fields we want to keep
         whitelist = ["content", "role", "tool_calls", "id", "name", "tool_call_id"]
         message_dict = {k: v for k, v in message_dict.items() if k in whitelist}
-        if "id" not in message_dict:
+        # Backfill when id is absent OR explicitly None: the None-strip below
+        # would drop a None id, and pydantic Message validation requires one.
+        if message_dict.get("id") is None:
             message_dict["id"] = str(uuid.uuid4())
         # remove all None values
         message_dict = {k: v for k, v in message_dict.items() if v is not None}

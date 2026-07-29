@@ -231,6 +231,30 @@ async def test_copilotkit_predict_state_emits_custom_event():
     ]
 
 
+async def test_copilotkit_predict_state_tool_argument_is_optional():
+    """``tool_argument`` is documented optional: omitting it must not KeyError,
+    and the wire value carries ``tool_argument=None`` (whole-object streaming)."""
+    ep.FastAPICrewFlowEventListener()  # registers bus handlers
+    flow = _FakeFlow()
+    queue = await ep.create_queue(flow)
+    flow_context.set(flow)
+    try:
+        result = await copilotkit_predict_state({"steps": {"tool_name": "SearchTool"}})
+        assert result is True
+        await _settle_bus()
+        items = _drain(queue)
+    finally:
+        await ep.delete_queue(flow)
+
+    assert len(items) == 1
+    event = items[0]
+    assert event.type == EventType.CUSTOM
+    assert event.name == "PredictState"
+    assert event.value == [
+        {"state_key": "steps", "tool": "SearchTool", "tool_argument": None}
+    ]
+
+
 async def test_copilotkit_emit_state_emits_state_snapshot():
     """``copilotkit_emit_state`` emits a STATE_SNAPSHOT carrying the state."""
     ep.FastAPICrewFlowEventListener()
