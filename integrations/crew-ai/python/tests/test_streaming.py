@@ -525,6 +525,279 @@ def test_translator_emission_shape_is_swappable_and_defaults_to_chunks():
         triples.translate(_ev("TEXT_MESSAGE_CHUNK", message_id="m", delta="x"))
 
 
+# -- backend tool execution ------------------------------------------------
+
+def test_translator_backend_tool_finished_emits_triples_then_result():
+    """A crewai ``tool_usage_finished`` event surfaces the backend tool call as
+    discrete START/ARGS/END (like the MCP path) followed by a TOOL_CALL_RESULT
+    that carries the output and shares the tool_call_id. START carries a
+    ``parent_message_id``.
+
+    ``output`` is a STRING because that is what real crewai delivers
+    (``ToolUsage._format_result`` returns ``str(result)``); the demo tool
+    returns ``json.dumps(...)`` so the string is valid JSON the card can
+    parse. The translator forwards it verbatim (no double-encode)."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    weather_json = '{"temperature": 20, "conditions": "sunny"}'
+    out = tr.translate(_ev(
+        "tool_usage_finished",
+        tool_name="get_weather",
+        tool_args={"location": "SF"},
+        output=weather_json,
+    ))
+    assert [e.type for e in out] == [
+        EventType.TOOL_CALL_START,
+        EventType.TOOL_CALL_ARGS,
+        EventType.TOOL_CALL_END,
+        EventType.TOOL_CALL_RESULT,
+    ]
+    start, args, end, result = out
+    assert start.tool_call_name == "get_weather"
+    assert start.parent_message_id  # tied to the assistant message
+    assert _json.loads(args.delta) == {"location": "SF"}
+    ids = {e.tool_call_id for e in out}
+    assert len(ids) == 1  # one call, one id across all four events
+    assert result.content == weather_json
+    assert _json.loads(result.content) == {"temperature": 20, "conditions": "sunny"}
+    assert result.role == "tool"
+    assert result.message_id and result.message_id != result.tool_call_id
+
+
+def test_translator_backend_tool_output_dict_is_json_encoded_defensively():
+    """When a caller delivers a structured (non-str) ``output``, it is
+    JSON-encoded (defensive path; real crewai always sends a str)."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    out = tr.translate(_ev(
+        "tool_usage_finished", tool_name="t", tool_args={},
+        output={"temperature": 20, "conditions": "sunny"},
+    ))
+    assert _json.loads(out[-1].content) == {"temperature": 20, "conditions": "sunny"}
+
+
+def test_translator_backend_tool_survives_messages_snapshot():
+    """The client drops any message absent from a MESSAGES_SNAPSHOT, and the
+    method-finish snapshot comes from ``state.messages`` (no tool call/result).
+    The translator must merge the surfaced call + result in, or the streamed
+    card is wiped at method-finish. The snapshot AssistantMessage id equals the
+    streamed START ``parent_message_id`` so the client does not remount."""
+    state = {"messages": [
+        {"role": "user", "content": "weather in SF", "id": "u1"},
+        {"role": "assistant", "content": "It is sunny in SF.", "id": "a1"},
+    ]}
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=lambda: state,
+    )
+    out = tr.translate(_ev(
+        "tool_usage_finished", tool_name="get_weather",
+        tool_args={"location": "SF"},
+        output='{"temperature": 20}',
+    ))
+    start = out[0]
+    tool_call_id = out[-1].tool_call_id
+    parent_message_id = start.parent_message_id
+
+    finished = tr.translate(_ev("method_execution_finished", method_name="chat"))
+    snapshot = finished[0]
+    assert snapshot.type == EventType.MESSAGES_SNAPSHOT
+    roles = [m.role for m in snapshot.messages]
+    # user, then the injected tool call + result, then the assistant answer.
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    asst_toolcall = snapshot.messages[1]
+    tool_msg = snapshot.messages[2]
+    # id continuity: streamed parent_message_id == snapshot assistant id.
+    assert asst_toolcall.id == parent_message_id
+    assert asst_toolcall.tool_calls[0].id == tool_call_id
+    assert asst_toolcall.tool_calls[0].function.name == "get_weather"
+    assert tool_msg.tool_call_id == tool_call_id
+    assert tool_msg.content == '{"temperature": 20}'
+    # A second snapshot does not duplicate the tool messages.
+    again = tr.translate(_ev("method_execution_finished", method_name="chat"))
+    assert [m.role for m in again[0].messages] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_translator_two_backend_tools_survive_snapshot_in_order():
+    """Two backend tools in one method: both call/result pairs are surfaced and
+    both survive the method-finish MESSAGES_SNAPSHOT, in call order, right after
+    the user message and before the assistant answer."""
+    state = {"messages": [
+        {"role": "user", "content": "weather in SF and NYC", "id": "u1"},
+        {"role": "assistant", "content": "Here you go.", "id": "a1"},
+    ]}
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=lambda: state,
+    )
+    r1 = tr.translate(_ev(
+        "tool_usage_finished", tool_name="get_weather",
+        tool_args={"location": "SF"}, output='{"temperature": 20}',
+    ))
+    r2 = tr.translate(_ev(
+        "tool_usage_finished", tool_name="get_weather",
+        tool_args={"location": "NYC"}, output='{"temperature": 5}',
+    ))
+    tc1, tc2 = r1[1].tool_call_id, r2[1].tool_call_id
+    assert tc1 != tc2
+
+    snapshot = tr.translate(_ev("method_execution_finished", method_name="chat"))[0]
+    roles = [m.role for m in snapshot.messages]
+    assert roles == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
+    tool_call_ids = [
+        m.tool_calls[0].id for m in snapshot.messages
+        if m.role == "assistant" and getattr(m, "tool_calls", None)
+    ]
+    assert tool_call_ids == [tc1, tc2]  # call order preserved
+
+
+def test_translator_backend_tool_snapshot_insert_after_system_when_no_user():
+    """When the snapshot has a system message but no user message, the backend
+    tool call/result are inserted AFTER the system preamble, not ahead of it."""
+    state = {"messages": [{"role": "system", "content": "sys", "id": "s1"}]}
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=lambda: state,
+    )
+    tr.translate(_ev(
+        "tool_usage_finished", tool_name="t", tool_args={}, output="ok",
+    ))
+    snapshot = tr.translate(_ev("method_execution_finished", method_name="chat"))[0]
+    assert [m.role for m in snapshot.messages] == ["system", "assistant", "tool"]
+
+
+def test_stringify_tool_output_branches():
+    """Defensive ``_stringify_tool_output`` coverage: None -> ""; pydantic-like
+    (model_dump) -> JSON; a plain object -> JSON of its str() (json.dumps
+    default=str); and a genuinely unencodable value (circular) -> str() fallback
+    on the logged except path."""
+    f = frames_mod.StreamFrameTranslator._stringify_tool_output
+    assert f(None) == ""
+
+    class _Model:
+        def model_dump(self):
+            return {"a": 1}
+
+    assert _json.loads(f(_Model())) == {"a": 1}
+
+    class _Obj:
+        def __repr__(self):
+            return "<obj>"
+
+    # default=str lets json.dumps encode a plain object as its str().
+    assert f(_Obj()) == '"<obj>"'
+
+    # A circular structure cannot be JSON-encoded even with default=str, so the
+    # except path fires and falls back to str().
+    circular: dict = {}
+    circular["self"] = circular
+    assert f(circular) == str(circular)
+
+
+def test_tool_args_to_json_branches():
+    """``_tool_args_to_json``: str passthrough, None -> '{}', dict -> JSON."""
+    f = frames_mod.StreamFrameTranslator._tool_args_to_json
+    assert f('{"raw": 1}') == '{"raw": 1}'
+    assert f(None) == "{}"
+    assert _json.loads(f({"a": 1})) == {"a": 1}
+
+
+def test_translator_backend_tool_started_is_dropped():
+    """``tool_usage_started`` emits nothing; the whole call+result is emitted
+    atomically on ``tool_usage_finished`` (no dangling call)."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    assert tr.translate(_ev(
+        "tool_usage_started", tool_name="get_weather", tool_args={"location": "SF"},
+    )) == []
+
+
+def test_translator_backend_tool_error_events_are_dropped():
+    """crewai retries backend tools up to 3x, emitting an error event per failed
+    attempt before any tool runs. Surfacing them would render phantom cards and,
+    once recorded to MESSAGES_SNAPSHOT, poison history. Like LangGraph's
+    OnToolError, we emit nothing; a terminal failure still surfaces via
+    ``tool_usage_finished`` (its error text in ``output``)."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=lambda: {"messages": []},
+    )
+    for etype in (
+        "tool_usage_error",
+        "tool_execution_error",
+        "tool_validate_input_error",
+        "tool_selection_error",
+    ):
+        assert tr.translate(_ev(
+            etype, tool_name="get_weather", tool_args={"location": "SF"},
+            error="upstream 500",
+        )) == [], etype
+    # And nothing was recorded into the snapshot (no phantom history).
+    snap = tr.translate(_ev("method_execution_finished", method_name="chat"))[0]
+    assert snap.messages == []
+
+
+def test_translator_backend_mcp_tool_is_not_double_surfaced():
+    """An MCP tool is a crewai BaseTool that ALSO emits ToolUsage. It has its own
+    MCP translation seam, so the backend path must skip it (probe by tool_class)
+    or the client renders two cards for one execution."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    for cls in ("MCPToolWrapper", "MCPNativeTool"):
+        assert tr.translate(_ev(
+            "tool_usage_finished", tool_name="search", tool_args={},
+            output="ok", tool_class=cls,
+        )) == [], cls
+    # A normal backend tool (any other tool_class) still surfaces.
+    out = tr.translate(_ev(
+        "tool_usage_finished", tool_name="search", tool_args={},
+        output="ok", tool_class="MyTool",
+    ))
+    assert out[0].type == EventType.TOOL_CALL_START
+
+
+def test_translator_backend_tool_string_args_passthrough():
+    """crewai ``tool_args`` may be a raw string; it is forwarded verbatim on the
+    ARGS event rather than re-encoded."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    out = tr.translate(_ev(
+        "tool_usage_finished", tool_name="t", tool_args='{"raw": true}', output="ok",
+    ))
+    args = next(e for e in out if e.type == EventType.TOOL_CALL_ARGS)
+    assert args.delta == '{"raw": true}'
+
+
+def test_is_backend_tool_event_predicate():
+    """The sink gate recognises only started/finished; error events are NOT
+    parked (they are dropped, so they never need to reach the translator)."""
+    for t in ("tool_usage_started", "tool_usage_finished"):
+        assert frames_mod.is_backend_tool_event(_ev(t)) is True
+    for t in (
+        "tool_usage_error", "tool_execution_error",
+        "tool_validate_input_error", "tool_selection_error",
+        "flow_started",
+    ):
+        assert frames_mod.is_backend_tool_event(_ev(t)) is False
+    assert frames_mod.is_backend_tool_event(_ev(EventType.TEXT_MESSAGE_CHUNK)) is False
+
+
+def test_is_recognized_event_covers_mapped_channels():
+    """RAW passthrough must not duplicate a mapped event. is_recognized_event
+    covers backend ToolUsage (incl. the suppressed ``started``), crew/agent
+    lifecycle, and MCP, alongside the base types."""
+    for t in (
+        "tool_usage_started", "tool_usage_finished",
+        "crew_kickoff_started", "agent_execution_started",
+        "mcp_tool_execution_started", "flow_started",
+        EventType.TEXT_MESSAGE_CHUNK,
+    ):
+        assert frames_mod.is_recognized_event(_ev(t)) is True, t
+    # A genuinely foreign event is NOT recognized (eligible for RAW).
+    assert frames_mod.is_recognized_event(_ev("cc_env")) is False
+
+
 # -- end-to-end through a REAL crewai Flow via astream ----------------------
 
 class _BridgeEmittingFlow(Flow):
@@ -583,6 +856,90 @@ async def test_frame_path_end_to_end_matches_legacy_wire_shape():
     assert run_started["runId"] == "r-1"
     text_deltas = [p["delta"] for p in payloads if p["type"] == "TEXT_MESSAGE_CHUNK"]
     assert text_deltas == ["Hello ", "world"]
+
+
+class _BackendToolFlow(Flow):
+    """A real Flow that emits a crewai ``tool_usage_finished`` event from a
+    worker thread (via ``asyncio.to_thread``, as the demo runs ``crew.kickoff``)
+    with a non-flow source. Exercises end-to-end: the sink parking a
+    non-``flow_copy`` event, the contextvar copy across the thread hop,
+    translation, and snapshot survival. ``output`` is a JSON string because
+    crewai stringifies tool output before emitting."""
+
+    @start()
+    async def chat(self):
+        from datetime import datetime, timezone
+        from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent
+        from ag_ui_crewai._capabilities import crewai_event_bus
+
+        now = datetime.now(timezone.utc)
+
+        def _emit_from_worker():
+            crewai_event_bus.emit(object(), ToolUsageFinishedEvent(
+                tool_name="get_weather",
+                tool_args={"location": "SF"},
+                output='{"temperature": 20, "conditions": "sunny"}',
+                started_at=now,
+                finished_at=now,
+            ))
+
+        # Off the loop, contextvars copied (same hop the demo's crew.kickoff
+        # takes). The scoped StreamFrame sink must still receive the event.
+        await asyncio.to_thread(_emit_from_worker)
+        return "done"
+
+
+@requires_stream_frames
+async def test_frame_path_surfaces_backend_tool_call_and_result():
+    """A backend tool executed inside the run (from a worker thread) surfaces as
+    TOOL_CALL_START/ARGS/END + TOOL_CALL_RESULT, bracketed by exactly one
+    RUN_STARTED / RUN_FINISHED, the result carrying the output and sharing the
+    call's tool_call_id, and both survive the method-finish MESSAGES_SNAPSHOT so
+    the card is not wiped."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_BackendToolFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    types = [p["type"] for p in payloads]
+
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+    assert types.count("RUN_STARTED") == 1
+    assert types.count("RUN_FINISHED") == 1
+    assert types.count("TOOL_CALL_RESULT") == 1
+    assert types.count("TOOL_CALL_START") == 1
+
+    start = next(p for p in payloads if p["type"] == "TOOL_CALL_START")
+    args = next(p for p in payloads if p["type"] == "TOOL_CALL_ARGS")
+    result = next(p for p in payloads if p["type"] == "TOOL_CALL_RESULT")
+    assert start["toolCallName"] == "get_weather"
+    assert start.get("parentMessageId")
+    assert _json.loads(args["delta"]) == {"location": "SF"}
+    assert start["toolCallId"] == result["toolCallId"]
+    assert _json.loads(result["content"]) == {"temperature": 20, "conditions": "sunny"}
+    assert result["role"] == "tool"
+
+    # The surfaced tool call + result must appear in the terminal
+    # MESSAGES_SNAPSHOT (same tool_call_id) or the client wipes the card.
+    snapshot = next(p for p in payloads if p["type"] == "MESSAGES_SNAPSHOT")
+    snap_msgs = snapshot["messages"]
+    asst = next(
+        m for m in snap_msgs
+        if m.get("role") == "assistant" and m.get("toolCalls")
+    )
+    tool_msg = next(m for m in snap_msgs if m.get("role") == "tool")
+    # id continuity: streamed START parentMessageId == snapshot assistant id.
+    assert asst["id"] == start["parentMessageId"]
+    assert asst["toolCalls"][0]["id"] == result["toolCallId"]
+    assert asst["toolCalls"][0]["function"]["name"] == "get_weather"
+    assert tool_msg["toolCallId"] == result["toolCallId"]
+    assert _json.loads(tool_msg["content"]) == {"temperature": 20, "conditions": "sunny"}
 
 
 def _make_run_input(thread_id="t-1", run_id="r-1"):

@@ -49,6 +49,7 @@ add_crewai_flow_fastapi_endpoint(app, MyFlow(), "/flow")
 - **FastAPI endpoint creation** – Automatic HTTP endpoint generation with proper event streaming
 - **Predictive state updates** – Real-time state synchronization between backend and frontend
 - **Streaming tool calls** – Live streaming of LLM responses and tool execution to the UI
+- **Backend tool rendering** – Tools bound to a CrewAI `Agent`/`Crew` run server-side and surface to the UI as a tool call plus a `TOOL_CALL_RESULT`, so the client can render them without executing the tool (see the `backend_tool_rendering` example). Requires the StreamFrame transport (crewai >= 1.6); on crewai 1.0–1.5 the legacy event-bus path does not surface backend tool calls. A tool that returns structured data should return it as a JSON string (e.g. `json.dumps(...)`), since crewai stringifies tool output before it reaches the bridge.
 
 ## Protocol surface
 

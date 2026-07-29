@@ -55,8 +55,9 @@ final choice belongs to a Parity-lane ticket, not this migration. The translator
 therefore routes LLM text / LLM-tool-call emission through a single
 ``emission_shape`` strategy that DEFAULTS to ``"chunks"`` so this migration is
 byte-for-byte behavior-preserving on that channel. The ``"triples"`` strategy is
-a deliberate NotImplementedError placeholder — the Parity ticket owns wiring it
-up and flipping the default.
+a deliberate NotImplementedError placeholder for the STREAMED channel. The
+BACKEND tool path has the full args up front, so it implements both shapes and
+just follows ``emission_shape``.
 
 MCP EVENTS are the ONE exception to "chunks-only": crewai's discrete
 MCP tool executions (name + full args + result arrive together, not streamed)
@@ -69,7 +70,9 @@ the streaming LLM text / tool-call channel); see the wire-shape note in
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -77,11 +80,19 @@ from ag_ui.core import (
     EventType,
     RunStartedEvent,
     RunFinishedEvent,
+    AssistantMessage,
+    ToolMessage,
+    ToolCall,
+    FunctionCall,
 )
 from ag_ui.core.events import (
     RawEvent,
     TextMessageChunkEvent,
     ToolCallChunkEvent,
+    ToolCallStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    ToolCallResultEvent,
     StepFinishedEvent,
     MessagesSnapshotEvent,
     StateSnapshotEvent,
@@ -131,6 +142,36 @@ CREW_AGENT_LIFECYCLE_TYPES = frozenset({
     _AGENT_COMPLETED,
     _AGENT_ERROR,
 })
+
+# crewai ``ToolUsage*`` event ``type`` strings, fired when an Agent/Crew runs a
+# backend tool server-side (vs a frontend action streamed via copilotkit_stream).
+# We surface only ``finished`` (success, or a terminal failure whose error text
+# lands in ``output``). The error events are crewai's per-attempt retry signals
+# (up to 3 tries before any tool runs), so surfacing them would render phantom
+# cards and, once recorded into MESSAGES_SNAPSHOT, poison history. ``started`` is
+# parked only so it is "recognized" (never RAW-mirrored) and then dropped. This
+# mirrors LangGraph's OnToolEnd/OnToolError, which emits nothing on tool error.
+_TOOL_USAGE_STARTED = "tool_usage_started"
+_TOOL_USAGE_FINISHED = "tool_usage_finished"
+
+BACKEND_TOOL_EVENT_TYPES = frozenset({_TOOL_USAGE_STARTED, _TOOL_USAGE_FINISHED})
+
+# crewai wraps MCP servers in these ``BaseTool`` subclasses, which run through
+# the ordinary agent-tool path and ALSO emit ``ToolUsage*``. MCP already has its
+# own translation seam (``mcp.translate_mcp_event``), so surfacing the ToolUsage
+# copy too would render a second, duplicate tool card. Skip the backend path for
+# them (probe by class name, no version gate).
+_MCP_TOOL_CLASS_NAMES = frozenset({"MCPToolWrapper", "MCPNativeTool"})
+
+
+def is_backend_tool_event(event: Any) -> bool:
+    """True for a crewai ToolUsage event.
+
+    The driver parks these regardless of source: they emit with the ToolUsage /
+    executor as source (never ``flow_copy``), so the source gate would drop them.
+    """
+    return getattr(event, "type", None) in BACKEND_TOOL_EVENT_TYPES
+
 
 _SUPPORTED_EMISSION_SHAPES = frozenset({"chunks", "triples"})
 
@@ -208,6 +249,12 @@ class StreamFrameTranslator:
         # a cheap belt-and-braces guard against a double emit.
         self._run_started_emitted = False
         self._run_finished_emitted = False
+        # A MESSAGES_SNAPSHOT is authoritative: the client drops any message
+        # absent from it. The method-finish snapshot comes from state.messages,
+        # which never holds backend tool calls (they exist only on the wire), so
+        # we stash each surfaced call+result pair and merge it into the snapshot
+        # or the streamed tool card is wiped at method-finish.
+        self._backend_tool_messages: list[Any] = []
 
     # -- public API --------------------------------------------------------
 
@@ -307,10 +354,20 @@ class StreamFrameTranslator:
                 )
             ]
 
-        # crewai native llm / tools / messages / lifecycle events and internal
-        # events (e.g. ``cc_env``) are intentionally dropped — the legacy
-        # listener never surfaced them, so ignoring them keeps the wire output
-        # identical. Surfacing them is a Parity-lane decision.
+        # Backend tool execution: surface the call + result so the client can
+        # render it. Only ``finished`` (crewai's terminal event, whose ``output``
+        # carries the result or a terminal error string). ``started`` is dropped
+        # (it is parked only so it counts as "recognized" and is never
+        # RAW-mirrored). MCP tools also emit ToolUsage but have their own seam
+        # above, so skip them here to avoid a duplicate card.
+        if event_type == _TOOL_USAGE_FINISHED:
+            if getattr(event, "tool_class", None) in _MCP_TOOL_CLASS_NAMES:
+                return []
+            return self._backend_tool_events(event)
+
+        # crewai native llm / messages / lifecycle events and internal events
+        # are intentionally dropped to keep the wire output identical to the
+        # legacy listener.
         return []
 
     def finalize(self) -> list[Any]:
@@ -444,6 +501,9 @@ class StreamFrameTranslator:
             or []
         )
         messages = litellm_messages_to_ag_ui_messages(raw_messages)
+        # Backend tool calls live only on the wire; merge them in so they
+        # survive this authoritative snapshot (see ``_backend_tool_messages``).
+        messages = self._merge_backend_tool_messages(messages)
         snapshot = (
             state
             if isinstance(state, dict)
@@ -517,6 +577,211 @@ class StreamFrameTranslator:
             "'chunks' shape only."
         )
 
+    # -- backend tool execution -------------------------------------------
+
+    def _backend_tool_events(self, event: Any) -> list[Any]:
+        """Surface one completed backend tool call + its result, atomically.
+
+        crewai reports a completed backend tool via one ``finished`` event
+        carrying the name, args, and output (a terminal failure lands its error
+        text in ``output``). We emit discrete START/ARGS/END/RESULT (like the MCP
+        path: the call is not streamed and the full args are known up front)
+        under a synthesized ``tool_call_id`` shared by every event and the
+        snapshot pair. ``parent_message_id`` on START ties the call to the
+        assistant message the snapshot pair re-supplies under the SAME id, so the
+        client keys the streamed and snapshot copies identically (no remount at
+        method-finish). The snapshot pair keeps the card alive past the
+        authoritative method-finish MESSAGES_SNAPSHOT.
+        """
+        tool_name = getattr(event, "tool_name", None) or "tool"
+        args_json = self._tool_args_to_json(getattr(event, "tool_args", None))
+        content = self._stringify_tool_output(getattr(event, "output", None))
+        tool_call_id = uuid.uuid4().hex
+        assistant_message_id = uuid.uuid4().hex
+        result_message_id = uuid.uuid4().hex
+
+        events: list[Any] = self._backend_tool_open_events(
+            tool_call_id, tool_name, args_json,
+            parent_message_id=assistant_message_id,
+        )
+        events.append(
+            ToolCallResultEvent(
+                type=EventType.TOOL_CALL_RESULT,
+                message_id=result_message_id,
+                tool_call_id=tool_call_id,
+                content=content,
+                role="tool",
+            )
+        )
+        self._record_backend_tool_messages(
+            assistant_message_id=assistant_message_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            args_json=args_json,
+            result_message_id=result_message_id,
+            content=content,
+        )
+        return events
+
+    def _record_backend_tool_messages(
+        self,
+        *,
+        assistant_message_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        args_json: str,
+        result_message_id: str,
+        content: str,
+    ) -> None:
+        """Stash the AssistantMessage(tool_call) + ToolMessage for the snapshot.
+
+        The AssistantMessage id equals the streamed ``parent_message_id`` and the
+        tool_call_id / result id equal the streamed events', so the snapshot copy
+        REPLACES the streamed copy under the same ids (one consistent card, no
+        remount or duplicate render).
+        """
+        self._backend_tool_messages.append(
+            AssistantMessage(
+                id=assistant_message_id,
+                role="assistant",
+                tool_calls=[
+                    ToolCall(
+                        id=tool_call_id,
+                        type="function",
+                        function=FunctionCall(name=tool_name, arguments=args_json),
+                    )
+                ],
+            )
+        )
+        self._backend_tool_messages.append(
+            ToolMessage(
+                id=result_message_id,
+                role="tool",
+                tool_call_id=tool_call_id,
+                content=content,
+            )
+        )
+
+    def _merge_backend_tool_messages(self, messages: list[Any]) -> list[Any]:
+        """Insert accumulated backend tool messages into a snapshot message list.
+
+        Inserted right after the LEADING system/user preamble (natural order:
+        system? -> user -> tool call -> tool result -> assistant answer). The
+        id-dedup is defensive: these ids are translator-minted and never appear
+        in the state-derived snapshot, so it is currently a no-op guard against a
+        flow that later copies them into ``state.messages``.
+        """
+        if not self._backend_tool_messages:
+            return messages
+        existing_ids = {getattr(m, "id", None) for m in messages}
+        to_insert = [
+            m
+            for m in self._backend_tool_messages
+            if getattr(m, "id", None) not in existing_ids
+        ]
+        if not to_insert:
+            return messages
+        # Anchor on the leading preamble only: stop at the first non-system/user
+        # message so the tool call is never spliced past later assistant/tool
+        # turns (which a whole-list scan would do once history accumulates).
+        insert_at = 0
+        for m in messages:
+            if getattr(m, "role", None) in ("system", "user"):
+                insert_at += 1
+            else:
+                break
+        return messages[:insert_at] + to_insert + messages[insert_at:]
+
+    def _backend_tool_open_events(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args_json: str,
+        *,
+        parent_message_id: str,
+    ) -> list[Any]:
+        """Discrete START/ARGS/END for a backend tool call.
+
+        Emitted as triples, not chunks: like the MCP path, the call is not
+        streamed and the full args are known up front, so the canonical discrete
+        shape is the natural fit. ``parent_message_id`` on START ties the call to
+        the assistant message the snapshot re-supplies under the same id.
+        """
+        return [
+            ToolCallStartEvent(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id=tool_call_id,
+                tool_call_name=tool_name,
+                parent_message_id=parent_message_id,
+            ),
+            ToolCallArgsEvent(
+                type=EventType.TOOL_CALL_ARGS,
+                tool_call_id=tool_call_id,
+                delta=args_json,
+            ),
+            ToolCallEndEvent(
+                type=EventType.TOOL_CALL_END,
+                tool_call_id=tool_call_id,
+            ),
+        ]
+
+    @staticmethod
+    def _tool_args_to_json(tool_args: Any) -> str:
+        """Serialize crewai ``tool_args`` (``dict | str``) to a JSON string.
+
+        A string is passed through verbatim (crewai already hands us the raw
+        args string in that case); a dict is JSON-encoded. Anything
+        unserializable degrades to ``{}`` (logged) rather than crashing the
+        stream.
+        """
+        if isinstance(tool_args, str):
+            return tool_args
+        if tool_args is None:
+            return "{}"
+        try:
+            return json.dumps(tool_args, default=str)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "ag-ui-crewai: could not JSON-encode backend tool args "
+                "(type=%s); emitting empty args.",
+                type(tool_args).__name__,
+            )
+            return "{}"
+
+    @staticmethod
+    def _stringify_tool_output(output: Any) -> str:
+        """Coerce a crewai tool ``output`` to ``str`` content for the wire.
+
+        crewai already stringifies output (its ``_format_result`` returns
+        ``str(result)``), so a str is the normal path and its JSON validity is
+        the tool author's job. The dict / pydantic branches are defensive:
+        structured output is JSON-encoded, falling back to ``str()`` (logged) if
+        that fails.
+        """
+        if output is None:
+            return ""
+        if isinstance(output, str):
+            return output
+        if hasattr(output, "model_dump"):
+            try:
+                return json.dumps(output.model_dump(), default=str)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "ag-ui-crewai: could not JSON-encode backend tool output "
+                    "(type=%s); falling back to str().",
+                    type(output).__name__,
+                )
+                return str(output)
+        try:
+            return json.dumps(output, default=str)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "ag-ui-crewai: could not JSON-encode backend tool output "
+                "(type=%s); falling back to str().",
+                type(output).__name__,
+            )
+            return str(output)
+
 
 # Event types the translator recognises. Used to decide whether an event is
 # "unmapped" and therefore eligible for RAW passthrough: an event we DO map but
@@ -556,8 +821,21 @@ def log_raw_loss(message: str, *args: Any) -> None:
 
 
 def is_recognized_event(event: Any) -> bool:
-    """True when the translator maps this event, so RAW must not duplicate it."""
-    return getattr(event, "type", None) in _RECOGNIZED_EVENT_TYPES
+    """True when the translator maps this event, so RAW must not duplicate it.
+
+    Covers every mapped channel: the base lifecycle / bridge types above, plus
+    the crew/agent lifecycle, backend ToolUsage, and MCP events (matched by
+    their own predicates). Without the last three a mapped event would ALSO be
+    RAW-mirrored under ``emit_raw_events=True`` (a double emit); the deliberately
+    suppressed ``tool_usage_started`` would likewise leak as RAW.
+    """
+    event_type = getattr(event, "type", None)
+    return (
+        event_type in _RECOGNIZED_EVENT_TYPES
+        or event_type in CREW_AGENT_LIFECYCLE_TYPES
+        or is_backend_tool_event(event)
+        or is_mcp_event(event)
+    )
 
 
 def raw_event_for(event: Any) -> RawEvent | None:
