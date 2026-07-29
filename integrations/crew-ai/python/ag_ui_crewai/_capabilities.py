@@ -127,7 +127,35 @@ StreamFrame = (
     if _STREAMING_TYPES_MODULE is not None
     else None
 )
-_stream_frame_available = StreamFrame is not None
+
+# The scoped stream-sink API (``crewai.events.stream_context``) landed together
+# with ``StreamFrame`` in 1.6. The bridge registers its OWN sink so the frame
+# translator receives the RAW AG-UI / lifecycle event object (source + exact
+# payload) rather than the ``to_serializable``-mangled ``frame.data`` snapshot
+# (CPK-7719 review blocker 1). ``publish_stream_event`` invokes every sink
+# synchronously on ``emit``, so a sink parked by ``event_id`` is guaranteed
+# populated before the corresponding frame is dequeued.
+_STREAM_CONTEXT_MODULE, _STREAM_CONTEXT_MODULE_NAME = _first_module(
+    ["crewai.events.stream_context"]
+)
+add_stream_sink = (
+    getattr(_STREAM_CONTEXT_MODULE, "add_stream_sink", None)
+    if _STREAM_CONTEXT_MODULE is not None
+    else None
+)
+reset_stream_sinks = (
+    getattr(_STREAM_CONTEXT_MODULE, "reset_stream_sinks", None)
+    if _STREAM_CONTEXT_MODULE is not None
+    else None
+)
+
+# The StreamFrame path needs BOTH the frame type and the sink API. They ship
+# together (1.6), but require both so a partial install falls back cleanly.
+_stream_frame_available = (
+    StreamFrame is not None
+    and callable(add_stream_sink)
+    and callable(reset_stream_sinks)
+)
 
 
 def flow_supports_stream_frames(flow: Any) -> bool:

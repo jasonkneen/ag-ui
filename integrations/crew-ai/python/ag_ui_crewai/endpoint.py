@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import uuid
+from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -25,6 +26,8 @@ from ._capabilities import (
     BaseEventListener,
     crewai_event_bus,
     flow_supports_stream_frames,
+    add_stream_sink,
+    reset_stream_sinks,
 )
 from ._frames import StreamFrameTranslator
 from crewai.flow.flow import Flow
@@ -1697,8 +1700,24 @@ async def _run_flow_frame_stream(
     * client-disconnect teardown via ``aclose()`` (see ``_aclose_stream_session``).
 
     ``flow_context`` is set so the ``sdk.copilotkit_*`` helpers can emit their
-    ``Bridged*`` events, which reach us as ``custom``-channel frames because
-    ``event_bus._prepare_event`` publishes to the scoped sink synchronously.
+    ``Bridged*`` events; those reach the scoped sink synchronously because
+    ``event_bus._prepare_event`` calls ``publish_stream_event`` on every
+    ``emit``.
+
+    Payload + identity come from the RAW event, not ``frame.data`` (CPK-7719
+    review blockers 1/2/3). We register our OWN scoped sink that parks the raw
+    event object keyed by ``event.event_id`` — but ONLY when ``source is
+    flow_copy``, so a nested ``crew.kickoff``'s own flow's lifecycle/method
+    events (which leak onto this same sink via the copied contextvars) are
+    excluded. The frame stream then supplies ORDERING; for each frame we look
+    up the parked raw event by ``frame.id`` and translate it. A frame with no
+    parked event belonged to a nested flow (or is a crewai-internal frame we
+    drop) and is skipped. This mirrors the legacy listener's ``source is
+    flow_copy`` gate and its pristine-payload behavior.
+
+    Because ``publish_stream_event`` runs the sink synchronously on ``emit``
+    and crewai enqueues the frame via ``loop.call_soon_threadsafe`` (a later
+    loop turn), the raw event is ALWAYS parked before its frame is dequeued.
     """
     token = flow_context.set(flow_copy)
     translator = StreamFrameTranslator(
@@ -1706,6 +1725,26 @@ async def _run_flow_frame_stream(
         run_id=input_data.run_id,
         state_provider=lambda: getattr(flow_copy, "state", {}),
     )
+    # Raw-event lookup buffer, populated by our scoped sink below. Keyed by
+    # ``event.event_id`` (== ``StreamFrame.id``). Only OUTER-flow events land
+    # here (source gate), which is exactly the nested-flow filter for blockers
+    # 2/3 — nested frames find nothing here and are dropped.
+    raw_events: dict[str, Any] = {}
+
+    def _sink(source: Any, event: Any) -> None:
+        # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
+        # flows emit with a DIFFERENT source (verified on the 1.15.7 wheel), and
+        # our own ``Bridged*`` events are emitted with ``flow_copy`` as source.
+        if source is flow_copy:
+            event_id = getattr(event, "event_id", None)
+            if event_id is not None:
+                raw_events[event_id] = event
+
+    # Register BEFORE the first ``__anext__``: crewai's astream spawns the
+    # flow-running task on first iteration and copies the CURRENT context, so
+    # the sink must already be in scope to reach the flow's emits. Guarded so a
+    # partial install (no sink API) degrades rather than crashing.
+    sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
     # ``astream`` returns an AsyncStreamSession; iterating it spawns crewai's
     # background kickoff task and streams ordered frames.
     session = flow_copy.astream(inputs=inputs)  # type: ignore[attr-defined]
@@ -1752,13 +1791,16 @@ async def _run_flow_frame_stream(
                     try:
                         frame = await aiter.__anext__()
                     except StopAsyncIteration:
-                        # Stream exhausted without a flow_finished frame (e.g.
-                        # a flow that raised HumanFeedbackPending). No
-                        # RUN_FINISHED — matches the legacy path, which only
-                        # emits RUN_FINISHED from a FlowFinishedEvent.
                         break
 
-                for event in translator.translate(frame):
+                # Look up the RAW event this frame carries (parked by our sink).
+                # Missing => a nested-flow / crewai-internal frame we drop, so
+                # the outer run's wire shape stays identical to the legacy path.
+                raw_event = raw_events.pop(frame.id, None)
+                if raw_event is None:
+                    continue
+
+                for event in translator.translate(raw_event):
                     _stamp_correlation_ids(
                         event,
                         thread_id=input_data.thread_id,
@@ -1766,10 +1808,24 @@ async def _run_flow_frame_stream(
                     )
                     yield encoder.encode(event)
 
-                if translator.is_run_end(frame):
+                if translator.run_finished:
                     # RUN_FINISHED just emitted; stop (mirrors the legacy
                     # ``None`` end-sentinel right after RUN_FINISHED).
                     break
+
+            # Belt-and-braces terminal (CPK-7719 blocker 3): the stream can
+            # exhaust with the run open but no outer ``flow_finished`` — e.g. the
+            # outer method caught a nested-flow error and returned, or a flow
+            # paused for human feedback. Emit the missing RUN_FINISHED so the
+            # client never sees a run that never ends. The RUN_ERROR paths below
+            # are the terminator for the errored case and never reach here.
+            for event in translator.finalize():
+                _stamp_correlation_ids(
+                    event,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield encoder.encode(event)
 
         except _CeilingExceeded as ceiling_exc:
             ceiling_display = f"{timeout:g}s"
@@ -1840,7 +1896,7 @@ async def _run_flow_frame_stream(
     finally:
         # aclose() replaces _cancel_and_join on this path; run it
         # unconditionally (including under outer cancellation) so the kickoff
-        # task never leaks, then reset the context var.
+        # task never leaks, then unregister the sink and reset the context var.
         try:
             await _aclose_stream_session(
                 session,
@@ -1848,7 +1904,11 @@ async def _run_flow_frame_stream(
                 run_id=input_data.run_id,
             )
         finally:
-            flow_context.reset(token)
+            try:
+                if sink_token is not None and callable(reset_stream_sinks):
+                    reset_stream_sinks(sink_token)
+            finally:
+                flow_context.reset(token)
 
 
 def _run_flow_stream(
