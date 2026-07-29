@@ -70,7 +70,7 @@ const ALL_TARGETS = {
     cwd: path.join(integrationsRoot, "agno/python/examples"),
   },
   "crew-ai": {
-    command: "poetry install",
+    command: "uv sync",
     name: "CrewAI",
     cwd: path.join(integrationsRoot, "crew-ai/python"),
   },

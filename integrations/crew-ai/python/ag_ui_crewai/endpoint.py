@@ -1,25 +1,36 @@
 """
 AG-UI FastAPI server for CrewAI.
 """
-import copy
 import asyncio
 import logging
 import re
 import time
 import uuid
+from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from ._env import _parse_env_float
+from ._copyutil import safe_deepcopy, rebind_bound_methods
 
-from crewai.utilities.events import (
+# CPK-7718: the flow/method lifecycle events, the event bus, and the listener
+# base moved from ``crewai.utilities.events`` (crewai 0.x) to ``crewai.events``
+# (crewai 1.x). ``_capabilities`` resolves whichever location exists and caches
+# the crewai capability probe (run once at import).
+from ._capabilities import (
+    CAPABILITIES,
     FlowStartedEvent,
     FlowFinishedEvent,
     MethodExecutionStartedEvent,
     MethodExecutionFinishedEvent,
+    BaseEventListener,
+    crewai_event_bus,
+    flow_supports_stream_frames,
+    add_stream_sink,
+    reset_stream_sinks,
 )
+from ._frames import StreamFrameTranslator
 from crewai.flow.flow import Flow
-from crewai.utilities.events.base_event_listener import BaseEventListener
 
 from ag_ui.core import (
     RunAgentInput,
@@ -139,6 +150,22 @@ class _CeilingExceeded(Exception):
 # fresh hex key that is never reused across the process lifetime.
 QUEUES = {}
 QUEUES_LOCK = asyncio.Lock()
+
+# CPK-7718 breaking change #2: crewai 1.x no longer dispatches event-bus
+# handlers inline on the caller's thread. Sync handlers (all of ours) are now
+# submitted to a ThreadPoolExecutor; only ``LLMStreamChunkEvent`` keeps the
+# inline path. Every ``Bridged*`` handler in
+# ``FastAPICrewFlowEventListener.setup_listeners`` therefore runs on a WORKER
+# thread and must reach the per-request ``asyncio.Queue`` via
+# ``loop.call_soon_threadsafe`` — a bare ``put_nowait`` from off-loop corrupts
+# the queue's getter-wakeup. We capture the request's running loop in
+# ``create_queue`` (which is awaited on that loop) and stash it here, keyed by
+# the same UUID as ``QUEUES``.
+#
+# NOTE (CPK-7719): the StreamFrame integration removes this listener entirely,
+# so this loop-capture + call_soon_threadsafe plumbing is the INTERIM
+# thread-safe fix, not the final design.
+QUEUE_LOOPS: dict = {}
 
 # Attribute name we set on flow objects to carry their per-request queue
 # key. Module-level so tests and the listener callbacks share one
@@ -641,13 +668,33 @@ async def create_queue(flow: object) -> asyncio.Queue:
     # an arbitrary ``object``; crewai ``Flow`` instances accept
     # arbitrary attribute writes but the static-typing path must stay
     # clean.
+    # Capture the request's running loop so off-thread listener callbacks can
+    # enqueue via ``loop.call_soon_threadsafe`` (CPK-7718 #2). ``create_queue``
+    # is always awaited on the request loop, so this is that loop.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - create_queue is always awaited
+        loop = None
     async with QUEUES_LOCK:
         queue = asyncio.Queue()
         QUEUES[queue_key] = queue
+        QUEUE_LOOPS[queue_key] = loop
         # Stamp only AFTER the queue is registered under its key so
         # a concurrent ``get_queue(flow)`` never observes the attr
         # pointing at a not-yet-present entry.
-        setattr(flow, _QUEUE_KEY_ATTR, queue_key)
+        #
+        # CPK-7718 #8: crewai 1.13+ made ``Flow`` a Pydantic ``BaseModel``.
+        # Try a normal ``setattr`` first (it honours any custom
+        # ``__setattr__`` — some callers/tests instrument the write — and works
+        # on crewai 1.15.x, which accepts our underscore-prefixed key); if a
+        # stricter Pydantic ``Flow`` rejects the undeclared attribute, fall back
+        # to ``object.__setattr__`` which bypasses Pydantic entirely. Either
+        # way the key lands in the instance ``__dict__`` and reads back via
+        # plain ``getattr`` (see ``get_queue``).
+        try:
+            setattr(flow, _QUEUE_KEY_ATTR, queue_key)
+        except (ValueError, AttributeError, TypeError):
+            object.__setattr__(flow, _QUEUE_KEY_ATTR, queue_key)
         return queue
 
 
@@ -708,6 +755,47 @@ def get_queue(flow: object) -> asyncio.Queue | None:
         return None
     return QUEUES.get(queue_key)
 
+
+def _get_queue_loop(flow: object) -> "asyncio.AbstractEventLoop | None":
+    """Return the request loop captured for ``flow`` in ``create_queue``.
+
+    Mirrors ``get_queue``'s lock-free contract (GIL-atomic ``dict.get``): the
+    off-thread listener callbacks read it without acquiring ``QUEUES_LOCK``.
+    """
+    queue_key = getattr(flow, _QUEUE_KEY_ATTR, None)
+    if queue_key is None:
+        return None
+    return QUEUE_LOOPS.get(queue_key)
+
+
+def _enqueue(source: object, event: object) -> None:
+    """Thread-safely enqueue ``event`` onto ``source``'s per-request queue.
+
+    CPK-7718 #2: crewai 1.x dispatches our sync bus handlers on a
+    ThreadPoolExecutor worker thread, so a bare ``queue.put_nowait`` would run
+    off the queue's owning loop and corrupt the getter-wakeup. We hop back onto
+    the captured request loop via ``call_soon_threadsafe``. If we happen to
+    already be on that loop (e.g. a future inline-dispatch path, or a unit test
+    driving the listener directly on the loop thread) we put directly to keep
+    behaviour synchronous. If no loop was captured, fall back to a direct put.
+    """
+    queue = get_queue(source)
+    if queue is None:
+        return
+    loop = _get_queue_loop(source)
+    if loop is None:
+        queue.put_nowait(event)
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        queue.put_nowait(event)
+    else:
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+
 async def delete_queue(flow: object) -> None:
     """Delete the queue for a flow."""
     queue_key = getattr(flow, _QUEUE_KEY_ATTR, None)
@@ -715,6 +803,68 @@ async def delete_queue(flow: object) -> None:
         return
     async with QUEUES_LOCK:
         QUEUES.pop(queue_key, None)
+        QUEUE_LOOPS.pop(queue_key, None)
+
+
+# How long the run-end event-bus flush may block (seconds). crewai 1.x can drop
+# in-flight off-thread handlers at run end; ``flush`` waits for them. Bounded so
+# a stuck handler cannot pin teardown. Overridable for operators tuning
+# disconnect-heavy load (mirrors the other AGUI_CREWAI_* knobs' spirit).
+_EVENT_BUS_FLUSH_TIMEOUT = 5.0
+
+
+def _copy_flow(flow: object) -> object:
+    """Return a per-request isolated copy of ``flow``.
+
+    Delegates to ``_copyutil.safe_deepcopy`` — plain ``copy.deepcopy`` on
+    healthy crewai builds, pin-and-share fallback on the crewai 1.15.x
+    ``Flow`` deep-copy bug (CPK-7718 #10, a NEW breaking change beyond the
+    enumerated nine, found by running the suite on the 1.15.7 wheel). Isolation
+    of the per-request conversation state is preserved either way.
+
+    CPK-7718 #11: when the pin-and-share fallback runs, the copy SHARES the
+    original's ``_methods`` dict (its bound ``@start`` / ``@listen`` methods
+    trial-deep-copy-fail because they reference the uncopyable ``memory`` via
+    ``__self__``, so the dict is pinned by reference). crewai 1.x executes
+    ``self._methods[name]`` — still bound to the ORIGINAL — so
+    ``kickoff_async``/``astream`` on the copy seeds the COPY's ``self._state``
+    while ``@start`` runs against the ORIGINAL's un-seeded state
+    (``KeyError: 'messages'`` at ``crews.py`` ``*self.state["messages"]``, and a
+    total loss of per-request isolation). Rebind the copy's flow methods to the
+    copy so state seeding and isolation both hold. No-op on healthy deep-copy
+    builds (already rebound) and on non-flow copies (no ``_methods``).
+    """
+    flow_copy = safe_deepcopy(flow, what="flow")
+    rebind_bound_methods(flow_copy)
+    return flow_copy
+
+
+async def _flush_event_bus() -> None:
+    """Best-effort run-end flush of the crewai event bus (CPK-7718 #5).
+
+    crewai 1.x dispatches sync handlers off-thread and can drop in-flight
+    handlers at run end; ``flush(timeout=...)`` waits for them so resources
+    unwind and our late listener callbacks settle before the queue/context are
+    torn down. No-op on crewai builds without ``flush`` (0.x). Run in the
+    default executor so the bounded blocking wait does not stall the request
+    loop, and swallow failures — this is hygiene, not correctness-critical.
+    """
+    if not CAPABILITIES.event_bus_has_flush:
+        return
+    flush = getattr(crewai_event_bus, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: flush(_EVENT_BUS_FLUSH_TIMEOUT)
+        )
+    except Exception as exc:  # noqa: BLE001 - flush is best-effort
+        _LOGGER.debug(
+            "ag-ui-crewai event-bus flush at run end failed: %s",
+            type(exc).__name__,
+        )
+
 
 GLOBAL_EVENT_LISTENER = None
 
@@ -736,113 +886,126 @@ class FastAPICrewFlowEventListener(BaseEventListener):
     """
 
     def setup_listeners(self, crewai_event_bus):
-        """Setup listeners for the FastAPI CrewFlow event listener"""
+        """Setup listeners for the FastAPI CrewFlow event listener.
+
+        CPK-7718 #2: every callback below runs on a ThreadPoolExecutor WORKER
+        thread under crewai 1.x (sync handlers are no longer dispatched inline
+        on the caller's thread). All queue writes therefore go through
+        ``_enqueue``, which hops back onto the request loop via
+        ``call_soon_threadsafe``. The ``None`` happy-path sentinel is enqueued
+        the same way so it stays ordered behind the ``RUN_FINISHED`` event on
+        the loop.
+
+        CPK-7718 #3: crewai 1.x dispatch is now EXACT-TYPE (keyed on
+        ``type(event)``), not ``isinstance`` — a handler registered on a base
+        class silently stops receiving subclasses. Every ``.on(...)`` below is
+        registered on the EXACT event type we emit / crewai emits (the
+        lifecycle events and our concrete ``Bridged*`` classes), so exact-type
+        dispatch delivers to each handler as before. No handler is registered
+        on a shared base class.
+        """
         @crewai_event_bus.on(FlowStartedEvent)
         def _(source, event):  # pylint: disable=unused-argument
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    RunStartedEvent(
-                        type=EventType.RUN_STARTED,
-                         # will be replaced by the correct thread_id/run_id when sending the event
-                        thread_id="?",
-                        run_id="?",
-                    ),
-                )
+            _enqueue(
+                source,
+                RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    # will be replaced by the correct thread_id/run_id when sending the event
+                    thread_id="?",
+                    run_id="?",
+                ),
+            )
         @crewai_event_bus.on(FlowFinishedEvent)
         def _(source, event):  # pylint: disable=unused-argument
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    RunFinishedEvent(
-                        type=EventType.RUN_FINISHED,
-                        thread_id="?",
-                        run_id="?",
-                    ),
-                )
-                queue.put_nowait(None)
+            _enqueue(
+                source,
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id="?",
+                    run_id="?",
+                ),
+            )
+            _enqueue(source, None)
         @crewai_event_bus.on(MethodExecutionStartedEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    StepStartedEvent(
-                        type=EventType.STEP_STARTED,
-                        step_name=event.method_name
-                    )
+            _enqueue(
+                source,
+                StepStartedEvent(
+                    type=EventType.STEP_STARTED,
+                    step_name=event.method_name
                 )
+            )
         @crewai_event_bus.on(MethodExecutionFinishedEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                # source.state may be a Pydantic model (with .messages attr) or a plain dict
-                state = source.state
-                raw_messages = getattr(state, "messages", None) or (state.get("messages") if isinstance(state, dict) else None) or []
-                messages = litellm_messages_to_ag_ui_messages(raw_messages)
+            if get_queue(source) is None:
+                return
+            # source.state may be a Pydantic model (with .messages attr) or a plain dict
+            state = source.state
+            raw_messages = getattr(state, "messages", None) or (state.get("messages") if isinstance(state, dict) else None) or []
+            messages = litellm_messages_to_ag_ui_messages(raw_messages)
 
-                queue.put_nowait(
-                    MessagesSnapshotEvent(
-                        type=EventType.MESSAGES_SNAPSHOT,
-                        messages=messages
-                    )
+            _enqueue(
+                source,
+                MessagesSnapshotEvent(
+                    type=EventType.MESSAGES_SNAPSHOT,
+                    messages=messages
                 )
-                queue.put_nowait(
-                    StateSnapshotEvent(
-                        type=EventType.STATE_SNAPSHOT,
-                        snapshot=state if isinstance(state, dict) else state.model_dump() if hasattr(state, "model_dump") else {}
-                    )
+            )
+            _enqueue(
+                source,
+                StateSnapshotEvent(
+                    type=EventType.STATE_SNAPSHOT,
+                    snapshot=state if isinstance(state, dict) else state.model_dump() if hasattr(state, "model_dump") else {}
                 )
-                queue.put_nowait(
-                    StepFinishedEvent(
-                        type=EventType.STEP_FINISHED,
-                        step_name=event.method_name
-                    )
+            )
+            _enqueue(
+                source,
+                StepFinishedEvent(
+                    type=EventType.STEP_FINISHED,
+                    step_name=event.method_name
                 )
+            )
         @crewai_event_bus.on(BridgedTextMessageChunkEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    TextMessageChunkEvent(
-                        type=EventType.TEXT_MESSAGE_CHUNK,
-                        message_id=event.message_id,
-                        role=event.role,
-                        delta=event.delta,
-                    )
+            _enqueue(
+                source,
+                TextMessageChunkEvent(
+                    type=EventType.TEXT_MESSAGE_CHUNK,
+                    message_id=event.message_id,
+                    role=event.role,
+                    delta=event.delta,
                 )
+            )
         @crewai_event_bus.on(BridgedToolCallChunkEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    ToolCallChunkEvent(
-                        type=EventType.TOOL_CALL_CHUNK,
-                        tool_call_id=event.tool_call_id,
-                        tool_call_name=event.tool_call_name,
-                        delta=event.delta,
-                    )
+            _enqueue(
+                source,
+                ToolCallChunkEvent(
+                    type=EventType.TOOL_CALL_CHUNK,
+                    tool_call_id=event.tool_call_id,
+                    tool_call_name=event.tool_call_name,
+                    delta=event.delta,
                 )
+            )
         @crewai_event_bus.on(BridgedCustomEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    CustomEvent(
-                        type=EventType.CUSTOM,
-                        name=event.name,
-                        value=event.value
-                    )
+            _enqueue(
+                source,
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=event.name,
+                    value=event.value
                 )
+            )
         @crewai_event_bus.on(BridgedStateSnapshotEvent)
         def _(source, event):
-            queue = get_queue(source)
-            if queue is not None:
-                queue.put_nowait(
-                    StateSnapshotEvent(
-                        type=EventType.STATE_SNAPSHOT,
-                        snapshot=event.snapshot
-                    )
+            _enqueue(
+                source,
+                StateSnapshotEvent(
+                    type=EventType.STATE_SNAPSHOT,
+                    snapshot=event.snapshot
                 )
+            )
 
 
 def _format_timeout_message(timeout: float | None) -> str:
@@ -1452,10 +1615,413 @@ async def _run_flow_event_stream(
                 allow_grace=allow_grace,
             )
         finally:
+            # CPK-7718 #5: flush the crewai event bus at run end so in-flight
+            # off-thread handlers settle before we drop the queue / reset the
+            # context var (crewai 1.x can otherwise drop them). Best-effort and
+            # a no-op on crewai builds without ``flush``.
             try:
-                await delete_queue(flow_copy)
+                await _flush_event_bus()
+            finally:
+                try:
+                    await delete_queue(flow_copy)
+                finally:
+                    flow_context.reset(token)
+
+
+async def _aclose_stream_session(
+    session: object,
+    *,
+    thread_id: str | None,
+    run_id: str | None,
+) -> None:
+    """Best-effort ``aclose()`` teardown for a crewai ``AsyncStreamSession``.
+
+    CPK-7719: ``aclose()`` replaces the legacy ``_cancel_and_join`` machinery on
+    the StreamFrame path — it cancels the background kickoff task crewai spawns
+    inside ``astream`` and closes the frame iterator. The OBSERVABLE behavior
+    (client-disconnect tears the run down, no leaked kickoff) must not regress.
+
+    Mirrors the ``_cancel_and_join`` uncancel dance (finding #2): on Python
+    3.11+ a bare ``await session.aclose()`` in a ``finally`` reached via outer
+    cancellation would re-raise ``CancelledError`` on entry (``Task.cancelling()``
+    is still non-zero), so ``aclose`` would never run and the kickoff task would
+    leak. We ``uncancel`` (via ``getattr`` for 3.10 compat) so the teardown
+    completes; the original in-flight cancellation resumes propagating once the
+    generator's ``finally`` unwinds.
+    """
+    aclose = getattr(session, "aclose", None)
+    if not callable(aclose):
+        return
+    current = asyncio.current_task()
+    uncancel = getattr(current, "uncancel", None)
+    if callable(uncancel):
+        uncancel()
+    try:
+        await aclose()
+    except asyncio.CancelledError:
+        # aclose itself was cancelled; re-raise so the cancellation is not
+        # silently swallowed (mirrors _cancel_and_join re-raise semantics).
+        raise
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOGGER.debug(
+            "CrewAI astream aclose failed thread=%s run=%s cause=%s",
+            thread_id,
+            run_id,
+            type(exc).__name__,
+        )
+
+
+async def _drain_frames_after_finish(aiter: Any) -> None:
+    """Drain the terminal tail of a frame stream after RUN_FINISHED (CPK-7719 #5).
+
+    crewai enqueues its end sentinel only AFTER ``kickoff_async`` fully returns —
+    result recorded, trace batch finalized — see ``create_async_frame_generator``
+    in crewai's ``utilities/streaming.py``: the ``flow_finished`` FRAME is emitted
+    from inside ``kickoff_async``, but the ``None`` that ends the iterator lands
+    only in the run task's ``finally``, one or more loop turns later.
+
+    If the driver ``break``s the instant RUN_FINISHED is emitted and lets the
+    ``finally`` ``aclose()`` the session, crewai's frame generator is
+    ``GeneratorExit``-ed at its ``yield`` and its OWN ``finally`` ``task.cancel()``s
+    the still-finalizing kickoff task — on EVERY happy-path run (verified against
+    the 1.15.7 wheel: the session ends ``is_cancelled=True`` with no ``result``).
+    Draining to natural ``StopAsyncIteration`` instead lets the run task reach its
+    end sentinel, so the subsequent ``aclose()`` is a no-op and the kickoff is
+    never cancelled mid-finalization. This is the frame-path analogue of the
+    legacy path's ``_cancel_and_join(allow_grace=True)`` happy-path window.
+
+    Bounded by ``_CANCEL_GRACE_SECONDS`` so a pathological finalization cannot
+    stall teardown — on grace expiry we return and the ``finally``'s ``aclose()``
+    force-cancels the tail (today's behavior, but only after the grace). Trailing
+    frames are DISCARDED: emitting any wire event after RUN_FINISHED would violate
+    the AG-UI run lifecycle, and a late upstream error can no longer become a
+    RUN_ERROR, so it is swallowed here rather than surfaced.
+    """
+    grace_deadline = time.monotonic() + _CANCEL_GRACE_SECONDS
+    while True:
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(aiter.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            # Run task reached its end sentinel: finalization completed.
+            return
+        except (asyncio.TimeoutError, TimeoutError):
+            # Grace window elapsed; fall back to the aclose() cancel.
+            return
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Post-terminal: a late error cannot become a RUN_ERROR now.
+            return
+        # A trailing frame arrived before exhaustion — discard it (no
+        # post-RUN_FINISHED wire events) and keep draining.
+
+
+async def _run_flow_frame_stream(
+    *,
+    flow_copy: object,
+    encoder: EventEncoder,
+    input_data: RunAgentInput,
+    inputs: dict,
+    timeout: float | None,
+):
+    """StreamFrame-path driver (CPK-7719): drive ``flow.astream`` and yield
+    encoded AG-UI events.
+
+    The behavior-preserving replacement for ``_run_flow_event_stream`` on crewai
+    >= 1.6. Instead of a process-global bus listener enqueuing onto a per-flow
+    ``asyncio.Queue`` (keyed by a uuid stamped on the Flow), we consume the
+    ordered ``StreamFrame`` envelopes crewai's scoped stream sink produces and
+    map them through the single ``StreamFrameTranslator`` seam.
+
+    Every must-survive behavior of the legacy path is preserved by REUSING the
+    same helpers:
+
+    * the four-code RUN_ERROR taxonomy (``AGUI_CREWAI_FLOW_TIMEOUT`` /
+      ``AGUI_CREWAI_UPSTREAM_TIMEOUT`` / ``AGUI_CREWAI_FLOW_ERROR_<Class>``) via
+      ``_CeilingExceeded`` / ``_format_timeout_message`` / ``_sanitize_exception_code``;
+    * the wall-clock ceiling + env knobs (``timeout`` is ``_flow_timeout_seconds()``);
+    * ``_stamp_correlation_ids`` on every emitted event and
+      ``_run_error_extras`` (camelCase wire aliases) on every RUN_ERROR;
+    * client-disconnect teardown via ``aclose()`` (see ``_aclose_stream_session``).
+
+    ``flow_context`` is set so the ``sdk.copilotkit_*`` helpers can emit their
+    ``Bridged*`` events; those reach the scoped sink synchronously because
+    ``event_bus._prepare_event`` calls ``publish_stream_event`` on every
+    ``emit``.
+
+    Payload + identity come from the RAW event, not ``frame.data`` (CPK-7719
+    review blockers 1/2/3). We register our OWN scoped sink that parks the raw
+    event object keyed by ``event.event_id`` — but ONLY when ``source is
+    flow_copy``, so a nested ``crew.kickoff``'s own flow's lifecycle/method
+    events (which leak onto this same sink via the copied contextvars) are
+    excluded. The frame stream then supplies ORDERING; for each frame we look
+    up the parked raw event by ``frame.id`` and translate it. A frame with no
+    parked event belonged to a nested flow (or is a crewai-internal frame we
+    drop) and is skipped. This mirrors the legacy listener's ``source is
+    flow_copy`` gate and its pristine-payload behavior.
+
+    Because ``publish_stream_event`` runs the sink synchronously on ``emit``
+    and crewai enqueues the frame via ``loop.call_soon_threadsafe`` (a later
+    loop turn), the raw event is ALWAYS parked before its frame is dequeued.
+    """
+    token = flow_context.set(flow_copy)
+    translator = StreamFrameTranslator(
+        thread_id=input_data.thread_id,
+        run_id=input_data.run_id,
+        state_provider=lambda: getattr(flow_copy, "state", {}),
+    )
+    # Raw-event lookup buffer, populated by our scoped sink below. Keyed by
+    # ``event.event_id`` (== ``StreamFrame.id``). Only OUTER-flow events land
+    # here (source gate), which is exactly the nested-flow filter for blockers
+    # 2/3 — nested frames find nothing here and are dropped.
+    raw_events: dict[str, Any] = {}
+
+    def _sink(source: Any, event: Any) -> None:
+        # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
+        # flows emit with a DIFFERENT source (verified on the 1.15.7 wheel), and
+        # our own ``Bridged*`` events are emitted with ``flow_copy`` as source.
+        if source is flow_copy:
+            event_id = getattr(event, "event_id", None)
+            if event_id is not None:
+                raw_events[event_id] = event
+
+    # Predeclared before the ``try`` so the ``finally`` teardown is always safe
+    # to reference even if sink registration or ``astream``/``__aiter__`` raises
+    # before assignment (CPK-7719 #4). ``flow_context`` is set ABOVE and reset in
+    # the ``finally`` — mirroring the legacy path's token-then-finally discipline.
+    sink_token = None
+    session = None
+    try:
+        try:
+            # Register the sink and open the stream INSIDE the ``try`` so a
+            # raising ``astream``/``__aiter__`` (a) is caught and mapped through
+            # the RUN_ERROR taxonomy below instead of escaping the generator with
+            # no terminal event, and (b) never leaks the ``flow_context`` token —
+            # both confirmed by the CPK-7719 review probe. Register BEFORE the
+            # first ``__anext__``: crewai's astream spawns the flow-running task
+            # on first iteration and copies the CURRENT context, so the sink must
+            # already be in scope to reach the flow's emits. Guarded so a partial
+            # install (no sink API) degrades rather than crashing.
+            sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
+            # ``astream`` returns an AsyncStreamSession; iterating it spawns
+            # crewai's background kickoff task and streams ordered frames.
+            session = flow_copy.astream(inputs=inputs)  # type: ignore[attr-defined]
+            aiter = session.__aiter__()
+            deadline = (
+                time.monotonic() + timeout if timeout is not None else None
+            )
+            while True:
+                # Enforce the wall-clock ceiling per frame read via
+                # ``asyncio.wait_for``: on timeout it cancels the in-flight
+                # ``__anext__`` AND awaits its unwind before raising, so crewai's
+                # scoped stream sink / background kickoff task tear down cleanly;
+                # ``aclose()`` in the ``finally`` then fully drains the task.
+                #
+                # CPK-7721 review #8 — cross-version note (``requires-python``
+                # floor is 3.10). ``wait_for`` internals differ:
+                #   * 3.12+: for ``timeout > 0`` it ``await``s the coroutine
+                #     INLINE (``async with timeouts.timeout(...)``), no Task wrap,
+                #     no context copy. (The ``ensure_future`` wrap survives only
+                #     on the ``timeout <= 0`` branch, which we never reach — the
+                #     ``remaining <= 0`` guard above raises first.)
+                #   * 3.10/3.11: ``wait_for`` UNCONDITIONALLY does
+                #     ``fut = ensure_future(fut)``, wrapping ``__anext__`` in a
+                #     Task and copying the current context per read.
+                # The per-read context copy on 3.10/3.11 is HARMLESS here: our
+                # ``_sink`` is registered (above) BEFORE this loop, so every
+                # per-read context copy inherits it and crewai's ``publish_stream_event``
+                # still reaches it; and both our own and crewai's sink-token
+                # ``reset``s happen OUTSIDE the wrapped ``__anext__`` boundary, so
+                # no token is reset in a foreign context. Verified against the
+                # 1.15.7 wheel on 3.12 and by emulating the 3.10/3.11
+                # ``ensure_future`` wrap (identical wire output, clean
+                # ``flow_context`` reset). Do NOT swap this for a hand-rolled
+                # ``ensure_future`` + ``asyncio.wait``: that would lose the
+                # cancel-and-await-unwind semantics ``wait_for`` gives us on
+                # timeout.
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _CeilingExceeded(_format_timeout_message(timeout))
+                    try:
+                        frame = await asyncio.wait_for(
+                            aiter.__anext__(), timeout=remaining
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except (asyncio.TimeoutError, TimeoutError) as te:
+                        # ``wait_for``'s own timeout fires only once the
+                        # deadline is reached; an upstream ``TimeoutError``
+                        # raised by the flow propagates BEFORE that. Use the
+                        # wall clock to disambiguate (CR7 CRITICAL parity):
+                        # at/past the deadline => our ceiling; earlier => an
+                        # upstream read timeout that must NOT masquerade as
+                        # AGUI_CREWAI_FLOW_TIMEOUT.
+                        if time.monotonic() >= deadline:
+                            raise _CeilingExceeded(
+                                _format_timeout_message(timeout)
+                            ) from te
+                        raise
+                else:
+                    try:
+                        frame = await aiter.__anext__()
+                    except StopAsyncIteration:
+                        break
+
+                # Look up the RAW event this frame carries (parked by our sink).
+                # Missing => a nested-flow / crewai-internal frame we drop, so
+                # the outer run's wire shape stays identical to the legacy path.
+                raw_event = raw_events.pop(frame.id, None)
+                if raw_event is None:
+                    continue
+
+                for event in translator.translate(raw_event):
+                    _stamp_correlation_ids(
+                        event,
+                        thread_id=input_data.thread_id,
+                        run_id=input_data.run_id,
+                    )
+                    yield encoder.encode(event)
+
+                if translator.run_finished:
+                    # RUN_FINISHED just emitted. Do NOT break-then-aclose(): that
+                    # cancels crewai's still-finalizing kickoff task on every
+                    # happy-path run (CPK-7719 #5). Drain the terminal tail to
+                    # natural exhaustion (bounded by the cancel grace) so the run
+                    # task completes and the ``finally`` aclose() is a no-op.
+                    await _drain_frames_after_finish(aiter)
+                    break
+
+            # Belt-and-braces terminal (CPK-7719 blocker 3): the stream can
+            # exhaust with the run open but no outer ``flow_finished`` — e.g. the
+            # outer method caught a nested-flow error and returned, or a flow
+            # paused for human feedback. Emit the missing RUN_FINISHED so the
+            # client never sees a run that never ends. The RUN_ERROR paths below
+            # are the terminator for the errored case and never reach here.
+            for event in translator.finalize():
+                _stamp_correlation_ids(
+                    event,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield encoder.encode(event)
+
+        except _CeilingExceeded as ceiling_exc:
+            ceiling_display = f"{timeout:g}s"
+            _LOGGER.warning(
+                "CrewAI flow exceeded ceiling thread=%s run=%s ceiling=%s detail=%s",
+                input_data.thread_id,
+                input_data.run_id,
+                ceiling_display,
+                ceiling_exc.args[0] if ceiling_exc.args else "",
+            )
+            message = (
+                f"thread={input_data.thread_id} run={input_data.run_id}: "
+                f"CrewAI flow exceeded ceiling={ceiling_display}"
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=message,
+                    code="AGUI_CREWAI_FLOW_TIMEOUT",
+                    **_run_error_extras(input_data),
+                )
+            )
+        except (asyncio.TimeoutError, TimeoutError) as upstream_exc:
+            # An upstream ``TimeoutError`` bubbled out of the flow (e.g. a
+            # LiteLLM/httpx read timeout) — NOT our ceiling. Distinct code so
+            # alerting can tell the two apart (CR7 CRITICAL parity).
+            ceiling_display = (
+                "disabled" if timeout is None else f"{timeout:g}s"
+            )
+            _LOGGER.warning(
+                "CrewAI upstream timeout during kickoff thread=%s run=%s "
+                "ceiling=%s cause=%s",
+                input_data.thread_id,
+                input_data.run_id,
+                ceiling_display,
+                type(upstream_exc).__name__,
+            )
+            message = (
+                f"thread={input_data.thread_id} run={input_data.run_id}: "
+                f"CrewAI upstream timeout during kickoff "
+                f"(ceiling={ceiling_display} did not fire)"
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=message,
+                    code="AGUI_CREWAI_UPSTREAM_TIMEOUT",
+                    **_run_error_extras(input_data),
+                )
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            _LOGGER.exception(
+                "CrewAI flow failed thread=%s run=%s cause=%s",
+                input_data.thread_id,
+                input_data.run_id,
+                type(e).__name__,
+            )
+            message = (
+                f"thread={input_data.thread_id} run={input_data.run_id}: "
+                f"CrewAI flow failed; see server logs"
+            )
+            sanitized_name = _sanitize_exception_code(type(e).__name__)
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=message,
+                    code=f"AGUI_CREWAI_FLOW_ERROR_{sanitized_name}",
+                    **_run_error_extras(input_data),
+                )
+            )
+    finally:
+        # aclose() replaces _cancel_and_join on this path; run it
+        # unconditionally (including under outer cancellation) so the kickoff
+        # task never leaks, then unregister the sink and reset the context var.
+        try:
+            await _aclose_stream_session(
+                session,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+        finally:
+            try:
+                if sink_token is not None and callable(reset_stream_sinks):
+                    reset_stream_sinks(sink_token)
             finally:
                 flow_context.reset(token)
+
+
+def _run_flow_stream(
+    *,
+    flow_copy: object,
+    encoder: EventEncoder,
+    input_data: RunAgentInput,
+    inputs: dict,
+    timeout: float | None,
+):
+    """Select the StreamFrame path (crewai >= 1.6 + a real ``astream`` flow) or
+    the legacy bus-listener path, returning the chosen async generator.
+
+    The probe is per-flow (``flow_supports_stream_frames``): the test doubles in
+    ``tests/test_task_cancellation.py`` implement only ``kickoff_async`` and so
+    transparently keep the legacy path (and its 27 cancellation tests). Real
+    crewai 1.6+ Flows take the StreamFrame path; crewai 1.0-1.5 falls back.
+    """
+    if flow_supports_stream_frames(flow_copy):
+        return _run_flow_frame_stream(
+            flow_copy=flow_copy,
+            encoder=encoder,
+            input_data=input_data,
+            inputs=inputs,
+            timeout=timeout,
+        )
+    return _run_flow_event_stream(
+        flow_copy=flow_copy,
+        encoder=encoder,
+        input_data=input_data,
+        inputs=inputs,
+        timeout=timeout,
+    )
 
 
 def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
@@ -1472,7 +2038,7 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
     async def agentic_chat_endpoint(input_data: RunAgentInput, request: Request):
         """Agentic chat endpoint"""
 
-        flow_copy = copy.deepcopy(flow)
+        flow_copy = _copy_flow(flow)
 
         # Get the accept header from the request
         accept_header = request.headers.get("accept")
@@ -1490,7 +2056,7 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
         timeout = _flow_timeout_seconds()
 
         return StreamingResponse(
-            _run_flow_event_stream(
+            _run_flow_stream(
                 flow_copy=flow_copy,
                 encoder=encoder,
                 input_data=input_data,
@@ -1544,7 +2110,7 @@ def add_crewai_crew_fastapi_endpoint(
     async def crew_endpoint(input_data: RunAgentInput, request: Request):
         """Crew chat endpoint with deferred initialization."""
         flow = await _get_flow()
-        flow_copy = copy.deepcopy(flow)
+        flow_copy = _copy_flow(flow)
 
         accept_header = request.headers.get("accept")
         encoder = EventEncoder(accept=accept_header)
@@ -1559,7 +2125,7 @@ def add_crewai_crew_fastapi_endpoint(
         timeout = _flow_timeout_seconds()
 
         return StreamingResponse(
-            _run_flow_event_stream(
+            _run_flow_stream(
                 flow_copy=flow_copy,
                 encoder=encoder,
                 input_data=input_data,
@@ -1577,6 +2143,23 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
     tools: list[Tool],
 ):
     """Default merge state for CrewAI"""
+    # CPK-7721 review #7 — multimodal / non-text content passes through RAW here.
+    #
+    # ``message.model_dump()`` serializes each message verbatim, including any
+    # AG-UI content PARTS (e.g. ``{"type": "image", "source": {...}}``) carried
+    # on ``content`` as an array. These flow straight into the flow state /
+    # LiteLLM, which expects OpenAI's ``{"type": "image_url", "image_url": {...}}``
+    # shape — so a multimodal input can hard-fail downstream.
+    #
+    # This is NEW exposure as of the TS ``maxVersion`` bump to 0.0.57 (this PR):
+    # the older compat middleware FLATTENED array content to a plain string
+    # before it reached the bridge (multimodal worked, but degraded to text). At
+    # 0.0.57 that middleware is off, so the parts arrive un-normalized.
+    #
+    # Converting content parts to LiteLLM's shape is a PARITY-LANE concern
+    # (CPK-7718 / CPK-7721 parity tickets), NOT this migration — do not add image
+    # normalization here. Left as a documented passthrough until the Parity lane
+    # owns it.
     messages = [message.model_dump() for message in messages]
 
     if len(messages) > 0:
