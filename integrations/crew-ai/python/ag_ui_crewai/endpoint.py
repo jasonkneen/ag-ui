@@ -27,9 +27,11 @@ from ._capabilities import (
     BaseEventListener,
     crewai_event_bus,
     flow_supports_stream_frames,
+    supported_checkpoint_kwargs,
     add_stream_sink,
     reset_stream_sinks,
 )
+from ._checkpoint import build_checkpoint_kwargs
 from ._frames import StreamFrameTranslator
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from crewai.flow.flow import Flow
@@ -1138,6 +1140,7 @@ async def _run_flow_event_stream(
     input_data: RunAgentInput,
     inputs: dict,
     timeout: float | None,
+    checkpoint_kwargs: dict | None = None,
 ):
     """Drive a single flow kickoff and yield encoded AG-UI events.
 
@@ -1199,8 +1202,22 @@ async def _run_flow_event_stream(
     allow_grace = False
     try:
         try:
+            # Only pass checkpoint kwargs this flow's kickoff_async declares, so
+            # a flow that predates them is called exactly as before.
+            _ckpt = supported_checkpoint_kwargs(
+                flow_copy.kickoff_async, checkpoint_kwargs or {}  # type: ignore[attr-defined]
+            )
+            if checkpoint_kwargs and not _ckpt:
+                # Checkpointing was enabled and a config was built, but this
+                # flow's kickoff_async does not accept it: warn so the no-op is
+                # visible rather than silently persisting nothing.
+                _LOGGER.warning(
+                    "ag-ui-crewai: checkpointing is enabled but "
+                    "flow.kickoff_async does not accept from_checkpoint; "
+                    "nothing will be persisted for this run."
+                )
             kickoff_task = asyncio.create_task(
-                flow_copy.kickoff_async(inputs=inputs)  # type: ignore[attr-defined]
+                flow_copy.kickoff_async(inputs=inputs, **_ckpt)  # type: ignore[attr-defined]
             )
 
             deadline = (
@@ -1707,6 +1724,7 @@ async def _run_flow_frame_stream(
     input_data: RunAgentInput,
     inputs: dict,
     timeout: float | None,
+    checkpoint_kwargs: dict | None = None,
 ):
     """StreamFrame-path driver: drive ``flow.astream`` and yield encoded AG-UI
     events.
@@ -1796,7 +1814,20 @@ async def _run_flow_frame_stream(
             sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
             # ``astream`` returns an AsyncStreamSession; iterating it spawns
             # crewai's background kickoff task and streams ordered frames.
-            session = flow_copy.astream(inputs=inputs)  # type: ignore[attr-defined]
+            # Filter against astream's own signature so an unsupported kwarg
+            # degrades cleanly instead of raising.
+            _ckpt = supported_checkpoint_kwargs(
+                flow_copy.astream, checkpoint_kwargs or {}  # type: ignore[attr-defined]
+            )
+            if checkpoint_kwargs and not _ckpt:
+                # Checkpointing enabled but this flow's astream does not accept
+                # it: warn so the no-op is visible.
+                _LOGGER.warning(
+                    "ag-ui-crewai: checkpointing is enabled but flow.astream "
+                    "does not accept from_checkpoint; nothing will be persisted "
+                    "for this run."
+                )
+            session = flow_copy.astream(inputs=inputs, **_ckpt)  # type: ignore[attr-defined]
             aiter = session.__aiter__()
             deadline = (
                 time.monotonic() + timeout if timeout is not None else None
@@ -1979,6 +2010,7 @@ def _run_flow_stream(
     input_data: RunAgentInput,
     inputs: dict,
     timeout: float | None,
+    checkpoint_kwargs: dict | None = None,
 ):
     """Select the StreamFrame path (crewai >= 1.6 + a real ``astream`` flow) or
     the legacy bus-listener path, returning the chosen async generator.
@@ -1987,6 +2019,9 @@ def _run_flow_stream(
     ``tests/test_task_cancellation.py`` implement only ``kickoff_async`` and so
     transparently keep the legacy path (and its 27 cancellation tests). Real
     crewai 1.6+ Flows take the StreamFrame path; crewai 1.0-1.5 falls back.
+
+    ``checkpoint_kwargs`` is forwarded to whichever driver is chosen; each
+    driver filters it against the exact method it invokes.
     """
     if flow_supports_stream_frames(flow_copy):
         return _run_flow_frame_stream(
@@ -1995,6 +2030,7 @@ def _run_flow_stream(
             input_data=input_data,
             inputs=inputs,
             timeout=timeout,
+            checkpoint_kwargs=checkpoint_kwargs,
         )
     return _run_flow_event_stream(
         flow_copy=flow_copy,
@@ -2002,6 +2038,7 @@ def _run_flow_stream(
         input_data=input_data,
         inputs=inputs,
         timeout=timeout,
+        checkpoint_kwargs=checkpoint_kwargs,
     )
 
 
@@ -2046,7 +2083,11 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
             context=input_data.context,
             forwarded_props=input_data.forwarded_props,
         )
+        # Keep the thread linkage crewai has always used; checkpointing layers
+        # on top and is off unless CREWAI_CHECKPOINT is set.
         inputs["id"] = input_data.thread_id
+
+        checkpoint_kwargs = build_checkpoint_kwargs(flow_copy, input_data)
 
         timeout = _flow_timeout_seconds()
 
@@ -2057,6 +2098,7 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
                 input_data=input_data,
                 inputs=inputs,
                 timeout=timeout,
+                checkpoint_kwargs=checkpoint_kwargs,
             ),
             media_type=encoder.get_content_type(),
         )
@@ -2117,7 +2159,10 @@ def add_crewai_crew_fastapi_endpoint(
             context=input_data.context,
             forwarded_props=input_data.forwarded_props,
         )
+        # Keep the thread linkage; layer opt-in checkpointing on top.
         inputs["id"] = input_data.thread_id
+
+        checkpoint_kwargs = build_checkpoint_kwargs(flow_copy, input_data)
 
         timeout = _flow_timeout_seconds()
 
@@ -2128,6 +2173,7 @@ def add_crewai_crew_fastapi_endpoint(
                 input_data=input_data,
                 inputs=inputs,
                 timeout=timeout,
+                checkpoint_kwargs=checkpoint_kwargs,
             ),
             media_type=encoder.get_content_type(),
         )
