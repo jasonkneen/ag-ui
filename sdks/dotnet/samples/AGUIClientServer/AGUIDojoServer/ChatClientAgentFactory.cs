@@ -293,6 +293,27 @@ internal static class ChatClientAgentFactory
     /// </summary>
     public const string A2UIPlannerSystemPrompt = A2UICompositionGuides.PlannerInstructions;
 
+    /// <summary>The system prompt for the fixed-schema demo.</summary>
+    public const string A2UIFixedSchemaSystemPrompt = """
+        You are a helpful travel assistant that can search for flights and hotels.
+        When the user asks about flights, use the search_flights tool.
+        When the user asks about hotels, use the search_hotels tool.
+        IMPORTANT: After calling a tool, do NOT repeat or summarize the data in your text
+        response. The tool renders a rich UI automatically. Just say something brief like
+        "Here are your results" or ask if they'd like to book.
+        """;
+
+    /// <summary>
+    /// Fixed-schema demo: the author owns the card layout (in code); the agent only supplies the
+    /// data via the search tools, whose return value is an A2UI operations envelope the middleware
+    /// paints. No generate_a2ui / subagent / recovery.
+    /// </summary>
+    public static IChatClient CreateA2UIFixedSchema() => CreateBaseChatClient();
+
+    /// <summary>The fixed-schema server tools (search_flights, search_hotels).</summary>
+    public static IList<AITool> CreateA2UIFixedSchemaTools() =>
+        [A2UIFixedSchemaTools.CreateSearchFlightsTool(), A2UIFixedSchemaTools.CreateSearchHotelsTool()];
+
     // Builds an A2UI-enabled chat client: the planner (with function invocation for any server
     // tools) wrapped by A2UIChatClient, which auto-injects generate_a2ui and drives a raw render
     // subagent through the recovery loop.

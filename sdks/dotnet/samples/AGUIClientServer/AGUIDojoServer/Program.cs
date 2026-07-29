@@ -45,6 +45,13 @@ app.MapDojoEndpoint("/predictive_state_updates",
     systemPrompt: ChatClientAgentFactory.PredictiveStateUpdatesSystemPrompt,
     configureStreamOptions: json => ChatClientAgentFactory.CreatePredictiveStateUpdatesStreamOptions(json));
 
+// A2UI fixed-schema: the search tools return a pre-authored a2ui_operations envelope; the A2UI
+// middleware paints it. No generate_a2ui / subagent / progressive-args tap needed.
+app.MapDojoEndpoint("/a2ui_fixed_schema",
+    ChatClientAgentFactory.CreateA2UIFixedSchema(),
+    serverTools: ChatClientAgentFactory.CreateA2UIFixedSchemaTools(),
+    systemPrompt: ChatClientAgentFactory.A2UIFixedSchemaSystemPrompt);
+
 // A2UI (agent-generated UI). generate_a2ui is auto-injected and handled by A2UIChatClient
 // (subagent + recovery); the stream options surface the render_a2ui argument fragments so
 // surfaces paint progressively.

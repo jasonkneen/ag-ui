@@ -508,7 +508,9 @@ export const agentsIntegrations = {
         // A2UI: generate_a2ui is auto-injected and handled server-side by the .NET
         // AGUI.A2UI adapter (subagent + recovery). The dojo runtime attaches the A2UI
         // painting middleware (no client-side tool injection, since injectsA2UITool is
-        // false for this integration), so these are plain HttpAgents.
+        // false for this integration), so these are plain HttpAgents. Fixed-schema needs no
+        // generation tool at all — its search tools return the surface envelope directly.
+        a2ui_fixed_schema: "a2ui_fixed_schema",
         a2ui_dynamic_schema: "a2ui_dynamic_schema",
         a2ui_advanced: "a2ui_advanced",
         a2ui_recovery: "a2ui_recovery",
