@@ -2,6 +2,7 @@
 Streaming and state helpers (copilotkit_stream and related utilities) for the CrewAI AG-UI bridge.
 """
 
+import copy
 import uuid
 from typing import List, Any, Optional, Mapping, Dict, Literal, TypedDict
 from litellm.types.utils import (
@@ -169,19 +170,31 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
     flow = flow_context.get(None)
 
     message_id: Optional[str] = None
-    tool_call_id: str = ""
     content = ""
     created = 0
     model = ""
     system_fingerprint = ""
     finish_reason=None
-    all_tool_calls = []
+    # Route tool-call deltas by their OpenAI ``.index`` so parallel calls stay
+    # separate; keyed in arrival order so the final reassembly preserves it.
+    # A provider that omits ``.index`` falls back to last-call routing below.
+    tool_calls_by_index: Dict[Any, Dict[str, Any]] = {}
+    last_tool_key: Any = None
+    auto_key = 0
 
     async for chunk in response:
         if message_id is None:
             message_id = chunk["id"]
 
-        text_content = chunk["choices"][0]["delta"]["content"] or None
+        # Some providers send trailing/usage-only chunks with an empty
+        # ``choices`` list; skip them rather than IndexError on ``choices[0]``.
+        choices = chunk["choices"] or None
+        if choices is None:
+            continue
+        choice = choices[0]
+        delta = choice["delta"]
+
+        text_content = delta["content"] or None
 
         # Stream text messages
         if text_content is not None:
@@ -199,38 +212,64 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
             # yield control to the event loop
             await yield_control()
 
-        # Stream tool calls
-        tool_calls = chunk["choices"][0]["delta"]["tool_calls"] or None
-        tool_call_id = tool_calls[0].id if tool_calls is not None else None
-        tool_call_arguments = tool_calls[0].function["arguments"] if tool_calls is not None else None
-        tool_call_name = tool_calls[0].function["name"] if tool_calls is not None else None
+        # Stream tool calls (index-routed, one bridged chunk per arg delta)
+        tool_calls = delta["tool_calls"] or None
+        if tool_calls is not None:
+            for tool_call in tool_calls:
+                delta_id = getattr(tool_call, "id", None)
+                delta_name = tool_call.function["name"]
+                delta_arguments = tool_call.function["arguments"]
 
-        if tool_call_id is not None:
-            all_tool_calls.append(
-                {
-                    "id": tool_call_id,
-                    "name": tool_call_name,
-                    "arguments": "",
-                }
-            )
+                # Resolve which accumulating call this delta belongs to.
+                index = getattr(tool_call, "index", None)
+                last_entry = tool_calls_by_index.get(last_tool_key)
+                if index is not None:
+                    key = index
+                elif delta_id is not None and last_entry is not None \
+                        and last_entry.get("id") == delta_id:
+                    # No index, but this delta re-echoes the current call's id:
+                    # a continuation, not a new call.
+                    key = last_tool_key
+                elif delta_id is not None and (
+                    last_entry is None or last_entry.get("id") is not None
+                ):
+                    # No index, a new id: a genuinely new call.
+                    key = ("auto", auto_key)
+                    auto_key += 1
+                else:
+                    # No index, no new id: continue the current call. Covers
+                    # argument-only deltas and the id-bearing delta of a call
+                    # whose args streamed first (empty accumulator, no IndexError).
+                    key = last_tool_key
+                last_tool_key = key
 
-        if tool_call_arguments is not None:
-            # add to the current tool call
-            all_tool_calls[-1]["arguments"] += tool_call_arguments
-            crewai_event_bus.emit(
-                flow,
-                BridgedToolCallChunkEvent(
-                    type=EventType.TOOL_CALL_CHUNK,
-                    tool_call_id=tool_call_id,
-                    tool_call_name=tool_call_name,
-                    delta=tool_call_arguments,
-                )
-            )
-            # yield control to the event loop
-            await yield_control()
+                entry = tool_calls_by_index.get(key)
+                if entry is None:
+                    entry = {"id": delta_id, "name": delta_name, "arguments": ""}
+                    tool_calls_by_index[key] = entry
+                else:
+                    # id/name can arrive on a later delta than the first.
+                    if delta_id is not None:
+                        entry["id"] = delta_id
+                    if delta_name is not None:
+                        entry["name"] = delta_name
+
+                if delta_arguments is not None:
+                    entry["arguments"] += delta_arguments
+                    crewai_event_bus.emit(
+                        flow,
+                        BridgedToolCallChunkEvent(
+                            type=EventType.TOOL_CALL_CHUNK,
+                            tool_call_id=entry["id"],
+                            tool_call_name=entry["name"],
+                            delta=delta_arguments,
+                        )
+                    )
+                    # yield control to the event loop
+                    await yield_control()
 
         # Stream finish reason
-        finish_reason = chunk["choices"][0]["finish_reason"]
+        finish_reason = choice["finish_reason"]
         created = chunk["created"]
         model = chunk["model"]
         system_fingerprint = chunk["system_fingerprint"]
@@ -247,7 +286,7 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
             id=tool_call["id"],
             type="function"
         )
-        for tool_call in all_tool_calls
+        for tool_call in tool_calls_by_index.values()
     ]
     return ModelResponse(
         id=message_id,
@@ -292,6 +331,10 @@ def litellm_messages_to_ag_ui_messages(messages: List[LiteLLMMessage]) -> List[M
         message_dict = {k: v for k, v in message_dict.items() if v is not None}
 
         if "tool_calls" in message_dict:
+            # The whitelist comprehension is a shallow copy, so this list and
+            # its dicts are still the caller's (e.g. the flow-state) objects.
+            # Deep-copy before stamping ``type`` so we don't mutate them in place.
+            message_dict["tool_calls"] = copy.deepcopy(message_dict["tool_calls"])
             for tool_call in message_dict["tool_calls"]:
                 if "type" not in tool_call:
                     tool_call["type"] = "function"

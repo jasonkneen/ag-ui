@@ -85,8 +85,22 @@ def _stream_chunk(chunk_id, *, content=None, tool_calls=None, finish_reason=None
     }
 
 
-def _tool_call_delta(*, call_id, name, arguments):
-    return SimpleNamespace(id=call_id, function={"name": name, "arguments": arguments})
+def _tool_call_delta(*, call_id, name, arguments, index=None):
+    ns = SimpleNamespace(id=call_id, function={"name": name, "arguments": arguments})
+    if index is not None:
+        ns.index = index
+    return ns
+
+
+def _empty_choices_chunk(chunk_id):
+    """A trailing usage-only chunk: valid envelope, empty ``choices`` list."""
+    return {
+        "id": chunk_id,
+        "created": 1700000000,
+        "model": "gpt-4o",
+        "system_fingerprint": "fp_test",
+        "choices": [],
+    }
 
 
 class _FakeStreamWrapper(CustomStreamWrapper):
@@ -200,6 +214,125 @@ async def test_copilotkit_stream_rejects_unknown_type():
     """An unrecognised response type raises ``ValueError``."""
     with pytest.raises(ValueError):
         await copilotkit_stream(object())
+
+
+# --------------------------------------------------------------------------
+# Streaming-handler robustness (index routing + empty-list/choices guards)
+# --------------------------------------------------------------------------
+
+async def test_copilotkit_stream_routes_parallel_tool_calls_by_index():
+    """Two tool calls interleaved across chunks (each carrying its OpenAI
+    ``.index``) reassemble into TWO distinct calls with correctly-partitioned
+    arguments — not one call with the args concatenated together."""
+    flow_context.set(None)
+
+    async def _gen():
+        # First deltas for both calls (id-bearing), out of order.
+        yield _stream_chunk("msg-p", tool_calls=[
+            _tool_call_delta(call_id="call-A", name="alpha", arguments='{"a":', index=0),
+        ])
+        yield _stream_chunk("msg-p", tool_calls=[
+            _tool_call_delta(call_id="call-B", name="beta", arguments='{"b":', index=1),
+        ])
+        # Continuation deltas (id/name absent), interleaved.
+        yield _stream_chunk("msg-p", tool_calls=[
+            _tool_call_delta(call_id=None, name=None, arguments="2}", index=1),
+        ])
+        yield _stream_chunk("msg-p", tool_calls=[
+            _tool_call_delta(call_id=None, name=None, arguments="1}", index=0),
+        ])
+        yield _stream_chunk("msg-p", finish_reason="stop")
+
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
+    calls = resp.choices[0].message.tool_calls
+    assert calls is not None and len(calls) == 2
+    by_id = {c.id: c for c in calls}
+    assert by_id["call-A"].function.name == "alpha"
+    assert by_id["call-A"].function.arguments == '{"a":1}'
+    assert by_id["call-B"].function.name == "beta"
+    assert by_id["call-B"].function.arguments == '{"b":2}'
+
+
+async def test_copilotkit_stream_tolerates_args_before_id_chunk():
+    """An argument delta arriving before any id-bearing chunk must not
+    IndexError on an empty accumulator; it seeds a call whose id fills in
+    when the id-bearing delta arrives."""
+    flow_context.set(None)
+
+    async def _gen():
+        # Pathological: args first, no id, no index.
+        yield _stream_chunk("msg-e", tool_calls=[
+            _tool_call_delta(call_id=None, name=None, arguments='{"x":'),
+        ])
+        # id/name arrive on a later delta.
+        yield _stream_chunk("msg-e", tool_calls=[
+            _tool_call_delta(call_id="call-late", name="fn", arguments="1}"),
+        ])
+        yield _stream_chunk("msg-e", finish_reason="stop")
+
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
+    calls = resp.choices[0].message.tool_calls
+    assert calls is not None and len(calls) == 1
+    assert calls[0].id == "call-late"
+    assert calls[0].function.name == "fn"
+    assert calls[0].function.arguments == '{"x":1}'
+
+
+async def test_copilotkit_stream_index_less_echoed_id_is_one_call():
+    """A provider that omits ``.index`` but re-echoes the same ``id`` on each
+    continuation delta must reassemble into ONE call, not fragment per delta."""
+    flow_context.set(None)
+
+    async def _gen():
+        yield _stream_chunk("msg-r", tool_calls=[
+            _tool_call_delta(call_id="call-1", name="fn", arguments='{"a":'),
+        ])
+        # Same id echoed, no index -> continuation, not a new call.
+        yield _stream_chunk("msg-r", tool_calls=[
+            _tool_call_delta(call_id="call-1", name=None, arguments="1}"),
+        ])
+        yield _stream_chunk("msg-r", finish_reason="stop")
+
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
+    calls = resp.choices[0].message.tool_calls
+    assert calls is not None and len(calls) == 1
+    assert calls[0].id == "call-1"
+    assert calls[0].function.arguments == '{"a":1}'
+
+
+async def test_copilotkit_stream_index_less_distinct_ids_are_separate_calls():
+    """Two sequential calls with no ``.index`` but DIFFERENT ids stay separate
+    (the echoed-id continuation rule must not merge genuinely distinct calls)."""
+    flow_context.set(None)
+
+    async def _gen():
+        yield _stream_chunk("msg-d", tool_calls=[
+            _tool_call_delta(call_id="call-1", name="fn1", arguments="{}"),
+        ])
+        yield _stream_chunk("msg-d", tool_calls=[
+            _tool_call_delta(call_id="call-2", name="fn2", arguments="{}"),
+        ])
+        yield _stream_chunk("msg-d", finish_reason="stop")
+
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
+    calls = resp.choices[0].message.tool_calls
+    assert calls is not None and len(calls) == 2
+    assert [c.id for c in calls] == ["call-1", "call-2"]
+
+
+async def test_copilotkit_stream_skips_empty_choices_chunk():
+    """A trailing usage-only chunk with an empty ``choices`` list is skipped,
+    not an IndexError; surrounding content still reassembles."""
+    flow_context.set(None)
+
+    async def _gen():
+        yield _stream_chunk("msg-c", content="Hi")
+        yield _empty_choices_chunk("msg-c")  # would IndexError on choices[0]
+        yield _stream_chunk("msg-c", finish_reason="stop")
+
+    resp = await copilotkit_stream(_FakeStreamWrapper(_gen()))
+    assert resp.choices[0].message.content == "Hi"
+    assert resp.choices[0].finish_reason == "stop"
 
 
 # --------------------------------------------------------------------------
