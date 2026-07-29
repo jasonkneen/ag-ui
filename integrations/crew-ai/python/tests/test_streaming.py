@@ -362,19 +362,42 @@ async def _collect(agen):
     return out
 
 
-class _FakeStreamSession:
-    """Minimal AsyncStreamSession stand-in: yields supplied frames, records
-    whether ``aclose`` was called. Lets us unit-test the driver's teardown /
-    ceiling handling without a live crewai run."""
+def _ev(type, event_id=None, **attrs):  # noqa: A002 - mirror event.type
+    """A RAW crewai/bridge event stand-in the translator reads by attribute.
 
-    def __init__(self, frames, *, hang=False):
-        self._frames = frames
+    The translator now consumes raw event objects (CPK-7719 blocker 1), so a
+    lifecycle event is any object exposing ``.type`` (+ ``.method_name`` etc.)
+    and a bridge event exposes its typed payload attributes directly — no
+    ``to_serializable`` ``frame.data`` in the loop."""
+    return SimpleNamespace(
+        type=type,
+        event_id=event_id or f"ev-{id(attrs)}",
+        **attrs,
+    )
+
+
+class _FakeStreamSession:
+    """Minimal AsyncStreamSession stand-in. Publishes each supplied RAW event to
+    the scoped sink (as crewai's ``event_bus._prepare_event`` does) and then
+    yields a StreamFrame-shaped stand-in whose ``id`` matches, so the driver's
+    source-gated raw-event lookup finds it. Records whether ``aclose`` was
+    called. Lets us unit-test the driver's teardown / ceiling handling without a
+    live crewai run."""
+
+    def __init__(self, events, *, source, hang=False):
+        self._events = events
+        self._source = source
         self._hang = hang
         self.aclosed = False
 
     async def _agen(self):
-        for fr in self._frames:
-            yield fr
+        from crewai.events.stream_context import publish_stream_event
+
+        for ev in self._events:
+            # The sink (registered by the driver in this same context) parks the
+            # raw event; the frame supplies ordering + the id to look it up.
+            publish_stream_event(self._source, ev)
+            yield _Frame(ev.type, id=ev.event_id)
         if self._hang:
             # Never terminate on its own — the ceiling / aclose must stop us.
             await asyncio.Event().wait()
@@ -387,11 +410,11 @@ class _FakeStreamSession:
 
 
 class _Frame:
-    """StreamFrame-shaped stand-in (only ``type`` / ``data`` are read)."""
+    """StreamFrame-shaped stand-in (the driver reads only ``type`` / ``id``)."""
 
-    def __init__(self, type, data=None):  # noqa: A002 - mirror StreamFrame.type
+    def __init__(self, type, id):  # noqa: A002 - mirror StreamFrame.type / .id
         self.type = type
-        self.data = data or {}
+        self.id = id
 
 
 # -- capability probe -------------------------------------------------------
@@ -418,57 +441,61 @@ def test_stream_frame_probe_is_per_flow_and_version_consistent():
 # -- translator wire shape (default = chunks) -------------------------------
 
 def test_translator_produces_current_chunk_wire_shape():
-    """The default translator maps bridge/lifecycle frames onto exactly the
+    """The default translator maps bridge/lifecycle events onto exactly the
     events the legacy listener produced — chunks, not triples."""
     state = {"messages": [{"role": "assistant", "content": "hi", "id": "m1"}]}
     tr = frames_mod.StreamFrameTranslator(
         thread_id="t-1", run_id="r-1", state_provider=lambda: state,
     )
 
-    assert [e.type for e in tr.translate(_Frame("flow_started"))] == [
+    assert [e.type for e in tr.translate(_ev("flow_started"))] == [
         EventType.RUN_STARTED
     ]
-    start_ev = tr.translate(_Frame("method_execution_started", {"method_name": "chat"}))
+    assert tr.run_started is True
+    start_ev = tr.translate(_ev("method_execution_started", method_name="chat"))
     assert start_ev[0].type == EventType.STEP_STARTED
     assert start_ev[0].step_name == "chat"
 
-    text = tr.translate(_Frame("TEXT_MESSAGE_CHUNK", {
-        "message_id": "m1", "role": "assistant", "delta": "hi",
-    }))
+    text = tr.translate(_ev(
+        "TEXT_MESSAGE_CHUNK", message_id="m1", role="assistant", delta="hi",
+    ))
     assert len(text) == 1
     assert text[0].type == EventType.TEXT_MESSAGE_CHUNK
     assert (text[0].message_id, text[0].role, text[0].delta) == ("m1", "assistant", "hi")
 
-    tool = tr.translate(_Frame("TOOL_CALL_CHUNK", {
-        "tool_call_id": "tc1", "tool_call_name": "searchTool", "delta": '{"q":1}',
-    }))
+    tool = tr.translate(_ev(
+        "TOOL_CALL_CHUNK", tool_call_id="tc1", tool_call_name="searchTool",
+        delta='{"q":1}',
+    ))
     assert tool[0].type == EventType.TOOL_CALL_CHUNK
     assert (tool[0].tool_call_id, tool[0].tool_call_name, tool[0].delta) == (
         "tc1", "searchTool", '{"q":1}'
     )
 
-    custom = tr.translate(_Frame("CUSTOM", {"name": "PredictState", "value": [1]}))
+    custom = tr.translate(_ev("CUSTOM", name="PredictState", value=[1]))
     assert custom[0].type == EventType.CUSTOM
     assert (custom[0].name, custom[0].value) == ("PredictState", [1])
 
-    snap = tr.translate(_Frame("STATE_SNAPSHOT", {"snapshot": {"p": 5}}))
+    snap = tr.translate(_ev("STATE_SNAPSHOT", snapshot={"p": 5}))
     assert snap[0].type == EventType.STATE_SNAPSHOT
     assert snap[0].snapshot == {"p": 5}
 
-    finished = tr.translate(_Frame("method_execution_finished", {"method_name": "chat"}))
+    finished = tr.translate(_ev("method_execution_finished", method_name="chat"))
     assert [e.type for e in finished] == [
         EventType.MESSAGES_SNAPSHOT, EventType.STATE_SNAPSHOT, EventType.STEP_FINISHED,
     ]
     assert finished[0].messages[0].id == "m1"
     assert finished[2].step_name == "chat"
 
-    fin = tr.translate(_Frame("flow_finished"))
+    fin = tr.translate(_ev("flow_finished"))
     assert fin[0].type == EventType.RUN_FINISHED
-    assert tr.is_run_end(_Frame("flow_finished")) is True
+    assert tr.run_finished is True
+    # Idempotent: a second flow_finished never re-emits RUN_FINISHED.
+    assert tr.translate(_ev("flow_finished")) == []
 
-    # Native crewai channels / unknown frames are dropped (behavior-preserving).
-    assert tr.translate(_Frame("llm_stream_chunk", {"chunk": "x"})) == []
-    assert tr.translate(_Frame("cc_env")) == []
+    # Native crewai channels / unknown events are dropped (behavior-preserving).
+    assert tr.translate(_ev("llm_stream_chunk", chunk="x")) == []
+    assert tr.translate(_ev("cc_env")) == []
 
 
 def test_translator_emission_shape_is_swappable_and_defaults_to_chunks():
@@ -488,7 +515,7 @@ def test_translator_emission_shape_is_swappable_and_defaults_to_chunks():
         thread_id="t", run_id="r", state_provider=dict, emission_shape="triples",
     )
     with pytest.raises(NotImplementedError):
-        triples.translate(_Frame("TEXT_MESSAGE_CHUNK", {"message_id": "m", "delta": "x"}))
+        triples.translate(_ev("TEXT_MESSAGE_CHUNK", message_id="m", delta="x"))
 
 
 # -- end-to-end through a REAL crewai Flow via astream ----------------------
@@ -634,6 +661,157 @@ async def test_frame_path_two_completions_emit_single_run_lifecycle():
     assert types.index("TEXT_MESSAGE_CHUNK") < types.index("RUN_FINISHED")
 
 
+# -- CPK-7719 review blockers: raw-payload fidelity, nested non-leak, terminal
+
+
+class _ProgressiveStateFlow(Flow):
+    """Emits an intermediate ``copilotkit_emit_state`` (as agentic_generative_ui
+    does mid-method) carrying string, deeply-nested, and reserved-name values."""
+
+    @start()
+    async def chat(self):
+        await copilotkit_emit_state({
+            "steps": [{"description": "Digging hole", "status": "completed"}],
+            # user-state keys that collide with crewai's _FRAME_DATA_EXCLUDE set
+            "type": "user-type",
+            "timestamp": "user-ts",
+            # a value at depth >= 5, where to_serializable() falls back to repr()
+            "deep": {"a": {"b": {"c": {"d": {"e": "deep-string"}}}}},
+        })
+        return "done"
+
+
+@requires_stream_frames
+async def test_frame_path_progressive_state_snapshot_is_verbatim():
+    """CPK-7719 blocker 1: the intermediate STATE_SNAPSHOT must equal the LIVE
+    state ``copilotkit_emit_state`` was given — no ``repr()`` quoting of strings
+    at depth >= 5, no dropping of user keys named ``type`` / ``timestamp``.
+
+    Pre-fix the translator built the snapshot from ``frame.data`` (crewai's
+    ``to_serializable(max_depth=5)`` output), so ``description`` arrived as
+    ``\"'Digging hole'\"`` and the depth-5 string was stringified — exactly the
+    corruption those progressive demos exist to surface. Verified against the
+    crewai 1.15.7 wheel."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_ProgressiveStateFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    # The intermediate emit (the one carrying "steps"), NOT the method-finished
+    # snapshot built from the flow's own state.
+    snap = next(
+        p["snapshot"] for p in payloads
+        if p["type"] == "STATE_SNAPSHOT" and "steps" in (p.get("snapshot") or {})
+    )
+    # No repr quoting of shallow strings.
+    assert snap["steps"][0]["description"] == "Digging hole", snap
+    assert snap["steps"][0]["status"] == "completed", snap
+    # Depth-5 string survives intact (pre-fix: a repr'd dict string).
+    assert snap["deep"]["a"]["b"]["c"]["d"]["e"] == "deep-string", snap
+    # User keys colliding with _FRAME_DATA_EXCLUDE are preserved verbatim.
+    assert snap["type"] == "user-type", snap
+    assert snap["timestamp"] == "user-ts", snap
+
+
+class _NestedNoLeakFlow(Flow):
+    """One outer method that performs a nested (crew-shaped) kickoff off the
+    loop. The nested flow emits its OWN method_execution_* / flow_* frames onto
+    this run's sink (contextvars copied by ``to_thread``)."""
+
+    @start()
+    async def chat(self):
+        await asyncio.to_thread(lambda: _InnerKickoffFlow().kickoff())
+        return "done"
+
+
+@requires_stream_frames
+async def test_frame_path_nested_flow_frames_do_not_leak():
+    """CPK-7719 blocker 2: a nested kickoff must NOT inject a second
+    STEP_STARTED / MESSAGES_SNAPSHOT / STATE_SNAPSHOT / STEP_FINISHED built from
+    the OUTER flow's state. The outer run has exactly ONE method, so each of
+    those appears exactly once — matching the legacy (``source is flow_copy``)
+    wire shape.
+
+    Pre-fix the nested ``method_execution_*`` frames passed the depth gate
+    (which only guarded flow_started/finished), so a mid-run authoritative
+    MESSAGES_SNAPSHOT from stale outer state could wipe streamed text."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_NestedNoLeakFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    types = [p["type"] for p in _decode_sse(encoded)]
+
+    assert types.count("RUN_STARTED") == 1, types
+    assert types.count("RUN_FINISHED") == 1, types
+    # Exactly one outer method => one of each step/snapshot event; no nested leak.
+    assert types.count("STEP_STARTED") == 1, types
+    assert types.count("STEP_FINISHED") == 1, types
+    assert types.count("MESSAGES_SNAPSHOT") == 1, types
+    assert types.count("STATE_SNAPSHOT") == 1, types
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+
+
+class _NestedRaisingInnerFlow(Flow):
+    @start()
+    async def boom(self):
+        raise RuntimeError("nested boom")
+
+
+class _OuterCatchesNestedErrorFlow(Flow):
+    """The outer method runs a nested kickoff that RAISES, catches it, and
+    continues to completion — the exact shape where crewai emits NO nested
+    ``flow_finished`` (it fires only on the nested success path)."""
+
+    @start()
+    async def chat(self):
+        try:
+            await asyncio.to_thread(lambda: _NestedRaisingInnerFlow().kickoff())
+        except Exception:  # noqa: BLE001 - outer intentionally swallows + continues
+            pass
+        return "outer-survived"
+
+
+@requires_stream_frames
+async def test_frame_path_nested_error_still_terminates_run():
+    """CPK-7719 blocker 3: a nested flow that raises (so its ``flow_finished``
+    is never emitted) while the outer method catches and continues must STILL
+    terminate the run — exactly one RUN_STARTED and a final RUN_FINISHED (or
+    RUN_ERROR), never a run that ends with neither.
+
+    Pre-fix the depth counter stuck at a non-zero value (the nested
+    ``flow_started`` bumped it, the missing nested ``flow_finished`` never
+    unwound it), so the outer ``flow_finished`` saw depth > 0 and emitted no
+    RUN_FINISHED — the client saw a run that never ended. Verified against the
+    crewai 1.15.7 wheel."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_OuterCatchesNestedErrorFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    ))
+    types = [p["type"] for p in _decode_sse(encoded)]
+
+    assert types.count("RUN_STARTED") == 1, types
+    assert types[0] == "RUN_STARTED"
+    # The run ALWAYS terminates — never ends with neither terminator.
+    assert types[-1] in ("RUN_FINISHED", "RUN_ERROR"), types
+    assert "RUN_FINISHED" in types or "RUN_ERROR" in types, types
+
+
 # -- CPK-7718 #11: per-request flow COPY seeds state before @start runs ------
 
 class _StateReadingFlow(Flow[CopilotKitState]):
@@ -764,20 +942,25 @@ async def test_frame_path_aclose_called_on_early_generator_close():
     aclose() on the session so the background kickoff task is torn down."""
     from ag_ui.encoder import EventEncoder
 
-    session = _FakeStreamSession(
-        [_Frame("flow_started"), _Frame("TEXT_MESSAGE_CHUNK", {
-            "message_id": "m", "role": "assistant", "delta": "x"})],
-        hang=True,
-    )
-
     class _AstreamFlow:
         state = {}
 
         def astream(self, inputs=None):
             return session
 
+    flow_copy = _AstreamFlow()
+    session = _FakeStreamSession(
+        [
+            _ev("flow_started", event_id="fs"),
+            _ev("TEXT_MESSAGE_CHUNK", event_id="tx",
+                message_id="m", role="assistant", delta="x"),
+        ],
+        source=flow_copy,
+        hang=True,
+    )
+
     gen = ep._run_flow_frame_stream(
-        flow_copy=_AstreamFlow(),
+        flow_copy=flow_copy,
         encoder=EventEncoder(),
         input_data=_make_run_input(),
         inputs={},
