@@ -39,7 +39,8 @@ from ag_ui.core import (
     RunFinishedEvent,
     RunErrorEvent,
     Message,
-    Tool
+    Tool,
+    Context
 )
 from ag_ui.core.events import (
   TextMessageChunkEvent,
@@ -59,6 +60,7 @@ from .events import (
   BridgedStateSnapshotEvent
 )
 from .context import flow_context
+from .utils import camel_to_snake
 from .sdk import litellm_messages_to_ag_ui_messages
 from .crews import ChatWithCrewFlow, CrewBaseInstance
 
@@ -2050,6 +2052,8 @@ def add_crewai_flow_fastapi_endpoint(app: FastAPI, flow: Flow, path: str = "/"):
             state=input_data.state,
             messages=input_data.messages,
             tools=input_data.tools,
+            context=input_data.context,
+            forwarded_props=input_data.forwarded_props,
         )
         inputs["id"] = input_data.thread_id
 
@@ -2119,6 +2123,8 @@ def add_crewai_crew_fastapi_endpoint(
             state=input_data.state,
             messages=input_data.messages,
             tools=input_data.tools,
+            context=input_data.context,
+            forwarded_props=input_data.forwarded_props,
         )
         inputs["id"] = input_data.thread_id
 
@@ -2141,8 +2147,20 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
     state: dict,
     messages: list[Message],
     tools: list[Tool],
+    context: list[Context] | None = None,
+    forwarded_props: Any = None,
 ):
     """Default merge state for CrewAI"""
+    # PNI-139 review — ``RunAgentInput.state`` is typed ``Any`` and required, so
+    # a client may legally send ``state: null`` or a non-mapping value. The
+    # ``{**state}`` spread below would raise ``TypeError`` on such input, and
+    # because this helper runs in the endpoint body BEFORE the
+    # ``StreamingResponse`` is constructed, that crash escapes the RUN_ERROR
+    # taxonomy as an uncorrelated 500. Coerce a non-mapping state to an empty
+    # dict so the run proceeds instead of dying opaquely.
+    if not isinstance(state, dict):
+        state = {}
+
     # CPK-7721 review #7 — multimodal / non-text content passes through RAW here.
     #
     # ``message.model_dump()`` serializes each message verbatim, including any
@@ -2173,9 +2191,42 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
         }
     } for tool in tools]
 
+    # PNI-139 — thread ``forwardedProps`` into the run.
+    #
+    # Frontend callers send these keys in camelCase; downstream flow / tool
+    # code reads snake_case, so normalize before merging (parity with the
+    # LangGraph adapter's ``camel_to_snake`` pass). These are transient
+    # per-request streaming hints, so they carry the LOWEST precedence: spread
+    # FIRST, so both the agent's persisted ``state`` and the reserved keys
+    # below (``messages`` / ``tools`` / ``context`` / ``copilotkit``) win on a
+    # name collision. This mirrors the LangGraph adapter, where the run payload
+    # is spread AFTER forwarded_props (``{**forwarded_props, **payload_input}``)
+    # so a forwarded key can never silently overwrite persisted agent state.
+    normalized_forwarded_props: dict = {}
+    if isinstance(forwarded_props, dict):
+        normalized_forwarded_props = {
+            camel_to_snake(k): v for k, v in forwarded_props.items()
+        }
+
+    # PNI-139 — thread ``input.context`` into the run so agent code and tools
+    # can read it from state. Serialize each entry to a plain dict so the flow
+    # state stays JSON-safe and tools can read ``entry["value"]`` directly.
+    context_list = [entry.model_dump() for entry in context] if context else []
+
     new_state = {
+        # Lowest precedence first: transient forwarded hints, then persisted
+        # state, then the reserved AG-UI keys (spread last, always win).
+        **normalized_forwarded_props,
         **state,
         "messages": messages,
+        # PNI-139 — expose frontend tools at a top-level ``tools`` key too.
+        # crewai has historically only surfaced them under
+        # ``copilotkit.actions``; the top-level key gives framework-neutral
+        # agent code a stable place to read them (parity with LangGraph's
+        # ``ag_ui_state["tools"]``). ``copilotkit.actions`` is kept for
+        # backward compatibility.
+        "tools": actions,
+        "context": context_list,
         "copilotkit": {
             "actions": actions
         }
