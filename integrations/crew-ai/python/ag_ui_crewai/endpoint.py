@@ -1671,6 +1671,52 @@ async def _aclose_stream_session(
         )
 
 
+async def _drain_frames_after_finish(aiter: Any) -> None:
+    """Drain the terminal tail of a frame stream after RUN_FINISHED (CPK-7719 #5).
+
+    crewai enqueues its end sentinel only AFTER ``kickoff_async`` fully returns —
+    result recorded, trace batch finalized — see ``create_async_frame_generator``
+    in crewai's ``utilities/streaming.py``: the ``flow_finished`` FRAME is emitted
+    from inside ``kickoff_async``, but the ``None`` that ends the iterator lands
+    only in the run task's ``finally``, one or more loop turns later.
+
+    If the driver ``break``s the instant RUN_FINISHED is emitted and lets the
+    ``finally`` ``aclose()`` the session, crewai's frame generator is
+    ``GeneratorExit``-ed at its ``yield`` and its OWN ``finally`` ``task.cancel()``s
+    the still-finalizing kickoff task — on EVERY happy-path run (verified against
+    the 1.15.7 wheel: the session ends ``is_cancelled=True`` with no ``result``).
+    Draining to natural ``StopAsyncIteration`` instead lets the run task reach its
+    end sentinel, so the subsequent ``aclose()`` is a no-op and the kickoff is
+    never cancelled mid-finalization. This is the frame-path analogue of the
+    legacy path's ``_cancel_and_join(allow_grace=True)`` happy-path window.
+
+    Bounded by ``_CANCEL_GRACE_SECONDS`` so a pathological finalization cannot
+    stall teardown — on grace expiry we return and the ``finally``'s ``aclose()``
+    force-cancels the tail (today's behavior, but only after the grace). Trailing
+    frames are DISCARDED: emitting any wire event after RUN_FINISHED would violate
+    the AG-UI run lifecycle, and a late upstream error can no longer become a
+    RUN_ERROR, so it is swallowed here rather than surfaced.
+    """
+    grace_deadline = time.monotonic() + _CANCEL_GRACE_SECONDS
+    while True:
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(aiter.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            # Run task reached its end sentinel: finalization completed.
+            return
+        except (asyncio.TimeoutError, TimeoutError):
+            # Grace window elapsed; fall back to the aclose() cancel.
+            return
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Post-terminal: a late error cannot become a RUN_ERROR now.
+            return
+        # A trailing frame arrived before exhaustion — discard it (no
+        # post-RUN_FINISHED wire events) and keep draining.
+
+
 async def _run_flow_frame_stream(
     *,
     flow_copy: object,
@@ -1740,17 +1786,28 @@ async def _run_flow_frame_stream(
             if event_id is not None:
                 raw_events[event_id] = event
 
-    # Register BEFORE the first ``__anext__``: crewai's astream spawns the
-    # flow-running task on first iteration and copies the CURRENT context, so
-    # the sink must already be in scope to reach the flow's emits. Guarded so a
-    # partial install (no sink API) degrades rather than crashing.
-    sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
-    # ``astream`` returns an AsyncStreamSession; iterating it spawns crewai's
-    # background kickoff task and streams ordered frames.
-    session = flow_copy.astream(inputs=inputs)  # type: ignore[attr-defined]
-    aiter = session.__aiter__()
+    # Predeclared before the ``try`` so the ``finally`` teardown is always safe
+    # to reference even if sink registration or ``astream``/``__aiter__`` raises
+    # before assignment (CPK-7719 #4). ``flow_context`` is set ABOVE and reset in
+    # the ``finally`` — mirroring the legacy path's token-then-finally discipline.
+    sink_token = None
+    session = None
     try:
         try:
+            # Register the sink and open the stream INSIDE the ``try`` so a
+            # raising ``astream``/``__aiter__`` (a) is caught and mapped through
+            # the RUN_ERROR taxonomy below instead of escaping the generator with
+            # no terminal event, and (b) never leaks the ``flow_context`` token —
+            # both confirmed by the CPK-7719 review probe. Register BEFORE the
+            # first ``__anext__``: crewai's astream spawns the flow-running task
+            # on first iteration and copies the CURRENT context, so the sink must
+            # already be in scope to reach the flow's emits. Guarded so a partial
+            # install (no sink API) degrades rather than crashing.
+            sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
+            # ``astream`` returns an AsyncStreamSession; iterating it spawns
+            # crewai's background kickoff task and streams ordered frames.
+            session = flow_copy.astream(inputs=inputs)  # type: ignore[attr-defined]
+            aiter = session.__aiter__()
             deadline = (
                 time.monotonic() + timeout if timeout is not None else None
             )
@@ -1809,8 +1866,12 @@ async def _run_flow_frame_stream(
                     yield encoder.encode(event)
 
                 if translator.run_finished:
-                    # RUN_FINISHED just emitted; stop (mirrors the legacy
-                    # ``None`` end-sentinel right after RUN_FINISHED).
+                    # RUN_FINISHED just emitted. Do NOT break-then-aclose(): that
+                    # cancels crewai's still-finalizing kickoff task on every
+                    # happy-path run (CPK-7719 #5). Drain the terminal tail to
+                    # natural exhaustion (bounded by the cancel grace) so the run
+                    # task completes and the ``finally`` aclose() is a no-op.
+                    await _drain_frames_after_finish(aiter)
                     break
 
             # Belt-and-braces terminal (CPK-7719 blocker 3): the stream can

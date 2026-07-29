@@ -389,6 +389,11 @@ class _FakeStreamSession:
         self._source = source
         self._hang = hang
         self.aclosed = False
+        # CPK-7719 #5 instrumentation: how many frames the driver actually
+        # consumed, and whether the iterator was drained to natural exhaustion
+        # (vs stopped early via break + aclose).
+        self.frames_yielded = 0
+        self.exhausted = False
 
     async def _agen(self):
         from crewai.events.stream_context import publish_stream_event
@@ -397,10 +402,12 @@ class _FakeStreamSession:
             # The sink (registered by the driver in this same context) parks the
             # raw event; the frame supplies ordering + the id to look it up.
             publish_stream_event(self._source, ev)
+            self.frames_yielded += 1
             yield _Frame(ev.type, id=ev.event_id)
         if self._hang:
             # Never terminate on its own — the ceiling / aclose must stop us.
             await asyncio.Event().wait()
+        self.exhausted = True
 
     def __aiter__(self):
         return self._agen()
@@ -971,3 +978,123 @@ async def test_frame_path_aclose_called_on_early_generator_close():
     assert "RUN_STARTED" in first
     await gen.aclose()
     assert session.aclosed is True
+
+
+# -- CPK-7719 #4: raising astream is mapped to RUN_ERROR + no contextvar leak --
+
+async def test_frame_path_raising_astream_emits_run_error_and_resets_context():
+    """CPK-7719 #4: if ``astream`` (or ``__aiter__``) raises, the driver must
+    (a) map it through the RUN_ERROR taxonomy — not let it escape the generator
+    with no terminal event — and (b) never leak the ``flow_context`` token into
+    the caller's context. Pre-fix, ``astream()``/``__aiter__()`` sat before the
+    ``try``, so a raise skipped both the except-handlers and the finally reset."""
+    from ag_ui.encoder import EventEncoder
+
+    flow_context.set(None)
+
+    class _AstreamBoom(Exception):
+        pass
+
+    class _RaisingAstreamFlow:
+        state = {}
+
+        def astream(self, inputs=None):
+            raise _AstreamBoom("astream failed before any frame")
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_RaisingAstreamFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    # (a) A single, taxonomy-coded RUN_ERROR — not a silent escape.
+    assert [p["type"] for p in payloads] == ["RUN_ERROR"]
+    assert payloads[0]["code"] == "AGUI_CREWAI_FLOW_ERROR_ASTREAMBOOM"
+    assert payloads[0]["threadId"] == "t-1"
+    assert payloads[0]["runId"] == "r-1"
+    # (b) The contextvar set at driver entry was reset in the finally.
+    assert flow_context.get(None) is None
+
+
+# -- CPK-7719 #5: drain the terminal tail; don't cancel kickoff mid-finalize ---
+
+async def test_frame_path_drains_tail_after_run_finished():
+    """CPK-7719 #5: after RUN_FINISHED the driver drains the frame stream to
+    natural exhaustion (so crewai's kickoff task finishes finalization) instead
+    of breaking immediately and letting aclose() cancel it. A frame arriving
+    AFTER flow_finished is consumed (drained) but produces no wire event."""
+    from ag_ui.encoder import EventEncoder
+
+    class _AstreamFlow:
+        state = {}
+
+        def astream(self, inputs=None):
+            return session
+
+    flow_copy = _AstreamFlow()
+    session = _FakeStreamSession(
+        [
+            _ev("flow_started", event_id="fs"),
+            _ev("flow_finished", event_id="ff"),
+            # A trailing frame after flow_finished — the tail crewai keeps
+            # producing while the kickoff task finalizes.
+            _ev(EventType.CUSTOM, event_id="tail", name="late", value="x"),
+        ],
+        source=flow_copy,
+    )
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=flow_copy,
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    types = [p["type"] for p in _decode_sse(encoded)]
+    # RUN_FINISHED is terminal; the trailing CUSTOM is drained, never emitted.
+    assert types == ["RUN_STARTED", "RUN_FINISHED"]
+    # All three frames were consumed and the iterator hit StopAsyncIteration —
+    # i.e. the driver drained rather than stopping at flow_finished.
+    assert session.frames_yielded == 3
+    assert session.exhausted is True
+
+
+@requires_stream_frames
+async def test_frame_path_does_not_cancel_kickoff_after_finish():
+    """CPK-7719 #5 (real Flow): on the happy path the kickoff task must finish
+    finalization — result recorded, not cancelled. Pre-fix the driver broke on
+    RUN_FINISHED and the finally's aclose() cancelled the still-finalizing task
+    on EVERY run (session ended is_cancelled=True with no result); verified
+    against the crewai 1.15.7 wheel. Draining the tail to exhaustion fixes it."""
+    from ag_ui.encoder import EventEncoder
+
+    class _ResultFlow(Flow):
+        @start()
+        async def go(self):
+            return "RESULT"
+
+    flow = _ResultFlow()
+    captured = {}
+    real_astream = flow.astream
+
+    def _capture(*args, **kwargs):
+        stream_session = real_astream(*args, **kwargs)
+        captured["session"] = stream_session
+        return stream_session
+
+    flow.astream = _capture
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=flow,
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    assert [p["type"] for p in _decode_sse(encoded)][-1] == "RUN_FINISHED"
+    session = captured["session"]
+    # The kickoff task completed normally rather than being cancelled by aclose.
+    assert session.is_cancelled is False
+    assert session.result == "RESULT"
