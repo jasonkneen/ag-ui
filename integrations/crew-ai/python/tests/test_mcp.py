@@ -1,4 +1,4 @@
-"""Tests for the MCP -> AG-UI event bridge (PNI-130).
+"""Tests for the MCP -> AG-UI event bridge.
 
 ``translate_mcp_event`` is stateless (mints fresh ids per call, so not pure) and
 dispatches on the crewai event's ``type`` string, so these tests drive it with

@@ -25,7 +25,7 @@ from litellm.types.utils import (
 )
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from crewai.flow.flow import FlowState
-# CPK-7718: the event bus moved from ``crewai.utilities.events`` (0.x) to
+# The event bus moved from ``crewai.utilities.events`` (0.x) to
 # ``crewai.events`` (1.x); ``_capabilities`` resolves whichever exists.
 from ._capabilities import crewai_event_bus
 from pydantic import BaseModel, Field, TypeAdapter

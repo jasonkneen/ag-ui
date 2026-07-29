@@ -20,7 +20,7 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# CPK-7718 #7: the crew-chat helpers (and the two ``generate_*_with_ai``
+# The crew-chat helpers (and the two ``generate_*_with_ai``
 # network helpers ``_stub_llm_network`` patches) moved from
 # ``crewai.cli.crew_chat`` (0.x - 1.14) to ``crewai.utilities.crew_chat``
 # (1.15+). Resolve whichever the installed crewai exposes so the stub patches
@@ -78,10 +78,10 @@ def _stub_llm_network():
     """Stub ONLY crewai's LLM-calling description helpers so the real
     ``generate_crew_chat_inputs`` + real ``ChatInputs`` still run offline.
 
-    The reviewer's key objection to the prior module was that it replaced
-    ``crew_chat_generate_crew_chat_inputs`` wholesale, so the real
-    ``ChatInputs`` construction (and the ``crew_name`` it validates) never
-    ran. Here we patch one level deeper — the two functions that make the
+    The prior approach replaced ``crew_chat_generate_crew_chat_inputs``
+    wholesale, so the real ``ChatInputs`` construction (and the
+    ``crew_name`` it validates) never ran. Here we patch one level
+    deeper — the two functions that make the
     actual ``chat_llm.call`` network requests — leaving the generator and
     the Pydantic model untouched.
     """
@@ -100,7 +100,7 @@ def _make_real_crewbase(cls_name="ResearchCrew"):
 
     crewai's ``@CrewBase`` sets ``_crew_name`` (to the class ``__name__``)
     and exposes a ``crew()`` factory — it does NOT expose ``.name``. That
-    is exactly the shape the round-2 name-read fix must handle.
+    is exactly the shape the name-read fix must handle.
     """
     @CrewBase
     class _Crew:
@@ -224,13 +224,13 @@ def _new_crew_flow(*, chat_llm=None, crew_model="crew-model-string"):
 
 async def test_chat_runs_crew_and_records_string_output():
     """A crew tool call runs the crew fn, records its string result, appends a
-    ``tool`` message, then (CPK-7717 defect 2) issues a follow-up completion so
-    the assistant speaks. Strengthened from the pre-fix 2-message version that
+    ``tool`` message, then issues a follow-up completion so the assistant
+    speaks. Strengthened from the pre-fix 2-message version that
     encoded the silent-assistant bug."""
     async def _fake_acompletion(**_kwargs):
         return object()
 
-    # Stateful stream mock: turn 1 names the crew tool; the defect-2 follow-up
+    # Stateful stream mock: turn 1 names the crew tool; the follow-up
     # turn returns plain text.
     stream_calls = {"n": 0}
 
@@ -286,7 +286,7 @@ async def test_chat_runs_crew_and_records_string_output():
 
     assert captured["args"] == {"topic": "ai"}
     assert state["outputs"] == "CREW OUTPUT"
-    # Three messages: assistant tool-call, tool result, defect-2 follow-up text.
+    # Three messages: assistant tool-call, tool result, follow-up text.
     assert len(state["messages"]) == 3
     tool_message = state["messages"][1]
     assert tool_message["role"] == "tool"
@@ -349,11 +349,11 @@ async def test_chat_crew_output_from_raw_attribute():
 
 def test_completion_llm_kwargs_forwards_all_connection_fields_real_llm():
     """A REAL ``crewai.LLM`` carrying custom connection settings has ALL of
-    them forwarded (round-2 finding 1) — model, api_key, api_base, api_version —
-    plus provider-specific ``additional_params`` spread. The reviewer's repro
+    them forwarded — model, api_key, api_base, api_version — plus
+    provider-specific ``additional_params`` spread. The failing case
     built exactly this LLM and saw only model+api_key.
 
-    CPK-7718: the model string is ``gpt-4o`` rather than ``azure/deployment``
+    The model string is ``gpt-4o`` rather than ``azure/deployment``
     because crewai 1.x eagerly loads a NATIVE provider for ``azure/*`` that
     requires the ``crewai[azure-ai-inference]`` extra — unrelated to the
     (provider-agnostic) field forwarding under test. On crewai 1.x ``LLM``
@@ -381,9 +381,9 @@ def test_completion_llm_kwargs_forwards_all_connection_fields_real_llm():
 
 def test_completion_llm_kwargs_forwards_base_url_when_set_real_llm():
     """A REAL ``crewai.LLM`` with ``base_url`` (local/self-hosted) forwards
-    it (the original CopilotKit#2742 local-model repro).
+    it (the original local-model repro).
 
-    CPK-7718: crewai 1.x normalises the stored ``base_url`` (e.g. appends
+    crewai 1.x normalises the stored ``base_url`` (e.g. appends
     ``/v1``), so we assert the forwarded value matches the LLM's OWN
     ``base_url`` attribute rather than a hard-coded literal — the point under
     test is that ``_completion_llm_kwargs`` forwards whatever the LLM exposes,
@@ -414,8 +414,8 @@ def test_completion_llm_kwargs_falls_back_when_llm_unresolved():
 
 
 def test_completion_llm_kwargs_forwards_generation_config_real_llm():
-    """A REAL ``crewai.LLM`` carrying generation config has it forwarded
-    (round-4 finding 1). crewai's own ``LLM._prepare_completion_params``
+    """A REAL ``crewai.LLM`` carrying generation config has it forwarded.
+    crewai's own ``LLM._prepare_completion_params``
     forwards temperature/top_p/max_tokens/etc., so the bridge must too or
     the config is silently replaced by provider defaults. ``temperature=0``
     (falsy but meaningful) survives; the empty default ``stop=[]`` is not
@@ -438,7 +438,7 @@ def test_completion_llm_kwargs_forwards_generation_config_real_llm():
 
 async def test_chat_forwards_connection_fields_to_acompletion_real_llm():
     """Both completion call sites receive the resolved connection fields
-    from a REAL ``crewai.LLM`` — the crew-run turn AND the defect-2
+    from a REAL ``crewai.LLM`` — the crew-run turn AND the
     follow-up."""
     calls = []
 
@@ -470,7 +470,7 @@ async def test_chat_forwards_connection_fields_to_acompletion_real_llm():
     async def _noop_emit_state(_state):
         return True
 
-    # CPK-7718: ``gpt-4o`` (not ``azure/deployment``) — crewai 1.x eagerly
+    # ``gpt-4o`` (not ``azure/deployment``) — crewai 1.x eagerly
     # loads a native azure provider needing an extra; the forwarding under test
     # is provider-agnostic. ``api_version`` rides ``additional_params`` on 1.x.
     real_llm = LLM(model="gpt-4o", api_key="secret",
@@ -494,7 +494,7 @@ async def test_chat_forwards_connection_fields_to_acompletion_real_llm():
         assert call["api_key"] == "secret"
         assert call["api_base"] == "https://azure.example"
         assert call["api_version"] == "2024-02-01"
-    # The follow-up (defect 2) forces text, not another tool call.
+    # The follow-up forces text, not another tool call.
     assert calls[1]["tool_choice"] == "none"
 
 
@@ -502,9 +502,9 @@ async def test_additional_params_do_not_collide_with_call_owned_kwargs():
     """A REAL ``crewai.LLM`` whose ``additional_params`` include keys the
     ``chat()`` call sites ALSO set explicitly must NOT raise ``TypeError:
     got multiple values for keyword argument`` — and the CALL-OWNED values
-    must win (round-3 finding 1).
+    must win.
 
-    The reviewer's repro was ``LLM(model="gpt-4o",
+    The repro was ``LLM(model="gpt-4o",
     parallel_tool_calls=True)``: crewai routes ``parallel_tool_calls`` into
     ``additional_params``, which the old code spread into the same
     ``acompletion(**kwargs, parallel_tool_calls=False, ...)`` call. Here we
@@ -512,7 +512,7 @@ async def test_additional_params_do_not_collide_with_call_owned_kwargs():
     into ``additional_params`` and assert the framework's own values are
     used, plus a benign custom param survives."""
     # ``api_key`` is supplied because crewai 1.0.x's native OpenAI provider
-    # validates ``OPENAI_API_KEY`` at construction time (CPK-7718 floor test);
+    # validates ``OPENAI_API_KEY`` at construction time;
     # it goes to the LLM's ``api_key`` attr, not ``additional_params``, so the
     # collision preconditions below are unaffected.
     real_llm = LLM(
@@ -582,7 +582,7 @@ async def test_additional_params_do_not_collide_with_call_owned_kwargs():
         assert isinstance(call["tools"], list) and call["tools"]
         # Benign custom additional_param is still forwarded.
         assert call["foo_custom"] == "bar"
-    # The follow-up (defect 2) turn sets tool_choice explicitly, so the
+    # The follow-up turn sets tool_choice explicitly, so the
     # call-owned "none" overrides the additional_params "SHOULD_LOSE"
     # sentinel — proving call-owned tool_choice wins on collision.
     assert calls[1]["tool_choice"] == "none"
@@ -594,7 +594,7 @@ async def test_additional_params_do_not_collide_with_call_owned_kwargs():
 
 async def test_crew_run_emits_state_snapshot():
     """Running the crew emits a STATE_SNAPSHOT reflecting the applied
-    output, routed to the bridge via the endpoint listener (defect 3)."""
+    output, routed to the bridge via the endpoint listener."""
     async def _fake_acompletion(**_kwargs):
         return object()
 
@@ -645,7 +645,7 @@ async def test_crew_run_emits_state_snapshot():
 
 
 async def test_crew_run_executes_off_the_event_loop():
-    """CPK-7719 (CPK-7717 defect 3 follow-up): the synchronous ``crew.kickoff``
+    """The synchronous ``crew.kickoff``
     tool function runs on a WORKER thread (``asyncio.to_thread``), not inline on
     the event loop — so SSE flushing / the wall-clock ceiling / client-disconnect
     cancellation can fire DURING the crew run instead of being blocked until it
@@ -723,7 +723,7 @@ def test_real_crewbase_matches_structural_protocol():
 
 
 def test_protocol_accepts_name_only_and_crew_name_only_wrappers():
-    """The protocol pins ONLY ``crew()`` (round-3 finding 3), so BOTH
+    """The protocol pins ONLY ``crew()``, so BOTH
     supported shapes conform: the repo's own ``CrewChatCrew`` (which
     exposes ``.name`` only, no ``_crew_name``) AND a real ``@CrewBase``
     instance (which exposes ``_crew_name`` only, no ``.name``). Requiring
@@ -751,7 +751,7 @@ def test_real_crewbase_direct_construction_reads_crew_name_and_builds_chatinputs
     """Constructing ``ChatWithCrewFlow`` from a REAL ``@CrewBase`` reads the
     name off ``_crew_name`` (not ``.name`` — which does not exist on a real
     @CrewBase and previously AttributeError'd) and feeds it into a REAL
-    ``ChatInputs`` with no validation error (round-2 finding 2)."""
+    ``ChatInputs`` with no validation error."""
     crews_mod._CREW_INPUTS_CACHE.clear()
 
     real = _make_real_crewbase(cls_name="ResearchCrew")
@@ -769,7 +769,7 @@ def test_real_crewbase_endpoint_triggers_lazy_flow_without_attribute_error():
     ``ChatWithCrewFlow(crew=...)`` construction — the exact site that
     AttributeError'd on ``crew.name`` before the fix. The request must
     complete (HTTP 200), proving the real ``_crew_name`` read and real
-    ``ChatInputs`` construction succeed end-to-end (round-2 finding 2)."""
+    ``ChatInputs`` construction succeed end-to-end."""
     real = _make_real_crewbase(cls_name="EndpointCrew")
 
     async def _fake_acompletion(**_kwargs):
@@ -800,7 +800,7 @@ def test_unnamed_crew_raises_clear_error():
     """A crew exposing ``crew()`` but neither a non-empty ``name`` nor
     ``_crew_name`` raises a CLEAR ``ValueError`` — never ``None`` into
     ``ChatInputs`` (which would surface as an opaque Pydantic validation
-    error deep in ``generate_crew_chat_inputs``) — round-2 finding 2."""
+    error deep in ``generate_crew_chat_inputs``)."""
     class _Unnamed:
         def crew(self):
             return type("C", (), {"chat_llm": LLM(model="gpt-4o", api_key="k")})()
@@ -855,22 +855,65 @@ def test_same_crew_reuses_cached_inputs_real_crewbase():
     assert gen_spy.call_count == 1
 
 
+def test_constructor_regenerates_inputs_after_cache_eviction():
+    """CONSTRUCTOR-level regenerate-on-miss.
+
+    The GC test below was narrowed to a direct cache-helper assertion because
+    crewai pins the constructing frame (so a real crew never GCs mid-test); it
+    no longer exercised the ``ChatWithCrewFlow.__init__`` path that MISSES the
+    cache and REGENERATES. This restores that end-to-end constructor coverage
+    by evicting the cache entry (the exact post-state the weakref ``evict_cb``
+    leaves after a GC) and asserting the NEXT construction for the SAME crew
+    re-runs the real ``generate_crew_chat_inputs`` rather than serving a stale
+    schema."""
+    crews_mod._CREW_INPUTS_CACHE.clear()
+
+    real = _make_real_crewbase(cls_name="RegenCrew")
+    wrapped = crews_mod.crew_chat_generate_crew_chat_inputs
+
+    with _stub_llm_network():
+        with patch.object(
+            crews_mod, "crew_chat_generate_crew_chat_inputs",
+            side_effect=wrapped,
+        ) as gen_spy:
+            f1 = crews_mod.ChatWithCrewFlow(crew=real)
+            # First construction generated + cached.
+            assert gen_spy.call_count == 1
+            assert id(real) in crews_mod._CREW_INPUTS_CACHE
+
+            # Evict the entry, mirroring the weakref evict_cb firing on GC.
+            crews_mod._CREW_INPUTS_CACHE.pop(id(real), None)
+
+            # Constructing again for the SAME crew misses the (evicted) cache
+            # and REGENERATES — the constructor invariant the narrowed GC test
+            # stopped covering.
+            f2 = crews_mod.ChatWithCrewFlow(crew=real)
+            assert gen_spy.call_count == 2
+
+    # A fresh schema object was produced on the regenerate (not the stale one),
+    # and it is re-cached.
+    assert f1.crew_chat_inputs is not f2.crew_chat_inputs
+    assert crews_mod._crew_inputs_cache_get(real) is f2.crew_chat_inputs
+
+    crews_mod._CREW_INPUTS_CACHE.clear()
+
+
 def test_cache_evicts_on_gc_and_regenerates_for_new_crew():
     """The cache maps ``id(crew) -> (weakref.ref(crew, evict_cb), schema)``,
     so when a weakref-able crew is garbage-collected the ``evict_cb`` pops
     its entry — eliminating the ``id(crew)`` reuse hazard where a freshly
     allocated wrapper inherits a collected wrapper's id and is silently
-    served the wrong schema (round-3 finding 2). A brand-new crew therefore
+    served the wrong schema. A brand-new crew therefore
     regenerates rather than receiving the old schema.
 
-    CPK-7718: on crewai 1.x, constructing a real ``ChatWithCrewFlow`` can no
+    On crewai 1.x, constructing a real ``ChatWithCrewFlow`` can no
     longer be used to drive this invariant — crewai retains a traceback frame
     from ``generate_crew_chat_inputs`` that pins the constructing frame (and
     thus the ``crew`` local) alive, so a real crew is never collected during
     the test regardless of wrapper type. We therefore exercise the eviction
     mechanism DIRECTLY against the cache helpers (``_crew_inputs_cache_set`` /
     ``_crew_inputs_cache_get`` / the ``evict_cb``), which is exactly the
-    round-3 id-reuse-safety logic under test — no crewai frame retention in the
+    id-reuse-safety logic under test — no crewai frame retention in the
     path."""
     crews_mod._CREW_INPUTS_CACHE.clear()
 
@@ -905,7 +948,7 @@ def test_cache_evicts_on_gc_and_regenerates_for_new_crew():
 
 def test_distinct_but_equal_crews_get_distinct_schemas_no_cross_serve():
     """Two DISTINCT-BUT-EQUAL crew wrappers (value-based ``__eq__`` /
-    ``__hash__``) must receive DISTINCT schemas (round-3 finding 2). The
+    ``__hash__``) must receive DISTINCT schemas. The
     prior ``WeakKeyDictionary`` keyed by ``__eq__`` / ``__hash__`` and so
     collapsed the two to one entry, cross-serving the first crew's schema
     to the second. The ``id(crew)`` key keys on identity, so each wrapper
@@ -940,7 +983,7 @@ def test_non_weakrefable_crew_is_not_cached_no_permanent_entry():
     ``__weakref__``) is NOT cached — the set path skips it rather than
     pinning a strong reference forever (which would leak the wrapper).
     Constructing multiple flows for such crews therefore accumulates NO
-    permanent cache entries (round-3 finding 2). ``crew()`` returns a REAL
+    permanent cache entries. ``crew()`` returns a REAL
     ``crewai.Crew`` and the real ``generate_crew_chat_inputs`` runs."""
     crews_mod._CREW_INPUTS_CACHE.clear()
 
@@ -974,7 +1017,7 @@ def test_non_weakrefable_crew_is_not_cached_no_permanent_entry():
 
 def test_crew_path_symbols_exported_from_package_top_level():
     """The previously-hidden Crew-path symbols are importable from the
-    package top level and declared in ``__all__`` (defect 5)."""
+    package top level and declared in ``__all__``."""
     import ag_ui_crewai as pkg
 
     for name in (
@@ -988,7 +1031,7 @@ def test_crew_path_symbols_exported_from_package_top_level():
 
 
 # --------------------------------------------------------------------------
-# CPK-7718 #11: per-request flow COPY seeds state before ``@start`` runs
+# per-request flow COPY seeds state before ``@start`` runs
 # --------------------------------------------------------------------------
 
 class _CrewShapedFlow(Flow):
@@ -1012,7 +1055,7 @@ class _CrewShapedFlow(Flow):
 
 
 async def test_copied_crew_flow_kickoff_seeds_state_before_start_runs():
-    """CPK-7718 #11: a per-request COPY of a crew-shaped Flow, driven through
+    """A per-request COPY of a crew-shaped Flow, driven through
     the REAL ``crewai_prepare_inputs`` -> ``kickoff_async(inputs=...)`` seam the
     crew endpoint uses, must seed ``messages`` / ``copilotkit`` into the COPY's
     ``self.state`` BEFORE ``@start`` runs.

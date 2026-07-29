@@ -16,10 +16,10 @@ from .sdk import (
 
 # CREW_ENTERPRISE_EVENT_LISTENER = CrewEnterpriseEventListener()
 
-# CPK-7717 defect 5: the Crew chat path was undiscoverable — the four
-# symbols below (the crew-endpoint factory, its input-prep helper, the
-# flow, and the exit signal) were absent from the package top level.
-# Export them alongside the pre-existing flow-path surface.
+# The Crew chat path was undiscoverable — the four symbols below (the
+# crew-endpoint factory, its input-prep helper, the flow, and the exit
+# signal) were absent from the package top level. Export them alongside
+# the pre-existing flow-path surface.
 __all__ = [
   "add_crewai_flow_fastapi_endpoint",
   "add_crewai_crew_fastapi_endpoint",

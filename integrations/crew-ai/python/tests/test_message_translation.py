@@ -130,7 +130,7 @@ def test_prepare_inputs_merges_incoming_state():
 
 
 # --------------------------------------------------------------------------
-# PNI-139 — context / forwardedProps / top-level tools forwarding
+# context / forwardedProps / top-level tools forwarding
 # --------------------------------------------------------------------------
 
 def test_prepare_inputs_threads_context_into_state():

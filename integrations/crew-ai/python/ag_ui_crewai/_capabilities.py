@@ -1,4 +1,4 @@
-"""Runtime capability detection for the CrewAI AG-UI bridge (CPK-7718).
+"""Runtime capability detection for the CrewAI AG-UI bridge.
 
 crewai's public surface shifted across the 0.x -> 1.x boundary. Rather than
 gate code paths on ``crewai.__version__`` (brittle — a version string is not a
@@ -46,7 +46,15 @@ def _first_module(candidates: list[str]) -> tuple[Any, str | None]:
     for name in candidates:
         try:
             return importlib.import_module(name), name
-        except Exception:  # noqa: BLE001 - any import failure is "not here"
+        except (ImportError, ModuleNotFoundError):
+            # Only "module genuinely not here" is a soft miss (fall through to
+            # the next candidate). A DIFFERENT error raised while importing an
+            # existing module — e.g. a real bug inside ``crewai.events`` (a
+            # SyntaxError, an AttributeError from a broken re-export, a failing
+            # top-level side effect) — must NOT be swallowed: doing so
+            # misreports a genuinely broken install as "install crewai>=1.0".
+            # ``ModuleNotFoundError`` is an ``ImportError`` subclass; both are
+            # listed for clarity.
             continue
     return None, None
 
@@ -107,7 +115,7 @@ _event_bus_has_flush = bool(crewai_event_bus is not None and callable(getattr(cr
 
 
 # --------------------------------------------------------------------------
-# StreamFrame streaming contract resolution (CPK-7719)
+# StreamFrame streaming contract resolution
 # --------------------------------------------------------------------------
 # crewai landed a public, ordered streaming envelope — ``StreamFrame`` and the
 # ``AsyncStreamSession`` returned by ``Flow.astream()`` — in 1.6.0 (hardened in
@@ -131,8 +139,8 @@ StreamFrame = (
 # The scoped stream-sink API (``crewai.events.stream_context``) landed together
 # with ``StreamFrame`` in 1.6. The bridge registers its OWN sink so the frame
 # translator receives the RAW AG-UI / lifecycle event object (source + exact
-# payload) rather than the ``to_serializable``-mangled ``frame.data`` snapshot
-# (CPK-7719 review blocker 1). ``publish_stream_event`` invokes every sink
+# payload) rather than the ``to_serializable``-mangled ``frame.data`` snapshot.
+# ``publish_stream_event`` invokes every sink
 # synchronously on ``emit``, so a sink parked by ``event_id`` is guaranteed
 # populated before the corresponding frame is dequeued.
 _STREAM_CONTEXT_MODULE, _STREAM_CONTEXT_MODULE_NAME = _first_module(
@@ -161,7 +169,7 @@ _stream_frame_available = (
 def flow_supports_stream_frames(flow: Any) -> bool:
     """Return True when ``flow`` can be driven via the StreamFrame contract.
 
-    Two conditions, both required (CPK-7719):
+    Two conditions, both required:
 
     * The installed crewai exposes ``StreamFrame`` (resolved once at import) —
       i.e. crewai >= 1.6. On 1.0-1.5 this is ``None`` and we fall back.
