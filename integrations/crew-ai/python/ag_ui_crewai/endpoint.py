@@ -2,6 +2,7 @@
 AG-UI FastAPI server for CrewAI.
 """
 import asyncio
+import copy
 import logging
 import re
 import time
@@ -62,7 +63,11 @@ from .events import (
 )
 from .context import flow_context
 from .utils import camel_to_snake
-from .sdk import litellm_messages_to_ag_ui_messages
+from .sdk import (
+  litellm_messages_to_ag_ui_messages,
+  consume_node_exit_snapshot_suppression,
+  reset_node_snapshot_suppression,
+)
 from .crews import ChatWithCrewFlow, CrewBaseInstance
 
 _LOGGER = logging.getLogger(__name__)
@@ -871,9 +876,26 @@ async def _flush_event_bus() -> None:
 
 GLOBAL_EVENT_LISTENER = None
 
+# Whether the most recent node withheld its STATE_SNAPSHOT, so FlowFinished
+# knows whether a terminal snapshot is still owed.
+_LAST_NODE_SUPPRESSED_ATTR = "_ag_ui_last_node_suppressed"
+
 # PNI-130: process-wide warn-once guard for the "MCP event with no active flow
 # in context" legacy-path drop (see ``_on_mcp_event`` in ``setup_listeners``).
 _MCP_NO_FLOW_WARNED = False
+
+
+def _flow_state_snapshot(state: object) -> dict:
+    """Point-in-time snapshot dict from a flow's state (Pydantic model or dict).
+
+    A deep copy so a later node mutating the live state cannot corrupt an
+    already-queued snapshot; ``model_dump`` already returns a fresh dict.
+    """
+    if isinstance(state, dict):
+        return copy.deepcopy(state)
+    if hasattr(state, "model_dump"):
+        return state.model_dump()
+    return {}
 
 class FastAPICrewFlowEventListener(BaseEventListener):
     """FastAPI CrewFlow event listener.
@@ -924,6 +946,19 @@ class FastAPICrewFlowEventListener(BaseEventListener):
             )
         @crewai_event_bus.on(FlowFinishedEvent)
         def _(source, event):  # pylint: disable=unused-argument
+            if get_queue(source) is None:
+                return
+            # Terminal snapshot only when the last node withheld its own: it
+            # delivers the authoritative flow.state the client is still missing.
+            # Otherwise it would just duplicate the last node's snapshot.
+            if getattr(source, _LAST_NODE_SUPPRESSED_ATTR, False):
+                _enqueue(
+                    source,
+                    StateSnapshotEvent(
+                        type=EventType.STATE_SNAPSHOT,
+                        snapshot=_flow_state_snapshot(source.state),
+                    ),
+                )
             _enqueue(
                 source,
                 RunFinishedEvent(
@@ -935,6 +970,8 @@ class FastAPICrewFlowEventListener(BaseEventListener):
             _enqueue(source, None)
         @crewai_event_bus.on(MethodExecutionStartedEvent)
         def _(source, event):
+            # Clear stale suppression flags from a prior node that raised.
+            reset_node_snapshot_suppression(source)
             _enqueue(
                 source,
                 StepStartedEvent(
@@ -958,13 +995,19 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                     messages=messages
                 )
             )
-            _enqueue(
-                source,
-                StateSnapshotEvent(
-                    type=EventType.STATE_SNAPSHOT,
-                    snapshot=state if isinstance(state, dict) else state.model_dump() if hasattr(state, "model_dump") else {}
+            # Suppress the node-exit snapshot when a prediction or manual emit
+            # is in flight, so the rebuild from source.state doesn't wipe what
+            # the client already holds. Record it for the FlowFinished handler.
+            suppress_state_snapshot = consume_node_exit_snapshot_suppression(source)
+            setattr(source, _LAST_NODE_SUPPRESSED_ATTR, suppress_state_snapshot)
+            if not suppress_state_snapshot:
+                _enqueue(
+                    source,
+                    StateSnapshotEvent(
+                        type=EventType.STATE_SNAPSHOT,
+                        snapshot=_flow_state_snapshot(state),
+                    ),
                 )
-            )
             _enqueue(
                 source,
                 StepFinishedEvent(

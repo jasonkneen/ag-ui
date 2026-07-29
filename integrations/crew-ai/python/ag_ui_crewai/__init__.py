@@ -6,6 +6,7 @@ from .endpoint import (
 from .crews import ChatWithCrewFlow
 from .sdk import (
   CopilotKitState,
+  StateItem,
   copilotkit_predict_state,
   copilotkit_emit_state,
   copilotkit_stream,
@@ -25,6 +26,7 @@ __all__ = [
   "crewai_prepare_inputs",
   "ChatWithCrewFlow",
   "CopilotKitState",
+  "StateItem",
   "copilotkit_predict_state",
   "copilotkit_emit_state",
   "copilotkit_stream",
