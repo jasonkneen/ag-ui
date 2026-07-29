@@ -23,8 +23,13 @@ requires-python = ">=3.10,<3.14"
 # optional ``crewai[litellm]`` extra at 1.0.0 — declaring it here resolves
 # our imports regardless of which crewai extras are installed (CPK-7718 #6).
 #
-# ``crewai-tools`` is declared so the crew-serving path (and downstream
-# demos) have the tools package available without a floating pin.
+# ``crewai-tools`` is NOT a runtime dependency (CPK-7721 review #6): the bridge
+# imports nothing from it (``grep -rn crewai_tools ag_ui_crewai/ tests/`` is
+# empty), yet as a hard dep it drags in ~37 transitive packages (pymupdf,
+# python-docx, pytube, youtube-transcript-api, tiktoken, beautifulsoup4, …). It
+# is exposed as the optional ``tools`` extra instead, so ``ag-ui-crewai[tools]``
+# still resolves it for consumers that build crews needing the tools package.
+# Demos that actually use crewai-tools must declare ``ag-ui-crewai[tools]``.
 #
 # ``ag-ui-protocol>=0.1.19`` (CPK-7721): 0.1.10 predated RUN_FINISHED.outcome
 # and was the loosest floor in the repo; 0.1.19 matches the in-repo SDK.
@@ -33,9 +38,13 @@ dependencies = [
     "fastapi>=0.115.12,<0.116.0",
     "uvicorn>=0.34.3,<0.35.0",
     "crewai>=1.0,<2",
-    "crewai-tools>=0.38.1",
     "litellm>=1.60.2",
 ]
+
+[project.optional-dependencies]
+# Opt-in: the crewai-tools package and its heavy transitive tree. The bridge
+# never imports it (see the note above, CPK-7721 review #6).
+tools = ["crewai-tools>=0.38.1"]
 
 [project.scripts]
 dev = "ag_ui_crewai.dojo:main"

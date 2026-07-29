@@ -15,10 +15,14 @@ source = { editable = "." }
 dependencies = [
     { name = "ag-ui-protocol" },
     { name = "crewai" },
-    { name = "crewai-tools" },
     { name = "fastapi" },
     { name = "litellm" },
     { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+tools = [
+    { name = "crewai-tools" },
 ]
 
 [package.dev-dependencies]
@@ -32,11 +36,12 @@ dev = [
 requires-dist = [
     { name = "ag-ui-protocol", specifier = ">=0.1.19" },
     { name = "crewai", specifier = ">=1.0,<2" },
-    { name = "crewai-tools", specifier = ">=0.38.1" },
+    { name = "crewai-tools", marker = "extra == 'tools'", specifier = ">=0.38.1" },
     { name = "fastapi", specifier = ">=0.115.12,<0.116.0" },
     { name = "litellm", specifier = ">=1.60.2" },
     { name = "uvicorn", specifier = ">=0.34.3,<0.35.0" },
 ]
+provides-extras = ["tools"]
 
 [package.metadata.requires-dev]
 dev = [
