@@ -1,7 +1,7 @@
 """Message/input translation: ``litellm_messages_to_ag_ui_messages`` (outbound)
 and ``crewai_prepare_inputs`` (inbound). No network."""
 
-from ag_ui.core import SystemMessage, Tool, UserMessage
+from ag_ui.core import Context, SystemMessage, Tool, UserMessage
 from ag_ui_crewai import endpoint as ep
 from ag_ui_crewai.sdk import litellm_messages_to_ag_ui_messages
 
@@ -127,3 +127,134 @@ def test_prepare_inputs_merges_incoming_state():
     assert out["keep"] == "me"
     assert out["messages"] == []
     assert out["copilotkit"] == {"actions": []}
+
+
+# --------------------------------------------------------------------------
+# PNI-139 — context / forwardedProps / top-level tools forwarding
+# --------------------------------------------------------------------------
+
+def test_prepare_inputs_threads_context_into_state():
+    """``input.context`` is serialized to a top-level ``context`` list so
+    agent code and tools can read it from state."""
+    out = ep.crewai_prepare_inputs(
+        state={},
+        messages=[],
+        tools=[],
+        context=[
+            Context(description="user timezone", value="UTC"),
+            Context(description="locale", value="en-US"),
+        ],
+    )
+    assert out["context"] == [
+        {"description": "user timezone", "value": "UTC"},
+        {"description": "locale", "value": "en-US"},
+    ]
+
+
+def test_prepare_inputs_defaults_context_to_empty_list():
+    """A run with no context yields an empty ``context`` list, not a missing
+    key (so downstream ``state["context"]`` reads never KeyError)."""
+    out = ep.crewai_prepare_inputs(state={}, messages=[], tools=[])
+    assert out["context"] == []
+
+
+def test_prepare_inputs_exposes_top_level_tools():
+    """Frontend tools are also surfaced at a top-level ``tools`` key, mirroring
+    the existing ``copilotkit.actions`` shape."""
+    out = ep.crewai_prepare_inputs(
+        state={},
+        messages=[],
+        tools=[Tool(
+            name="searchTool",
+            description="search the web",
+            parameters={"type": "object", "properties": {}},
+        )],
+    )
+    expected = [{
+        "type": "function",
+        "function": {
+            "name": "searchTool",
+            "description": "search the web",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    assert out["tools"] == expected
+    # backward compatibility: copilotkit.actions still carries the same shape.
+    assert out["copilotkit"]["actions"] == expected
+
+
+def test_prepare_inputs_normalizes_and_threads_forwarded_props():
+    """``forwardedProps`` keys are camel_to_snake normalized and merged into
+    the top-level run state."""
+    out = ep.crewai_prepare_inputs(
+        state={},
+        messages=[],
+        tools=[],
+        forwarded_props={"streamSubgraphs": False, "nodeName": "planner"},
+    )
+    assert out["stream_subgraphs"] is False
+    assert out["node_name"] == "planner"
+    # the original camelCase keys are not leaked alongside.
+    assert "streamSubgraphs" not in out
+    assert "nodeName" not in out
+
+
+def test_prepare_inputs_forwarded_props_cannot_clobber_reserved_keys():
+    """A stray forwarded key must not override messages/tools/context/
+    copilotkit — the explicit keys win."""
+    out = ep.crewai_prepare_inputs(
+        state={},
+        messages=[UserMessage(id="u", role="user", content="hi")],
+        tools=[],
+        context=[Context(description="d", value="v")],
+        forwarded_props={
+            "messages": "evil",
+            "tools": "evil",
+            "context": "evil",
+            "copilotkit": "evil",
+        },
+    )
+    assert out["messages"][0]["content"] == "hi"
+    assert out["tools"] == []
+    assert out["context"] == [{"description": "d", "value": "v"}]
+    assert out["copilotkit"] == {"actions": []}
+
+
+def test_prepare_inputs_state_wins_over_forwarded_props():
+    """On a key collision, persisted ``state`` wins over transient
+    ``forwardedProps`` (parity with LangGraph, where the payload is spread
+    after forwarded_props). Forwarded props are per-request streaming hints and
+    must not silently overwrite the agent's own accumulated state."""
+    out = ep.crewai_prepare_inputs(
+        state={"shared_key": "from-state"},
+        messages=[],
+        tools=[],
+        forwarded_props={"sharedKey": "from-forwarded"},
+    )
+    assert out["shared_key"] == "from-state"
+
+
+def test_prepare_inputs_coerces_null_or_non_mapping_state():
+    """``RunAgentInput.state`` is typed ``Any``/required, so a client can send
+    ``state: null`` or a non-mapping. crewai_prepare_inputs runs in the endpoint
+    body BEFORE the StreamingResponse, so a ``{**state}`` TypeError there would
+    escape the RUN_ERROR taxonomy as an uncorrelated 500. A non-mapping state
+    must coerce to an empty dict, never crash."""
+    for bad in (None, "nope", 42, ["a", "b"]):
+        out = ep.crewai_prepare_inputs(state=bad, messages=[], tools=[])
+        assert out["messages"] == []
+        assert out["copilotkit"] == {"actions": []}
+        assert out["context"] == []
+
+
+def test_prepare_inputs_ignores_non_dict_forwarded_props():
+    """A non-dict (or None) ``forwarded_props`` is a no-op, never a crash."""
+    for bad in (None, "nope", 42, ["a", "b"]):
+        out = ep.crewai_prepare_inputs(
+            state={"keep": 1},
+            messages=[],
+            tools=[],
+            forwarded_props=bad,
+        )
+        assert out["keep"] == 1
+        assert out["messages"] == []
