@@ -20,8 +20,8 @@ import concurrent.futures
 import pytest
 from pydantic import BaseModel
 
-# CPK-7718: crewai 1.x deleted ``crewai.utilities.events``; resolve the bus and
-# lifecycle events through the version-agnostic capability shim.
+# Resolve the bus and lifecycle events through the version-agnostic shim
+# (crewai 1.x moved them off ``crewai.utilities.events``).
 from ag_ui_crewai._capabilities import (
     FlowFinishedEvent,
     MethodExecutionFinishedEvent,
@@ -179,13 +179,8 @@ def test_consume_on_none_flow_is_safe():
 
 
 # --------------------------------------------------------------------------
-# endpoint listener honours the suppression decision
-#
-# These drive the REAL listener over the crewai event bus. The listener is
-# registered BEFORE the node body runs, so Bridged events emitted by
-# copilotkit_emit_state / copilotkit_predict_state inside the node actually
-# reach the queue (a listener registered afterwards would silently drop them,
-# masking a total-state-loss regression).
+# endpoint listener honours the suppression decision (driven over the real bus,
+# listener registered before the node body so bridged events reach the queue)
 # --------------------------------------------------------------------------
 
 def _drain(queue):
@@ -200,12 +195,11 @@ def _names(events):
 
 
 async def _await_future(fut):
-    """Await whatever crewai's bus.emit returns.
+    """Await whatever crewai 1.x's bus.emit returns.
 
-    CPK-7718: crewai 1.x runs sync bus handlers in a ThreadPoolExecutor and
-    ``emit`` returns a ``concurrent.futures.Future`` (or an asyncio future for
-    async/dependency handlers, or ``None`` when there are no handlers). Awaiting
-    it guarantees the handler ran before we inspect the queue.
+    A ``concurrent.futures.Future`` for sync handlers, an asyncio future for
+    async ones, or ``None`` when there are no handlers. Awaiting it ensures the
+    handler ran before we inspect the queue.
     """
     if fut is None:
         return
@@ -216,12 +210,7 @@ async def _await_future(fut):
 
 
 async def _settle():
-    """Drain off-thread handler work onto the queue.
-
-    ``flush`` blocks until every pending handler future completes (so their
-    ``call_soon_threadsafe`` queue puts are scheduled on this loop); the ticks
-    then let those scheduled puts actually run.
-    """
+    """Flush off-thread handlers, then tick so their queue puts run."""
     crewai_event_bus.flush()
     for _ in range(3):
         await asyncio.sleep(0)
@@ -234,13 +223,11 @@ async def _emit(source, event):
 
 
 async def _run_node(source, *, method_name="chat", body=None, flow_finished=False):
-    """Simulate one flow node end to end over the real event bus.
+    """Drive one flow node over the real bus; return the drained queue events.
 
-    Registers the listener, fires MethodExecutionStarted, runs ``body`` (with
-    flow_context set so the SDK hooks target ``source``), fires
-    MethodExecutionFinished, then optionally FlowFinished. Awaits/flushes the
-    off-thread bus between steps so the drained queue reflects a settled,
-    ordered stream. Returns the drained queue events for this node.
+    Fires Started, runs ``body`` (flow_context set so the SDK hooks target
+    ``source``), then Finished and optionally FlowFinished, flushing the
+    off-thread bus between steps so the drained stream is settled and ordered.
     """
     queue = ep.get_queue(source) or await ep.create_queue(source)
     with crewai_event_bus.scoped_handlers():

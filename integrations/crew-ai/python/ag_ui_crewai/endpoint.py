@@ -876,10 +876,8 @@ async def _flush_event_bus() -> None:
 
 GLOBAL_EVENT_LISTENER = None
 
-# Stashed on the flow by the MethodExecutionFinished handler to record whether
-# the most recent node withheld its STATE_SNAPSHOT, so FlowFinished can decide
-# whether a terminal snapshot is still owed (avoids duplicating a snapshot the
-# last node already emitted).
+# Whether the most recent node withheld its STATE_SNAPSHOT, so FlowFinished
+# knows whether a terminal snapshot is still owed.
 _LAST_NODE_SUPPRESSED_ATTR = "_ag_ui_last_node_suppressed"
 
 # PNI-130: process-wide warn-once guard for the "MCP event with no active flow
@@ -888,17 +886,10 @@ _MCP_NO_FLOW_WARNED = False
 
 
 def _flow_state_snapshot(state: object) -> dict:
-    """Coerce a flow's ``state`` (Pydantic model or plain dict) to a snapshot dict.
+    """Point-in-time snapshot dict from a flow's state (Pydantic model or dict).
 
-    Shared by the node-exit and the terminal (``FlowFinished``) STATE_SNAPSHOT
-    emitters so both derive the wire payload the same way.
-
-    The snapshot is a point-in-time copy: the event is encoded off the queue
-    asynchronously while the flow keeps running, so returning the live
-    ``flow.state`` dict by reference would let a later node's mutation corrupt
-    an already-queued snapshot. ``model_dump`` already returns a fresh dict;
-    the plain-dict branch is deep-copied to match. State that reaches here is
-    JSON-serializable (it is about to be SSE-encoded), so deep-copy is safe.
+    A deep copy so a later node mutating the live state cannot corrupt an
+    already-queued snapshot; ``model_dump`` already returns a fresh dict.
     """
     if isinstance(state, dict):
         return copy.deepcopy(state)
@@ -957,14 +948,9 @@ class FastAPICrewFlowEventListener(BaseEventListener):
         def _(source, event):  # pylint: disable=unused-argument
             if get_queue(source) is None:
                 return
-            # Terminal STATE_SNAPSHOT (parity with LangGraph's end-of-run
-            # snapshot). Emitted ONLY when the last node withheld its snapshot
-            # (a prediction / manual emit was in flight): in that case the
-            # client may be missing the authoritative full flow.state, so this
-            # delivers it, including keys only a suppressed node mutated and any
-            # partial emit_state payloads. When the last node already emitted
-            # its snapshot, a terminal snapshot would just duplicate it, so it
-            # is skipped.
+            # Terminal snapshot only when the last node withheld its own: it
+            # delivers the authoritative flow.state the client is still missing.
+            # Otherwise it would just duplicate the last node's snapshot.
             if getattr(source, _LAST_NODE_SUPPRESSED_ATTR, False):
                 _enqueue(
                     source,
@@ -984,9 +970,7 @@ class FastAPICrewFlowEventListener(BaseEventListener):
             _enqueue(source, None)
         @crewai_event_bus.on(MethodExecutionStartedEvent)
         def _(source, event):
-            # Clear any per-node suppression flags left over from a prior node
-            # (e.g. one that declared predict_state then raised before its
-            # MethodExecutionFinished fired) so this node starts clean.
+            # Clear stale suppression flags from a prior node that raised.
             reset_node_snapshot_suppression(source)
             _enqueue(
                 source,
@@ -1011,17 +995,10 @@ class FastAPICrewFlowEventListener(BaseEventListener):
                     messages=messages
                 )
             )
-            # Shared-state streaming (parity with LangGraph): when this node
-            # streamed a predicted tool call or emitted a manual snapshot, the
-            # client already holds the authoritative state. Rebuilding it from
-            # ``source.state`` here would wipe that prediction, so suppress the
-            # node-exit STATE_SNAPSHOT. The flags are consumed unconditionally
-            # so they never leak into the next node (which would drop a
-            # legitimate snapshot).
+            # Suppress the node-exit snapshot when a prediction or manual emit
+            # is in flight, so the rebuild from source.state doesn't wipe what
+            # the client already holds. Record it for the FlowFinished handler.
             suppress_state_snapshot = consume_node_exit_snapshot_suppression(source)
-            # Remember whether THIS (currently last) node withheld its
-            # snapshot; FlowFinished uses it to decide whether a terminal
-            # snapshot is still owed (see the FlowFinished handler).
             setattr(source, _LAST_NODE_SUPPRESSED_ATTR, suppress_state_snapshot)
             if not suppress_state_snapshot:
                 _enqueue(

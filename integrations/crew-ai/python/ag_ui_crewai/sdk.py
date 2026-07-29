@@ -58,41 +58,28 @@ class PredictStateConfig(TypedDict):
 
 @dataclass(frozen=True)
 class StateItem:
-    """A single predicted-state binding.
+    """A predicted-state binding: stream ``tool``'s ``tool_argument`` into ``state_key``.
 
-    Mirrors the LangGraph ``StateItem`` (``ag_ui_langgraph`` middleware) so
-    the two integrations describe shared-state streaming with the same
-    vocabulary: as ``tool``'s ``tool_argument`` streams in, the client
-    renders it under ``state_key`` before the tool result lands. When
-    ``tool_argument`` is ``None`` the whole tool-call argument object is
-    emitted under ``state_key``.
+    ``tool_argument=None`` streams the whole tool-call argument object. Mirrors
+    the LangGraph ``StateItem`` vocabulary.
     """
     state_key: str
     tool: str
     tool_argument: Optional[str] = None
 
 
-# Attributes stashed on the running ``Flow`` object to coordinate node-exit
-# STATE_SNAPSHOT suppression between these SDK hooks and the endpoint's
-# ``MethodExecutionFinished`` listener. LangGraph performs the equivalent
-# suppression inside its own event loop (``ag_ui_langgraph.agent``: the
-# ``model_made_tool_call`` / ``manually_emitted_state`` flags). CrewAI has
-# no such loop, so the state travels on the flow instance instead. The same
-# object is visible via ``flow_context`` here and as ``source`` in the
-# listener. Names are underscore-prefixed to avoid colliding with any real
-# CrewAI ``Flow`` field.
+# Per-node suppression flags stashed on the running Flow (visible via
+# flow_context in the hooks and as ``source`` in the endpoint listener).
+# Underscore-prefixed to avoid clashing with real Flow fields.
 _PREDICT_STATE_TOOLS_ATTR = "_ag_ui_predict_state_tools"
 _PREDICTED_TOOL_STREAMED_ATTR = "_ag_ui_predicted_tool_streamed"
 _MANUAL_STATE_EMITTED_ATTR = "_ag_ui_manual_state_emitted"
 
 
 def _record_predicted_tools(flow: Any, tools: "set[str]") -> None:
-    """Remember which tool names predict state for the current node.
+    """Record the tools that predict state for this node.
 
-    Unions with any tools already recorded for the node so that two
-    ``copilotkit_predict_state`` calls in the same node both take effect (the
-    second must not drop the first's bindings). The set is reset at node entry
-    and consumed at node exit, so it only ever accumulates within one node.
+    Unions so two predict_state calls in one node both take effect.
     """
     if flow is not None:
         existing = getattr(flow, _PREDICT_STATE_TOOLS_ATTR, None) or set()
@@ -100,12 +87,10 @@ def _record_predicted_tools(flow: Any, tools: "set[str]") -> None:
 
 
 def _mark_predicted_tool_streamed(flow: Any, tool_name: Optional[str]) -> None:
-    """Flag that a predicted tool call actually started streaming.
+    """Flag that a predicted tool actually streamed.
 
-    This is the CrewAI analogue of LangGraph's ``model_made_tool_call``: the
-    node-exit snapshot must only be suppressed when the predicted tool is
-    genuinely invoked, otherwise a node that declared ``predict_state`` but
-    took a different branch would silently drop a legitimate state update.
+    Suppression only fires when the tool is genuinely invoked, so a node that
+    declared predict_state but took another branch still emits its snapshot.
     """
     if flow is None or not tool_name:
         return
@@ -121,26 +106,12 @@ def _mark_manual_state_emitted(flow: Any) -> None:
 
 
 def reset_node_snapshot_suppression(flow: Any) -> None:
-    """Clear all per-node suppression coordination state.
+    """Clear the per-node suppression flags at node entry.
 
-    Called at node entry (``MethodExecutionStarted``) so a node always starts
-    from a clean slate. Without this, a node that calls
-    ``copilotkit_predict_state`` and then raises before
-    ``MethodExecutionFinished`` fires would leave its predicted-tool set on
-    the flow, and the next node could spuriously suppress a legitimate
-    snapshot. This is the entry-side counterpart to the exit-side reset in
-    ``consume_node_exit_snapshot_suppression``.
-
-    The suppression flags are stored on the single flow instance, which is
-    correct for a sequential node chain (router chains, the shipped
-    shared-state demos). CrewAI does run listeners triggered by the same
-    method concurrently (``asyncio.gather``), so if two parallel branches
-    each stream state, these per-flow flags are best-effort and a branch's
-    entry-reset can race another's in-flight flag. That only affects the
-    mid-run smoothing: the terminal ``STATE_SNAPSHOT`` emitted on
-    ``FlowFinished`` always delivers the authoritative final ``flow.state``,
-    so a race can at worst cause a transient flicker, never a wrong final
-    state. Per-branch coordination is left as future work.
+    Guards against a node that declared predict_state then raised (leaving a
+    stale tool set) suppressing the next node's snapshot. Flags live on the
+    single flow, so under parallel fan-out branches they are best-effort; the
+    terminal FlowFinished snapshot still guarantees a correct final state.
     """
     if flow is None:
         return
@@ -150,27 +121,17 @@ def reset_node_snapshot_suppression(flow: Any) -> None:
 
 
 def consume_node_exit_snapshot_suppression(flow: Any) -> bool:
-    """Return whether this node's auto STATE_SNAPSHOT should be suppressed.
+    """Whether this node's auto STATE_SNAPSHOT should be suppressed; resets the flags.
 
-    The node-exit snapshot rebuilds state from ``flow.state`` and would wipe
-    a prediction the client is already rendering (predicted tool arguments)
-    or a manual snapshot whose shape differs from ``flow.state`` (keys that
-    live only in the emitted payload). Suppressing it here mirrors
-    LangGraph's node-exit suppression. The authoritative full state still
-    reaches the client: either a later node emits its own snapshot, or, when
-    the last node of the run was the one that suppressed, the terminal
-    STATE_SNAPSHOT that ``FlowFinished`` emits in exactly that case (see
-    ``endpoint.py``) delivers the true ``flow.state``. That guarantees the
-    client ends every run consistent even when a node emitted only a partial
-    payload or the predicted node was the last one.
-
-    The per-node flags are cleared on read so the next node starts clean.
+    Suppressed when a predicted tool streamed or a manual snapshot was emitted,
+    so the node-exit rebuild from flow.state doesn't wipe what the client is
+    already showing. A later node's snapshot, or the terminal FlowFinished
+    snapshot, still delivers the authoritative flow.state.
     """
     if flow is None:
         return False
     predicted = getattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, False)
     manual = getattr(flow, _MANUAL_STATE_EMITTED_ATTR, False)
-    # Reset per-node coordination state so the next node is not affected.
     setattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, False)
     setattr(flow, _MANUAL_STATE_EMITTED_ATTR, False)
     setattr(flow, _PREDICT_STATE_TOOLS_ATTR, set())
@@ -255,9 +216,7 @@ async def copilotkit_predict_state(
 
     value = _normalize_predict_state(config)
 
-    # Record which tools predict state for this node so the streaming layer
-    # can tell when a predicted tool call actually fires (see
-    # ``_mark_predicted_tool_streamed``).
+    # So the streaming layer can tell when a predicted tool actually fires.
     _record_predicted_tools(flow, {item["tool"] for item in value})
 
     crewai_event_bus.emit(
@@ -288,13 +247,10 @@ async def copilotkit_emit_state(state: Any) -> Literal[True]:
         await copilotkit_emit_state({"progress": i})
     ```
 
-    Each call streams a STATE_SNAPSHOT to the client immediately, and the
-    node-exit snapshot rebuilt from ``flow.state`` is suppressed so the emitted
-    payload is not clobbered mid-run. Note the end-of-run terminal snapshot is
-    rebuilt from ``flow.state``: keys present only in an emitted payload (for
-    example a ``{"progress": i}`` indicator not stored on ``flow.state``) are
-    shown during the run but replaced by the authoritative ``flow.state`` when
-    the run finishes. Write anything that must persist onto ``flow.state``.
+    The emitted payload streams to the client immediately and the node-exit
+    snapshot is suppressed so it is not clobbered mid-run. At run end the state
+    is rebuilt from ``flow.state``, so anything that must persist beyond the run
+    should be written there, not only emitted.
 
     Parameters
     ----------
@@ -309,17 +265,11 @@ async def copilotkit_emit_state(state: Any) -> Literal[True]:
     """
     flow = flow_context.get(None)
 
-    # This manual snapshot is authoritative for the current node; flag it so
-    # the endpoint suppresses the node-exit snapshot rebuilt from flow.state,
-    # which would otherwise wipe keys that live only in ``state``.
+    # Suppress the node-exit snapshot so this payload is not clobbered mid-run.
     _mark_manual_state_emitted(flow)
 
-    # Deep-copy so the snapshot is a point-in-time capture. Callers commonly
-    # pass the live flow state and keep mutating it (e.g. a progress loop that
-    # emits after each step); without the copy a later mutation could corrupt
-    # this already-queued snapshot before it is encoded. Matches the copy
-    # discipline in endpoint._flow_state_snapshot. State is JSON-serializable
-    # (it is about to be SSE-encoded), so deep-copy is safe.
+    # Deep-copy: callers often emit the live flow state and keep mutating it, so
+    # snapshot a point-in-time copy before it is queued.
     crewai_event_bus.emit(
         flow,
         BridgedStateSnapshotEvent(
@@ -403,12 +353,8 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
                 }
             )
 
-        # If this tool was registered via copilotkit_predict_state, the client
-        # is already rendering its streamed arguments as state. Flag it so the
-        # node-exit snapshot is suppressed (parity with LangGraph's
-        # model_made_tool_call). The name is checked on whichever chunk carries
-        # it, not only the id-bearing chunk, since some providers stream the
-        # tool id and function name in separate deltas.
+        # Checked on whichever chunk carries the name (some providers stream the
+        # tool id and name in separate deltas), not only the id-bearing chunk.
         if tool_call_name is not None:
             _mark_predicted_tool_streamed(flow, tool_call_name)
 
