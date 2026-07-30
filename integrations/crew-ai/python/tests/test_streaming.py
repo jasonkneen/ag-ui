@@ -819,6 +819,80 @@ async def test_frame_path_nested_error_still_terminates_run():
     assert "RUN_FINISHED" in types or "RUN_ERROR" in types, types
 
 
+# -- sink source-gating: crew/agent parked, nested-flow method dropped ------
+
+class _MixedSourceSession:
+    """AsyncStreamSession stand-in that publishes each RAW event to the scoped
+    sink under a PER-EVENT source (not one shared source), so we can drive the
+    sink's crew/agent-vs-nested-flow source gate directly."""
+
+    def __init__(self, pairs):
+        self._pairs = pairs
+        self.aclosed = False
+
+    async def _agen(self):
+        from crewai.events.stream_context import publish_stream_event
+
+        for source, ev in self._pairs:
+            publish_stream_event(source, ev)
+            yield _Frame(ev.type, id=ev.event_id)
+
+    def __aiter__(self):
+        return self._agen()
+
+    async def aclose(self):
+        self.aclosed = True
+
+
+class _MixedSourceFlow:
+    state = {}
+
+    def __init__(self, session):
+        self._session = session
+
+    def astream(self, inputs=None):
+        return self._session
+
+
+@requires_stream_frames
+async def test_frame_path_sink_parks_crew_agent_but_drops_nested_flow_method():
+    """The driver's scoped ``_sink`` parks crew/agent lifecycle events even when
+    their source is NOT the outer flow (they are run-scoped), while a nested
+    FLOW method event (non-crew/agent, non-outer source) is dropped."""
+    from ag_ui.encoder import EventEncoder
+
+    outer = _MixedSourceFlow(None)  # session attached once the pairs reference it
+    other = object()  # a non-outer source (nested-flow / crew emitter)
+
+    pairs = [
+        (outer, _ev("flow_started", event_id="fs")),
+        (outer, _ev("method_execution_started", event_id="ms", method_name="m")),
+        # Crew event from a NON-outer source -> parked (surfaces as a STEP).
+        (other, _ev("crew_kickoff_started", event_id="cs", crew_name="research_crew")),
+        # Nested-FLOW method from a NON-outer source -> dropped (no STEP).
+        (other, _ev("method_execution_started", event_id="nested",
+                    method_name="nested_method")),
+        (other, _ev("crew_kickoff_completed", event_id="cc", crew_name="research_crew")),
+        (outer, _ev("method_execution_finished", event_id="mf", method_name="m")),
+        (outer, _ev("flow_finished", event_id="ff")),
+    ]
+    outer._session = _MixedSourceSession(pairs)
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=outer,
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    started_names = [p["stepName"] for p in payloads if p["type"] == "STEP_STARTED"]
+
+    assert "research_crew" in started_names   # crew parked despite non-outer source
+    assert "nested_method" not in started_names  # nested-flow method dropped
+    assert "m" in started_names               # outer method still surfaces
+
+
 # -- per-request flow COPY seeds state before @start runs ------
 
 class _StateReadingFlow(Flow[CopilotKitState]):

@@ -32,10 +32,11 @@ from ._capabilities import (
     reset_stream_sinks,
 )
 from ._checkpoint import build_checkpoint_kwargs
-from ._frames import StreamFrameTranslator
+from ._frames import StreamFrameTranslator, CREW_AGENT_LIFECYCLE_TYPES
 from ._config import resolve_emit_raw_events as _resolve_emit_raw_events
 from ._frames import is_recognized_event, log_raw_loss, raw_event_for
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
+from .attribution import flat_method_attribution
 from crewai.flow.flow import Flow
 
 from ag_ui.core import (
@@ -164,6 +165,33 @@ QUEUE_LOOPS: dict = {}
 # key. Module-level so tests and the listener callbacks share one
 # source of truth.
 _QUEUE_KEY_ATTR = "_agui_queue_key"
+
+# Stable namespace for deterministic per-(run, method) step ids on the LEGACY
+# bus-listener path. That path is dispatched on an unordered ThreadPoolExecutor,
+# so it cannot maintain a stack; instead it stamps FLAT per-method attribution
+# whose ``step_id`` must be IDENTICAL on the method's STEP_STARTED and
+# STEP_FINISHED. A uuid5 over ``queue_key:method_name`` gives both handlers the
+# same id without sharing state.
+#
+# Collision note: this per-(run, method) id collides if the same method runs
+# more than once in a single run. That is acceptable: the legacy path is the
+# unordered fallback, whereas the ordered frame path mints a unique id per
+# execution.
+_LEGACY_STEP_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
+
+
+def _legacy_method_step_id(queue_key: object, method_name: str) -> str:
+    """Deterministic step id for a legacy-path Flow method.
+
+    ``uuid5`` over ``queue_key:method_name`` so the same (run, method) pair
+    yields the same id on STEP_STARTED and STEP_FINISHED (the pairing key a
+    topology-aware consumer needs) without the two off-thread handlers sharing
+    any mutable state. ``queue_key`` scopes it to the run so two concurrent runs
+    of the same method do not collide.
+    """
+    return uuid.uuid5(
+        _LEGACY_STEP_ID_NAMESPACE, f"{queue_key}:{method_name}"
+    ).hex
 
 # Hard wall-clock ceiling on a single flow run. A runaway flow (e.g. a hung
 # LiteLLM stream or an infinite loop in a user task) must not be able to pin
@@ -916,11 +944,25 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
         def _(source, event):
             # Clear stale suppression flags from a prior node that raised.
             reset_node_snapshot_suppression(source)
+            # Flat per-method attribution. The legacy bus path is dispatched on
+            # an unordered thread pool, so it cannot maintain a stack (see
+            # attribution.py); it stamps flow ownership + a stable per-(run,
+            # method) step_id only. Crew/Agent nesting is a StreamFrame-path
+            # feature, so no crew/agent handlers are registered here.
+            queue_key = getattr(source, _QUEUE_KEY_ATTR, None)
+            method_name = str(getattr(event, "method_name", None) or "method")
+            step_id = _legacy_method_step_id(queue_key, method_name)
             _enqueue(
                 source,
                 StepStartedEvent(
                     type=EventType.STEP_STARTED,
-                    step_name=event.method_name
+                    step_name=method_name,
+                    raw_event=flat_method_attribution(
+                        method_name,
+                        flow_name=getattr(event, "flow_name", None),
+                        fingerprint=getattr(event, "source_fingerprint", None),
+                        step_id=step_id,
+                    ),
                 )
             )
         @crewai_event_bus.on(MethodExecutionFinishedEvent)
@@ -952,11 +994,22 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
                         snapshot=_flow_state_snapshot(state),
                     ),
                 )
+            # The finish reuses the same step_id as the matching start (same
+            # (queue_key, method_name)) so a consumer can pair them.
+            queue_key = getattr(source, _QUEUE_KEY_ATTR, None)
+            method_name = str(getattr(event, "method_name", None) or "method")
+            step_id = _legacy_method_step_id(queue_key, method_name)
             _enqueue(
                 source,
                 StepFinishedEvent(
                     type=EventType.STEP_FINISHED,
-                    step_name=event.method_name
+                    step_name=method_name,
+                    raw_event=flat_method_attribution(
+                        method_name,
+                        flow_name=getattr(event, "flow_name", None),
+                        fingerprint=getattr(event, "source_fingerprint", None),
+                        step_id=step_id,
+                    ),
                 )
             )
         @crewai_event_bus.on(BridgedTextMessageChunkEvent)
@@ -1782,14 +1835,15 @@ async def _run_flow_frame_stream(
 
     Payload + identity come from the RAW event, not ``frame.data``. We register
     our OWN scoped sink that parks the raw event object keyed by
-    ``event.event_id`` — but ONLY when ``source is flow_copy``, so a nested
-    ``crew.kickoff``'s own flow's lifecycle/method
-    events (which leak onto this same sink via the copied contextvars) are
-    excluded. The frame stream then supplies ORDERING; for each frame we look
+    ``event.event_id``. Outer-flow lifecycle/method events are parked only when
+    ``source is flow_copy`` (so a nested ``crew.kickoff``'s own flow's
+    lifecycle/method events, which leak onto this same sink via the copied
+    contextvars, are excluded); Crew/Agent lifecycle events are parked
+    regardless of source (they are run-scoped and arrive with a non-outer
+    source) so the translator can attribute the crew/agent hierarchy. The frame
+    stream then supplies ORDERING; for each frame we look
     up the parked raw event by ``frame.id`` and translate it. A frame with no
-    parked event belonged to a nested flow (or is a crewai-internal frame we
-    drop) and is skipped. This mirrors the legacy listener's ``source is
-    flow_copy`` gate and its pristine-payload behavior.
+    parked event is skipped.
 
     Because ``publish_stream_event`` runs the sink synchronously on ``emit``
     and crewai enqueues the frame via ``loop.call_soon_threadsafe`` (a later
@@ -1842,20 +1896,23 @@ async def _run_flow_frame_stream(
         return encoder.encode(raw_mirror)
 
     def _sink(source: Any, event: Any) -> None:
-        # ``source is flow_copy`` isolates the outer run: nested ``crew.kickoff``
-        # flows emit with a DIFFERENT source (verified on the 1.15.7 wheel), and
-        # our own ``Bridged*`` events are emitted with ``flow_copy`` as source.
-        #
-        # crewai's MCP events are emitted with the agent/crew as source (NOT
-        # flow_copy), so the source gate alone would drop them. Park them by
-        # TYPE too. This sink is context-scoped (crewai.events.stream_context), so
-        # only THIS run's MCP events (including those from nested crews) reach it
-        # -- no cross-run leakage -- and the type gate keeps nested-flow LIFECYCLE
-        # events (still source != flow_copy) filtered out as before.
+        # source is flow_copy isolates the outer run: its own lifecycle/method
+        # events and our Bridged* events carry flow_copy as source, while a
+        # nested crew.kickoff's own flow's lifecycle/method events leak here
+        # with a different source and must stay dropped (no double RUN_STARTED,
+        # no mis-nested method). MCP and Crew/Agent lifecycle events are parked
+        # regardless of source because this sink is scoped to the run's context
+        # (no cross-run leak); crew/agent events let the translator attribute
+        # the hierarchy. Any other foreign event is parked for RAW passthrough
+        # only when opt-in is on (bounded buffer, oldest evicted with a log).
         event_id = getattr(event, "event_id", None)
         if event_id is None:
             return
-        if source is flow_copy or is_mcp_event(event):
+        if (
+            source is flow_copy
+            or is_mcp_event(event)
+            or getattr(event, "type", None) in CREW_AGENT_LIFECYCLE_TYPES
+        ):
             raw_events[event_id] = event
         elif emit_raw_events:
             if len(foreign_events) >= _FOREIGN_EVENT_BUFFER_MAX:

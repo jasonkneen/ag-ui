@@ -634,6 +634,11 @@ async def test_crew_run_emits_state_snapshot():
                         lambda crew, messages: (lambda **_k: "OUT"),
                     ):
                         await flow.chat()
+        # The MethodExecutionFinished handler that emits the STATE_SNAPSHOT runs
+        # on crewai's off-thread pool; settle it before the synchronous drain so
+        # the snapshot has landed. Real HTTP streams drain in an awaiting loop,
+        # so they never need this.
+        await ep._flush_event_bus()
         items = _drain(queue)
     finally:
         flow_context.reset(token)
