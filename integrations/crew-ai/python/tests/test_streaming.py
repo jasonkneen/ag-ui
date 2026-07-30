@@ -529,6 +529,39 @@ def test_translator_produces_current_chunk_wire_shape():
     assert tr.translate(_ev("cc_env")) == []
 
 
+def test_translator_maps_tool_call_result():
+    """A bridged TOOL_CALL_RESULT (emitted by copilotkit_emit_tool_result for a
+    backend-run tool) maps to a ToolCallResultEvent so middlewares that commit
+    from the result (e.g. the A2UI fixed-schema paint) receive it."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    out = tr.translate(_ev(
+        "TOOL_CALL_RESULT", message_id="m1", tool_call_id="c1",
+        content='{"a2ui_operations":[]}',
+    ))
+    assert len(out) == 1
+    assert out[0].type == EventType.TOOL_CALL_RESULT
+    assert (
+        out[0].message_id, out[0].tool_call_id, out[0].content, out[0].role
+    ) == ("m1", "c1", '{"a2ui_operations":[]}', "tool")
+
+
+def test_translator_preserves_tool_chunk_parent_message_id():
+    """The tool-call chunk carries parent_message_id so the client keeps the
+    tool call on its assistant message when the terminal MESSAGES_SNAPSHOT
+    re-sends it (no re-anchor below streamed activities)."""
+    tr = frames_mod.StreamFrameTranslator(
+        thread_id="t", run_id="r", state_provider=dict,
+    )
+    out = tr.translate(_ev(
+        "TOOL_CALL_CHUNK", tool_call_id="c1", tool_call_name="generate_a2ui",
+        parent_message_id="m1", delta="{}",
+    ))
+    assert out[0].type == EventType.TOOL_CALL_CHUNK
+    assert out[0].parent_message_id == "m1"
+
+
 def test_translator_emission_shape_is_swappable_and_defaults_to_chunks():
     """The emission shape is a single seam defaulting to chunks; the parity
     'triples' shape is a documented NotImplementedError placeholder."""

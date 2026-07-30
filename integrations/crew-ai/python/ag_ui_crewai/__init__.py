@@ -9,8 +9,17 @@ from .sdk import (
   StateItem,
   copilotkit_predict_state,
   copilotkit_emit_state,
+  copilotkit_emit_tool_result,
   copilotkit_stream,
   copilotkit_exit,
+)
+from .a2ui_tool import (
+  A2UITool,
+  get_a2ui_tools,
+  plan_a2ui_injection,
+  apply_a2ui_plan_to_tools,
+  is_auto_injected_a2ui_tool,
+  A2UI_STREAM_KEY,
 )
 # from .enterprise import CrewEnterpriseEventListener
 
@@ -32,6 +41,13 @@ __all__ = [
   "StateItem",
   "copilotkit_predict_state",
   "copilotkit_emit_state",
+  "copilotkit_emit_tool_result",
   "copilotkit_stream",
   "copilotkit_exit",
+  "A2UITool",
+  "get_a2ui_tools",
+  "plan_a2ui_injection",
+  "apply_a2ui_plan_to_tools",
+  "is_auto_injected_a2ui_tool",
+  "A2UI_STREAM_KEY",
 ]

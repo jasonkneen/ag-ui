@@ -2,6 +2,7 @@ import { LLMock, type ChatMessage } from "@copilotkit/aimock";
 import * as path from "node:path";
 import { registerA2UIRecoveryFixtures } from "./a2ui-recovery-fixtures";
 import { registerA2UIADKFixtures } from "./a2ui-adk-fixtures";
+import { registerA2UICrewAIFixtures } from "./a2ui-crewai-fixtures";
 
 // Configurable so parallel worktrees / runs don't collide on one aimock port.
 const MOCK_PORT = Number(process.env.AIMOCK_PORT) || 5555;
@@ -31,6 +32,11 @@ export async function setupLLMock(): Promise<void> {
   // OSS-162 A2UI recovery showcase fixtures (predicate fixtures, must precede
   // the generic loadFixtureFile below).
   registerA2UIRecoveryFixtures(mockServer);
+
+  // CrewAI A2UI fixtures (gpt-4o, scoped to CrewAI-unique prompts so
+  // they never intercept the LangGraph/ADK demos). Predicate fixtures, before
+  // the generic loader.
+  registerA2UICrewAIFixtures(mockServer);
 
   // Extract text from message content — handles both string and array-of-parts
   // (Strands SDK sends content as [{type: "text", text: "..."}])

@@ -12,6 +12,9 @@ from .examples.agentic_generative_ui import AgenticGenerativeUIFlow
 from .examples.shared_state import SharedStateFlow
 from .examples.predictive_state_updates import PredictiveStateUpdatesFlow
 from .examples.error_flow import ErrorFlow
+from .examples.a2ui_dynamic_schema import A2UIDynamicSchemaFlow
+from .examples.a2ui_recovery import A2UIRecoveryFlow
+from .examples.a2ui_fixed_schema import A2UIFixedSchemaFlow
 
 app = FastAPI(title="CrewAI Dojo Example Server")
 
@@ -67,6 +70,24 @@ add_crewai_flow_fastapi_endpoint(
     app=app,
     flow=ErrorFlow(),
     path="/error_flow",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=A2UIDynamicSchemaFlow(),
+    path="/a2ui_dynamic_schema",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=A2UIRecoveryFlow(),
+    path="/a2ui_recovery",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=A2UIFixedSchemaFlow(),
+    path="/a2ui_fixed_schema",
 )
 
 def main():

@@ -57,6 +57,7 @@ from ag_ui.core import (
 from ag_ui.core.events import (
   TextMessageChunkEvent,
   ToolCallChunkEvent,
+  ToolCallResultEvent,
   StepStartedEvent,
   StepFinishedEvent,
   MessagesSnapshotEvent,
@@ -68,11 +69,15 @@ from ag_ui.encoder import EventEncoder
 from .events import (
   BridgedTextMessageChunkEvent,
   BridgedToolCallChunkEvent,
+  BridgedToolCallResultEvent,
   BridgedCustomEvent,
   BridgedStateSnapshotEvent
 )
 from .context import flow_context
 from .utils import camel_to_snake, dump_agui_message
+# Toolkit split: routes the A2UI component-schema context entry (stamped by
+# ``@ag-ui/a2ui-middleware``) into ``state["ag-ui"]`` for the a2ui subagent tool.
+from ag_ui_a2ui_toolkit import split_a2ui_schema_context
 from .sdk import (
   litellm_messages_to_ag_ui_messages,
   consume_node_exit_snapshot_suppression,
@@ -1040,7 +1045,20 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
                     type=EventType.TOOL_CALL_CHUNK,
                     tool_call_id=event.tool_call_id,
                     tool_call_name=event.tool_call_name,
+                    parent_message_id=getattr(event, "parent_message_id", None),
                     delta=event.delta,
+                )
+            )
+        @crewai_event_bus.on(BridgedToolCallResultEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ToolCallResultEvent(
+                    type=EventType.TOOL_CALL_RESULT,
+                    message_id=event.message_id,
+                    tool_call_id=event.tool_call_id,
+                    content=event.content,
+                    role="tool",
                 )
             )
         @crewai_event_bus.on(BridgedCustomEvent)
@@ -2479,5 +2497,36 @@ def crewai_prepare_inputs(  # pylint: disable=unused-argument, too-many-argument
             "actions": actions
         }
     }
+
+    # A2UI: route the component-schema context entry and the ``injectA2UITool``
+    # runtime flag into the canonical ``state["ag-ui"]`` namespace the a2ui
+    # subagent tool reads (matching the LangGraph / Strands adapters). Added
+    # ONLY when A2UI is actually in play so non-A2UI runs see no state change.
+    inject_flag = (
+        forwarded_props.get("injectA2UITool")
+        if isinstance(forwarded_props, dict)
+        else None
+    )
+    a2ui_schema_value, a2ui_regular_context = split_a2ui_schema_context(context_list)
+    if a2ui_schema_value is not None or inject_flag is not None:
+        ag_ui_ns: dict = {"context": a2ui_regular_context}
+        if a2ui_schema_value is not None:
+            ag_ui_ns["a2ui_schema"] = a2ui_schema_value
+            # Route the (large) A2UI component-schema entry into ``ag-ui`` only:
+            # drop it from the top-level ``context`` so framework-neutral agent
+            # code does not receive the schema blob as if it were user context
+            # (and it does not round-trip via STATE_SNAPSHOT twice).
+            new_state["context"] = a2ui_regular_context
+        if inject_flag is not None:
+            ag_ui_ns["inject_a2ui_tool"] = inject_flag
+        new_state["ag-ui"] = ag_ui_ns
+    else:
+        # ``ag-ui`` is an adapter-owned namespace, and it round-trips to the
+        # client via STATE_SNAPSHOT. A prior turn's ``inject_a2ui_tool`` /
+        # ``a2ui_schema`` echoed back in ``state`` would otherwise survive the
+        # ``**state`` spread and silently re-enable injection on a turn the
+        # frontend left A2UI off. Own it authoritatively: drop the stale entry
+        # when A2UI is not in play this turn.
+        new_state.pop("ag-ui", None)
 
     return new_state

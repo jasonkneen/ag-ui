@@ -34,6 +34,7 @@ from .context import flow_context
 from .events import (
   BridgedTextMessageChunkEvent,
   BridgedToolCallChunkEvent,
+  BridgedToolCallResultEvent,
   BridgedCustomEvent,
   BridgedStateSnapshotEvent
 )
@@ -323,6 +324,11 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
         if message_id is None:
             message_id = chunk["id"]
 
+        # Providers (Azure, or an ``include_usage`` final chunk) can emit a chunk
+        # with no choices; skip it rather than IndexError out of the whole run.
+        if not chunk["choices"]:
+            continue
+
         text_content = chunk["choices"][0]["delta"]["content"] or None
 
         # Stream text messages
@@ -370,6 +376,14 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
                     type=EventType.TOOL_CALL_CHUNK,
                     tool_call_id=tool_call_id,
                     tool_call_name=tool_call_name,
+                    # Associate the streamed tool call with THIS assistant message
+                    # so the client keeps it in place when the terminal
+                    # MESSAGES_SNAPSHOT re-sends the same message. Without it the
+                    # tool call becomes a standalone message with a fresh client
+                    # id, and the snapshot re-appends the assistant message after
+                    # any activity streamed in between (the a2ui surface), dropping
+                    # the tool-call chip below the surface.
+                    parent_message_id=message_id,
                     delta=tool_call_arguments,
                 )
             )
@@ -487,6 +501,38 @@ async def copilotkit_exit() -> Literal[True]:
             name="Exit",
             value=""
         )
+    )
+
+    await yield_control()
+
+    return True
+
+
+async def copilotkit_emit_tool_result(
+    tool_call_id: str,
+    content: str,
+    *,
+    message_id: Optional[str] = None,
+) -> Literal[True]:
+    """Emit a TOOL_CALL_RESULT event for a tool the flow executed itself.
+
+    ``copilotkit_stream`` streams the model's tool CALL (chunks); it does not
+    emit the RESULT of a backend tool the flow runs. Middlewares that key off
+    TOOL_CALL_RESULT (e.g. the A2UI middleware detecting an ``a2ui_operations``
+    envelope, or closing an outer tool call in render order) need it, so a flow
+    node calls this right after it appends the tool-result message to state.
+    """
+    flow = flow_context.get(None)
+
+    crewai_event_bus.emit(
+        flow,
+        BridgedToolCallResultEvent(
+            type=EventType.TOOL_CALL_RESULT,
+            message_id=message_id or str(uuid.uuid4()),
+            tool_call_id=tool_call_id,
+            content=content,
+            role="tool",
+        ),
     )
 
     await yield_control()
