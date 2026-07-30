@@ -34,7 +34,12 @@ from ._capabilities import (
 from ._checkpoint import build_checkpoint_kwargs
 from ._frames import StreamFrameTranslator, CREW_AGENT_LIFECYCLE_TYPES
 from ._config import resolve_emit_raw_events as _resolve_emit_raw_events
-from ._frames import is_recognized_event, log_raw_loss, raw_event_for
+from ._frames import (
+    is_recognized_event,
+    log_raw_loss,
+    raw_event_for,
+    is_backend_tool_event,
+)
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from .attribution import flat_method_attribution
 from crewai.flow.flow import Flow
@@ -231,6 +236,10 @@ _FOREIGN_EVENT_BUFFER_MAX = 512
 # for the first one that asks. Deliberate trade against per-request log spam, since
 # the message names a transport limitation rather than a per-endpoint defect.
 _LEGACY_RAW_WARNING_EMITTED = False
+# Same once-per-process discipline for the backend-tool-rendering gap: the legacy
+# listener registers no ToolUsage handler, so a backend tool call is invisible on
+# crewai 1.0-1.5. Warn once so a missing tool card there is diagnosable.
+_LEGACY_BACKEND_TOOL_WARNING_EMITTED = False
 
 _DRAIN_MAX_PASSES = 10
 _DRAIN_BUDGET_SECONDS = 0.050
@@ -1237,6 +1246,20 @@ async def _run_flow_event_stream(
             "the unmapped events"
         )
 
+    global _LEGACY_BACKEND_TOOL_WARNING_EMITTED  # pylint: disable=global-statement
+    if not _LEGACY_BACKEND_TOOL_WARNING_EMITTED:
+        # Backend tool rendering lives only on the StreamFrame path; the legacy
+        # listener registers no ToolUsage handler, so a backend tool runs without
+        # emitting TOOL_CALL_* / TOOL_CALL_RESULT. Say so once so the missing card
+        # is diagnosable rather than silent.
+        _LEGACY_BACKEND_TOOL_WARNING_EMITTED = True
+        _LOGGER.warning(
+            "ag-ui-crewai: backend tool rendering requires the crewai StreamFrame "
+            "transport (crewai >= 1.6 and a flow exposing astream); this run is on "
+            "the legacy event-bus listener, so any Agent/Crew backend tool call will "
+            "run WITHOUT emitting TOOL_CALL_* / TOOL_CALL_RESULT"
+        )
+
     # ``create_queue`` registers an entry in the module-level ``QUEUES``
     # mapping. If ``flow_context.set`` raises between ``create_queue`` and the
     # main ``try:`` block, the registered queue is orphaned — nothing deletes
@@ -1900,17 +1923,19 @@ async def _run_flow_frame_stream(
         # events and our Bridged* events carry flow_copy as source, while a
         # nested crew.kickoff's own flow's lifecycle/method events leak here
         # with a different source and must stay dropped (no double RUN_STARTED,
-        # no mis-nested method). MCP and Crew/Agent lifecycle events are parked
-        # regardless of source because this sink is scoped to the run's context
-        # (no cross-run leak); crew/agent events let the translator attribute
-        # the hierarchy. Any other foreign event is parked for RAW passthrough
-        # only when opt-in is on (bounded buffer, oldest evicted with a log).
+        # no mis-nested method). MCP, backend tool (ToolUsage), and Crew/Agent
+        # lifecycle events are parked regardless of source because this sink is
+        # scoped to the run's context (no cross-run leak); crew/agent events let
+        # the translator attribute the hierarchy. Any other foreign event is
+        # parked for RAW passthrough only when opt-in is on (bounded buffer,
+        # oldest evicted with a log).
         event_id = getattr(event, "event_id", None)
         if event_id is None:
             return
         if (
             source is flow_copy
             or is_mcp_event(event)
+            or is_backend_tool_event(event)
             or getattr(event, "type", None) in CREW_AGENT_LIFECYCLE_TYPES
         ):
             raw_events[event_id] = event
