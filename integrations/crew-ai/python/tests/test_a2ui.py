@@ -469,6 +469,29 @@ async def test_run_catalog_splice_valid_for_real_args_split_charwise(monkeypatch
     assert doc["surfaceId"] == "prod"
 
 
+async def test_copilotkit_emit_tool_result_emits_bridged_event(monkeypatch):
+    # The a2ui flows call this after a tool runs so middlewares that commit from
+    # TOOL_CALL_RESULT (fixed-schema paint, outer-call close) receive it.
+    from ag_ui_crewai import sdk
+    from ag_ui_crewai.events import BridgedToolCallResultEvent
+
+    captured = []
+
+    class _Bus:
+        def emit(self, source, event):
+            captured.append(event)
+
+    monkeypatch.setattr(sdk, "crewai_event_bus", _Bus())
+    await sdk.copilotkit_emit_tool_result("call-1", '{"a2ui_operations":[]}')
+    assert len(captured) == 1
+    ev = captured[0]
+    assert isinstance(ev, BridgedToolCallResultEvent)
+    assert (ev.tool_call_id, ev.content, ev.role) == (
+        "call-1", '{"a2ui_operations":[]}', "tool",
+    )
+    assert ev.message_id  # auto-generated when not supplied
+
+
 async def test_run_no_tool_call_exhausts(monkeypatch):
     # Sub-agent produces no render call on every attempt -> recovery exhausts.
     fake, calls = _make_fake_acompletion([None, None])

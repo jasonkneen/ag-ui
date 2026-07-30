@@ -324,6 +324,11 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
         if message_id is None:
             message_id = chunk["id"]
 
+        # Providers (Azure, or an ``include_usage`` final chunk) can emit a chunk
+        # with no choices; skip it rather than IndexError out of the whole run.
+        if not chunk["choices"]:
+            continue
+
         text_content = chunk["choices"][0]["delta"]["content"] or None
 
         # Stream text messages

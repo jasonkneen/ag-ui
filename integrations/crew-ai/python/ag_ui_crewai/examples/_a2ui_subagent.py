@@ -8,11 +8,14 @@ is inherent to the toolkit loop, so they share this turn.
 """
 
 import json
+import logging
 
 from litellm import acompletion
 
 from ..sdk import copilotkit_emit_tool_result, copilotkit_stream
 from ..a2ui_tool import apply_a2ui_plan_to_tools, plan_a2ui_injection
+
+logger = logging.getLogger("ag_ui_crewai")
 
 MODEL = "openai/gpt-4o"
 
@@ -127,6 +130,11 @@ async def run_a2ui_subagent_turn(state) -> None:
         try:
             args = json.loads(tool_call.function.arguments or "{}")
         except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "generate_a2ui tool-call args were not valid JSON; "
+                "generating with defaults: %r",
+                tool_call.function.arguments,
+            )
             args = {}
         envelope = await plan["tool"].run(args)
         state["messages"].append(

@@ -10,6 +10,7 @@ generation, no recovery.
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ from ag_ui_a2ui_toolkit import (
 
 from ..sdk import copilotkit_emit_tool_result, copilotkit_stream
 
+logger = logging.getLogger("ag_ui_crewai")
+
 MODEL = "openai/gpt-4o"
 
 # Both surfaces render against the dojo's fixed catalog (Row / FlightCard /
@@ -36,7 +39,7 @@ _SCHEMAS_DIR = Path(__file__).parent / "a2ui_fixed_schema_schemas"
 
 
 def _load_schema(name: str) -> list[dict[str, Any]]:
-    with open(_SCHEMAS_DIR / name) as f:
+    with open(_SCHEMAS_DIR / name, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -169,6 +172,12 @@ class A2UIFixedSchemaFlow(Flow):
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
             except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "%s tool-call args were not valid JSON; rendering an empty "
+                    "surface: %r",
+                    tool_call.function.name,
+                    tool_call.function.arguments,
+                )
                 args = {}
             envelope = build(args)
             state["messages"].append(
