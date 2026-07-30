@@ -1,4 +1,4 @@
-"""MCP (Model Context Protocol) event bridging for ag_ui_crewai (PNI-130).
+"""MCP (Model Context Protocol) event bridging for ag_ui_crewai.
 
 CrewAI gained first-class MCP support in 1.4.0: ``Agent(mcps=[...])`` accepting
 config objects, ``crewai.mcp.MCPServer{Stdio,HTTP,SSE}``, and a family of
@@ -25,22 +25,20 @@ the StreamFrame frame-translator (``_frames.StreamFrameTranslator``, crewai
 could leak across runs or races on the process-wide listener, which protects
 cancellation/teardown.
 
-Capability detection is runtime-only (PNI-130 hard rule): ``crewai_mcp_available``
-probes ``crewai.mcp.MCPServerStdio`` -- the clean 1.4.0 signal -- rather than
+Capability detection is runtime-only: ``crewai_mcp_available`` probes
+``crewai.mcp.MCPServerStdio`` -- the clean 1.4.0 signal -- rather than
 version-gating on a version string. ``Agent.mcps`` is deliberately NOT probed:
 it exists from crewai 1.0.0 as ``list[str]`` and cannot distinguish 1.0 from
 1.4. Below 1.4 the probe fails, ``register_mcp_listeners`` logs one warning and
 is a clean no-op.
 
-Wire-shape note (PNI-136 / PNI-145): the granular ``TOOL_CALL_START``/``ARGS``/
-``END``/``RESULT`` shape is the protocol-canonical representation of a discrete
-(non-streaming) tool call and matches the START/CONTENT/END triples the six
-non-crewai integrations emit. PNI-136's chunks-vs-triples wire-shape decision
-was still In Progress and PNI-145's StreamFrame translator defaults text /
+Wire-shape note: the granular ``TOOL_CALL_START``/``ARGS``/``END``/``RESULT``
+shape is the protocol-canonical representation of a discrete (non-streaming)
+tool call and matches the START/CONTENT/END triples the six non-crewai
+integrations emit. The StreamFrame translator defaults streaming text /
 LLM-tool-call emission to ``chunks``; MCP executions are discrete (name + full
 args + result arrive together), so triples are the natural fit here regardless
-of how that decision lands for streaming LLM tool calls. Documented as an
-assumption; revisit if PNI-136 mandates chunks for MCP too.
+of how the chunks-vs-triples decision lands for streaming LLM tool calls.
 """
 
 import json
@@ -382,7 +380,7 @@ def _translate_mcp_event_impl(event: Any) -> List[BaseEvent]:
 def crewai_mcp_available() -> bool:
     """Return True when crewai>=1.4 first-class MCP support is importable.
 
-    Probes ``crewai.mcp.MCPServerStdio`` -- the clean 1.4.0 signal (PNI-130).
+    Probes ``crewai.mcp.MCPServerStdio`` -- the clean 1.4.0 signal.
     Only ``ImportError`` (crewai < 1.4, module absent) is treated as
     "unavailable"; any OTHER exception is a real breakage and is allowed to
     propagate rather than being silently mislabelled as "too old".

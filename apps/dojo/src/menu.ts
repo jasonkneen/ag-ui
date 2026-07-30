@@ -274,7 +274,8 @@ export const menuIntegrations = [
     features: [
       "agentic_chat",
       "v1_agentic_chat",
-      // "backend_tool_rendering",
+      "backend_tool_rendering",
+      "interrupt",
       "human_in_the_loop",
       "agentic_generative_ui",
       "predictive_state_updates",
@@ -282,6 +283,9 @@ export const menuIntegrations = [
       "tool_based_generative_ui",
       "crew_chat",
       "error_flow",
+      "a2ui_dynamic_schema",
+      "a2ui_recovery",
+      "a2ui_fixed_schema",
     ],
   },
   // {

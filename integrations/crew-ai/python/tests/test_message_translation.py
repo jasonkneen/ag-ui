@@ -31,6 +31,19 @@ def test_litellm_conversion_generates_id_when_missing():
     assert len(out[0].id) == 36  # canonical uuid4 string length
 
 
+def test_litellm_conversion_generates_id_when_explicitly_none():
+    """A message with ``id`` present but ``None`` still gets a generated UUID.
+
+    Regression: the backfill guarded only on the key being absent, so an
+    explicit ``id=None`` survived to the None-strip, which then dropped the key
+    and left pydantic ``Message`` validation to fail on a missing id."""
+    out = litellm_messages_to_ag_ui_messages(
+        [{"role": "user", "content": "yo", "id": None}]
+    )
+    assert isinstance(out[0].id, str)
+    assert len(out[0].id) == 36  # canonical uuid4 string length
+
+
 def test_litellm_conversion_injects_tool_call_type():
     """Tool calls missing an explicit ``type`` are stamped ``function``."""
     out = litellm_messages_to_ag_ui_messages(
@@ -147,7 +160,7 @@ def test_prepare_inputs_merges_incoming_state():
 
 
 # --------------------------------------------------------------------------
-# PNI-139 — context / forwardedProps / top-level tools forwarding
+# context / forwardedProps / top-level tools forwarding
 # --------------------------------------------------------------------------
 
 def test_prepare_inputs_threads_context_into_state():
