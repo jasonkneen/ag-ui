@@ -55,6 +55,7 @@ from ._hitl import (
     resume_requested,
 )
 from ._reasoning import is_thinking_event
+from ._memory import apply_thread_memory_scope
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from .attribution import flat_method_attribution
 from crewai.flow.flow import Flow
@@ -2547,6 +2548,11 @@ async def _run_flow_resume_stream(
         )
         return
 
+    # ``from_pending`` built its own instance for THIS request, so scoping it
+    # mutates nothing shared. A resumed run is still one thread's conversation,
+    # and its crew writes to memory like any other run.
+    apply_thread_memory_scope(resumed_flow, thread_id)
+
     token = flow_context.set(resumed_flow)
     translator = StreamFrameTranslator(
         thread_id=thread_id,
@@ -2857,6 +2863,11 @@ def add_crewai_flow_fastapi_endpoint(
             )
 
         flow_copy = _copy_flow(flow)
+        # Copying the flow does NOT isolate crew memory: crewai keeps it in a
+        # shared on-disk store namespaced by crew name, so every threadId would
+        # otherwise read and write the same namespace. Scope it here, before a
+        # run driver is selected, so both drivers are covered.
+        apply_thread_memory_scope(flow_copy, input_data.thread_id)
 
         inputs = crewai_prepare_inputs(
             state=input_data.state,
@@ -2952,6 +2963,11 @@ def add_crewai_crew_fastapi_endpoint(
 
         flow = await _get_flow()
         flow_copy = _copy_flow(flow)
+        # Copying the flow does NOT isolate crew memory: crewai keeps it in a
+        # shared on-disk store namespaced by crew name, so every threadId would
+        # otherwise read and write the same namespace. Scope it here, before a
+        # run driver is selected, so both drivers are covered.
+        apply_thread_memory_scope(flow_copy, input_data.thread_id)
 
         inputs = crewai_prepare_inputs(
             state=input_data.state,

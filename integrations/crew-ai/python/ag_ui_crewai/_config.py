@@ -34,6 +34,14 @@ SUPPORTED_EMISSION_SHAPES = frozenset({"triples", "chunks"})
 DEFAULT_EMISSION_SHAPE = "triples"
 
 EMISSION_SHAPE_ENV_VAR = "AGUI_CREWAI_EMISSION_SHAPE"
+# Per-thread crew-memory isolation ships ON: sharing one memory namespace across
+# every AG-UI ``threadId`` leaks one chat's remembered facts into another, which
+# is a privacy bug rather than a feature. The opt-out exists because a
+# deployment may WANT one durable knowledge base behind every chat; turning it
+# off restores the pre-fix "one namespace per crew name" behaviour exactly.
+DEFAULT_THREAD_SCOPED_MEMORY = True
+
+THREAD_SCOPED_MEMORY_ENV_VAR = "AGUI_CREWAI_THREAD_SCOPED_MEMORY"
 
 # Vocabulary ``_parse_env_bool`` accepts, so the "was this value used?" check stays
 # in step with the parser instead of duplicating its token list.
@@ -111,3 +119,26 @@ def resolve_emission_shape(emission_shape: str | None) -> str:
             resolved, used = token, True
     _warn_if_env_value_ignored(EMISSION_SHAPE_ENV_VAR, raw, used)
     return resolved
+def resolve_thread_scoped_memory() -> bool:
+    """Resolve per-thread crew-memory isolation: env var > shipped default (on).
+
+    Env-only, and re-read per request rather than resolved once at registration:
+    unlike ``emit_raw_events`` there is no endpoint-factory argument to conflict
+    with, and an operator flipping the variable should not have to know which
+    call it was frozen at.
+
+    Deliberately NOT ``_parse_env_bool``: that parser treats anything outside its
+    true-set as false, which is the right fail-safe for an option that ships OFF
+    but the wrong one here: a typo would silently DISABLE isolation and restore
+    the cross-thread leak. Only a recognised false token turns it off; anything
+    else keeps the shipped default and warns once.
+    """
+    raw = os.environ.get(THREAD_SCOPED_MEMORY_ENV_VAR)
+    if raw is None:
+        return DEFAULT_THREAD_SCOPED_MEMORY
+    token = raw.strip().casefold()
+    used = token in _BOOL_TOKENS
+    _warn_if_env_value_ignored(THREAD_SCOPED_MEMORY_ENV_VAR, raw, used)
+    if not used:
+        return DEFAULT_THREAD_SCOPED_MEMORY
+    return token in _TRUE_VALUES
