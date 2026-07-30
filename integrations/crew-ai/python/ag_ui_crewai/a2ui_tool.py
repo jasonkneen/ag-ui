@@ -56,7 +56,7 @@ from ag_ui_a2ui_toolkit import (
 
 from ._capabilities import crewai_event_bus
 from .context import flow_context
-from .events import BridgedToolCallChunkEvent
+from .events import BridgedToolCallChunkEvent, BridgedToolCallResultEvent
 from .utils import yield_control
 
 # Re-export the toolkit constants/types callers type their params bag against,
@@ -459,14 +459,48 @@ class A2UITool:
             )
             await yield_control()
 
-    async def run(self, args: Optional[dict], *, flow: Any = None) -> str:
+    def _emit_tool_result(self, flow: Any, tool_call_id: Optional[str], envelope: str) -> None:
+        """Emit the TOOL_CALL_RESULT for this generate_a2ui call so the a2ui
+        middleware closes the outer call and can commit / hard-fail from the
+        envelope. Emitted here (not left to the caller) so a flow that forgets
+        cannot leave an exhausted recovery stuck at "building"."""
+        if not tool_call_id:
+            return
+        crewai_event_bus.emit(
+            flow,
+            BridgedToolCallResultEvent(
+                type=EventType.TOOL_CALL_RESULT,
+                message_id=str(uuid.uuid4()),
+                tool_call_id=tool_call_id,
+                content=envelope,
+                role="tool",
+            ),
+        )
+
+    async def run(
+        self,
+        args: Optional[dict],
+        *,
+        tool_call_id: Optional[str] = None,
+        flow: Any = None,
+    ) -> str:
         """Generate (or update) an A2UI surface and return the operations
         envelope (a JSON string a flow node appends as the tool result).
 
-        Streams the sub-agent's ``render_a2ui`` progress to the wire; on
-        validation failure the toolkit recovery loop retries, each attempt
-        re-streaming render so the middleware shows building -> retrying -> paint.
+        Pass ``tool_call_id`` (the outer generate_a2ui call id) so this emits its
+        own TOOL_CALL_RESULT; the middleware needs it to close the call and, on
+        exhaustion, paint the tasteful hard-failure. Streams the sub-agent's
+        ``render_a2ui`` progress to the wire; on validation failure the toolkit
+        recovery loop retries, each attempt re-streaming render so the middleware
+        shows building -> retrying -> paint.
         """
+        flow = flow if flow is not None else flow_context.get(None)
+        if flow is None:
+            logger.warning(
+                "A2UITool.run has no flow (call it inside a flow node so "
+                "flow_context is set, or pass flow=); render progress and the "
+                "tool result will not reach the wire."
+            )
         cfg = self._cfg
         args = args if isinstance(args, dict) else {}
         intent = args.get("intent")
@@ -492,7 +526,9 @@ class A2UITool:
 
         if prep.get("error"):
             logger.warning("A2UI request prep failed: %s", prep["error"])
-            return wrap_error_envelope(prep["error"])
+            envelope = wrap_error_envelope(prep["error"])
+            self._emit_tool_result(flow, tool_call_id, envelope)
+            return envelope
 
         if cfg["model_kwargs"] is None:
             # get_a2ui_tools enforces this, but guard so a hand-built tool never
@@ -557,7 +593,6 @@ class A2UITool:
             ),
         )
 
-        flow = flow if flow is not None else flow_context.get(None)
         name_state: dict = {}
         get_task: Optional[asyncio.Task] = None
         try:
@@ -609,7 +644,9 @@ class A2UITool:
             future.add_done_callback(_log_abandoned_recovery_result)
             raise
 
-        return future.result()["envelope"]
+        envelope = future.result()["envelope"]
+        self._emit_tool_result(flow, tool_call_id, envelope)
+        return envelope
 
 
 def get_a2ui_tools(params: A2UIToolParams, glue: Optional[dict] = None) -> A2UITool:

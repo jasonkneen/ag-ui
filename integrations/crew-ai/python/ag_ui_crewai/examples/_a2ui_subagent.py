@@ -12,7 +12,7 @@ import logging
 
 from litellm import acompletion
 
-from ..sdk import copilotkit_emit_tool_result, copilotkit_stream
+from ..sdk import copilotkit_stream
 from ..a2ui_tool import apply_a2ui_plan_to_tools, plan_a2ui_injection
 
 logger = logging.getLogger("ag_ui_crewai")
@@ -136,11 +136,10 @@ async def run_a2ui_subagent_turn(state) -> None:
                 tool_call.function.arguments,
             )
             args = {}
-        envelope = await plan["tool"].run(args)
+        # run() emits its own TOOL_CALL_RESULT (given the outer call id) so the
+        # middleware closes the call in render order and, on exhaustion, paints
+        # the hard-failure - a flow can't leave it stuck at "building".
+        envelope = await plan["tool"].run(args, tool_call_id=tool_call.id)
         state["messages"].append(
             {"role": "tool", "content": envelope, "tool_call_id": tool_call.id}
         )
-        # Emit the tool result so the a2ui middleware closes the outer
-        # generate_a2ui call in render order (the surface itself already painted
-        # from the streamed render_a2ui; the middleware dedups the re-paint).
-        await copilotkit_emit_tool_result(tool_call.id, envelope)

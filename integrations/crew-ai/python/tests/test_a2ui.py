@@ -312,6 +312,46 @@ async def test_run_exhausts_recovery(monkeypatch):
     assert calls["n"] == 2
 
 
+async def test_run_emits_tool_call_result_when_id_given(monkeypatch):
+    # run() self-emits TOOL_CALL_RESULT so a flow can't leave the middleware
+    # stuck at "building" by forgetting to emit it.
+    fake, _ = _make_fake_acompletion([VALID_ARGS])
+    bus = _RecordingBus()
+    monkeypatch.setattr(a2, "acompletion", fake)
+    monkeypatch.setattr(a2, "crewai_event_bus", bus)
+    tool = a2.get_a2ui_tools({"model": "m"})
+    envelope = await tool.run({"intent": "create"}, tool_call_id="outer-1")
+    results = [e for e in bus.events if e.type == "TOOL_CALL_RESULT"]
+    assert len(results) == 1
+    assert (results[0].tool_call_id, results[0].content, results[0].role) == (
+        "outer-1", envelope, "tool",
+    )
+
+
+async def test_run_without_id_emits_no_tool_call_result(monkeypatch):
+    fake, _ = _make_fake_acompletion([VALID_ARGS])
+    bus = _RecordingBus()
+    monkeypatch.setattr(a2, "acompletion", fake)
+    monkeypatch.setattr(a2, "crewai_event_bus", bus)
+    tool = a2.get_a2ui_tools({"model": "m"})
+    await tool.run({"intent": "create"})
+    assert not [e for e in bus.events if e.type == "TOOL_CALL_RESULT"]
+
+
+async def test_run_emits_tool_call_result_on_recovery_exhaustion(monkeypatch):
+    # Even when recovery exhausts, the error envelope must reach the middleware
+    # via TOOL_CALL_RESULT so it paints the hard-failure instead of hanging.
+    fake, _ = _make_fake_acompletion([INVALID_ARGS, INVALID_ARGS])
+    bus = _RecordingBus()
+    monkeypatch.setattr(a2, "acompletion", fake)
+    monkeypatch.setattr(a2, "crewai_event_bus", bus)
+    tool = a2.get_a2ui_tools({"model": "m", "recovery": {"maxAttempts": 2}})
+    envelope = await tool.run({"intent": "create"}, tool_call_id="outer-2")
+    results = [e for e in bus.events if e.type == "TOOL_CALL_RESULT"]
+    assert len(results) == 1 and results[0].content == envelope
+    assert json.loads(envelope)["code"] == "a2ui_recovery_exhausted"
+
+
 async def test_run_update_without_prior_surface_errors(monkeypatch):
     fake, _ = _make_fake_acompletion([VALID_ARGS])
     monkeypatch.setattr(a2, "acompletion", fake)
