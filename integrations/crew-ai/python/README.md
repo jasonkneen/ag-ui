@@ -97,21 +97,26 @@ today. `emit_raw_events` defaults to re-reading the environment, so pass the sam
 value your endpoint was registered with if you want the declaration to describe
 *that* endpoint.
 
-`reasoning.supported` is True **only** when all three hold: the installed crewai
-exposes `LLMThinkingChunkEvent`, the `StreamFrame` transport exists (RAW is the only
-channel carrying reasoning today), *and* the passed LLM resolves to the native Google
-Gen AI provider. Otherwise `reason` names the missing piece
-(`thinking_event_missing`, `raw_transport_unavailable`, `llm_not_provided`,
-`llm_not_resolvable`, `provider_not_native_gemini`) and `transport` is `None`.
+Reasoning surfaces as first-class `REASONING_*` events (`REASONING_START` /
+`REASONING_MESSAGE_START` / `REASONING_MESSAGE_CONTENT` / `REASONING_MESSAGE_END` /
+`REASONING_END`, plus `REASONING_ENCRYPTED_VALUE` for signature / redacted-thinking
+blocks), **provider-agnostic** and on **both** transports. It needs neither
+`emit_raw_events` nor the `StreamFrame` transport. Two channels feed it:
 
-Reasoning is native-Gemini-only in crewai: on the 1.15.7 wheel the sole caller of
-`BaseLLM._emit_thinking_chunk_event` is `crewai/llms/providers/gemini/completion.py`.
-Anthropic's native provider has a thinking config but never emits the event, and every
-LiteLLM-routed model (including `vertex_ai/gemini-*`) emits nothing. Passing no `llm`
-therefore reports `supported: False` rather than claiming support off the class probe
-alone. On the crew-serving path `crews.py` drives completions through
-`litellm.acompletion` directly, so the native Gemini provider never runs and reasoning
-does not surface there even when it is reported supported for the LLM you passed.
+- **litellm delta** (`copilotkit_stream`): reads `reasoning_content` /
+  `thinking_blocks` for any reasoning-capable model routed through litellm
+  (deepseek-reasoner, Anthropic extended thinking, Bedrock, xAI,
+  gemini-via-litellm, and reasoning models normalised by litellm). This is the
+  provider-agnostic path and drives the crew-serving path in `crews.py` too.
+- **native `LLMThinkingChunkEvent`** (crewai's Gemini provider, crewai >= 1.10.1):
+  an additional source on the `StreamFrame` path.
+
+`reasoning.supported` is therefore True whenever a reasoning channel is live (the
+litellm channel is effectively always live, as litellm is a direct dependency). A
+non-reasoning model simply emits nothing (graceful no-op). `requiresEmitRawEvents`
+is `False`. The `nativeGeminiProvider` / `resolvedProvider` fields are
+informational (the native event is an extra source, not a requirement), and
+`thinkingEventAvailable` reports whether the native Gemini event resolved.
 
 ## Tuning knobs
 
