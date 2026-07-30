@@ -402,6 +402,7 @@ export const agentsIntegrations = {
       (path) => new CrewAIAgent({ url: `${envVars.crewAiUrl}/${path}` }),
       {
         agentic_chat: "agentic_chat",
+        interrupt: "interrupt",
         // TODO: Add agent for backend_tool_rendering
         // backend_tool_rendering: "backend_tool_rendering",
         human_in_the_loop: "human_in_the_loop",
