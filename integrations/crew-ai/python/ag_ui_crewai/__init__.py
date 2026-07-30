@@ -14,6 +14,8 @@ from .sdk import (
 )
 # from .enterprise import CrewEnterpriseEventListener
 
+from ._capabilities import get_capabilities
+
 # CREW_ENTERPRISE_EVENT_LISTENER = CrewEnterpriseEventListener()
 
 # The Crew chat path was undiscoverable — the four symbols below (the
@@ -21,6 +23,7 @@ from .sdk import (
 # signal) were absent from the package top level. Export them alongside
 # the pre-existing flow-path surface.
 __all__ = [
+    "get_capabilities",
   "add_crewai_flow_fastapi_endpoint",
   "add_crewai_crew_fastapi_endpoint",
   "crewai_prepare_inputs",

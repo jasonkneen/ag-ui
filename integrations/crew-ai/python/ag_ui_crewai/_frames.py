@@ -66,6 +66,7 @@ the streaming LLM text / tool-call channel); see the wire-shape note in
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -75,6 +76,7 @@ from ag_ui.core import (
     RunFinishedEvent,
 )
 from ag_ui.core.events import (
+    RawEvent,
     TextMessageChunkEvent,
     ToolCallChunkEvent,
     StepStartedEvent,
@@ -86,6 +88,8 @@ from ag_ui.core.events import (
 
 from .sdk import litellm_messages_to_ag_ui_messages
 from .mcp import is_mcp_event, translate_mcp_event
+
+_LOGGER = logging.getLogger(__name__)
 
 # crewai lifecycle-event ``type`` strings. Pinned as constants so a rename
 # upstream surfaces here rather than silently producing no wire events.
@@ -322,3 +326,96 @@ class StreamFrameTranslator:
             "the StreamFrame migration ships the behavior-preserving "
             "'chunks' shape only."
         )
+
+
+# Event types the translator recognises. Used to decide whether an event is
+# "unmapped" and therefore eligible for RAW passthrough: an event we DO map but
+# deliberately suppress must not leak out as a RAW event as well.
+_RECOGNIZED_EVENT_TYPES = frozenset(
+    {
+        _FLOW_STARTED,
+        _FLOW_FINISHED,
+        _METHOD_STARTED,
+        _METHOD_FINISHED,
+        EventType.TEXT_MESSAGE_CHUNK,
+        EventType.TOOL_CALL_CHUNK,
+        EventType.CUSTOM,
+        EventType.STATE_SNAPSHOT,
+    }
+)
+
+# Source tag on emitted RAW events, so a consumer can tell CrewAI passthrough apart
+# from other producers' raw channels.
+_RAW_SOURCE = "crewai"
+
+# One WARNING per process for the first RAW-passthrough loss, then DEBUG. An
+# operator who turned RAW on is debugging something and would never see a
+# DEBUG-only drop, but a per-event WARNING under sustained pressure is its own
+# problem.
+_RAW_LOSS_WARNED = False
+
+
+def log_raw_loss(message: str, *args: Any) -> None:
+    """Log a RAW-passthrough loss: WARNING the first time, DEBUG thereafter."""
+    global _RAW_LOSS_WARNED  # pylint: disable=global-statement
+    if _RAW_LOSS_WARNED:
+        _LOGGER.debug(message, *args)
+        return
+    _RAW_LOSS_WARNED = True
+    _LOGGER.warning(message, *args)
+
+
+def is_recognized_event(event: Any) -> bool:
+    """True when the translator maps this event, so RAW must not duplicate it."""
+    return getattr(event, "type", None) in _RECOGNIZED_EVENT_TYPES
+
+
+def raw_event_for(event: Any) -> RawEvent | None:
+    """Wrap an unmapped crewai event as an AG-UI ``RAW`` event.
+
+    Payload preference order:
+
+    1. ``model_dump(mode="json")`` - every crewai event is a Pydantic model, and
+       ``mode="json"`` resolves enums / datetimes for us.
+    2. the event's own ``__dict__``, filtered to JSON-safe scalars and containers.
+
+    A RAW passthrough must never be able to break the run, so a payload we cannot
+    build at all yields ``None`` (the caller drops the mirror) rather than raising
+    into the driver's event loop.
+    """
+    event_type = getattr(event, "type", None)
+    if event_type is None:
+        return None
+
+    payload: Any = None
+    model_dump = getattr(event, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="json")
+        except Exception as dump_exc:  # noqa: BLE001 - falls back below
+            # Surface WHY the richer payload was unavailable; silence made a degraded
+            # RAW payload indistinguishable from a complete one.
+            _LOGGER.debug(
+                "ag-ui-crewai RAW passthrough could not model_dump a %r event (%s); "
+                "falling back to instance attributes",
+                event_type,
+                type(dump_exc).__name__,
+            )
+            payload = None
+
+    if payload is None:
+        source_dict = getattr(event, "__dict__", None)
+        if isinstance(source_dict, dict):
+            payload = {
+                key: value
+                for key, value in source_dict.items()
+                if not key.startswith("_")
+                and isinstance(value, (str, int, float, bool, type(None), list, dict))
+            }
+
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    payload.setdefault("type", str(event_type))
+    return RawEvent(type=EventType.RAW, event=payload, source=_RAW_SOURCE)
