@@ -843,6 +843,80 @@ async def test_frame_path_nested_error_still_terminates_run():
     assert "RUN_FINISHED" in types or "RUN_ERROR" in types, types
 
 
+# -- sink source-gating: crew/agent parked, nested-flow method dropped ------
+
+class _MixedSourceSession:
+    """AsyncStreamSession stand-in that publishes each RAW event to the scoped
+    sink under a PER-EVENT source (not one shared source), so we can drive the
+    sink's crew/agent-vs-nested-flow source gate directly."""
+
+    def __init__(self, pairs):
+        self._pairs = pairs
+        self.aclosed = False
+
+    async def _agen(self):
+        from crewai.events.stream_context import publish_stream_event
+
+        for source, ev in self._pairs:
+            publish_stream_event(source, ev)
+            yield _Frame(ev.type, id=ev.event_id)
+
+    def __aiter__(self):
+        return self._agen()
+
+    async def aclose(self):
+        self.aclosed = True
+
+
+class _MixedSourceFlow:
+    state = {}
+
+    def __init__(self, session):
+        self._session = session
+
+    def astream(self, inputs=None):
+        return self._session
+
+
+@requires_stream_frames
+async def test_frame_path_sink_parks_crew_agent_but_drops_nested_flow_method():
+    """The driver's scoped ``_sink`` parks crew/agent lifecycle events even when
+    their source is NOT the outer flow (they are run-scoped), while a nested
+    FLOW method event (non-crew/agent, non-outer source) is dropped."""
+    from ag_ui.encoder import EventEncoder
+
+    outer = _MixedSourceFlow(None)  # session attached once the pairs reference it
+    other = object()  # a non-outer source (nested-flow / crew emitter)
+
+    pairs = [
+        (outer, _ev("flow_started", event_id="fs")),
+        (outer, _ev("method_execution_started", event_id="ms", method_name="m")),
+        # Crew event from a NON-outer source -> parked (surfaces as a STEP).
+        (other, _ev("crew_kickoff_started", event_id="cs", crew_name="research_crew")),
+        # Nested-FLOW method from a NON-outer source -> dropped (no STEP).
+        (other, _ev("method_execution_started", event_id="nested",
+                    method_name="nested_method")),
+        (other, _ev("crew_kickoff_completed", event_id="cc", crew_name="research_crew")),
+        (outer, _ev("method_execution_finished", event_id="mf", method_name="m")),
+        (outer, _ev("flow_finished", event_id="ff")),
+    ]
+    outer._session = _MixedSourceSession(pairs)
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=outer,
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    started_names = [p["stepName"] for p in payloads if p["type"] == "STEP_STARTED"]
+
+    assert "research_crew" in started_names   # crew parked despite non-outer source
+    assert "nested_method" not in started_names  # nested-flow method dropped
+    assert "m" in started_names               # outer method still surfaces
+
+
 # -- per-request flow COPY seeds state before @start runs ------
 
 class _StateReadingFlow(Flow[CopilotKitState]):
@@ -1189,3 +1263,195 @@ async def test_frame_path_surfaces_mcp_tool_calls():
         assert expected in types, (expected, types)
     customs = [p for p in payloads if p["type"] == "CUSTOM"]
     assert any(c.get("name") == "mcp_connection_started" for c in customs)
+
+
+# --------------------------------------------------------------------------
+# RAW passthrough: opt-in, default OFF, never before RUN_STARTED
+# --------------------------------------------------------------------------
+
+class _ForeignSourceEmittingFlow(Flow):
+    """Emits a crewai llm event the way crewai itself does: with the EMITTER as
+    source, not the flow.
+
+    Every llm / agent / task / tool event on the 1.15.7 wheel is emitted this way
+    (``crewai_event_bus.emit(self, event=...)`` in ``llms/base_llm.py``), so the
+    driver's outer-flow source gate never parks them - which is why RAW passthrough
+    needs a second buffer to see them at all."""
+
+    @start()
+    async def chat(self):
+        from ag_ui_crewai._capabilities import (
+            LLMThinkingChunkEvent,
+            crewai_event_bus,
+        )
+        if LLMThinkingChunkEvent is not None:
+            crewai_event_bus.emit(
+                object(),  # stands in for the LLM instance crewai emits with
+                event=LLMThinkingChunkEvent(chunk="pondering", call_id="c-1"),
+            )
+        return "done"
+
+
+@requires_stream_frames
+async def test_raw_passthrough_mirrors_foreign_source_events_end_to_end():
+    """RAW passthrough has to reach the llm / agent / task / tool channels, which
+    crewai emits with the EMITTER as source. Gating those out (as the TRANSLATION
+    path must, so they cannot synthesize a run lifecycle) left the flag emitting
+    nothing at all, including for ``llm_thinking_chunk`` - the channel the reasoning
+    capability points at."""
+    from ag_ui.encoder import EventEncoder
+    from ag_ui_crewai._capabilities import LLMThinkingChunkEvent
+
+    if LLMThinkingChunkEvent is None:  # pragma: no cover
+        pytest.skip("installed crewai does not expose LLMThinkingChunkEvent")
+
+    payloads = _decode_sse(await _collect(ep._run_flow_frame_stream(
+        flow_copy=_ForeignSourceEmittingFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+        emit_raw_events=True,
+    )))
+    types = [p["type"] for p in payloads]
+
+    # The invariant RAW can break: crewai raises some events BEFORE flow_started, and
+    # @ag-ui/client's verifyEvents throws "First event must be 'RUN_STARTED'".
+    assert types[0] == "RUN_STARTED", types
+    raws = [p for p in payloads if p["type"] == "RAW"]
+    assert raws, types
+    assert all(p["source"] == "crewai" for p in raws)
+    assert types.index("RUN_STARTED") < types.index("RAW"), types
+
+    thinking = next(p for p in raws if p["event"]["type"] == "llm_thinking_chunk")
+    assert thinking["event"]["chunk"] == "pondering"
+
+    # Still exactly one run lifecycle: a foreign event can never synthesize one.
+    assert types.count("RUN_STARTED") == 1
+    assert types.count("RUN_FINISHED") == 1
+
+
+@requires_stream_frames
+async def test_foreign_source_events_are_dropped_when_raw_is_off():
+    """Default OFF means default OFF: the payload-bloat guard."""
+    from ag_ui.encoder import EventEncoder
+    from ag_ui_crewai._capabilities import LLMThinkingChunkEvent
+
+    if LLMThinkingChunkEvent is None:  # pragma: no cover
+        pytest.skip("installed crewai does not expose LLMThinkingChunkEvent")
+
+    payloads = _decode_sse(await _collect(ep._run_flow_frame_stream(
+        flow_copy=_ForeignSourceEmittingFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={"id": "t-1"},
+        timeout=30.0,
+    )))
+
+    assert "RAW" not in [p["type"] for p in payloads]
+
+
+@requires_stream_frames
+async def test_saturated_raw_buffer_degrades_without_breaking_the_run(
+    caplog, monkeypatch
+):
+    """Both RAW buffers are bounded. A saturated buffer must degrade RAW mirroring,
+    never the run - and it must say so, because silence is indistinguishable from
+    "crewai emitted nothing", the very thing RAW exists to rule out."""
+    import logging
+
+    from ag_ui.encoder import EventEncoder
+    from ag_ui_crewai._capabilities import LLMThinkingChunkEvent
+
+    if LLMThinkingChunkEvent is None:  # pragma: no cover
+        pytest.skip("installed crewai does not expose LLMThinkingChunkEvent")
+
+    # Cap of 0 so EVERY event is refused: deterministic, unlike a cap of 1 that a
+    # short run may simply never reach.
+    monkeypatch.setattr(ep, "_FOREIGN_EVENT_BUFFER_MAX", 0)
+    monkeypatch.setattr(frames_mod, "_RAW_LOSS_WARNED", False)
+
+    with caplog.at_level(logging.DEBUG, logger="ag_ui_crewai._frames"):
+        payloads = _decode_sse(await _collect(ep._run_flow_frame_stream(
+            flow_copy=_ForeignSourceEmittingFlow(),
+            encoder=EventEncoder(),
+            input_data=_make_run_input(),
+            inputs={"id": "t-1"},
+            timeout=30.0,
+            emit_raw_events=True,
+        )))
+
+    types = [p["type"] for p in payloads]
+    assert types[0] == "RUN_STARTED", types
+    assert types[-1] == "RUN_FINISHED", types
+    assert "RAW" not in types, types
+    assert any("RAW passthrough" in r.getMessage() for r in caplog.records), caplog.text
+
+
+async def test_legacy_transport_says_it_cannot_serve_raw(caplog, monkeypatch):
+    """The legacy bus listener only receives the event types it registers, so there
+    is nothing to mirror. Say so once per process rather than ignoring the flag."""
+    import logging
+
+    from ag_ui.core import RunFinishedEvent
+    from ag_ui.encoder import EventEncoder
+
+    monkeypatch.setattr(ep, "_LEGACY_RAW_WARNING_EMITTED", False)
+
+    class _ImmediateFlow:
+        state = {}
+
+        def __deepcopy__(self, memo):
+            return self
+
+        async def kickoff_async(self, inputs=None):
+            queue = ep.get_queue(self)
+            queue.put_nowait(RunFinishedEvent(
+                type=EventType.RUN_FINISHED, thread_id="?", run_id="?",
+            ))
+            queue.put_nowait(None)
+            return None
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_crewai.endpoint"):
+        payloads = _decode_sse(await _collect(ep._run_flow_event_stream(
+            flow_copy=_ImmediateFlow(),
+            encoder=EventEncoder(),
+            input_data=_make_run_input(),
+            inputs={"id": "t-1"},
+            timeout=30.0,
+            emit_raw_events=True,
+        )))
+
+    assert [p["type"] for p in payloads] == ["RUN_FINISHED"], payloads
+    assert any(
+        "requires the crewai StreamFrame transport" in r.getMessage()
+        for r in caplog.records
+    ), caplog.text
+
+
+def test_raw_event_builder_never_raises_and_tags_its_source():
+    """A RAW mirror must never be able to break the run, so an unusable payload
+    yields None (the driver drops the mirror) rather than raising into the loop."""
+    class _Unserializable:
+        type = "llm_call_started"
+
+        def model_dump(self, mode=None):
+            raise RuntimeError("nope")
+
+    mirror = frames_mod.raw_event_for(_Unserializable())
+    # Falls back to instance attributes; the class has none, so the payload is the
+    # type alone rather than an exception.
+    assert mirror is not None
+    assert mirror.source == "crewai"
+    assert mirror.event["type"] == "llm_call_started"
+
+    # No ``type`` at all is not mirrorable.
+    assert frames_mod.raw_event_for(SimpleNamespace()) is None
+
+
+def test_mapped_events_are_never_duplicated_as_raw():
+    """The flag adds the events that would otherwise be dropped. An event the bridge
+    DOES map must not also appear as RAW."""
+    assert frames_mod.is_recognized_event(_ev("flow_started")) is True
+    assert frames_mod.is_recognized_event(_ev("TEXT_MESSAGE_CHUNK")) is True
+    assert frames_mod.is_recognized_event(_ev("llm_thinking_chunk")) is False
