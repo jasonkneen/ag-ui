@@ -390,6 +390,118 @@ def supported_checkpoint_kwargs(method: Any, kwargs: dict[str, Any]) -> dict[str
 
 
 # --------------------------------------------------------------------------
+# Async human-feedback (HITL) resolution
+# --------------------------------------------------------------------------
+# crewai's async HITL landed at 1.8: a flow method wrapped with
+# ``@human_feedback`` whose provider RAISES ``HumanFeedbackPending`` pauses the
+# run; the framework persists the pending state and ``Flow.from_pending(flow_id)``
+# + ``flow.resume_async(feedback)`` resume it. The pause / feedback lifecycle
+# events live on ``crewai.events.types.flow_events`` and are NOT re-exported at
+# the ``crewai.events`` root (verified on the 1.15.7 wheel), so resolve them
+# there first, with the root as a fallback for a future re-export.
+_FLOW_EVENTS_MODULE, _FLOW_EVENTS_MODULE_NAME = _first_module(
+    ["crewai.events.types.flow_events", "crewai.events"]
+)
+_HITL_EVENT_NAMES = [
+    "HumanFeedbackRequestedEvent",
+    "HumanFeedbackReceivedEvent",
+    "FlowPausedEvent",
+    "MethodExecutionPausedEvent",
+]
+if _FLOW_EVENTS_MODULE is not None:
+    _hitl_event_attrs = _resolve_attrs(_FLOW_EVENTS_MODULE, _HITL_EVENT_NAMES)
+else:  # pragma: no cover - crewai without a flow-events module is pre-HITL
+    _hitl_event_attrs = dict.fromkeys(_HITL_EVENT_NAMES, None)
+# Fall back to the crewai.events root for any name the primary module missed.
+_EVENTS_ROOT_MODULE, _ = _first_module(["crewai.events"])
+if _EVENTS_ROOT_MODULE is not None:
+    for _name, _value in list(_hitl_event_attrs.items()):
+        if _value is None:
+            _hitl_event_attrs[_name] = getattr(_EVENTS_ROOT_MODULE, _name, None)
+
+HumanFeedbackRequestedEvent = _hitl_event_attrs["HumanFeedbackRequestedEvent"]
+HumanFeedbackReceivedEvent = _hitl_event_attrs["HumanFeedbackReceivedEvent"]
+FlowPausedEvent = _hitl_event_attrs["FlowPausedEvent"]
+MethodExecutionPausedEvent = _hitl_event_attrs["MethodExecutionPausedEvent"]
+
+# The pause signal + provider protocol live on ``crewai.flow``.
+_FLOW_PKG_MODULE, _ = _first_module(["crewai.flow"])
+HumanFeedbackPending = (
+    getattr(_FLOW_PKG_MODULE, "HumanFeedbackPending", None) if _FLOW_PKG_MODULE else None
+)
+HumanFeedbackProvider = (
+    getattr(_FLOW_PKG_MODULE, "HumanFeedbackProvider", None) if _FLOW_PKG_MODULE else None
+)
+
+# Resume API, probed on the resolved Flow class (``from_pending`` is a
+# classmethod, ``resume_async`` an instance coroutine).
+_flow_from_pending_supported = callable(getattr(_Flow, "from_pending", None))
+_flow_resume_async_supported = callable(getattr(_Flow, "resume_async", None))
+
+
+def _model_has_field(model: Any, field_name: str) -> bool:
+    """True when a Pydantic ``model`` declares ``field_name``."""
+    fields = getattr(model, "model_fields", None)
+    return bool(fields) and field_name in fields
+
+
+# ``HumanFeedbackRequestedEvent.request_id`` (crewai 1.12.2+) is the stable,
+# non-synthesizable id the bridge maps onto ``AGUIInterrupt.id``. Probe for the
+# field rather than the version; below it there is no stable id and HITL is not
+# advertised.
+_human_feedback_request_id_supported = (
+    HumanFeedbackRequestedEvent is not None
+    and _model_has_field(HumanFeedbackRequestedEvent, "request_id")
+)
+
+# Two levels, so a pause that surfaces as an interrupt is never stranded by a
+# too-strict resume gate:
+#
+# * ``_human_feedback_resume_available`` gates the pause / resume LIFECYCLE. It
+#   needs the pause signal, the resume classmethod + coroutine, and the
+#   StreamFrame transport (async HITL >=1.8 always ships alongside StreamFrame
+#   >=1.6, and the bridge only drives the lifecycle on the frame path). It does
+#   NOT require a stable request id: the interrupt id falls back to the flow id
+#   (== thread_id), which resume keys by, so 1.8-1.12.1 pauses still resume.
+# * ``_human_feedback_available`` is the ADVERTISED capability (stable interrupt
+#   ids). It adds the request-event class and its ``request_id`` field (1.12.2+).
+#   Below that, the lifecycle still works with flow-id ids and a warning.
+_human_feedback_resume_available = (
+    HumanFeedbackPending is not None
+    and FlowPausedEvent is not None
+    and _flow_from_pending_supported
+    and _flow_resume_async_supported
+    and _stream_frame_available
+)
+_human_feedback_available = (
+    _human_feedback_resume_available
+    and HumanFeedbackRequestedEvent is not None
+    and _human_feedback_request_id_supported
+)
+
+# Named enabling versions for warning text only (never a code-path gate).
+HITL_ENABLING_VERSIONS: dict[str, str] = {
+    "human_feedback": "1.8.0",
+    "request_id": "1.12.2",
+    "stream_frame": "1.6.0",
+}
+
+
+def flow_supports_human_feedback(flow: Any) -> bool:
+    """Return True when THIS flow can pause / resume via async human feedback.
+
+    Mirrors ``flow_supports_stream_frames`` / ``flow_supports_checkpointing``:
+    the installed crewai must expose the async-HITL API (probed above) AND this
+    specific flow must expose the resume coroutine and the frame transport, so
+    the ``kickoff_async``-only test doubles in ``tests/test_task_cancellation.py``
+    stay off the HITL path.
+    """
+    if not _human_feedback_resume_available:
+        return False
+    return callable(getattr(flow, "resume_async", None)) and hasattr(flow, "astream")
+
+
+# --------------------------------------------------------------------------
 # crewai-files multimodal input resolution
 # --------------------------------------------------------------------------
 # crewai's ``input_files=`` (1.9.0+) is inert without the separate
@@ -452,6 +564,12 @@ class _Capabilities:
     checkpoint_fork_supported: bool = False
     checkpoint_events_available: bool = False
     checkpoint_state_module: str | None = None
+    # Async human-feedback (HITL): informational; the wiring keys off the
+    # resolved symbols / ``flow_supports_human_feedback`` per-flow probe.
+    flow_events_module: str | None = None
+    human_feedback_available: bool = False
+    human_feedback_resume_available: bool = False
+    human_feedback_request_id_supported: bool = False
     crewai_files_available: bool = False
     missing: tuple[str, ...] = field(default_factory=tuple)
 
@@ -499,6 +617,29 @@ class _Capabilities:
                 "Upgrade to crewai>=1.6 for the ordered StreamFrame transport.",
                 self.crewai_version,
             )
+        if not self.human_feedback_resume_available:
+            # NOT a hard gap; chat / tool-based HITL is unaffected. Emit an
+            # INFO note so operators know async interrupt (pause / resume) needs
+            # the async-HITL API + the StreamFrame transport.
+            _LOGGER.info(
+                "ag-ui-crewai: crewai %s does not expose the async human-feedback "
+                "interrupt API the bridge needs (async @human_feedback pause, "
+                "Flow.from_pending/resume_async, StreamFrame); interrupt/resume "
+                "is disabled. Upgrade to crewai>=%s for AG-UI interrupts.",
+                self.crewai_version,
+                HITL_ENABLING_VERSIONS["human_feedback"],
+            )
+        elif not self.human_feedback_request_id_supported:
+            # Lifecycle works, but without a stable per-request id the interrupt
+            # id falls back to the flow id (== thread_id). Fine for one pending
+            # per thread; upgrade for a stable id across multiple pauses.
+            _LOGGER.info(
+                "ag-ui-crewai: crewai %s supports async human-feedback but not "
+                "HumanFeedbackRequestedEvent.request_id; interrupt ids fall back "
+                "to the flow id. Upgrade to crewai>=%s for stable request ids.",
+                self.crewai_version,
+                HITL_ENABLING_VERSIONS["request_id"],
+            )
 
 
 def _detect() -> _Capabilities:
@@ -526,6 +667,10 @@ def _detect() -> _Capabilities:
         checkpoint_fork_supported=_checkpoint_fork_supported,
         checkpoint_events_available=_checkpoint_events_available,
         checkpoint_state_module=_CKPT_STATE_MODULE_NAME,
+        flow_events_module=_FLOW_EVENTS_MODULE_NAME,
+        human_feedback_available=_human_feedback_available,
+        human_feedback_resume_available=_human_feedback_resume_available,
+        human_feedback_request_id_supported=_human_feedback_request_id_supported,
         crewai_files_available=_crewai_files_available,
         missing=tuple(missing),
     )

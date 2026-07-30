@@ -93,6 +93,7 @@ from ag_ui.core.events import (
     ToolCallArgsEvent,
     ToolCallEndEvent,
     ToolCallResultEvent,
+    StepStartedEvent,
     StepFinishedEvent,
     MessagesSnapshotEvent,
     StateSnapshotEvent,
@@ -101,6 +102,7 @@ from ag_ui.core.events import (
 
 from .sdk import litellm_messages_to_ag_ui_messages
 from .mcp import is_mcp_event, translate_mcp_event
+from ._hitl import HITLOptions, build_agui_interrupt, build_interrupt_tail
 from .attribution import (
     BoundaryTracker,
     FLOW_METHOD,
@@ -119,6 +121,11 @@ _FLOW_FINISHED = "flow_finished"
 _METHOD_STARTED = "method_execution_started"
 _METHOD_FINISHED = "method_execution_finished"
 _METHOD_FAILED = "method_execution_failed"
+
+# Async-HITL pause events (crewai >= 1.8). ``human_feedback_requested`` carries
+# the stable ``request_id``; ``flow_paused`` carries the ``flow_id``.
+_HUMAN_FEEDBACK_REQUESTED = "human_feedback_requested"
+_FLOW_PAUSED = "flow_paused"
 
 # Crew- and Agent-level ``type`` strings. The ordered StreamFrame path sees
 # these (crew/agent frames arrive on the outer flow's ``astream`` with a source
@@ -171,7 +178,6 @@ def is_backend_tool_event(event: Any) -> bool:
     executor as source (never ``flow_copy``), so the source gate would drop them.
     """
     return getattr(event, "type", None) in BACKEND_TOOL_EVENT_TYPES
-
 
 _SUPPORTED_EMISSION_SHAPES = frozenset({"chunks", "triples"})
 
@@ -228,6 +234,8 @@ class StreamFrameTranslator:
         run_id: str,
         state_provider: Callable[[], Any],
         emission_shape: str = "chunks",
+        hitl_options: HITLOptions | None = None,
+        resumed: bool = False,
     ) -> None:
         if emission_shape not in _SUPPORTED_EMISSION_SHAPES:
             raise ValueError(
@@ -238,6 +246,12 @@ class StreamFrameTranslator:
         self._run_id = run_id
         self._state_provider = state_provider
         self.emission_shape = emission_shape
+        self._hitl_options = hitl_options or HITLOptions()
+        # True for a RESUMED run: the method that was suspended finishes in a run
+        # that never saw its start, so its step has to be opened before it can be
+        # closed (the client rejects a STEP_FINISHED for a step it never saw
+        # started). A fresh run keeps the flat-close behavior.
+        self._resumed = resumed
         # One ordered boundary stack per run, driven in emit order by
         # ``translate``: ``enter`` on a start frame, ``exit`` on the matching
         # finish, ``drain_all`` at run end so every STEP_STARTED is closed.
@@ -249,6 +263,15 @@ class StreamFrameTranslator:
         # a cheap belt-and-braces guard against a double emit.
         self._run_started_emitted = False
         self._run_finished_emitted = False
+        # Async-HITL pause capture. A ``@human_feedback`` provider raising
+        # ``HumanFeedbackPending`` pauses the flow WITHOUT a ``flow_finished``;
+        # the request/pause events are recorded here so ``finalize`` can
+        # terminate the run with an interrupt outcome instead of a plain finish.
+        # The paused method's STEP is closed by draining the boundary tracker,
+        # which the AG-UI client requires before RUN_FINISHED.
+        self._pending_request: dict[str, Any] | None = None
+        self._paused: bool = False
+        self._paused_flow_id: str | None = None
         # A MESSAGES_SNAPSHOT is authoritative: the client drops any message
         # absent from it. The method-finish snapshot comes from state.messages,
         # which never holds backend tool calls (they exist only on the wire), so
@@ -267,6 +290,37 @@ class StreamFrameTranslator:
     def run_finished(self) -> bool:
         """Whether RUN_FINISHED has been emitted (the run terminated)."""
         return self._run_finished_emitted
+
+    @property
+    def interrupted(self) -> bool:
+        """Whether the flow paused for async human feedback.
+
+        Either signal proves a pause: ``human_feedback_requested`` (the bridge's
+        provider) OR ``flow_paused`` alone (a custom provider that raises
+        ``HumanFeedbackPending`` without emitting the request event). Keyed on a
+        dedicated flag, not on ``_paused_flow_id``, so a ``flow_paused`` carrying
+        no usable flow id still counts as a pause (the interrupt id then falls
+        back to the thread id) rather than being silently reported as completed.
+        """
+        return self._pending_request is not None or self._paused
+
+    def ensure_run_started(self) -> list[Any]:
+        """Emit RUN_STARTED if the run has not opened yet, else nothing.
+
+        Lets a driver guarantee RUN_STARTED is the first wire event even when the
+        underlying crewai call emits no ``flow_started`` (e.g. ``resume_async``).
+        Idempotent: a later ``flow_started`` is suppressed by the same flag.
+        """
+        if self._run_started_emitted:
+            return []
+        self._run_started_emitted = True
+        return [
+            RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=self._thread_id,
+                run_id=self._run_id,
+            )
+        ]
 
     def translate(self, event: Any) -> list[Any]:
         """Map one raw crewai/bridge event to the AG-UI events it produces."""
@@ -324,6 +378,23 @@ class StreamFrameTranslator:
             return self._agent_started_events(event)
         if event_type in (_AGENT_COMPLETED, _AGENT_ERROR):
             return self._agent_finished_events(event)
+
+        # Async-HITL pause. Record the request (stable id + prompt) and the
+        # paused flow id; no wire event here (``finalize`` emits the interrupt
+        # tail once the finish-less frame stream exhausts).
+        if event_type == _HUMAN_FEEDBACK_REQUESTED:
+            self._pending_request = {
+                "request_id": getattr(event, "request_id", None),
+                "message": getattr(event, "message", None),
+                "method_name": getattr(event, "method_name", None),
+                "output": getattr(event, "output", None),
+                "emit": getattr(event, "emit", None),
+            }
+            return []
+        if event_type == _FLOW_PAUSED:
+            self._paused = True
+            self._paused_flow_id = getattr(event, "flow_id", None)
+            return []
 
         # crewai's first-class MCP events (crewai >= 1.4). Emitted with
         # the agent/crew as source (not the flow), so the driver's sink parks
@@ -384,28 +455,86 @@ class StreamFrameTranslator:
         """Belt-and-braces terminal.
 
         Called once when the frame stream exhausts cleanly. If the run opened
-        (RUN_STARTED) but no outer ``flow_finished`` closed it — e.g. the outer
-        method caught a nested-flow error and the stream just ended — emit the
-        missing RUN_FINISHED so the client NEVER sees a run that never ends. The
-        errored path terminates via RUN_ERROR instead and must not call this.
+        (RUN_STARTED) but no outer ``flow_finished`` closed it (the outer
+        method caught a nested-flow error, the stream just ended, or the flow
+        PAUSED for async human feedback), emit the missing terminal so the
+        client NEVER sees a run that never ends. A pause terminates with the
+        interrupt tail (opt-in outcome); every other case with a plain
+        RUN_FINISHED. The errored path terminates via RUN_ERROR instead and must
+        not call this.
         """
-        if self._run_started_emitted and not self._run_finished_emitted:
-            self._run_finished_emitted = True
-            # Same drain-before-terminal discipline as the ``flow_finished``
-            # branch: close every open boundary (deepest-first) so the client
-            # never sees a dangling STEP_STARTED.
-            events: list[Any] = [
-                step_finished_event(b) for b in self._tracker.drain_all()
-            ]
-            events.append(
-                RunFinishedEvent(
-                    type=EventType.RUN_FINISHED,
-                    thread_id=self._thread_id,
-                    run_id=self._run_id,
-                )
+        if not (self._run_started_emitted and not self._run_finished_emitted):
+            return []
+        self._run_finished_emitted = True
+        # Same drain-before-terminal discipline as the ``flow_finished`` branch:
+        # close every open boundary (deepest-first) so the client never sees a
+        # dangling STEP_STARTED. This is also what balances the step of a method
+        # an interrupt paused mid-flight, which the client requires before any
+        # terminal event.
+        events: list[Any] = [
+            step_finished_event(b) for b in self._tracker.drain_all()
+        ]
+        interrupt = self._build_interrupt()
+        if interrupt is not None:
+            return events + build_interrupt_tail(
+                interrupt,
+                thread_id=self._thread_id,
+                run_id=self._run_id,
+                options=self._hitl_options,
             )
-            return events
-        return []
+        events.append(
+            RunFinishedEvent(
+                type=EventType.RUN_FINISHED,
+                thread_id=self._thread_id,
+                run_id=self._run_id,
+            )
+        )
+        return events
+
+    def note_pause_from_context(self, context: Any) -> None:
+        """Seed pause state from a ``HumanFeedbackPending.context``.
+
+        The frame driver normally captures the pause from the ``flow_paused`` /
+        ``human_feedback_requested`` frames. If instead the pause PROPAGATES out
+        of ``astream`` / ``resume_async`` as ``HumanFeedbackPending``, the driver
+        calls this so ``finalize`` still emits the interrupt tail rather than a
+        RUN_ERROR. The flow id doubles as the stable request id (matching the
+        bridge provider, which stamps ``request_id`` with the flow id).
+        """
+        self._paused = True
+        flow_id = getattr(context, "flow_id", None)
+        if self._pending_request is None:
+            self._pending_request = {
+                "request_id": flow_id,
+                "message": getattr(context, "message", None),
+                "method_name": getattr(context, "method_name", None),
+                "output": getattr(context, "method_output", None),
+                "emit": getattr(context, "emit", None),
+            }
+        if self._paused_flow_id is None:
+            self._paused_flow_id = flow_id
+
+    def _build_interrupt(self) -> Any:
+        """Build the AG-UI interrupt for a paused run, or ``None`` if not paused.
+
+        Works from either pause signal. When ``human_feedback_requested`` was
+        seen, its fields (stable id, prompt, emit options) populate the
+        interrupt. When only ``flow_paused`` was seen (a custom provider), the
+        interrupt still carries a resumable id from the flow id. The flow id
+        falls back to the run's ``thread_id`` (== crewai ``flow_id``) when the
+        pause event did not carry one.
+        """
+        if not self.interrupted:
+            return None
+        req = self._pending_request or {}
+        return build_agui_interrupt(
+            request_id=req.get("request_id"),
+            flow_id=self._paused_flow_id or self._thread_id,
+            message=req.get("message"),
+            method_name=req.get("method_name"),
+            output=req.get("output"),
+            emit=req.get("emit"),
+        )
 
     # -- lifecycle --------------------------------------------------------
 
@@ -522,7 +651,16 @@ class StreamFrameTranslator:
             else {}
         )
         method_name = _coerce_name(getattr(event, "method_name", None), "method")
-        events: list[Any] = [
+        closed = self._tracker.exit(FLOW_METHOD, method_name)
+        events: list[Any] = []
+        if not closed and self._resumed:
+            # RESUMED run: the suspended method finishes in a run that never saw
+            # its start, so open the step here. The client rejects a
+            # STEP_FINISHED for a step it never saw started.
+            events.append(
+                StepStartedEvent(type=EventType.STEP_STARTED, step_name=method_name)
+            )
+        events += [
             MessagesSnapshotEvent(
                 type=EventType.MESSAGES_SNAPSHOT,
                 messages=messages,
@@ -532,13 +670,11 @@ class StreamFrameTranslator:
                 snapshot=snapshot,
             ),
         ]
-        closed = self._tracker.exit(FLOW_METHOD, method_name)
         if closed:
             events.extend(self._close_boundaries(closed, _METHOD_FINISHED))
         else:
-            # No open boundary for this method: fall back to a flat close,
-            # using the same coerced ``method_name`` the START used so a None
-            # cannot leak onto the wire.
+            # Flat close for the synthesized step opened above, using the same
+            # coerced ``method_name`` so a None cannot leak onto the wire.
             events.append(
                 StepFinishedEvent(
                     type=EventType.STEP_FINISHED,

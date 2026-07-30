@@ -4,6 +4,7 @@ from .endpoint import (
   crewai_prepare_inputs,
 )
 from .crews import ChatWithCrewFlow
+from ._hitl import AGUIFeedbackProvider, agui_feedback_provider
 from .sdk import (
   CopilotKitState,
   StateItem,
@@ -37,6 +38,8 @@ __all__ = [
   "add_crewai_crew_fastapi_endpoint",
   "crewai_prepare_inputs",
   "ChatWithCrewFlow",
+  "AGUIFeedbackProvider",
+  "agui_feedback_provider",
   "CopilotKitState",
   "StateItem",
   "copilotkit_predict_state",

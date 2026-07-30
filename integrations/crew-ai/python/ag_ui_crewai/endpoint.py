@@ -27,9 +27,12 @@ from ._capabilities import (
     BaseEventListener,
     crewai_event_bus,
     flow_supports_stream_frames,
+    flow_supports_human_feedback,
     supported_checkpoint_kwargs,
     add_stream_sink,
     reset_stream_sinks,
+    HITL_ENABLING_VERSIONS,
+    HumanFeedbackPending,
 )
 from ._checkpoint import build_checkpoint_kwargs
 from ._frames import StreamFrameTranslator, CREW_AGENT_LIFECYCLE_TYPES
@@ -39,6 +42,11 @@ from ._frames import (
     log_raw_loss,
     raw_event_for,
     is_backend_tool_event,
+)
+from ._hitl import (
+    HITLOptions,
+    feedback_from_resume,
+    resume_requested,
 )
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from .attribution import flat_method_attribution
@@ -116,6 +124,21 @@ __all__ = [
 # ``get_task`` between ``asyncio.wait`` returning and the ``finally`` clause
 # cancelling it.
 _UNSET = object()
+
+
+class _NeverRaised(Exception):
+    """Placeholder exception type that is never raised.
+
+    Stands in for ``HumanFeedbackPending`` when the installed crewai predates
+    async HITL (the resolved symbol is ``None``), so ``except`` clauses that
+    catch a pause propagation stay valid without matching anything.
+    """
+
+
+# The pause signal to catch when it PROPAGATES out of astream / resume_async
+# (rather than ending the stream cleanly). ``None`` on pre-HITL crewai, so fall
+# back to the never-raised sentinel to keep the ``except`` clause well-typed.
+_HUMAN_FEEDBACK_PENDING_EXC = HumanFeedbackPending or _NeverRaised
 
 
 class _KickoffCancelled(Exception):
@@ -1847,6 +1870,7 @@ async def _run_flow_frame_stream(
     inputs: dict,
     timeout: float | None,
     checkpoint_kwargs: dict | None = None,
+    hitl_options: HITLOptions | None = None,
     emit_raw_events: bool = False,
 ):
     """StreamFrame-path driver: drive ``flow.astream`` and yield encoded AG-UI
@@ -1895,6 +1919,7 @@ async def _run_flow_frame_stream(
         thread_id=input_data.thread_id,
         run_id=input_data.run_id,
         state_provider=lambda: getattr(flow_copy, "state", {}),
+        hitl_options=hitl_options,
     )
     # Raw-event lookup buffer, populated by our scoped sink below. Keyed by
     # ``event.event_id`` (== ``StreamFrame.id``). Only OUTER-flow events land
@@ -2127,7 +2152,14 @@ async def _run_flow_frame_stream(
             # paused for human feedback. Emit the missing RUN_FINISHED so the
             # client never sees a run that never ends. The RUN_ERROR paths below
             # are the terminator for the errored case and never reach here.
-            for event in translator.finalize():
+            #
+            # Open the run first when a pause was captured but RUN_STARTED never
+            # went out (no flow_started frame): otherwise finalize() would
+            # short-circuit and strand the paused run with an empty stream.
+            interrupt_open = (
+                translator.ensure_run_started() if translator.interrupted else []
+            )
+            for event in (*interrupt_open, *translator.finalize()):
                 _stamp_correlation_ids(
                     event,
                     thread_id=input_data.thread_id,
@@ -2135,6 +2167,22 @@ async def _run_flow_frame_stream(
                 )
                 yield encoder.encode(event)
 
+        except _HUMAN_FEEDBACK_PENDING_EXC as pending_exc:
+            # The pause PROPAGATED out of astream instead of ending the stream
+            # cleanly. Seed the pause from the exception context (in case the
+            # frames never arrived) and emit the interrupt tail, NOT a
+            # RUN_ERROR, which would misreport a paused run as failed. Open the
+            # run first: if the pause propagated before a flow_started frame was
+            # translated, finalize() would otherwise short-circuit and emit
+            # nothing (empty, unresumable stream).
+            translator.note_pause_from_context(getattr(pending_exc, "context", None))
+            for event in (*translator.ensure_run_started(), *translator.finalize()):
+                _stamp_correlation_ids(
+                    event,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield encoder.encode(event)
         except _CeilingExceeded as ceiling_exc:
             ceiling_display = f"{timeout:g}s"
             _LOGGER.warning(
@@ -2227,6 +2275,7 @@ def _run_flow_stream(
     inputs: dict,
     timeout: float | None,
     checkpoint_kwargs: dict | None = None,
+    hitl_options: HITLOptions | None = None,
     emit_raw_events: bool = False,
 ):
     """Select the StreamFrame path (crewai >= 1.6 + a real ``astream`` flow) or
@@ -2248,6 +2297,7 @@ def _run_flow_stream(
             inputs=inputs,
             timeout=timeout,
             checkpoint_kwargs=checkpoint_kwargs,
+            hitl_options=hitl_options,
             emit_raw_events=emit_raw_events,
         )
     return _run_flow_event_stream(
@@ -2261,11 +2311,321 @@ def _run_flow_stream(
     )
 
 
+# Sentinel enqueued by the resume task's done-callback so the consume loop knows
+# the resumed coroutine returned (vs a raw crewai event).
+_RESUME_DONE = object()
+
+
+async def _reject_unsupported_resume(input_data: RunAgentInput, encoder: EventEncoder):
+    """Emit a single RUN_ERROR for a resume the installed crewai cannot honour.
+
+    A resume request arrived but the async-HITL API is unavailable (crewai too
+    old, or a flow that cannot pause/resume). Fail loudly and correlated rather
+    than silently starting a fresh run.
+    """
+    _LOGGER.warning(
+        "CrewAI resume requested but async human-feedback is unsupported "
+        "thread=%s run=%s (need crewai>=%s + StreamFrame)",
+        input_data.thread_id,
+        input_data.run_id,
+        HITL_ENABLING_VERSIONS["human_feedback"],
+    )
+    yield encoder.encode(
+        RunErrorEvent(
+            message=(
+                f"thread={input_data.thread_id} run={input_data.run_id}: CrewAI "
+                f"resume is unsupported by this deployment; async human-feedback "
+                f"needs crewai>={HITL_ENABLING_VERSIONS['human_feedback']} with "
+                f"the StreamFrame transport"
+            ),
+            code="AGUI_CREWAI_RESUME_UNSUPPORTED",
+            **_run_error_extras(input_data),
+        )
+    )
+
+
+async def _run_flow_resume_stream(
+    *,
+    flow: object,
+    encoder: EventEncoder,
+    input_data: RunAgentInput,
+    timeout: float | None,
+    hitl_options: HITLOptions | None = None,
+    emit_raw_events: bool = False,
+):
+    """Resume a flow paused for async human feedback and yield AG-UI events.
+
+    Reloads the pending flow via ``Flow.from_pending(thread_id)`` (crewai's own
+    persistence, NOT a per-request copy, since only the persisted pending
+    state carries the resume point), drives ``resume_async(feedback)``, and maps
+    the resumed run's events through the same ``StreamFrameTranslator`` as a
+    kickoff. Events are captured via a scoped stream sink (``resume_async`` has
+    no ``astream`` session), so ``publish_stream_event`` delivers each raw event
+    synchronously on emit; ordering is preserved by the queue.
+
+    Reuses the kickoff drivers' RUN_ERROR taxonomy, wall-clock ceiling, and
+    ``_cancel_and_join`` teardown so cancellation / disconnect behaviour does not
+    diverge across the two paths.
+    """
+    thread_id = input_data.thread_id
+    run_id = input_data.run_id
+    feedback, _interrupt_id = feedback_from_resume(input_data)
+
+    # Reload the pending flow. ``from_pending`` builds its own instance from the
+    # class + crewai persistence; a missing pending state (unknown / already
+    # resumed thread) is a client-correlated 4xx-style condition, distinct from
+    # an internal failure.
+    try:
+        resumed_flow = type(flow).from_pending(thread_id)  # type: ignore[attr-defined]
+    except ValueError as exc:
+        _LOGGER.warning(
+            "CrewAI resume found no pending feedback thread=%s run=%s cause=%s",
+            thread_id,
+            run_id,
+            exc,
+        )
+        yield encoder.encode(
+            RunErrorEvent(
+                message=(
+                    f"thread={thread_id} run={run_id}: no paused CrewAI flow to "
+                    f"resume (unknown or already-resumed thread)"
+                ),
+                code="AGUI_CREWAI_NO_PENDING_FEEDBACK",
+                **_run_error_extras(input_data),
+            )
+        )
+        return
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOGGER.exception(
+            "CrewAI resume reload failed thread=%s run=%s cause=%s",
+            thread_id,
+            run_id,
+            type(exc).__name__,
+        )
+        yield encoder.encode(
+            RunErrorEvent(
+                message=(
+                    f"thread={thread_id} run={run_id}: CrewAI resume reload "
+                    f"failed; see server logs"
+                ),
+                code=f"AGUI_CREWAI_FLOW_ERROR_{_sanitize_exception_code(type(exc).__name__)}",
+                **_run_error_extras(input_data),
+            )
+        )
+        return
+
+    token = flow_context.set(resumed_flow)
+    translator = StreamFrameTranslator(
+        thread_id=thread_id,
+        run_id=run_id,
+        state_provider=lambda: getattr(resumed_flow, "state", {}),
+        hitl_options=hitl_options,
+        resumed=True,
+    )
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _sink(source: Any, event: Any) -> None:
+        # Outer-run isolation identical to the kickoff frame driver: only this
+        # flow's own events (plus MCP events, emitted with the agent as source).
+        if source is resumed_flow or is_mcp_event(event):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    # Predeclared before the try so the finally teardown is always safe to
+    # reference even if sink registration raises; the actual registration runs
+    # INSIDE the try (mirroring the kickoff frame driver) so a failure is mapped
+    # through the RUN_ERROR taxonomy AND the flow_context token never leaks.
+    sink_token = None
+    resume_task: asyncio.Task | None = None
+    allow_grace = False
+    try:
+        try:
+            sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
+            resume_task = asyncio.create_task(
+                resumed_flow.resume_async(feedback)  # type: ignore[attr-defined]
+            )
+            resume_task.add_done_callback(
+                lambda _t: loop.call_soon_threadsafe(queue.put_nowait, _RESUME_DONE)
+            )
+            # Open the run BEFORE consuming so RUN_STARTED is always the first
+            # wire event, even if resume_async emits no flow_started. A later
+            # flow_started is suppressed by the same idempotency flag, so this
+            # never doubles RUN_STARTED.
+            for event in translator.ensure_run_started():
+                _stamp_correlation_ids(event, thread_id=thread_id, run_id=run_id)
+                yield encoder.encode(event)
+            deadline = (
+                time.monotonic() + timeout if timeout is not None else None
+            )
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _CeilingExceeded(_format_timeout_message(timeout))
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except (asyncio.TimeoutError, TimeoutError) as te:
+                        # Same disambiguation as the kickoff driver: a wait_for
+                        # timeout at/past the deadline is OUR ceiling firing
+                        # (AGUI_CREWAI_FLOW_TIMEOUT), not an upstream read
+                        # timeout. Re-raise anything earlier unchanged.
+                        if time.monotonic() >= deadline:
+                            raise _CeilingExceeded(
+                                _format_timeout_message(timeout)
+                            ) from te
+                        raise
+                else:
+                    item = await queue.get()
+
+                if item is _RESUME_DONE:
+                    # resume_async returned. A trailing event emitted on a crewai
+                    # worker thread can be call_soon_threadsafe-scheduled AFTER
+                    # the done-callback, so a single pass could miss it. Drain
+                    # across bounded scheduler ticks (mirrors the kickoff driver's
+                    # multi-pass drain) so late puts still land before terminate.
+                    drain_deadline = time.monotonic() + _DRAIN_BUDGET_SECONDS
+                    for _ in range(_DRAIN_MAX_PASSES):
+                        while not queue.empty():
+                            pending_item = queue.get_nowait()
+                            if pending_item is _RESUME_DONE:
+                                continue
+                            for event in translator.translate(pending_item):
+                                _stamp_correlation_ids(
+                                    event, thread_id=thread_id, run_id=run_id
+                                )
+                                yield encoder.encode(event)
+                        if time.monotonic() >= drain_deadline:
+                            break
+                        await asyncio.sleep(0)
+                    allow_grace = True
+                    break
+
+                if emit_raw_events and not is_recognized_event(item):
+                    # Same RAW passthrough as the kickoff driver: mirror an event
+                    # the translator does not map. RUN_STARTED is already out
+                    # (opened before the loop), so no hold-until-started buffer
+                    # is needed here.
+                    raw_mirror = raw_event_for(item)
+                    if raw_mirror is not None:
+                        _stamp_correlation_ids(
+                            raw_mirror, thread_id=thread_id, run_id=run_id
+                        )
+                        yield encoder.encode(raw_mirror)
+
+                for event in translator.translate(item):
+                    _stamp_correlation_ids(event, thread_id=thread_id, run_id=run_id)
+                    yield encoder.encode(event)
+                if translator.run_finished:
+                    allow_grace = True
+                    break
+
+            # Surface a resume_async failure through the RUN_ERROR taxonomy
+            # rather than a swallowed traceback (the done-callback fires for
+            # both return and raise).
+            if resume_task.done() and not resume_task.cancelled():
+                exc = resume_task.exception()
+                if exc is not None:
+                    raise exc
+
+            # Terminal: RUN_STARTED was already emitted above. FlowFinished
+            # closes the run with RUN_FINISHED; a re-pause closes it with the
+            # interrupt tail; a clean return with neither is closed by the
+            # belt-and-braces RUN_FINISHED. All three flow through finalize().
+            for event in translator.finalize():
+                _stamp_correlation_ids(event, thread_id=thread_id, run_id=run_id)
+                yield encoder.encode(event)
+
+        except _HUMAN_FEEDBACK_PENDING_EXC as pending_exc:
+            # A re-pause that PROPAGATED (rather than being returned) out of
+            # resume_async. Seed from context and emit the interrupt tail so the
+            # client can resume again, instead of a RUN_ERROR.
+            translator.note_pause_from_context(getattr(pending_exc, "context", None))
+            for event in translator.finalize():
+                _stamp_correlation_ids(event, thread_id=thread_id, run_id=run_id)
+                yield encoder.encode(event)
+        except _CeilingExceeded as ceiling_exc:
+            ceiling_display = f"{timeout:g}s"
+            _LOGGER.warning(
+                "CrewAI resume exceeded ceiling thread=%s run=%s ceiling=%s detail=%s",
+                thread_id,
+                run_id,
+                ceiling_display,
+                ceiling_exc.args[0] if ceiling_exc.args else "",
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=(
+                        f"thread={thread_id} run={run_id}: CrewAI flow exceeded "
+                        f"ceiling={ceiling_display}"
+                    ),
+                    code="AGUI_CREWAI_FLOW_TIMEOUT",
+                    **_run_error_extras(input_data),
+                )
+            )
+        except (asyncio.TimeoutError, TimeoutError) as upstream_exc:
+            ceiling_display = "disabled" if timeout is None else f"{timeout:g}s"
+            _LOGGER.warning(
+                "CrewAI upstream timeout during resume thread=%s run=%s "
+                "ceiling=%s cause=%s",
+                thread_id,
+                run_id,
+                ceiling_display,
+                type(upstream_exc).__name__,
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=(
+                        f"thread={thread_id} run={run_id}: CrewAI upstream "
+                        f"timeout during resume (ceiling={ceiling_display} did "
+                        f"not fire)"
+                    ),
+                    code="AGUI_CREWAI_UPSTREAM_TIMEOUT",
+                    **_run_error_extras(input_data),
+                )
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            _LOGGER.exception(
+                "CrewAI resume failed thread=%s run=%s cause=%s",
+                thread_id,
+                run_id,
+                type(e).__name__,
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=(
+                        f"thread={thread_id} run={run_id}: CrewAI resume failed; "
+                        f"see server logs"
+                    ),
+                    code=f"AGUI_CREWAI_FLOW_ERROR_{_sanitize_exception_code(type(e).__name__)}",
+                    **_run_error_extras(input_data),
+                )
+            )
+    finally:
+        try:
+            await _cancel_and_join(
+                resume_task,
+                thread_id=thread_id,
+                run_id=run_id,
+                allow_grace=allow_grace,
+            )
+        finally:
+            try:
+                await _flush_event_bus()
+            finally:
+                try:
+                    if sink_token is not None and callable(reset_stream_sinks):
+                        reset_stream_sinks(sink_token)
+                finally:
+                    flow_context.reset(token)
+
+
 def add_crewai_flow_fastapi_endpoint(
     app: FastAPI,
     flow: Flow,
     path: str = "/",
     *,
+    emit_interrupt_outcome: bool = False,
+    enable_legacy_on_interrupt_event: bool = True,
     emit_raw_events: bool | None = None,
 ):
     """Adds a CrewAI endpoint to the FastAPI app.
@@ -2275,8 +2635,31 @@ def add_crewai_flow_fastapi_endpoint(
     are mirrored onto AG-UI ``RAW`` events. Off by default. Resolved at registration,
     so a non-bool raises here rather than per request; ``None`` reads
     ``AGUI_CREWAI_EMIT_RAW_EVENTS``.
+
+    Async human-in-the-loop: when the flow pauses on an ``@human_feedback``
+    method whose provider raises ``HumanFeedbackPending`` (see
+    :data:`ag_ui_crewai.agui_feedback_provider`), the run terminates with an
+    AG-UI interrupt and the next request carrying ``RunAgentInput.resume[]``
+    resumes it via ``Flow.from_pending`` + ``resume_async``.
+
+    ``emit_interrupt_outcome`` (default False) opts into the structured
+    ``RUN_FINISHED.outcome``. CopilotKit < 1.61.2 breaks on it, so it stays off
+    by default and the interrupt is surfaced via the legacy ``on_interrupt``
+    CUSTOM event. Disabling ``enable_legacy_on_interrupt_event`` forces the
+    outcome on so the interrupt is always surfaced by at least one channel.
+
+    IMPORTANT for CopilotKit >= 1.61.2 (``useInterrupt``): resume works only via
+    the structured outcome. The legacy ``on_interrupt`` channel renders the
+    interrupt but its ``resolve()`` does not send a ``RunAgentInput.resume[]``
+    back, so the run re-kicks off and re-pauses in a loop. Pass
+    ``emit_interrupt_outcome=True`` (or ``enable_legacy_on_interrupt_event=False``)
+    for those clients.
     """
     global GLOBAL_EVENT_LISTENER # pylint: disable=global-statement
+    hitl_options = HITLOptions(
+        emit_interrupt_outcome=emit_interrupt_outcome,
+        enable_legacy_on_interrupt_event=enable_legacy_on_interrupt_event,
+    )
 
     # Set up the global event listener singleton
     # we are doing this here because calling add_crewai_flow_fastapi_endpoint is a clear indicator
@@ -2304,13 +2687,36 @@ def add_crewai_flow_fastapi_endpoint(
     async def agentic_chat_endpoint(input_data: RunAgentInput, request: Request):
         """Agentic chat endpoint"""
 
-        flow_copy = _copy_flow(flow)
-
         # Get the accept header from the request
         accept_header = request.headers.get("accept")
 
         # Create an event encoder to properly format SSE events
         encoder = EventEncoder(accept=accept_header)
+
+        timeout = _flow_timeout_seconds()
+
+        # Resume a paused flow. ``from_pending`` reloads persisted pending state
+        # (not a per-request copy), so the resume driver takes the ORIGINAL flow
+        # (for its class) rather than a fresh ``_copy_flow``.
+        if resume_requested(input_data):
+            if not flow_supports_human_feedback(flow):
+                return StreamingResponse(
+                    _reject_unsupported_resume(input_data, encoder),
+                    media_type=encoder.get_content_type(),
+                )
+            return StreamingResponse(
+                _run_flow_resume_stream(
+                    flow=flow,
+                    encoder=encoder,
+                    input_data=input_data,
+                    timeout=timeout,
+                    hitl_options=hitl_options,
+                    emit_raw_events=resolved_emit_raw_events,
+                ),
+                media_type=encoder.get_content_type(),
+            )
+
+        flow_copy = _copy_flow(flow)
 
         inputs = crewai_prepare_inputs(
             state=input_data.state,
@@ -2325,8 +2731,6 @@ def add_crewai_flow_fastapi_endpoint(
 
         checkpoint_kwargs = build_checkpoint_kwargs(flow_copy, input_data)
 
-        timeout = _flow_timeout_seconds()
-
         return StreamingResponse(
             _run_flow_stream(
                 flow_copy=flow_copy,
@@ -2335,6 +2739,7 @@ def add_crewai_flow_fastapi_endpoint(
                 inputs=inputs,
                 timeout=timeout,
                 checkpoint_kwargs=checkpoint_kwargs,
+                hitl_options=hitl_options,
                 emit_raw_events=resolved_emit_raw_events,
             ),
             media_type=encoder.get_content_type(),
@@ -2389,11 +2794,21 @@ def add_crewai_crew_fastapi_endpoint(
     @app.post(path)
     async def crew_endpoint(input_data: RunAgentInput, request: Request):
         """Crew chat endpoint with deferred initialization."""
-        flow = await _get_flow()
-        flow_copy = _copy_flow(flow)
-
         accept_header = request.headers.get("accept")
         encoder = EventEncoder(accept=accept_header)
+
+        # The crew endpoint wraps its crew in a ``ChatWithCrewFlow`` that cannot
+        # be rebuilt via ``from_pending`` (its constructor needs the crew), and a
+        # crew never pauses for async feedback. Reject a resume directive
+        # explicitly rather than silently starting a fresh run.
+        if resume_requested(input_data):
+            return StreamingResponse(
+                _reject_unsupported_resume(input_data, encoder),
+                media_type=encoder.get_content_type(),
+            )
+
+        flow = await _get_flow()
+        flow_copy = _copy_flow(flow)
 
         inputs = crewai_prepare_inputs(
             state=input_data.state,

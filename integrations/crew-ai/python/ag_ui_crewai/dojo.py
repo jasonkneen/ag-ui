@@ -12,6 +12,7 @@ from .examples.agentic_generative_ui import AgenticGenerativeUIFlow
 from .examples.shared_state import SharedStateFlow
 from .examples.predictive_state_updates import PredictiveStateUpdatesFlow
 from .examples.error_flow import ErrorFlow
+from .examples.interrupt_flow import InterruptFlow
 from .examples.a2ui_dynamic_schema import A2UIDynamicSchemaFlow
 from .examples.a2ui_recovery import A2UIRecoveryFlow
 from .examples.a2ui_fixed_schema import A2UIFixedSchemaFlow
@@ -70,6 +71,17 @@ add_crewai_flow_fastapi_endpoint(
     app=app,
     flow=ErrorFlow(),
     path="/error_flow",
+)
+
+# emit_interrupt_outcome=True: CopilotKit v2 `useInterrupt` (>=1.61.2) resumes
+# from the standard RUN_FINISHED.outcome. With the default (legacy on_interrupt
+# only) its resolve() does not round-trip a RunAgentInput.resume[], so the run
+# re-kicks off and re-pauses in a loop. Enable the outcome for modern clients.
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=InterruptFlow(),
+    path="/interrupt",
+    emit_interrupt_outcome=True,
 )
 
 add_crewai_flow_fastapi_endpoint(
