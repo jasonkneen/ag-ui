@@ -98,11 +98,18 @@ from ag_ui.core.events import (
     MessagesSnapshotEvent,
     StateSnapshotEvent,
     CustomEvent,
+    ReasoningStartEvent,
+    ReasoningMessageStartEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningEndEvent,
+    ReasoningEncryptedValueEvent,
 )
 
 from .sdk import litellm_messages_to_ag_ui_messages
 from .mcp import is_mcp_event, translate_mcp_event
 from ._hitl import HITLOptions, build_agui_interrupt, build_interrupt_tail
+from ._reasoning import is_thinking_event, thinking_event_text
 from .attribution import (
     BoundaryTracker,
     FLOW_METHOD,
@@ -272,6 +279,20 @@ class StreamFrameTranslator:
         self._pending_request: dict[str, Any] | None = None
         self._paused: bool = False
         self._paused_flow_id: str | None = None
+        # Native-reasoning lifecycle (crewai's Gemini ``LLMThinkingChunkEvent``).
+        # These arrive as a stream of chunks with no explicit end signal, so the
+        # message stays open until the next non-thinking event (or finalize)
+        # flushes it. The litellm-path reasoning events are already fully-formed
+        # lifecycle events and are mapped 1:1, without this state.
+        self._reasoning_message_id: str | None = None
+        self._reasoning_open = False
+        # litellm-path reasoning is mapped 1:1, so it needs no per-event flush.
+        # These flags are consulted ONLY by ``flush_open_reasoning`` on the error
+        # path, which closes a message left half-open when a mid-run error drops
+        # its trailing END frames.
+        self._litellm_message_id: str | None = None
+        self._litellm_msg_open = False
+        self._litellm_started = False
         # A MESSAGES_SNAPSHOT is authoritative: the client drops any message
         # absent from it. The method-finish snapshot comes from state.messages,
         # which never holds backend tool calls (they exist only on the wire), so
@@ -323,7 +344,20 @@ class StreamFrameTranslator:
         ]
 
     def translate(self, event: Any) -> list[Any]:
-        """Map one raw crewai/bridge event to the AG-UI events it produces."""
+        """Map one raw crewai/bridge event to the AG-UI events it produces.
+
+        Native thinking chunks (crewai's Gemini provider) drive a stateful
+        reasoning lifecycle; any other event first flushes an open native
+        reasoning message so its ``REASONING_MESSAGE_END`` / ``REASONING_END``
+        precede whatever comes next on the wire.
+        """
+        if is_thinking_event(event):
+            return self._native_thinking_events(event)
+        prefix = self._flush_native_reasoning()
+        events = self._translate_non_thinking(event)
+        return prefix + events if prefix else events
+
+    def _translate_non_thinking(self, event: Any) -> list[Any]:
         event_type = getattr(event, "type", None)
 
         if event_type == _FLOW_STARTED:
@@ -435,6 +469,61 @@ class StreamFrameTranslator:
                 )
             ]
 
+        # Reasoning lifecycle from the litellm path (``sdk.copilotkit_stream``):
+        # already fully-formed lifecycle events, mapped 1:1. The open/close
+        # flags are consulted only by ``flush_open_reasoning`` on the error path.
+        if event_type == EventType.REASONING_START:
+            self._litellm_message_id = getattr(event, "message_id", None)
+            self._litellm_started = True
+            return [
+                ReasoningStartEvent(
+                    type=EventType.REASONING_START,
+                    message_id=self._litellm_message_id,
+                )
+            ]
+        if event_type == EventType.REASONING_MESSAGE_START:
+            self._litellm_msg_open = True
+            return [
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START,
+                    message_id=getattr(event, "message_id", None),
+                    role=getattr(event, "role", None),
+                )
+            ]
+        if event_type == EventType.REASONING_MESSAGE_CONTENT:
+            return [
+                ReasoningMessageContentEvent(
+                    type=EventType.REASONING_MESSAGE_CONTENT,
+                    message_id=getattr(event, "message_id", None),
+                    delta=getattr(event, "delta", None),
+                )
+            ]
+        if event_type == EventType.REASONING_MESSAGE_END:
+            self._litellm_msg_open = False
+            return [
+                ReasoningMessageEndEvent(
+                    type=EventType.REASONING_MESSAGE_END,
+                    message_id=getattr(event, "message_id", None),
+                )
+            ]
+        if event_type == EventType.REASONING_END:
+            self._litellm_started = False
+            return [
+                ReasoningEndEvent(
+                    type=EventType.REASONING_END,
+                    message_id=getattr(event, "message_id", None),
+                )
+            ]
+        if event_type == EventType.REASONING_ENCRYPTED_VALUE:
+            return [
+                ReasoningEncryptedValueEvent(
+                    type=EventType.REASONING_ENCRYPTED_VALUE,
+                    subtype=getattr(event, "subtype", None),
+                    entity_id=getattr(event, "entity_id", None),
+                    encrypted_value=getattr(event, "encrypted_value", None),
+                )
+            ]
+
         # Backend tool execution: surface the call + result so the client can
         # render it. Only ``finished`` (crewai's terminal event, whose ``output``
         # carries the result or a terminal error string). ``started`` is dropped
@@ -463,17 +552,18 @@ class StreamFrameTranslator:
         RUN_FINISHED. The errored path terminates via RUN_ERROR instead and must
         not call this.
         """
+        # main's guard: return [] unless the run is open and not yet finished.
+        # This also prevents a trailing REASONING_* after RUN_FINISHED (the
+        # flow_finished branch already flushed reasoning via translate()).
         if not (self._run_started_emitted and not self._run_finished_emitted):
             return []
         self._run_finished_emitted = True
-        # Same drain-before-terminal discipline as the ``flow_finished`` branch:
-        # close every open boundary (deepest-first) so the client never sees a
-        # dangling STEP_STARTED. This is also what balances the step of a method
-        # an interrupt paused mid-flight, which the client requires before any
-        # terminal event.
-        events: list[Any] = [
-            step_finished_event(b) for b in self._tracker.drain_all()
-        ]
+        # Reasoning ENDs first (both channels; on a clean run the litellm channel
+        # already self-closed so this is a no-op), then STEP_FINISHED (drain
+        # boundaries deepest-first so no dangling STEP_STARTED; also balances a
+        # method an interrupt paused mid-flight), then the terminal event.
+        events: list[Any] = self.flush_open_reasoning()
+        events.extend(step_finished_event(b) for b in self._tracker.drain_all())
         interrupt = self._build_interrupt()
         if interrupt is not None:
             return events + build_interrupt_tail(
@@ -489,6 +579,92 @@ class StreamFrameTranslator:
                 run_id=self._run_id,
             )
         )
+        return events
+
+    # -- native reasoning lifecycle (crewai Gemini thinking chunks) --------
+
+    def _native_thinking_events(self, event: Any) -> list[Any]:
+        """Open (if needed) and extend the native reasoning message.
+
+        crewai streams thinking as ``chunk`` deltas with no explicit end; the
+        message opens on the first chunk and is closed lazily by
+        ``_flush_native_reasoning`` when a non-thinking event follows.
+        """
+        text = thinking_event_text(event)
+        if text is None:
+            return []
+        events: list[Any] = []
+        if not self._reasoning_open:
+            self._reasoning_message_id = uuid.uuid4().hex
+            self._reasoning_open = True
+            events.append(
+                ReasoningStartEvent(
+                    type=EventType.REASONING_START,
+                    message_id=self._reasoning_message_id,
+                )
+            )
+            events.append(
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START,
+                    message_id=self._reasoning_message_id,
+                    role="reasoning",
+                )
+            )
+        events.append(
+            ReasoningMessageContentEvent(
+                type=EventType.REASONING_MESSAGE_CONTENT,
+                message_id=self._reasoning_message_id,
+                delta=text,
+            )
+        )
+        return events
+
+    def _flush_native_reasoning(self) -> list[Any]:
+        """Close an open native reasoning message, returning its END events."""
+        if not self._reasoning_open:
+            return []
+        message_id = self._reasoning_message_id
+        self._reasoning_open = False
+        self._reasoning_message_id = None
+        return [
+            ReasoningMessageEndEvent(
+                type=EventType.REASONING_MESSAGE_END,
+                message_id=message_id,
+            ),
+            ReasoningEndEvent(
+                type=EventType.REASONING_END,
+                message_id=message_id,
+            ),
+        ]
+
+    def flush_open_reasoning(self) -> list[Any]:
+        """Close any reasoning message still open, on either channel.
+
+        Called by the frame driver on the error/timeout path so a run that
+        errors mid-reasoning does not leave a half-open lifecycle before
+        RUN_ERROR, and by ``finalize`` before the terminal event. Closes the
+        native message (via ``_flush_native_reasoning``) and the litellm message
+        (whose trailing END frames the exited frame loop never dequeues).
+        Idempotent: each channel closes at most once, so a channel already
+        closed on the happy path is a no-op.
+        """
+        events = self._flush_native_reasoning()
+        if self._litellm_msg_open:
+            self._litellm_msg_open = False
+            events.append(
+                ReasoningMessageEndEvent(
+                    type=EventType.REASONING_MESSAGE_END,
+                    message_id=self._litellm_message_id,
+                )
+            )
+        if self._litellm_started:
+            self._litellm_started = False
+            events.append(
+                ReasoningEndEvent(
+                    type=EventType.REASONING_END,
+                    message_id=self._litellm_message_id,
+                )
+            )
         return events
 
     def note_pause_from_context(self, context: Any) -> None:
@@ -943,6 +1119,13 @@ _RECOGNIZED_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_CHUNK,
         EventType.CUSTOM,
         EventType.STATE_SNAPSHOT,
+        # Reasoning lifecycle from the litellm path (Bridged* events, mapped 1:1).
+        EventType.REASONING_START,
+        EventType.REASONING_MESSAGE_START,
+        EventType.REASONING_MESSAGE_CONTENT,
+        EventType.REASONING_MESSAGE_END,
+        EventType.REASONING_END,
+        EventType.REASONING_ENCRYPTED_VALUE,
     }
 )
 
@@ -971,10 +1154,12 @@ def is_recognized_event(event: Any) -> bool:
     """True when the translator maps this event, so RAW must not duplicate it.
 
     Covers every mapped channel: the base lifecycle / bridge types above, plus
-    the crew/agent lifecycle, backend ToolUsage, and MCP events (matched by
-    their own predicates). Without the last three a mapped event would ALSO be
-    RAW-mirrored under ``emit_raw_events=True`` (a double emit); the deliberately
-    suppressed ``tool_usage_started`` would likewise leak as RAW.
+    the crew/agent lifecycle, backend ToolUsage, MCP events, and crewai's native
+    thinking-chunk event (all matched by their own predicates). Without these a
+    mapped event would ALSO be RAW-mirrored under ``emit_raw_events=True`` (a
+    double emit) -- notably the native ``llm_thinking_chunk``, which the sink
+    parks for TRANSLATION to REASONING_*; the deliberately suppressed
+    ``tool_usage_started`` would likewise leak as RAW.
     """
     event_type = getattr(event, "type", None)
     return (
@@ -982,6 +1167,7 @@ def is_recognized_event(event: Any) -> bool:
         or event_type in CREW_AGENT_LIFECYCLE_TYPES
         or is_backend_tool_event(event)
         or is_mcp_event(event)
+        or is_thinking_event(event)
     )
 
 

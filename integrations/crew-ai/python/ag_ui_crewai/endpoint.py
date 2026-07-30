@@ -48,6 +48,7 @@ from ._hitl import (
     feedback_from_resume,
     resume_requested,
 )
+from ._reasoning import is_thinking_event
 from .mcp import is_mcp_event, register_mcp_listeners, translate_mcp_event
 from .attribution import flat_method_attribution
 from crewai.flow.flow import Flow
@@ -71,6 +72,12 @@ from ag_ui.core.events import (
   MessagesSnapshotEvent,
   StateSnapshotEvent,
   CustomEvent,
+  ReasoningStartEvent,
+  ReasoningMessageStartEvent,
+  ReasoningMessageContentEvent,
+  ReasoningMessageEndEvent,
+  ReasoningEndEvent,
+  ReasoningEncryptedValueEvent,
 )
 from ag_ui.encoder import EventEncoder
 
@@ -79,7 +86,13 @@ from .events import (
   BridgedToolCallChunkEvent,
   BridgedToolCallResultEvent,
   BridgedCustomEvent,
-  BridgedStateSnapshotEvent
+  BridgedStateSnapshotEvent,
+  BridgedReasoningStartEvent,
+  BridgedReasoningMessageStartEvent,
+  BridgedReasoningMessageContentEvent,
+  BridgedReasoningMessageEndEvent,
+  BridgedReasoningEndEvent,
+  BridgedReasoningEncryptedValueEvent,
 )
 from .context import flow_context
 from .utils import camel_to_snake, dump_agui_message
@@ -1104,6 +1117,67 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
                 )
             )
 
+        # Reasoning lifecycle emitted by ``sdk.copilotkit_stream`` off the
+        # litellm delta. Mapped 1:1 like the text / tool-call chunks above.
+        @crewai_event_bus.on(BridgedReasoningStartEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningStartEvent(
+                    type=EventType.REASONING_START,
+                    message_id=event.message_id,
+                )
+            )
+        @crewai_event_bus.on(BridgedReasoningMessageStartEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START,
+                    message_id=event.message_id,
+                    role=event.role,
+                )
+            )
+        @crewai_event_bus.on(BridgedReasoningMessageContentEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningMessageContentEvent(
+                    type=EventType.REASONING_MESSAGE_CONTENT,
+                    message_id=event.message_id,
+                    delta=event.delta,
+                )
+            )
+        @crewai_event_bus.on(BridgedReasoningMessageEndEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningMessageEndEvent(
+                    type=EventType.REASONING_MESSAGE_END,
+                    message_id=event.message_id,
+                )
+            )
+        @crewai_event_bus.on(BridgedReasoningEndEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningEndEvent(
+                    type=EventType.REASONING_END,
+                    message_id=event.message_id,
+                )
+            )
+        @crewai_event_bus.on(BridgedReasoningEncryptedValueEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ReasoningEncryptedValueEvent(
+                    type=EventType.REASONING_ENCRYPTED_VALUE,
+                    subtype=event.subtype,
+                    entity_id=event.entity_id,
+                    encrypted_value=event.encrypted_value,
+                )
+            )
+
         # Surface crewai's first-class MCP events (crewai >= 1.4) on the LEGACY
         # bus-listener transport (crewai 1.4-1.5, StreamFrame absent). crewai
         # emits MCP events with the agent/crew as ``source`` (NOT the Flow), so
@@ -1921,6 +1995,20 @@ async def _run_flow_frame_stream(
         state_provider=lambda: getattr(flow_copy, "state", {}),
         hitl_options=hitl_options,
     )
+
+    def _closing_reasoning_frames():
+        """Encoded REASONING_* END events for any reasoning left open at error.
+
+        Emitted before a RUN_ERROR so a run that fails mid-reasoning does not
+        leave a half-open lifecycle on the wire. A no-op when nothing is open.
+        """
+        for reasoning_event in translator.flush_open_reasoning():
+            _stamp_correlation_ids(
+                reasoning_event,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+            yield encoder.encode(reasoning_event)
     # Raw-event lookup buffer, populated by our scoped sink below. Keyed by
     # ``event.event_id`` (== ``StreamFrame.id``). Only OUTER-flow events land
     # here (source gate), which is exactly the nested-flow filter: nested
@@ -1966,12 +2054,16 @@ async def _run_flow_frame_stream(
         # events and our Bridged* events carry flow_copy as source, while a
         # nested crew.kickoff's own flow's lifecycle/method events leak here
         # with a different source and must stay dropped (no double RUN_STARTED,
-        # no mis-nested method). MCP, backend tool (ToolUsage), and Crew/Agent
-        # lifecycle events are parked regardless of source because this sink is
-        # scoped to the run's context (no cross-run leak); crew/agent events let
-        # the translator attribute the hierarchy. Any other foreign event is
-        # parked for RAW passthrough only when opt-in is on (bounded buffer,
-        # oldest evicted with a log).
+        # no mis-nested method). MCP, backend tool (ToolUsage), Crew/Agent
+        # lifecycle, and native thinking-chunk events are parked regardless of
+        # source because this sink is scoped to the run's context (no cross-run
+        # leak); crew/agent events let the translator attribute the hierarchy.
+        # crewai's native LLMThinkingChunkEvent (Gemini provider) is emitted with
+        # the LLM as source (not flow_copy): park it in raw_events so it is
+        # TRANSLATED to REASONING_* -- it therefore never also lands in
+        # foreign_events, so RAW passthrough cannot double-emit it. Any other
+        # foreign event is parked for RAW passthrough only when opt-in is on
+        # (bounded buffer, oldest evicted with a log).
         event_id = getattr(event, "event_id", None)
         if event_id is None:
             return
@@ -1979,6 +2071,7 @@ async def _run_flow_frame_stream(
             source is flow_copy
             or is_mcp_event(event)
             or is_backend_tool_event(event)
+            or is_thinking_event(event)
             or getattr(event, "type", None) in CREW_AGENT_LIFECYCLE_TYPES
         ):
             raw_events[event_id] = event
@@ -2196,6 +2289,8 @@ async def _run_flow_frame_stream(
                 f"thread={input_data.thread_id} run={input_data.run_id}: "
                 f"CrewAI flow exceeded ceiling={ceiling_display}"
             )
+            for reasoning_frame in _closing_reasoning_frames():
+                yield reasoning_frame
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,
@@ -2223,6 +2318,8 @@ async def _run_flow_frame_stream(
                 f"CrewAI upstream timeout during kickoff "
                 f"(ceiling={ceiling_display} did not fire)"
             )
+            for reasoning_frame in _closing_reasoning_frames():
+                yield reasoning_frame
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,
@@ -2242,6 +2339,8 @@ async def _run_flow_frame_stream(
                 f"CrewAI flow failed; see server logs"
             )
             sanitized_name = _sanitize_exception_code(type(e).__name__)
+            for reasoning_frame in _closing_reasoning_frames():
+                yield reasoning_frame
             yield encoder.encode(
                 RunErrorEvent(
                     message=message,

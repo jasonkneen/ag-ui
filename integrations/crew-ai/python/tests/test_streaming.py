@@ -1803,15 +1803,16 @@ class _ForeignSourceEmittingFlow(Flow):
 
     @start()
     async def chat(self):
-        from ag_ui_crewai._capabilities import (
-            LLMThinkingChunkEvent,
-            crewai_event_bus,
+        from ag_ui_crewai._capabilities import crewai_event_bus
+        # A genuinely FOREIGN llm event: emitted with the LLM as source (not the
+        # flow) and NOT recognized/translated by the bridge, so it is eligible for
+        # RAW passthrough. ``llm_thinking_chunk`` is deliberately NOT used here: it
+        # is now a translated channel (-> REASONING_*), covered separately.
+        from crewai.events.types.llm_events import LLMStreamChunkEvent
+        crewai_event_bus.emit(
+            object(),  # stands in for the LLM instance crewai emits with
+            event=LLMStreamChunkEvent(chunk="pondering", call_id="c-1"),
         )
-        if LLMThinkingChunkEvent is not None:
-            crewai_event_bus.emit(
-                object(),  # stands in for the LLM instance crewai emits with
-                event=LLMThinkingChunkEvent(chunk="pondering", call_id="c-1"),
-            )
         return "done"
 
 
@@ -1846,8 +1847,8 @@ async def test_raw_passthrough_mirrors_foreign_source_events_end_to_end():
     assert all(p["source"] == "crewai" for p in raws)
     assert types.index("RUN_STARTED") < types.index("RAW"), types
 
-    thinking = next(p for p in raws if p["event"]["type"] == "llm_thinking_chunk")
-    assert thinking["event"]["chunk"] == "pondering"
+    foreign = next(p for p in raws if p["event"]["type"] == "llm_stream_chunk")
+    assert foreign["event"]["chunk"] == "pondering"
 
     # Still exactly one run lifecycle: a foreign event can never synthesize one.
     assert types.count("RUN_STARTED") == 1
@@ -1977,4 +1978,7 @@ def test_mapped_events_are_never_duplicated_as_raw():
     DOES map must not also appear as RAW."""
     assert frames_mod.is_recognized_event(_ev("flow_started")) is True
     assert frames_mod.is_recognized_event(_ev("TEXT_MESSAGE_CHUNK")) is True
-    assert frames_mod.is_recognized_event(_ev("llm_thinking_chunk")) is False
+    # ``llm_thinking_chunk`` is now mapped (-> REASONING_*), so it is recognized
+    # and must never be RAW-duplicated. A genuinely unmapped llm event still is.
+    assert frames_mod.is_recognized_event(_ev("llm_thinking_chunk")) is True
+    assert frames_mod.is_recognized_event(_ev("llm_stream_chunk")) is False

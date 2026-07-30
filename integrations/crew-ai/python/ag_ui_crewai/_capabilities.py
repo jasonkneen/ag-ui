@@ -257,6 +257,32 @@ except Exception:  # pragma: no cover - litellm is a declared direct dep
 
 
 # --------------------------------------------------------------------------
+# Reasoning resolution
+# --------------------------------------------------------------------------
+# Two channels carry model reasoning: the litellm streaming delta
+# (``reasoning_content`` / ``thinking_blocks`` -- provider-agnostic, always
+# available since litellm is a direct dep) and crewai's native
+# ``LLMThinkingChunkEvent`` (its Gemini provider, crewai >= 1.10.1). The event
+# lives at ``crewai.events.types.llm_events`` (1.x) / ``crewai.utilities.events.
+# llm_events`` (0.x) and is NOT re-exported at the events-package root. Resolved
+# here (before ``_detect``) so both the capability snapshot and the frame-path
+# sink gate share ONE probe.
+_LLM_EVENTS_MODULE, _ = _first_module(
+    ["crewai.events.types.llm_events", "crewai.utilities.events.llm_events"]
+)
+LLMThinkingChunkEvent = (
+    getattr(_LLM_EVENTS_MODULE, "LLMThinkingChunkEvent", None)
+    if _LLM_EVENTS_MODULE is not None
+    else None
+)
+_thinking_event_available = LLMThinkingChunkEvent is not None
+_native_reasoning_event_available = _thinking_event_available
+# Reasoning surfacing is available whenever ANY channel is live -- not gated to
+# a single provider. The litellm delta channel is effectively always live.
+_reasoning_available = _litellm_available or _thinking_event_available
+
+
+# --------------------------------------------------------------------------
 # Checkpointing resolution
 # --------------------------------------------------------------------------
 # crewai's checkpointing pieces landed in different releases, so each is
@@ -554,6 +580,11 @@ class _Capabilities:
     crew_chat_module: str | None
     crew_chat_available: bool
     litellm_available: bool
+    # Reasoning: available whenever ANY channel is live (litellm delta or the
+    # native thinking event), never gated to a single provider. Surfaced for
+    # the protocol capability table.
+    reasoning_available: bool = False
+    native_reasoning_event_available: bool = False
     stream_frame_available: bool = False
     # Checkpointing: informational; the wiring keys off the resolved
     # symbols / ``flow_supports_checkpointing`` per-flow probe, not these fields.
@@ -659,6 +690,8 @@ def _detect() -> _Capabilities:
         crew_chat_module=_CREW_CHAT_MODULE_NAME,
         crew_chat_available=_crew_chat_available,
         litellm_available=_litellm_available,
+        reasoning_available=_reasoning_available,
+        native_reasoning_event_available=_native_reasoning_event_available,
         stream_frame_available=_stream_frame_available,
         checkpoint_config_available=_checkpoint_config_available,
         checkpointing_available=_checkpointing_available,
@@ -683,29 +716,16 @@ CAPABILITIES = _detect()
 
 
 # --------------------------------------------------------------------------
-# Reasoning / thinking-chunk resolution
+# Native-Gemini resolution (informational reasoning fields)
 # --------------------------------------------------------------------------
-# crewai emits ``LLMThinkingChunkEvent`` for thinking models. The class living
-# at ``<events>.types.llm_events`` is NOT evidence that a given run will produce
-# reasoning: verified against the crewai 1.15.7 wheel, the ONLY call site of
-# ``BaseLLM._emit_thinking_chunk_event`` is
-# ``crewai/llms/providers/gemini/completion.py`` - the native Google Gen AI
-# provider. Anthropic's native provider carries a ``thinking`` config and
-# extracts thinking blocks, but never emits the event; every LiteLLM-routed model
-# (including ``vertex_ai/gemini-*``, which falls back to LiteLLM) emits nothing.
-#
-# So ``get_capabilities`` requires BOTH the class AND a resolved native-Gemini
-# LLM before it advertises reasoning. Advertising off the bare class probe would
-# claim reasoning support for every OpenAI / Anthropic / Ollama run.
-_LLM_EVENTS_MODULE, _ = _first_module(
-    ["crewai.events.types.llm_events", "crewai.utilities.events.llm_events"]
-)
-LLMThinkingChunkEvent = (
-    getattr(_LLM_EVENTS_MODULE, "LLMThinkingChunkEvent", None)
-    if _LLM_EVENTS_MODULE is not None
-    else None
-)
-_thinking_event_available = LLMThinkingChunkEvent is not None
+# The thinking-chunk event class + availability flags are resolved ONCE above
+# (before ``_detect``). Reasoning is now surfaced provider-agnostically via the
+# litellm channel and the native event, so ``get_capabilities`` no longer gates
+# reasoning on a native-Gemini LLM. The resolver below stays only to populate
+# the informational ``nativeGeminiProvider`` / ``resolvedProvider`` fields: the
+# native ``LLMThinkingChunkEvent`` (verified on the 1.15.7 wheel, emitted only by
+# ``crewai/llms/providers/gemini/completion.py``) is an EXTRA frame-path source,
+# not a requirement.
 
 # crewai's canonical name for the native Google Gen AI provider. ``LLM.__new__``
 # maps both the ``gemini/`` and ``google/`` model prefixes onto it and stamps it
@@ -825,55 +845,37 @@ def _is_native_gemini(llm: Any) -> bool:
     return _safe_hasattr(llm, "thinking_config")
 
 
-def _reasoning_capability(llm: Any, *, raw_enabled: bool = False) -> dict:
+def _reasoning_capability(llm: Any = None) -> dict:
     """Build the ``reasoning`` block of the capability declaration.
 
-    ``supported`` is True only when the thinking-chunk event class resolves, the
-    RAW transport exists (StreamFrame, crewai >= 1.6, the only channel carrying
-    reasoning today), and the passed object resolves to a native-Gemini LLM.
+    Reasoning surfaces as first-class ``REASONING_*`` events, provider-agnostic
+    and on BOTH transports: ``copilotkit_stream`` reads the litellm delta's
+    ``reasoning_content`` / ``thinking_blocks`` for any reasoning-capable model
+    (deepseek-reasoner, Anthropic extended thinking, Bedrock, xAI,
+    gemini-via-litellm, ...), and crewai's native Gemini provider additionally
+    emits ``LLMThinkingChunkEvent`` on the StreamFrame path. It needs NEITHER
+    ``emit_raw_events`` NOR the StreamFrame transport.
 
-    Caveat: on the crew-serving path ``crews.py`` calls ``litellm.acompletion``
-    directly, so crewai's native Gemini provider never runs and reasoning does not
-    surface there even when this reports it supported. When no LLM is passed we
-    report ``supported: False`` with ``reason: "llm_not_provided"`` - the honest
-    answer, since reasoning availability is a per-LLM fact and cannot be derived
-    from the installed crewai alone.
+    ``supported`` describes the bridge capability, not whether a given model will
+    actually reason: a non-reasoning model simply emits nothing (graceful
+    no-op). It is therefore True whenever a reasoning channel is live -- the
+    litellm channel is effectively always live (a direct dep).
+    ``nativeGeminiProvider`` / ``resolvedProvider`` are informational: the native
+    event is an EXTRA source, not a requirement.
     """
     resolved = _resolve_llm(llm)
-    native_gemini = _is_native_gemini(resolved)
-    # Reasoning only reaches the wire through RAW passthrough, which needs the
-    # StreamFrame transport's scoped sink. Claiming support on crewai 1.0-1.5 would
-    # contradict ``rawEvents.supported: False`` in the same declaration.
-    if not _thinking_event_available:
-        reason = "thinking_event_missing"
-    elif not CAPABILITIES.stream_frame_available:
-        reason = "raw_transport_unavailable"
-    elif resolved is None:
-        # Distinguish the two: a caller who passed something deserves to know the
-        # probe could not find an LLM inside it, not that they passed nothing.
-        reason = "llm_not_provided" if llm is None else "llm_not_resolvable"
-    elif not native_gemini:
-        reason = "provider_not_native_gemini"
-    else:
-        reason = None
     return {
-        "supported": reason is None,
+        "supported": CAPABILITIES.reasoning_available,
+        # Provider-agnostic path (always live when litellm is installed).
+        "litellmChannel": CAPABILITIES.litellm_available,
+        # crewai's native Gemini thinking event: an extra frame-path source.
         "thinkingEventAvailable": _thinking_event_available,
-        "nativeGeminiProvider": native_gemini,
+        "nativeGeminiProvider": _is_native_gemini(resolved),
         # A caller object: a raising property here would escape the whole query.
         "resolvedProvider": _safe_getattr(resolved, "provider"),
-        # Reasoning reaches the wire through RAW passthrough today (there is no
-        # dedicated CrewAI -> REASONING_* mapping yet), so a caller that wants it
-        # must ALSO enable ``emit_raw_events`` - hence the explicit flag below
-        # rather than a bare "supported: true" that would over-promise.
-        "transport": "raw" if reason is None else None,
-        # Always required for reasoning to reach the wire; ``rawEventsEnabled`` says
-        # whether this configuration actually has it on.
-        "requiresEmitRawEvents": True,
-        "rawEventsEnabled": bool(
-            raw_enabled and CAPABILITIES.stream_frame_available
-        ),
-        "reason": reason,
+        # First-class REASONING_* mapping: reasoning does NOT ride RAW passthrough.
+        "requiresEmitRawEvents": False,
+        "reason": None if CAPABILITIES.reasoning_available else "litellm_unavailable",
     }
 
 
@@ -911,10 +913,11 @@ def get_capabilities(
     llm:
         The LLM, or an object carrying one: an Agent (``.llm``), a Crew
         (``.agents[*].llm``, or ``chat_llm`` / ``manager_llm`` when set), or a Flow
-        holding either. Resolution is read-only and never calls a factory. Required for a meaningful ``reasoning`` answer: reasoning is
-        native-Gemini-only in crewai, so without an LLM to resolve we report
-        ``supported: False`` with ``reason: "llm_not_provided"`` rather than
-        advertising support off the bare event-class probe.
+        holding either. Resolution is read-only and never calls a factory.
+        Optional for ``reasoning``: reasoning is now provider-agnostic (the
+        litellm channel), so it is reported supported regardless of the LLM. An
+        LLM only enriches the informational ``nativeGeminiProvider`` /
+        ``resolvedProvider`` fields.
     emission_shape / emit_raw_events:
         The values the endpoint was configured with. Defaults (``None``) resolve
         the same way the endpoint factories resolve them, so a caller that
@@ -973,6 +976,6 @@ def get_capabilities(
             "enabled": bool(resolved_raw and CAPABILITIES.stream_frame_available),
             "default": DEFAULT_EMIT_RAW_EVENTS,
         },
-        "reasoning": _reasoning_capability(llm, raw_enabled=resolved_raw),
+        "reasoning": _reasoning_capability(llm),
         "crewChat": {"supported": CAPABILITIES.crew_chat_available},
     }
