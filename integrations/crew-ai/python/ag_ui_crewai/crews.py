@@ -178,6 +178,37 @@ def _llm_timeout_seconds() -> float | None:
     )
 
 
+def _crew_result_to_text(result: Any) -> str:
+    """Coerce a crew-run result to a string for ``state['outputs']`` and the
+    tool message content.
+
+    A crewai ``CrewOutput`` always has ``json_dict`` / ``pydantic`` / ``raw``
+    fields, and the first two are ``None`` for a text-only crew, so gating on
+    ``hasattr`` alone dropped the text and passed a non-string object
+    downstream. Gate on the value instead: an existing string verbatim, else a
+    non-None ``json_dict`` / ``pydantic`` serialized to JSON (``str`` would emit
+    a non-JSON repr), else a non-empty string ``raw``, else ``str(result)``.
+    """
+    if isinstance(result, str):
+        return result
+
+    json_dict = getattr(result, "json_dict", None)
+    if json_dict is not None:
+        return json.dumps(json_dict)
+
+    pydantic = getattr(result, "pydantic", None)
+    if pydantic is not None:
+        if hasattr(pydantic, "model_dump_json"):
+            return pydantic.model_dump_json()
+        return str(pydantic)
+
+    raw = getattr(result, "raw", None)
+    if isinstance(raw, str) and raw:
+        return raw
+
+    return str(result)
+
+
 CREW_EXIT_TOOL = {
     "type": "function",
     "function": {
@@ -379,18 +410,14 @@ class ChatWithCrewFlow(Flow):
                 # torn down. Bounding the crew run itself is upstream-crewai work.
                 result = await asyncio.to_thread(crew_function, **args)
 
-                if isinstance(result, str):
-                    self.state["outputs"] = result
-                elif hasattr(result, "json_dict"):
-                    self.state["outputs"] = result.json_dict
-                elif hasattr(result, "raw"):
-                    self.state["outputs"] = result.raw
-                else:
-                    raise ValueError("Unexpected result type", type(result))
+                # Record the crew output as a string (see _crew_result_to_text)
+                # for both state["outputs"] and the tool message content.
+                output_text = _crew_result_to_text(result)
+                self.state["outputs"] = output_text
 
                 self.state["messages"].append({
                     "role": "tool",
-                    "content": result,
+                    "content": output_text,
                     "tool_call_id": message["tool_calls"][0]["id"]
                 })
 
