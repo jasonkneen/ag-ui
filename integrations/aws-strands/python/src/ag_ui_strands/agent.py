@@ -66,6 +66,11 @@ def _extract_agent_kwargs(agent: StrandsAgentCore) -> dict:
 # outstanding frontend calls at once.
 _WIRE_MAP_MAX = 512
 
+# Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
+# cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
+# tool receives this in place of a real answer and can treat it as a denial.
+INTERRUPT_CANCELLED = {"cancelled": True}
+
 
 def _get_strands_session_manager(agent: Any) -> Any:
     """Return the agent's Strands ``SessionManager``, or ``None``.
@@ -78,12 +83,51 @@ def _get_strands_session_manager(agent: Any) -> Any:
     )
 
 
+def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
+    """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
+
+    Strands' ``reason`` is free-form (any JSON), whereas AG-UI's ``reason`` is a
+    categorical string. The interrupt *name* is the closest categorical fit, so
+    it becomes ``reason``; the original reason object is preserved verbatim under
+    ``metadata`` so no information is lost on the wire.
+    """
+    raw_reason = getattr(strands_interrupt, "reason", None)
+    return Interrupt(
+        id=getattr(strands_interrupt, "id", ""),
+        reason=getattr(strands_interrupt, "name", None) or "interrupt",
+        message=raw_reason if isinstance(raw_reason, str) else None,
+        metadata=(
+            {"strands_reason": raw_reason} if raw_reason is not None else None
+        ),
+    )
+
+
+def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
+    """Return the native Strands interrupts for a paused run, or ``[]``.
+
+    Prefers the terminal ``AgentResult`` (``stop_reason == "interrupt"`` with a
+    populated ``interrupts``); falls back to the live agent's
+    ``_interrupt_state`` so a pause is still detected if the result event was
+    consumed by the stream's early-break path.
+    """
+    if terminal_result is not None:
+        if getattr(terminal_result, "stop_reason", None) == "interrupt":
+            interrupts = getattr(terminal_result, "interrupts", None) or []
+            if interrupts:
+                return list(interrupts)
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is not None and getattr(interrupt_state, "activated", False):
+        return list(getattr(interrupt_state, "interrupts", {}).values())
+    return []
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
     CustomEvent,
     EventType,
     FunctionCall,
+    Interrupt,
     MessagesSnapshotEvent,
     ReasoningEncryptedValueEvent,
     ReasoningEndEvent,
@@ -94,6 +138,7 @@ from ag_ui.core import (
     RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
+    RunFinishedInterruptOutcome,
     RunStartedEvent,
     StateSnapshotEvent,
     StepFinishedEvent,
@@ -866,6 +911,10 @@ class StrandsAgent:
             stop_text_streaming = False
             halt_event_stream = False
             pending_halt = False
+            # Terminal ``AgentResult`` from Strands (carried on the final
+            # ``{"result": ...}`` stream event). Used after the loop to detect a
+            # native interrupt pause (``stop_reason == "interrupt"``).
+            terminal_result = None
 
             # Reasoning/thinking state tracking
             reasoning_started = False
@@ -952,7 +1001,33 @@ class StrandsAgent:
                 and self.config.replay_history_into_strands
                 and has_nonvoid_frontend_result
             )
-            if replay_history:
+
+            # A client answering a native Strands interrupt sends its responses
+            # in ``RunAgentInput.resume`` (per the AG-UI interrupt round-trip),
+            # not as a new user message. Translate those into the Strands resume
+            # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
+            # and drive the stream with it — this takes precedence over every
+            # other path, since a resume run carries no fresh prompt.
+            resume_prompt = None
+            resume_entries = getattr(input_data, "resume", None)
+            if isinstance(resume_entries, list) and resume_entries:
+                resume_prompt = [
+                    {
+                        "interruptResponse": {
+                            "interruptId": entry.interrupt_id,
+                            "response": (
+                                INTERRUPT_CANCELLED
+                                if entry.status == "cancelled"
+                                else entry.payload
+                            ),
+                        }
+                    }
+                    for entry in resume_entries
+                ]
+
+            if resume_prompt is not None:
+                agent_stream = strands_agent.stream_async(resume_prompt)
+            elif replay_history:
                 native_history = _build_strands_history(input_data.messages)
                 # Apply ``state_context_builder`` to the last user-text
                 # message in the reconciled history rather than to the
@@ -1049,6 +1124,13 @@ class StrandsAgent:
                         continue
 
                     logger.debug(f"Received event: {event}")
+
+                    # Capture the terminal ``AgentResult`` (always emitted last
+                    # by ``stream_async``) so a native interrupt pause can be
+                    # detected after the loop. Recorded before the
+                    # ``complete``/``force_stop`` break so it is never dropped.
+                    if "result" in event and event["result"] is not None:
+                        terminal_result = event["result"]
 
                     # Skip lifecycle events
                     if event.get("init_event_loop") or event.get("start_event_loop"):
@@ -1979,12 +2061,30 @@ class StrandsAgent:
                 snapshot=current_state,
             )
 
-            # Always finish the run - frontend handles keeping action executing
-            yield RunFinishedEvent(
-                type=EventType.RUN_FINISHED,
-                thread_id=input_data.thread_id,
-                run_id=input_data.run_id,
-            )
+            # If the run paused on a native Strands interrupt, surface it as an
+            # AG-UI interrupt outcome so the client can collect a response and
+            # resume via ``RunAgentInput.resume`` next turn. Otherwise finish
+            # bare, exactly as before (no behavior change for normal runs).
+            native_interrupts = _extract_interrupts(strands_agent, terminal_result)
+            if native_interrupts:
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                    outcome=RunFinishedInterruptOutcome(
+                        type="interrupt",
+                        interrupts=[
+                            _strands_interrupt_to_agui(i) for i in native_interrupts
+                        ],
+                    ),
+                )
+            else:
+                # Always finish the run - frontend handles keeping action executing
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
 
         except Exception as e:
             import traceback

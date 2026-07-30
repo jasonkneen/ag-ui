@@ -83,6 +83,30 @@ agentcore deploy
 
 For the complete deployment walkthrough, see [Deploy AG-UI servers in AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-agui.html).
 
+## Human-in-the-loop (native Strands interrupts)
+
+Tools that pause with `tool_context.interrupt(...)` are bridged to the AG-UI
+interrupt round-trip:
+
+- When a run pauses, it finishes with `RUN_FINISHED` carrying a
+  `RunFinishedInterruptOutcome` (`outcome.type == "interrupt"`) and one AG-UI
+  `Interrupt` per Strands interrupt. The Strands interrupt *name* becomes the
+  AG-UI `reason`; the original (free-form) reason object is preserved under
+  `metadata.strands_reason`.
+- To resume, the client sends the next `RunAgentInput` on the **same
+  `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
+  payload=...)]`. The tool's `interrupt()` call returns exactly `payload`.
+- `status="cancelled"` resumes the tool with the sentinel
+  `{"cancelled": True}` (`ag_ui_strands.agent.INTERRUPT_CANCELLED`) so it can
+  treat the pause as a denial.
+
+> **Persistence:** interrupt state lives on the per-thread agent instance. The
+> in-memory per-thread cache only preserves it within a single process, so
+> pause and resume must hit the same process. For stateless / multi-container
+> HTTP deployments, wire a durable `SessionManager` via
+> `StrandsAgentConfig.session_manager_provider` so interrupt state round-trips
+> across processes.
+
 ## Supported AG-UI Events
 
 The integration supports the following AG-UI event families:
