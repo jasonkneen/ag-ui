@@ -282,6 +282,9 @@ export const menuIntegrations = [
       "tool_based_generative_ui",
       "crew_chat",
       "error_flow",
+      "a2ui_dynamic_schema",
+      "a2ui_recovery",
+      "a2ui_fixed_schema",
     ],
   },
   // {

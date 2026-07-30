@@ -57,6 +57,7 @@ from ag_ui.core import (
 from ag_ui.core.events import (
   TextMessageChunkEvent,
   ToolCallChunkEvent,
+  ToolCallResultEvent,
   StepStartedEvent,
   StepFinishedEvent,
   MessagesSnapshotEvent,
@@ -68,6 +69,7 @@ from ag_ui.encoder import EventEncoder
 from .events import (
   BridgedTextMessageChunkEvent,
   BridgedToolCallChunkEvent,
+  BridgedToolCallResultEvent,
   BridgedCustomEvent,
   BridgedStateSnapshotEvent
 )
@@ -1043,7 +1045,20 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
                     type=EventType.TOOL_CALL_CHUNK,
                     tool_call_id=event.tool_call_id,
                     tool_call_name=event.tool_call_name,
+                    parent_message_id=getattr(event, "parent_message_id", None),
                     delta=event.delta,
+                )
+            )
+        @crewai_event_bus.on(BridgedToolCallResultEvent)
+        def _(source, event):
+            _enqueue(
+                source,
+                ToolCallResultEvent(
+                    type=EventType.TOOL_CALL_RESULT,
+                    message_id=event.message_id,
+                    tool_call_id=event.tool_call_id,
+                    content=event.content,
+                    role="tool",
                 )
             )
         @crewai_event_bus.on(BridgedCustomEvent)

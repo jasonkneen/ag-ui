@@ -338,6 +338,16 @@ class StreamFrameTranslator:
             return self._text_events(event)
         if event_type == EventType.TOOL_CALL_CHUNK:
             return self._tool_events(event)
+        if event_type == EventType.TOOL_CALL_RESULT:
+            return [
+                ToolCallResultEvent(
+                    type=EventType.TOOL_CALL_RESULT,
+                    message_id=getattr(event, "message_id", None),
+                    tool_call_id=getattr(event, "tool_call_id", None),
+                    content=getattr(event, "content", None),
+                    role="tool",
+                )
+            ]
         if event_type == EventType.CUSTOM:
             return [
                 CustomEvent(
@@ -566,6 +576,7 @@ class StreamFrameTranslator:
                     type=EventType.TOOL_CALL_CHUNK,
                     tool_call_id=getattr(event, "tool_call_id", None),
                     tool_call_name=getattr(event, "tool_call_name", None),
+                    parent_message_id=getattr(event, "parent_message_id", None),
                     delta=getattr(event, "delta", None),
                 )
             ]

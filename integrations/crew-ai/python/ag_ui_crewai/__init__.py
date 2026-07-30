@@ -9,6 +9,7 @@ from .sdk import (
   StateItem,
   copilotkit_predict_state,
   copilotkit_emit_state,
+  copilotkit_emit_tool_result,
   copilotkit_stream,
   copilotkit_exit,
 )
@@ -40,6 +41,7 @@ __all__ = [
   "StateItem",
   "copilotkit_predict_state",
   "copilotkit_emit_state",
+  "copilotkit_emit_tool_result",
   "copilotkit_stream",
   "copilotkit_exit",
   "A2UITool",
