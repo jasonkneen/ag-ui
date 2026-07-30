@@ -2407,6 +2407,13 @@ def add_crewai_flow_fastapi_endpoint(
     by default and the interrupt is surfaced via the legacy ``on_interrupt``
     CUSTOM event. Disabling ``enable_legacy_on_interrupt_event`` forces the
     outcome on so the interrupt is always surfaced by at least one channel.
+
+    IMPORTANT for CopilotKit >= 1.61.2 (``useInterrupt``): resume works only via
+    the structured outcome. The legacy ``on_interrupt`` channel renders the
+    interrupt but its ``resolve()`` does not send a ``RunAgentInput.resume[]``
+    back, so the run re-kicks off and re-pauses in a loop. Pass
+    ``emit_interrupt_outcome=True`` (or ``enable_legacy_on_interrupt_event=False``)
+    for those clients.
     """
     global GLOBAL_EVENT_LISTENER # pylint: disable=global-statement
     hitl_options = HITLOptions(
