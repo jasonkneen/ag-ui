@@ -2,8 +2,20 @@
 Streaming and state helpers (copilotkit_stream and related utilities) for the CrewAI AG-UI bridge.
 """
 
+import copy
 import uuid
-from typing import List, Any, Optional, Mapping, Dict, Literal, TypedDict
+from dataclasses import dataclass
+from typing import (
+  List,
+  Any,
+  Optional,
+  Mapping,
+  Dict,
+  Literal,
+  Sequence,
+  TypedDict,
+  Union,
+)
 from litellm.types.utils import (
   ModelResponse,
   Choices,
@@ -13,7 +25,9 @@ from litellm.types.utils import (
 )
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from crewai.flow.flow import FlowState
-from crewai.utilities.events import crewai_event_bus
+# The event bus moved from ``crewai.utilities.events`` (0.x) to
+# ``crewai.events`` (1.x); ``_capabilities`` resolves whichever exists.
+from ._capabilities import crewai_event_bus
 from pydantic import BaseModel, Field, TypeAdapter
 from ag_ui.core import EventType, Message
 from .context import flow_context
@@ -41,8 +55,119 @@ class PredictStateConfig(TypedDict):
     tool_name: str
     tool_argument: Optional[str]
 
+
+@dataclass(frozen=True)
+class StateItem:
+    """A predicted-state binding: stream ``tool``'s ``tool_argument`` into ``state_key``.
+
+    ``tool_argument=None`` streams the whole tool-call argument object. Mirrors
+    the LangGraph ``StateItem`` vocabulary.
+    """
+    state_key: str
+    tool: str
+    tool_argument: Optional[str] = None
+
+
+# Per-node suppression flags stashed on the running Flow (visible via
+# flow_context in the hooks and as ``source`` in the endpoint listener).
+# Underscore-prefixed to avoid clashing with real Flow fields.
+_PREDICT_STATE_TOOLS_ATTR = "_ag_ui_predict_state_tools"
+_PREDICTED_TOOL_STREAMED_ATTR = "_ag_ui_predicted_tool_streamed"
+_MANUAL_STATE_EMITTED_ATTR = "_ag_ui_manual_state_emitted"
+
+
+def _record_predicted_tools(flow: Any, tools: "set[str]") -> None:
+    """Record the tools that predict state for this node.
+
+    Unions so two predict_state calls in one node both take effect.
+    """
+    if flow is not None:
+        existing = getattr(flow, _PREDICT_STATE_TOOLS_ATTR, None) or set()
+        setattr(flow, _PREDICT_STATE_TOOLS_ATTR, existing | set(tools))
+
+
+def _mark_predicted_tool_streamed(flow: Any, tool_name: Optional[str]) -> None:
+    """Flag that a predicted tool actually streamed.
+
+    Suppression only fires when the tool is genuinely invoked, so a node that
+    declared predict_state but took another branch still emits its snapshot.
+    """
+    if flow is None or not tool_name:
+        return
+    predicted = getattr(flow, _PREDICT_STATE_TOOLS_ATTR, None)
+    if predicted and tool_name in predicted:
+        setattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, True)
+
+
+def _mark_manual_state_emitted(flow: Any) -> None:
+    """Flag that ``copilotkit_emit_state`` published an authoritative snapshot."""
+    if flow is not None:
+        setattr(flow, _MANUAL_STATE_EMITTED_ATTR, True)
+
+
+def reset_node_snapshot_suppression(flow: Any) -> None:
+    """Clear the per-node suppression flags at node entry.
+
+    Guards against a node that declared predict_state then raised (leaving a
+    stale tool set) suppressing the next node's snapshot. Flags live on the
+    single flow, so under parallel fan-out branches they are best-effort; the
+    terminal FlowFinished snapshot still guarantees a correct final state.
+    """
+    if flow is None:
+        return
+    setattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, False)
+    setattr(flow, _MANUAL_STATE_EMITTED_ATTR, False)
+    setattr(flow, _PREDICT_STATE_TOOLS_ATTR, set())
+
+
+def consume_node_exit_snapshot_suppression(flow: Any) -> bool:
+    """Whether this node's auto STATE_SNAPSHOT should be suppressed; resets the flags.
+
+    Suppressed when a predicted tool streamed or a manual snapshot was emitted,
+    so the node-exit rebuild from flow.state doesn't wipe what the client is
+    already showing. A later node's snapshot, or the terminal FlowFinished
+    snapshot, still delivers the authoritative flow.state.
+    """
+    if flow is None:
+        return False
+    predicted = getattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, False)
+    manual = getattr(flow, _MANUAL_STATE_EMITTED_ATTR, False)
+    setattr(flow, _PREDICTED_TOOL_STREAMED_ATTR, False)
+    setattr(flow, _MANUAL_STATE_EMITTED_ATTR, False)
+    setattr(flow, _PREDICT_STATE_TOOLS_ATTR, set())
+    return bool(predicted or manual)
+
+
+def _normalize_predict_state(
+        config: Union[Mapping[str, PredictStateConfig], Sequence[StateItem]]
+    ) -> List[Dict[str, Any]]:
+    """Normalize either supported ``predict_state`` shape to the wire form.
+
+    Accepts the historical mapping form (``{state_key: {tool_name, tool_argument}}``)
+    and a sequence of :class:`StateItem`. ``tool_argument`` is optional in
+    both shapes.
+    """
+    if isinstance(config, Mapping):
+        return [
+            {
+                "state_key": k,
+                "tool": v["tool_name"],
+                "tool_argument": v.get("tool_argument"),
+            }
+            for k, v in config.items()
+        ]
+    return [
+        {
+            "state_key": item.state_key,
+            "tool": item.tool,
+            "tool_argument": item.tool_argument,
+        }
+        for item in config
+    ]
+
+
 async def copilotkit_predict_state(
-        config: Dict[str, PredictStateConfig]
+        config: Union[Mapping[str, PredictStateConfig], Sequence[StateItem]]
     ) -> Literal[True]:
     """
     Stream tool calls as state to CopilotKit.
@@ -64,9 +189,22 @@ async def copilotkit_predict_state(
     )
     ```
 
+    ``copilotkit_predict_state`` must be called inside the same flow node
+    that streams the predicted tool call; the prediction binding is scoped to
+    that node.
+
+    A sequence of :class:`StateItem` is also accepted, matching the LangGraph
+    shared-state vocabulary:
+
+    ```python
+    await copilotkit_predict_state([
+        StateItem(state_key="steps", tool="SearchTool", tool_argument="steps"),
+    ])
+    ```
+
     Parameters
     ----------
-    config : Dict[str, CopilotKitPredictStateConfig]
+    config : Mapping[str, PredictStateConfig] | Sequence[StateItem]
         The configuration to predict the state.
 
     Returns
@@ -76,13 +214,11 @@ async def copilotkit_predict_state(
     """
     flow = flow_context.get(None)
 
-    value = [
-        {
-            "state_key": k,
-            "tool": v["tool_name"],
-            "tool_argument": v["tool_argument"]
-        } for k, v in config.items()
-    ]
+    value = _normalize_predict_state(config)
+
+    # So the streaming layer can tell when a predicted tool actually fires.
+    _record_predicted_tools(flow, {item["tool"] for item in value})
+
     crewai_event_bus.emit(
         flow,
         BridgedCustomEvent(
@@ -101,12 +237,6 @@ async def copilotkit_emit_state(state: Any) -> Literal[True]:
     Emits intermediate state to CopilotKit.
     Useful if you have a longer running node and you want to update the user with the current state of the node.
 
-    To install the CopilotKit SDK, run:
-
-    ```bash
-    pip install copilotkit[crewai]
-    ```
-
     ### Examples
 
     ```python
@@ -116,6 +246,11 @@ async def copilotkit_emit_state(state: Any) -> Literal[True]:
         await some_long_running_operation(i)
         await copilotkit_emit_state({"progress": i})
     ```
+
+    The emitted payload streams to the client immediately and the node-exit
+    snapshot is suppressed so it is not clobbered mid-run. At run end the state
+    is rebuilt from ``flow.state``, so anything that must persist beyond the run
+    should be written there, not only emitted.
 
     Parameters
     ----------
@@ -129,11 +264,17 @@ async def copilotkit_emit_state(state: Any) -> Literal[True]:
 
     """
     flow = flow_context.get(None)
+
+    # Suppress the node-exit snapshot so this payload is not clobbered mid-run.
+    _mark_manual_state_emitted(flow)
+
+    # Deep-copy: callers often emit the live flow state and keep mutating it, so
+    # snapshot a point-in-time copy before it is queued.
     crewai_event_bus.emit(
         flow,
         BridgedStateSnapshotEvent(
             type=EventType.STATE_SNAPSHOT,
-            snapshot=state
+            snapshot=copy.deepcopy(state)
         )
     )
 
@@ -212,6 +353,11 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
                 }
             )
 
+        # Checked on whichever chunk carries the name (some providers stream the
+        # tool id and name in separate deltas), not only the id-bearing chunk.
+        if tool_call_name is not None:
+            _mark_predicted_tool_streamed(flow, tool_call_name)
+
         if tool_call_arguments is not None:
             # add to the current tool call
             all_tool_calls[-1]["arguments"] += tool_call_arguments
@@ -284,7 +430,7 @@ def litellm_messages_to_ag_ui_messages(messages: List[LiteLLMMessage]) -> List[M
         # whitelist the fields we want to keep
         whitelist = ["content", "role", "tool_calls", "id", "name", "tool_call_id"]
         message_dict = {k: v for k, v in message_dict.items() if k in whitelist}
-        if not "id" in message_dict:
+        if "id" not in message_dict:
             message_dict["id"] = str(uuid.uuid4())
         # remove all None values
         message_dict = {k: v for k, v in message_dict.items() if v is not None}

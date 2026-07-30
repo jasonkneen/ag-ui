@@ -50,6 +50,68 @@ add_crewai_flow_fastapi_endpoint(app, MyFlow(), "/flow")
 - **Predictive state updates** – Real-time state synchronization between backend and frontend
 - **Streaming tool calls** – Live streaming of LLM responses and tool execution to the UI
 
+## Protocol surface
+
+### RAW passthrough (opt-in, default OFF)
+
+`emit_raw_events=True` mirrors the crewai events this bridge does **not** map onto
+AG-UI `RAW` events: crewai's llm / agent / task / tool channels (including
+`llm_thinking_chunk`), nested-flow lifecycle events, and internals such as `cc_env`.
+Events the bridge already maps are never duplicated as RAW.
+
+```python
+add_crewai_flow_fastapi_endpoint(app, MyFlow(), "/flow", emit_raw_events=True)
+# or, without a code change:  AGUI_CREWAI_EMIT_RAW_EVENTS=1
+```
+
+It is off by default deliberately: LangGraph shipped RAW passthrough on and the
+payload bloat had to be walked back. RAW payloads are large and can carry prompt and
+completion text, so enabling it widens what leaves your process.
+
+Requires the `StreamFrame` transport: the installed crewai must expose it (>= 1.6)
+**and** the served flow must expose `astream`, which the driver probes per flow. On
+the legacy event-bus fallback the bridge logs one warning per process and emits no
+RAW events, because that listener never sees the unmapped events.
+
+RAW mirrors never precede `RUN_STARTED`. crewai raises some events before the flow
+opens, and a `RAW` first event makes the reference client reject the whole stream, so
+those are held and released once the run has opened. Both RAW buffers are bounded; a
+saturated buffer degrades mirroring (logged) rather than the run.
+
+### `get_capabilities()`
+
+Returns a capability declaration (the CrewAI counterpart of
+`LangGraphAgent.get_capabilities`). `crewai.__version__` appears only as
+informational metadata, never as a gate.
+
+```python
+from ag_ui_crewai import get_capabilities
+
+get_capabilities(llm=my_agent.llm, emit_raw_events=True)
+```
+
+`transport`, `rawEvents`, `reasoning` and `crewChat` come from runtime probes;
+`humanInTheLoop` and `state` are static declarations of what the bridge implements
+today. `emit_raw_events` defaults to re-reading the environment, so pass the same
+value your endpoint was registered with if you want the declaration to describe
+*that* endpoint.
+
+`reasoning.supported` is True **only** when all three hold: the installed crewai
+exposes `LLMThinkingChunkEvent`, the `StreamFrame` transport exists (RAW is the only
+channel carrying reasoning today), *and* the passed LLM resolves to the native Google
+Gen AI provider. Otherwise `reason` names the missing piece
+(`thinking_event_missing`, `raw_transport_unavailable`, `llm_not_provided`,
+`llm_not_resolvable`, `provider_not_native_gemini`) and `transport` is `None`.
+
+Reasoning is native-Gemini-only in crewai: on the 1.15.7 wheel the sole caller of
+`BaseLLM._emit_thinking_chunk_event` is `crewai/llms/providers/gemini/completion.py`.
+Anthropic's native provider has a thinking config but never emits the event, and every
+LiteLLM-routed model (including `vertex_ai/gemini-*`) emits nothing. Passing no `llm`
+therefore reports `supported: False` rather than claiming support off the class probe
+alone. On the crew-serving path `crews.py` drives completions through
+`litellm.acompletion` directly, so the native Gemini provider never runs and reasoning
+does not surface there even when it is reported supported for the LLM you passed.
+
 ## Tuning knobs
 
 The CrewAI integration exposes three environment variables for tuning
@@ -60,8 +122,16 @@ package; override these only if your deployment has specific needs
 ### `AGUI_CREWAI_LLM_TIMEOUT_SECONDS`
 
 Per-read timeout forwarded to `litellm.acompletion` in
-`ChatWithCrewFlow.chat` (both the initial call and the post-`crew_exit`
-tool-choice=`"none"` call).
+`ChatWithCrewFlow.chat`. It applies to all three completion sites: the
+initial call, the post-crew-run follow-up (tool-choice=`"none"`) that
+lets the assistant speak about the crew result, and the post-`crew_exit`
+(tool-choice=`"none"`) call.
+
+> **Limitation — no tool chaining after a crew run.** The post-crew-run
+> follow-up uses `tool_choice="none"`, so the assistant summarizes the crew
+> result as text but cannot call a frontend action in the same turn. A flow
+> like "run the crew, then update the UI" is not reachable on this path
+> today; allowing bounded tool re-entry there is future work.
 
 - **Default:** `120` seconds.
 - **Non-positive** (e.g. `0`, `-1`): disables the per-read timeout —

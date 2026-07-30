@@ -378,6 +378,36 @@ export const menuIntegrations = [
     ],
   },
   {
+    id: "claude-managed-agents-dotnet",
+    name: "Claude Managed Agents (.NET)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
+    id: "claude-managed-agents-python",
+    name: "Claude Managed Agents (Python)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
+    id: "claude-managed-agents-typescript",
+    name: "Claude Managed Agents (Typescript)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
     id: "langroid",
     name: "Langroid",
     features: [
