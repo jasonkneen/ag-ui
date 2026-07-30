@@ -36,8 +36,15 @@ from .events import (
   BridgedToolCallChunkEvent,
   BridgedToolCallResultEvent,
   BridgedCustomEvent,
-  BridgedStateSnapshotEvent
+  BridgedStateSnapshotEvent,
+  BridgedReasoningStartEvent,
+  BridgedReasoningMessageStartEvent,
+  BridgedReasoningMessageContentEvent,
+  BridgedReasoningMessageEndEvent,
+  BridgedReasoningEndEvent,
+  BridgedReasoningEncryptedValueEvent,
 )
+from ._reasoning import reasoning_from_delta
 from .utils import yield_control, convert_litellm_multimodal_to_agui
 
 class CopilotKitProperties(BaseModel):
@@ -320,7 +327,36 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
     finish_reason=None
     all_tool_calls = []
 
-    async for chunk in response:
+    # Reasoning lifecycle. Reasoning tokens (delta.reasoning_content /
+    # delta.thinking_blocks) precede the answer; open a reasoning message on the
+    # first reasoning delta and close it once the model emits answer text or a
+    # tool call (or the stream ends).
+    reasoning_message_id: Optional[str] = None
+    reasoning_open = False
+
+    def _close_reasoning():
+        nonlocal reasoning_open, reasoning_message_id
+        if not reasoning_open:
+            return
+        crewai_event_bus.emit(
+            flow,
+            BridgedReasoningMessageEndEvent(
+                type=EventType.REASONING_MESSAGE_END,
+                message_id=reasoning_message_id,
+            ),
+        )
+        crewai_event_bus.emit(
+            flow,
+            BridgedReasoningEndEvent(
+                type=EventType.REASONING_END,
+                message_id=reasoning_message_id,
+            ),
+        )
+        reasoning_open = False
+        reasoning_message_id = None
+
+    try:
+      async for chunk in response:
         if message_id is None:
             message_id = chunk["id"]
 
@@ -329,10 +365,56 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
         if not chunk["choices"]:
             continue
 
-        text_content = chunk["choices"][0]["delta"]["content"] or None
+        delta = chunk["choices"][0]["delta"]
+
+        # Stream reasoning tokens (provider-agnostic via litellm normalisation).
+        reasoning = reasoning_from_delta(delta)
+        if reasoning:
+            if not reasoning_open:
+                reasoning_message_id = str(uuid.uuid4())
+                crewai_event_bus.emit(
+                    flow,
+                    BridgedReasoningStartEvent(
+                        type=EventType.REASONING_START,
+                        message_id=reasoning_message_id,
+                    ),
+                )
+                crewai_event_bus.emit(
+                    flow,
+                    BridgedReasoningMessageStartEvent(
+                        type=EventType.REASONING_MESSAGE_START,
+                        message_id=reasoning_message_id,
+                        role="reasoning",
+                    ),
+                )
+                reasoning_open = True
+            if reasoning.text:
+                crewai_event_bus.emit(
+                    flow,
+                    BridgedReasoningMessageContentEvent(
+                        type=EventType.REASONING_MESSAGE_CONTENT,
+                        message_id=reasoning_message_id,
+                        delta=reasoning.text,
+                    ),
+                )
+            for value in reasoning.encrypted:
+                crewai_event_bus.emit(
+                    flow,
+                    BridgedReasoningEncryptedValueEvent(
+                        type=EventType.REASONING_ENCRYPTED_VALUE,
+                        subtype="message",
+                        entity_id=reasoning_message_id,
+                        encrypted_value=value,
+                    ),
+                )
+            await yield_control()
+
+        text_content = delta["content"] or None
 
         # Stream text messages
         if text_content is not None:
+            # Reasoning is done once the answer starts.
+            _close_reasoning()
             # add to the current text message
             content += text_content
             crewai_event_bus.emit(
@@ -348,10 +430,14 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
             await yield_control()
 
         # Stream tool calls
-        tool_calls = chunk["choices"][0]["delta"]["tool_calls"] or None
+        tool_calls = delta["tool_calls"] or None
         tool_call_id = tool_calls[0].id if tool_calls is not None else None
         tool_call_arguments = tool_calls[0].function["arguments"] if tool_calls is not None else None
         tool_call_name = tool_calls[0].function["name"] if tool_calls is not None else None
+
+        if tool_calls is not None:
+            # Reasoning is done once the model calls a tool.
+            _close_reasoning()
 
         if tool_call_id is not None:
             all_tool_calls.append(
@@ -398,6 +484,11 @@ async def _copilotkit_stream_custom_stream_wrapper(response: CustomStreamWrapper
 
         if finish_reason is not None:
             break
+    finally:
+        # Close a reasoning message left open by a stream that carried only
+        # reasoning, ended before any answer text / tool call, or raised
+        # mid-reasoning.
+        _close_reasoning()
 
     tool_calls = [
         ChatCompletionMessageToolCall(

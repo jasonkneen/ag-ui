@@ -1,6 +1,7 @@
 """Capability declaration and RAW-passthrough configuration: ``get_capabilities()``,
-the native-Gemini reasoning probe, and the "explicit argument > env var > default"
-resolution behind ``emit_raw_events``. No network."""
+the provider-agnostic reasoning capability + native-Gemini LLM resolution, and the
+"explicit argument > env var > default" resolution behind ``emit_raw_events``.
+No network."""
 
 import dataclasses
 
@@ -49,18 +50,19 @@ def test_get_capabilities_gates_raw_events_on_the_streamframe_transport(monkeypa
     assert on["rawEvents"]["enabled"] is True
     assert get_capabilities(emit_raw_events=False)["rawEvents"]["enabled"] is False
 
-    # Unavailable transport: the flag cannot turn it on, and reasoning must not
-    # advertise a RAW channel that does not exist.
+    # Unavailable transport: the flag cannot turn RAW on. Reasoning is now a
+    # first-class channel (litellm), independent of RAW / StreamFrame, so it
+    # stays supported here.
     _set_stream_frames(False)
     off = get_capabilities(llm=_FakeNativeGemini(), emit_raw_events=True)
     assert off["transport"]["streamFrames"] is False
     assert off["rawEvents"]["supported"] is False
     assert off["rawEvents"]["enabled"] is False
-    assert off["reasoning"]["supported"] is False
-    assert off["reasoning"]["reason"] == "raw_transport_unavailable"
+    assert off["reasoning"]["supported"] is True
+    assert off["reasoning"]["requiresEmitRawEvents"] is False
 
 
-# -- reasoning: native-Gemini-only -----------------------------------------
+# -- reasoning: provider-agnostic, first-class ------------------------------
 
 class _FakeNativeGemini:
     """Structural stand-in for ``crewai.llms.providers.gemini.completion``:
@@ -82,57 +84,55 @@ class _FakeLiteLLMGemini:
     model = "gemini/gemini-1.0-unlisted"
 
 
-def test_reasoning_requires_an_llm_and_does_not_claim_support_from_the_class_probe():
-    """The ``LLMThinkingChunkEvent`` class existing is NOT evidence a run will
-    produce reasoning - it is emitted only by the native Gemini provider. With no
-    LLM to resolve, report unsupported with an explicit reason."""
-    if caps_mod.LLMThinkingChunkEvent is None:  # pragma: no cover
-        pytest.skip("installed crewai does not expose LLMThinkingChunkEvent")
-    if not caps_mod._stream_frame_available:  # pragma: no cover
-        pytest.skip("installed crewai has no StreamFrame transport for RAW")
-
+def test_reasoning_supported_without_an_llm_and_provider_agnostic():
+    """Reasoning is a first-class, provider-agnostic bridge capability (the
+    litellm reasoning_content / thinking_blocks channel), NOT gated on a
+    native-Gemini LLM or the RAW transport. It is reported supported even with no
+    LLM to resolve. ``thinkingEventAvailable`` reports the extra native source."""
     reasoning = get_capabilities()["reasoning"]
 
-    assert reasoning["supported"] is False
-    assert reasoning["reason"] == "llm_not_provided"
-    # The class probe is reported separately, so callers can see WHY.
+    assert reasoning["supported"] is True
+    assert reasoning["requiresEmitRawEvents"] is False
+    assert reasoning["litellmChannel"] is True
+    assert reasoning["nativeGeminiProvider"] is False
     assert reasoning["thinkingEventAvailable"] is (
         caps_mod.LLMThinkingChunkEvent is not None
     )
 
 
-def test_reasoning_supported_only_for_native_gemini():
-    if caps_mod.LLMThinkingChunkEvent is None:  # pragma: no cover
-        pytest.skip("installed crewai does not expose LLMThinkingChunkEvent")
-    if not caps_mod._stream_frame_available:  # pragma: no cover
-        pytest.skip("installed crewai has no StreamFrame transport for RAW")
+def test_reasoning_supported_across_providers():
+    """Provider-agnostic: native Gemini, OpenAI, and LiteLLM-routed models are all
+    reported supported (the litellm channel carries reasoning for any
+    reasoning-capable model). The native-Gemini fields are informational only."""
+    gemini = get_capabilities(llm=_FakeNativeGemini())["reasoning"]
+    assert gemini["supported"] is True
+    assert gemini["nativeGeminiProvider"] is True
+    assert gemini["resolvedProvider"] == "gemini"
 
-    supported = get_capabilities(llm=_FakeNativeGemini(), emit_raw_events=True)[
-        "reasoning"
-    ]
-    assert supported["supported"] is True
-    assert supported["rawEventsEnabled"] is True
-    assert supported["nativeGeminiProvider"] is True
-    assert supported["resolvedProvider"] == "gemini"
-    # Reasoning reaches the wire via RAW passthrough today.
-    assert supported["transport"] == "raw"
-
-    not_gemini = get_capabilities(llm=_FakeOpenAI())["reasoning"]
-    assert not_gemini["supported"] is False
-    assert not_gemini["reason"] == "provider_not_native_gemini"
+    openai = get_capabilities(llm=_FakeOpenAI())["reasoning"]
+    assert openai["supported"] is True
+    assert openai["nativeGeminiProvider"] is False
+    assert openai["resolvedProvider"] == "openai"
 
     litellm_routed = get_capabilities(llm=_FakeLiteLLMGemini())["reasoning"]
-    assert litellm_routed["supported"] is False
-    assert litellm_routed["reason"] == "provider_not_native_gemini"
+    assert litellm_routed["supported"] is True
+    assert litellm_routed["nativeGeminiProvider"] is False
 
 
-def test_reasoning_unsupported_when_the_thinking_event_class_is_absent(monkeypatch):
-    """On a crewai without ``LLMThinkingChunkEvent`` the answer is unsupported
-    even for a native-Gemini LLM."""
+def test_reasoning_still_supported_via_litellm_when_thinking_event_absent(monkeypatch):
+    """On a crewai without ``LLMThinkingChunkEvent`` reasoning is STILL supported
+    through the litellm channel; only the extra native Gemini source is gone. The
+    ``reasoning_available`` flag keys off the litellm channel too, so patch both."""
     monkeypatch.setattr(caps_mod, "_thinking_event_available", False)
+    monkeypatch.setattr(
+        caps_mod,
+        "CAPABILITIES",
+        dataclasses.replace(caps_mod.CAPABILITIES, reasoning_available=True),
+    )
     reasoning = caps_mod._reasoning_capability(_FakeNativeGemini())
-    assert reasoning["supported"] is False
-    assert reasoning["reason"] == "thinking_event_missing"
+    assert reasoning["supported"] is True
+    assert reasoning["thinkingEventAvailable"] is False
+    assert reasoning["reason"] is None
 
 
 def test_reasoning_resolves_the_llm_through_agent_and_crew_wrappers():
@@ -240,16 +240,18 @@ def test_llm_resolution_terminates_on_a_cycle():
     assert caps_mod._resolve_llm(node) is None
 
 
-def test_unresolvable_llm_is_distinguished_from_no_llm():
-    """A caller who passed SOMETHING deserves to know the probe found no LLM inside
-    it, rather than being told they passed nothing."""
+def test_reasoning_supported_regardless_of_llm_resolution():
+    """Reasoning no longer hinges on resolving an LLM (it is provider-agnostic via
+    the litellm channel), so passing nothing, or an object with no LLM inside it,
+    both still report supported. LLM resolution only feeds the informational
+    ``resolvedProvider`` field, which stays None when nothing resolves."""
     class _NoLLMAnywhere:
         pass
 
-    assert get_capabilities()["reasoning"]["reason"] == "llm_not_provided"
-    assert get_capabilities(llm=_NoLLMAnywhere())["reasoning"]["reason"] == (
-        "llm_not_resolvable"
-    )
+    for caps in (get_capabilities(), get_capabilities(llm=_NoLLMAnywhere())):
+        assert caps["reasoning"]["supported"] is True
+        assert caps["reasoning"]["reason"] is None
+        assert caps["reasoning"]["resolvedProvider"] is None
 
 
 def test_native_gemini_is_recognised_under_both_provider_stamps():
