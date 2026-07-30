@@ -108,6 +108,45 @@ opens, and a `RAW` first event makes the reference client reject the whole strea
 those are held and released once the run has opened. Both RAW buffers are bounded; a
 saturated buffer degrades mirroring (logged) rather than the run.
 
+### Crew memory is isolated per `threadId` (default ON)
+
+A crew served with `Crew(memory=True)` keeps its memories in one on-disk store,
+namespaced by the *crew name*. Nothing in that namespace derives from the AG-UI
+`threadId`, so without help every chat served by an endpoint reads and writes the
+same namespace and one user's remembered facts surface in another user's chat.
+(Setting `inputs["id"] = thread_id` does not help: that scopes crewai's flow-state
+persistence, a different subsystem.)
+
+The bridge closes that by giving each request a `MemoryScope` view of the crew's
+memory, rooted at a path derived from the request's `threadId`. Threads are
+mutually invisible; each still sees its own history across sequential runs. One
+physical store, no directory-per-thread sprawl.
+
+```bash
+# Opt out: restore the pre-fix behaviour of one memory namespace per crew,
+# shared by every chat. Useful when the crew is a durable knowledge base
+# rather than a per-conversation memory.
+AGUI_CREWAI_THREAD_SCOPED_MEMORY=false
+```
+
+Limitations, in order of how likely you are to hit them:
+
+- **Only crews the bridge can reach are scoped.** That means the crew you passed
+  to `add_crewai_crew_fastapi_endpoint`, and any crew your `Flow` holds as an
+  attribute. A crew *constructed inside* a flow method is created after this
+  point and is not scoped; construct it as a flow attribute, or pass it a
+  `Memory` you scope yourself.
+- **Agent-level memory is not scoped.** `Agent(memory=...)` takes precedence over
+  the crew's memory in crewai, and agents are shared across concurrent requests,
+  so the bridge leaves them alone. Prefer crew-level memory, or scope the agent's
+  memory yourself.
+- **Isolation is logical, not physical.** All threads share one store and one
+  embedder; a scope keeps reads and writes inside a namespace, it is not a
+  security boundary against code that queries the store directly.
+- **Older crewai degrades rather than crashing.** The bridge probes for crewai's
+  unified memory view API at runtime. On a build without it, isolation is not
+  active and the bridge logs one warning saying exactly that.
+
 ### `get_capabilities()`
 
 Returns a capability declaration (the CrewAI counterpart of
