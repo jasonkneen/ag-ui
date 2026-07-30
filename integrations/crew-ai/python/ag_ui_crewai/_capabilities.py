@@ -303,6 +303,14 @@ _CREWAI_MODULE, _ = _first_module(["crewai"])
 _Flow = getattr(_CREWAI_MODULE, "Flow", None) if _CREWAI_MODULE else None
 _Crew = getattr(_CREWAI_MODULE, "Crew", None) if _CREWAI_MODULE else None
 
+# ``BaseAgent`` is the base every crewai agent derives from, including a user's
+# own subclass, so it is the wider net for "this attribute is an agent".
+# ``crewai.Agent`` is the fallback for a build that does not expose it.
+_BASE_AGENT_MODULE, _ = _first_module(["crewai.agents.agent_builder.base_agent"])
+_Agent = (
+    getattr(_BASE_AGENT_MODULE, "BaseAgent", None) if _BASE_AGENT_MODULE else None
+) or (getattr(_CREWAI_MODULE, "Agent", None) if _CREWAI_MODULE else None)
+
 
 def _kwarg_in_signature(func: Any, name: str) -> bool:
     """True when ``func`` declares a parameter ``name`` (or accepts ``**kwargs``).

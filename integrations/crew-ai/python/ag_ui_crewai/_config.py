@@ -34,7 +34,7 @@ SUPPORTED_EMISSION_SHAPES = frozenset({"triples", "chunks"})
 DEFAULT_EMISSION_SHAPE = "triples"
 
 EMISSION_SHAPE_ENV_VAR = "AGUI_CREWAI_EMISSION_SHAPE"
-# Per-thread crew-memory isolation ships ON: sharing one memory namespace across
+# Per-thread memory isolation (crew and agent) ships ON: sharing one namespace across
 # every AG-UI ``threadId`` leaks one chat's remembered facts into another, which
 # is a privacy bug rather than a feature. The opt-out exists because a
 # deployment may WANT one durable knowledge base behind every chat; turning it

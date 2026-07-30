@@ -1,13 +1,21 @@
-"""Per-thread isolation of CrewAI crew memory.
+"""Per-thread isolation of CrewAI memory (crew-level and agent-level).
 
-Everything here runs OFFLINE against a real ``Crew(memory=True)``: a fake
-embedding function stands in for OpenAI, and every write supplies an explicit
-scope / categories / importance, which is the condition under which crewai's
-``EncodingFlow`` skips its LLM analysis step. The only thing mocked is the
-embedder, so the store, the scope arithmetic and the recall path are all real.
+Everything here runs OFFLINE against a real ``Crew(memory=True)`` / a real
+``Agent`` with its own ``Memory``: a fake embedding function stands in for
+OpenAI, and every write supplies an explicit scope / categories / importance,
+which is the condition under which crewai's ``EncodingFlow`` skips its LLM
+analysis step. The only thing mocked is the embedder, so the store, the scope
+arithmetic and the recall path are all real.
+
+``Agent(memory=True)`` builds its Memory with crewai's DEFAULT embedder, which
+needs a live API key the moment anything is written. Behavioural tests therefore
+hand the agent an explicit ``Memory(embedder=<deterministic>)`` -- the same
+object ``memory=True`` would have produced, minus the network. Constructing
+``Agent(memory=True)`` is itself offline (the embedder is resolved lazily), so
+the reported shape is still asserted directly, structurally.
 
 The seam under test is the one the FastAPI endpoints use: copy the flow for this
-request, then scope the copy's crew memory to the request's ``threadId``.
+request, then scope the copy's memory to the request's ``threadId``.
 """
 
 import copy
@@ -15,8 +23,9 @@ import hashlib
 import logging
 
 import pytest
-from crewai import Agent, Crew, Flow, Task
+from crewai import Agent, Crew, Flow, Process, Task
 from crewai.flow import start
+from crewai.memory.unified_memory import Memory
 from chromadb.api.types import EmbeddingFunction as _ChromaEmbeddingFunction
 from crewai.rag.embeddings.providers.custom.embedding_callable import (
     CustomEmbeddingFunction as _CrewEmbeddingFunction,
@@ -205,13 +214,307 @@ def test_concurrent_requests_get_independent_scopes(crew_flow):
     assert run_a.crew._memory._memory is run_b.crew._memory._memory
 
 
-def test_scoped_view_keeps_the_rest_of_the_crew_shared(crew_flow):
-    """Only ``_memory`` is re-pointed; nothing else about the crew changes."""
+def test_scoped_view_changes_nothing_but_the_memory(crew_flow):
+    """The crew, agent and task views differ from the originals only in memory.
+
+    The agents and tasks are per-request views (see
+    ``test_the_shared_agents_and_tasks_are_never_mutated`` for why), but they are
+    still equal to the originals field-for-field, and everything hanging off them
+    -- tools, LLM, knowledge -- is the same object.
+    """
     run = _serve(crew_flow, "thread-A")
 
     assert run.crew.name == crew_flow.crew.name
     assert run.crew.agents == crew_flow.crew.agents
     assert run.crew.tasks == crew_flow.crew.tasks
+    assert run.crew.agents[0].llm is crew_flow.crew.agents[0].llm
+    assert run.crew.agents[0].tools is crew_flow.crew.agents[0].tools
+
+
+# ---------------------------------------------------------------------------
+# Agent-level memory: ``Agent(memory=...)`` beats the crew's, so it needs its own
+# scope. crewai's executor resolves ``agent.memory or crew._memory``.
+# ---------------------------------------------------------------------------
+
+
+def _offline_memory():
+    """The ``Memory`` ``Agent(memory=True)`` builds, minus the OpenAI embedder."""
+    return Memory(embedder=_EMBEDDER_SPEC)
+
+
+@pytest.fixture
+def agent_memory_flow(tmp_path, monkeypatch):
+    """A crew whose AGENT carries its own memory (the crew's is off)."""
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+    agent = Agent(
+        role="helper",
+        goal="help",
+        backstory="b",
+        llm="gpt-4o-mini",
+        memory=_offline_memory(),
+    )
+    task = Task(description="d", expected_output="e", agent=agent)
+    crew = Crew(name="support-crew", agents=[agent], tasks=[task])
+    return _CrewHoldingFlow(crew)
+
+
+def _executing_agent(run):
+    """The agent crewai will actually run the first task with."""
+    return run.crew._get_agent_to_use(run.crew.tasks[0])
+
+
+def test_two_threads_cannot_read_each_others_agent_memory(agent_memory_flow):
+    """The same leak one level down: an agent's own memory must be per-thread."""
+    run_a = _serve(agent_memory_flow, "thread-A")
+    _remember(_executing_agent(run_a).memory, "AGENT-A-SECRET: the user is Ada")
+
+    run_b = _serve(agent_memory_flow, "thread-B")
+
+    assert _recall(_executing_agent(run_b).memory, "who is the user") == []
+    assert _recall(_executing_agent(run_a).memory, "who is the user") == [
+        "AGENT-A-SECRET: the user is Ada"
+    ]
+
+
+def test_one_thread_keeps_its_agent_memory_across_sequential_runs(agent_memory_flow):
+    """Isolation must not degenerate into amnesia at the agent level either."""
+    first_run = _serve(agent_memory_flow, "thread-A")
+    _remember(_executing_agent(first_run).memory, "REMEMBERED: the target is staging")
+
+    second_run = _serve(agent_memory_flow, "thread-A")
+
+    assert _recall(_executing_agent(second_run).memory, "the target") == [
+        "REMEMBERED: the target is staging"
+    ]
+
+
+def test_the_task_executes_with_the_scoped_agent(agent_memory_flow):
+    """The scoped agent has to be the one crewai picks, or the scoping is inert.
+
+    crewai resolves the executing agent from ``task.agent``, NOT from
+    ``Crew.agents``, so a task left pointing at the shared agent would run with
+    the shared, unscoped memory however well-scoped the roster is.
+    """
+    run = _serve(agent_memory_flow, "thread-A")
+
+    assert _executing_agent(run) is run.crew.agents[0]
+    assert type(_executing_agent(run).memory).__name__ == "MemoryScope"
+
+
+def test_an_agent_built_with_memory_true_is_scoped(tmp_path, monkeypatch):
+    """The reported shape, asserted verbatim: ``Agent(memory=True)``.
+
+    Structural only -- ``memory=True`` resolves to a ``Memory`` on crewai's
+    DEFAULT embedder, so writing through it would need a live API key.
+    """
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+    agent = Agent(role="helper", goal="help", backstory="b", llm="gpt-4o-mini", memory=True)
+    task = Task(description="d", expected_output="e", agent=agent)
+    flow = _CrewHoldingFlow(Crew(name="support-crew", agents=[agent], tasks=[task]))
+
+    run_a = _serve(flow, "thread-A")
+    run_b = _serve(flow, "thread-B")
+
+    assert type(agent.memory).__name__ == "Memory"
+    assert type(_executing_agent(run_a).memory).__name__ == "MemoryScope"
+    assert (
+        _executing_agent(run_a).memory.root_path
+        != _executing_agent(run_b).memory.root_path
+    )
+
+
+def test_a_hierarchical_manager_agents_memory_is_scoped(tmp_path, monkeypatch):
+    """Under the hierarchical process the executing agent is the MANAGER."""
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+    manager = Agent(
+        role="manager",
+        goal="manage",
+        backstory="b",
+        llm="gpt-4o-mini",
+        memory=_offline_memory(),
+    )
+    worker = Agent(role="helper", goal="help", backstory="b", llm="gpt-4o-mini")
+    task = Task(description="d", expected_output="e", agent=worker)
+    flow = _CrewHoldingFlow(
+        Crew(
+            name="support-crew",
+            agents=[worker],
+            tasks=[task],
+            process=Process.hierarchical,
+            manager_agent=manager,
+        )
+    )
+
+    run_a = _serve(flow, "thread-A")
+    _remember(_executing_agent(run_a).memory, "MANAGER-A: the budget is 40")
+
+    run_b = _serve(flow, "thread-B")
+
+    assert _executing_agent(run_a) is run_a.crew.manager_agent
+    assert _recall(_executing_agent(run_b).memory, "the budget") == []
+    assert type(manager.memory).__name__ == "Memory"
+
+
+def test_a_standalone_agent_on_the_flow_is_scoped(tmp_path, monkeypatch):
+    """An agent a flow drives directly, with no crew, is scoped too."""
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+    agent = Agent(
+        role="helper",
+        goal="help",
+        backstory="b",
+        llm="gpt-4o-mini",
+        memory=_offline_memory(),
+    )
+
+    class _AgentHoldingFlow(Flow):
+        def __init__(self):
+            super().__init__()
+            self.agent = agent
+
+        @start()
+        def go(self):  # pragma: no cover - never kicked off
+            return "ok"
+
+    flow = _AgentHoldingFlow()
+    run_a = _serve(flow, "thread-A")
+    _remember(run_a.agent.memory, "SOLO-A: the room is 12B")
+
+    run_b = _serve(flow, "thread-B")
+
+    assert _recall(run_b.agent.memory, "which room") == []
+    assert type(agent.memory).__name__ == "Memory"
+
+
+def test_an_agent_without_its_own_memory_still_gets_the_scoped_crew(crew_flow):
+    """Falling back to crew memory must reach THIS request's scoped crew.
+
+    ``Crew.kickoff`` assigns ``agent.crew`` on every agent it is given, and the
+    executor reads the crew's memory back off that attribute. Two concurrent
+    requests sharing one agent object would leave the loser reading the winner's
+    thread namespace, so each request gets its own agent view even when the agent
+    has no memory of its own.
+    """
+    run_a = _serve(crew_flow, "thread-A")
+    run_b = _serve(crew_flow, "thread-B")
+
+    assert _executing_agent(run_a).memory is None
+    assert _executing_agent(run_a) is not _executing_agent(run_b)
+    assert _executing_agent(run_a) is not crew_flow.crew.agents[0]
+
+
+def test_the_shared_agents_and_tasks_are_never_mutated(agent_memory_flow):
+    """Nothing the concurrent requests share may be re-pointed."""
+    template_crew = agent_memory_flow.crew
+    template_agent = template_crew.agents[0]
+    template_task = template_crew.tasks[0]
+    template_memory = template_agent.memory
+
+    run_a = _serve(agent_memory_flow, "thread-A")
+    run_b = _serve(agent_memory_flow, "thread-B")
+
+    assert template_agent.memory is template_memory
+    assert type(template_memory).__name__ == "Memory"
+    assert template_task.agent is template_agent
+    assert template_crew.agents[0] is template_agent
+    assert template_crew.tasks[0] is template_task
+    # ...and the two requests hold independent scopes over the one store.
+    memory_a = _executing_agent(run_a).memory
+    memory_b = _executing_agent(run_b).memory
+    assert memory_a.root_path != memory_b.root_path
+    assert memory_a._memory is memory_b._memory is template_memory
+
+
+def test_task_context_edges_point_at_this_requests_tasks(tmp_path, monkeypatch):
+    """A copied task's ``context`` must name the copies, not the shared tasks.
+
+    ``context`` names other Task OBJECTS, and crewai reads their ``.output`` to
+    build the downstream prompt. Left pointing at the shared tasks, a downstream
+    task would read an output this request never produced.
+    """
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+    agent = Agent(role="helper", goal="help", backstory="b", llm="gpt-4o-mini")
+    first = Task(description="first", expected_output="e", agent=agent)
+    second = Task(description="second", expected_output="e", agent=agent, context=[first])
+    flow = _CrewHoldingFlow(
+        Crew(
+            name="support-crew",
+            agents=[agent],
+            tasks=[first, second],
+            memory=True,
+            embedder=_EMBEDDER_SPEC,
+        )
+    )
+
+    run = _serve(flow, "thread-A")
+
+    assert run.crew.tasks[1].context == [run.crew.tasks[0]]
+    assert run.crew.tasks[1].context[0] is run.crew.tasks[0]
+    assert second.context == [first]
+
+
+def test_opt_out_leaves_agent_memory_shared(agent_memory_flow, monkeypatch):
+    """``AGUI_CREWAI_THREAD_SCOPED_MEMORY=false`` disables agent scoping too."""
+    monkeypatch.setenv("AGUI_CREWAI_THREAD_SCOPED_MEMORY", "false")
+
+    run_a = _serve(agent_memory_flow, "thread-A")
+    _remember(_executing_agent(run_a).memory, "SHARED: the office is in Lisbon")
+    run_b = _serve(agent_memory_flow, "thread-B")
+
+    assert _executing_agent(run_a) is agent_memory_flow.crew.agents[0]
+    assert _recall(_executing_agent(run_b).memory, "where is the office") == [
+        "SHARED: the office is in Lisbon"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Fail-loud: a write that lands on a shared object must not be served
+# ---------------------------------------------------------------------------
+
+
+def test_a_write_through_to_the_shared_agent_fails_the_request(tmp_path, monkeypatch):
+    """A copy that is not a copy must raise, not silently share one namespace."""
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+
+    class _UncopyableAgent(Agent):
+        def __copy__(self):
+            return self
+
+    agent = _UncopyableAgent(
+        role="helper",
+        goal="help",
+        backstory="b",
+        llm="gpt-4o-mini",
+        memory=_offline_memory(),
+    )
+    task = Task(description="d", expected_output="e", agent=agent)
+    flow = _CrewHoldingFlow(Crew(name="support-crew", agents=[agent], tasks=[task]))
+
+    with pytest.raises(RuntimeError, match="mutated the SHARED .*Agent.memory"):
+        _serve(flow, "thread-A")
+
+
+def test_a_write_through_to_the_shared_task_fails_the_request(tmp_path, monkeypatch):
+    """Same guarantee for tasks: ``task.agent`` is what selects the memory."""
+    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai-store"))
+
+    class _UncopyableTask(Task):
+        def __copy__(self):
+            return self
+
+    agent = Agent(role="helper", goal="help", backstory="b", llm="gpt-4o-mini")
+    task = _UncopyableTask(description="d", expected_output="e", agent=agent)
+    flow = _CrewHoldingFlow(
+        Crew(
+            name="support-crew",
+            agents=[agent],
+            tasks=[task],
+            memory=True,
+            embedder=_EMBEDDER_SPEC,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="mutated the SHARED .*Task.agent"):
+        _serve(flow, "thread-A")
 
 
 # ---------------------------------------------------------------------------
