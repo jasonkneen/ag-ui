@@ -567,6 +567,41 @@ async def _run_resume(flow, input_data, options):
     return _decode(chunks)
 
 
+def _assert_event_balance(events):
+    """Mini AG-UI-client verifyEvents: STEP_STARTED / STEP_FINISHED must
+    balance, and RUN_FINISHED must not fire while a step is still active. The
+    real @ag-ui/client rejects a stream that violates either (an interrupt that
+    pauses a method mid-flight leaves its step open otherwise)."""
+    active = []
+    for e in events:
+        t = e.get("type")
+        if t == "STEP_STARTED":
+            active.append(e.get("stepName"))
+        elif t == "STEP_FINISHED":
+            name = e.get("stepName")
+            assert name in active, (
+                f"STEP_FINISHED {name!r} with no open STEP_STARTED; active={active}"
+            )
+            active.remove(name)
+        elif t == "RUN_FINISHED":
+            assert not active, f"RUN_FINISHED while steps still active: {active}"
+
+
+async def test_e2e_step_balance_across_interrupt(_isolated_cwd):
+    # Pause must close the paused method's step before RUN_FINISHED; resume must
+    # re-open the continuing method's step so its STEP_FINISHED is not an orphan.
+    flow = _DemoInterruptFlow()
+    paused = await _run_kickoff(
+        flow, _mk_input("bal"), HITLOptions(emit_interrupt_outcome=True)
+    )
+    _assert_event_balance(paused)
+    resume = [ResumeEntry(interrupt_id="bal", status="resolved", payload="approved")]
+    resumed = await _run_resume(
+        flow, _mk_input("bal", resume=resume), HITLOptions(emit_interrupt_outcome=True)
+    )
+    _assert_event_balance(resumed)
+
+
 async def test_e2e_kickoff_pause_default_opts(_isolated_cwd):
     flow = _DemoInterruptFlow()
     events = await _run_kickoff(flow, _mk_input("thr-a"), HITLOptions())

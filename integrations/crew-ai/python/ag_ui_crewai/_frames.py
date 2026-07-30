@@ -149,6 +149,12 @@ class StreamFrameTranslator:
         self._pending_request: dict[str, Any] | None = None
         self._paused: bool = False
         self._paused_flow_id: str | None = None
+        # Name of the STEP whose STEP_STARTED was emitted but not yet closed.
+        # An interrupt pauses a method mid-flight, so the step must be closed
+        # before RUN_FINISHED (the AG-UI client rejects RUN_FINISHED while a
+        # step is active); on resume the continuing method's STEP_FINISHED has
+        # no STEP_STARTED in the new run, so one is synthesized to balance it.
+        self._open_step: str | None = None
 
     # -- public API --------------------------------------------------------
 
@@ -224,10 +230,12 @@ class StreamFrameTranslator:
                 )
             ]
         if event_type == _METHOD_STARTED:
+            method_name = getattr(event, "method_name", None)
+            self._open_step = method_name
             return [
                 StepStartedEvent(
                     type=EventType.STEP_STARTED,
-                    step_name=getattr(event, "method_name", None),
+                    step_name=method_name,
                 )
             ]
         if event_type == _METHOD_FINISHED:
@@ -302,7 +310,10 @@ class StreamFrameTranslator:
         self._run_finished_emitted = True
         interrupt = self._build_interrupt()
         if interrupt is not None:
-            return build_interrupt_tail(
+            # Close the method the interrupt paused so RUN_FINISHED is not sent
+            # while a step is still active (the AG-UI client rejects that).
+            head = self._close_open_step()
+            return head + build_interrupt_tail(
                 interrupt,
                 thread_id=self._thread_id,
                 run_id=self._run_id,
@@ -386,7 +397,17 @@ class StreamFrameTranslator:
             else {}
         )
         method_name = getattr(event, "method_name", None)
-        return [
+        # On resume the method that was suspended finishes without a fresh
+        # STEP_STARTED in this run (it started in the run that paused), so
+        # synthesize one to keep STEP_STARTED / STEP_FINISHED balanced for the
+        # AG-UI client. A normally-started step already matches self._open_step.
+        events: list[Any] = []
+        if self._open_step != method_name:
+            events.append(
+                StepStartedEvent(type=EventType.STEP_STARTED, step_name=method_name)
+            )
+        self._open_step = None
+        events += [
             MessagesSnapshotEvent(
                 type=EventType.MESSAGES_SNAPSHOT,
                 messages=messages,
@@ -400,6 +421,15 @@ class StreamFrameTranslator:
                 step_name=method_name,
             ),
         ]
+        return events
+
+    def _close_open_step(self) -> list[Any]:
+        """STEP_FINISHED for a step left open by an interrupt pause, else []."""
+        if self._open_step is None:
+            return []
+        step = self._open_step
+        self._open_step = None
+        return [StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=step)]
 
     # -- emission-shape strategy (default "chunks") -----------------------
 
