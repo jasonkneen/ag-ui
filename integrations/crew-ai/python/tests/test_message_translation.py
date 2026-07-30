@@ -59,6 +59,23 @@ def test_litellm_conversion_injects_tool_call_type():
     assert tool_calls[0]["function"]["name"] == "f"
 
 
+def test_litellm_conversion_does_not_mutate_caller_tool_calls():
+    """Stamping ``type=function`` must not mutate the caller's (flow-state)
+    tool_call dicts in place: the whitelist comprehension is a shallow copy,
+    so a deep-enough copy is required before writing back."""
+    tool_call = {"id": "t1", "function": {"name": "f", "arguments": "{}"}}
+    message = {"role": "assistant", "id": "a3", "content": None,
+               "tool_calls": [tool_call]}
+
+    out = litellm_messages_to_ag_ui_messages([message])
+
+    # Output is stamped...
+    assert out[0].model_dump()["tool_calls"][0]["type"] == "function"
+    # ...but the caller's original dict is untouched.
+    assert "type" not in tool_call
+    assert message["tool_calls"][0] is tool_call
+
+
 def test_litellm_conversion_accepts_litellm_message_object():
     """A non-Mapping LiteLLM ``Message`` goes through the ``model_dump`` branch."""
     from litellm.types.utils import Message as LiteLLMMessage
