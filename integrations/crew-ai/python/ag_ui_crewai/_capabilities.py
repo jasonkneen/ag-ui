@@ -1,4 +1,4 @@
-"""Runtime capability detection for the CrewAI AG-UI bridge (CPK-7718).
+"""Runtime capability detection for the CrewAI AG-UI bridge.
 
 crewai's public surface shifted across the 0.x -> 1.x boundary. Rather than
 gate code paths on ``crewai.__version__`` (brittle — a version string is not a
@@ -20,11 +20,40 @@ module-load time without a circular dependency (mirrors ``_env``).
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ag_ui.core import EventType
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def _safe_getattr(obj: Any, name: str) -> Any:
+    """``getattr`` that cannot propagate a caller's property exception.
+
+    Capability probing walks arbitrary user objects, where a raising property must
+    read as "absent" rather than failing the query.
+    """
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - a raising property is "not present"
+        return None
+
+
+def _safe_hasattr(obj: Any, name: str) -> bool:
+    """``hasattr`` that cannot propagate a caller's property exception.
+
+    Presence, not truthiness: ``GeminiCompletion`` declares
+    ``thinking_config: Any = None``, so an "is not None" check would report the
+    native provider as absent.
+    """
+    try:
+        return hasattr(obj, name)
+    except Exception:  # noqa: BLE001 - a raising property is "not usable"
+        return False
 
 
 def _crewai_version() -> str:
@@ -46,7 +75,15 @@ def _first_module(candidates: list[str]) -> tuple[Any, str | None]:
     for name in candidates:
         try:
             return importlib.import_module(name), name
-        except Exception:  # noqa: BLE001 - any import failure is "not here"
+        except (ImportError, ModuleNotFoundError):
+            # Only "module genuinely not here" is a soft miss (fall through to
+            # the next candidate). A DIFFERENT error raised while importing an
+            # existing module — e.g. a real bug inside ``crewai.events`` (a
+            # SyntaxError, an AttributeError from a broken re-export, a failing
+            # top-level side effect) — must NOT be swallowed: doing so
+            # misreports a genuinely broken install as "install crewai>=1.0".
+            # ``ModuleNotFoundError`` is an ``ImportError`` subclass; both are
+            # listed for clarity.
             continue
     return None, None
 
@@ -107,7 +144,7 @@ _event_bus_has_flush = bool(crewai_event_bus is not None and callable(getattr(cr
 
 
 # --------------------------------------------------------------------------
-# StreamFrame streaming contract resolution (CPK-7719)
+# StreamFrame streaming contract resolution
 # --------------------------------------------------------------------------
 # crewai landed a public, ordered streaming envelope — ``StreamFrame`` and the
 # ``AsyncStreamSession`` returned by ``Flow.astream()`` — in 1.6.0 (hardened in
@@ -131,8 +168,8 @@ StreamFrame = (
 # The scoped stream-sink API (``crewai.events.stream_context``) landed together
 # with ``StreamFrame`` in 1.6. The bridge registers its OWN sink so the frame
 # translator receives the RAW AG-UI / lifecycle event object (source + exact
-# payload) rather than the ``to_serializable``-mangled ``frame.data`` snapshot
-# (CPK-7719 review blocker 1). ``publish_stream_event`` invokes every sink
+# payload) rather than the ``to_serializable``-mangled ``frame.data`` snapshot.
+# ``publish_stream_event`` invokes every sink
 # synchronously on ``emit``, so a sink parked by ``event_id`` is guaranteed
 # populated before the corresponding frame is dequeued.
 _STREAM_CONTEXT_MODULE, _STREAM_CONTEXT_MODULE_NAME = _first_module(
@@ -161,7 +198,7 @@ _stream_frame_available = (
 def flow_supports_stream_frames(flow: Any) -> bool:
     """Return True when ``flow`` can be driven via the StreamFrame contract.
 
-    Two conditions, both required (CPK-7719):
+    Two conditions, both required:
 
     * The installed crewai exposes ``StreamFrame`` (resolved once at import) —
       i.e. crewai >= 1.6. On 1.0-1.5 this is ``None`` and we fall back.
@@ -219,6 +256,313 @@ except Exception:  # pragma: no cover - litellm is a declared direct dep
     _litellm_available = False
 
 
+# --------------------------------------------------------------------------
+# Reasoning resolution
+# --------------------------------------------------------------------------
+# Two channels carry model reasoning: the litellm streaming delta
+# (``reasoning_content`` / ``thinking_blocks`` -- provider-agnostic, always
+# available since litellm is a direct dep) and crewai's native
+# ``LLMThinkingChunkEvent`` (its Gemini provider, crewai >= 1.10.1). The event
+# lives at ``crewai.events.types.llm_events`` (1.x) / ``crewai.utilities.events.
+# llm_events`` (0.x) and is NOT re-exported at the events-package root. Resolved
+# here (before ``_detect``) so both the capability snapshot and the frame-path
+# sink gate share ONE probe.
+_LLM_EVENTS_MODULE, _ = _first_module(
+    ["crewai.events.types.llm_events", "crewai.utilities.events.llm_events"]
+)
+LLMThinkingChunkEvent = (
+    getattr(_LLM_EVENTS_MODULE, "LLMThinkingChunkEvent", None)
+    if _LLM_EVENTS_MODULE is not None
+    else None
+)
+_thinking_event_available = LLMThinkingChunkEvent is not None
+_native_reasoning_event_available = _thinking_event_available
+# Reasoning surfacing is available whenever ANY channel is live -- not gated to
+# a single provider. The litellm delta channel is effectively always live.
+_reasoning_available = _litellm_available or _thinking_event_available
+
+
+# --------------------------------------------------------------------------
+# Checkpointing resolution
+# --------------------------------------------------------------------------
+# crewai's checkpointing pieces landed in different releases, so each is
+# resolved/probed independently (never gated on ``__version__``) and its
+# enabling version named in the warning text. ``from_checkpoint`` (1.13)
+# predates ``CheckpointConfig`` (1.14), so the two are probed separately: on
+# 1.13.x the kwarg exists but no config can be built, and the bridge stays on
+# the no-checkpoint path.
+CHECKPOINT_ENABLING_VERSIONS: dict[str, str] = {
+    "from_checkpoint": "1.13.0",
+    "checkpoint_config": "1.14.0",
+    "fork": "1.14.2",
+    "checkpoint_events": "1.14.3",
+    "restore_from_state_id": "1.14.5",
+}
+
+_CREWAI_MODULE, _ = _first_module(["crewai"])
+_Flow = getattr(_CREWAI_MODULE, "Flow", None) if _CREWAI_MODULE else None
+_Crew = getattr(_CREWAI_MODULE, "Crew", None) if _CREWAI_MODULE else None
+
+
+def _kwarg_in_signature(func: Any, name: str) -> bool:
+    """True when ``func`` declares a parameter ``name`` (or accepts ``**kwargs``).
+
+    Used to probe whether a crewai release grew a given keyword argument
+    without gating on the version string. A ``**kwargs`` catch-all counts as
+    "accepts it": passing an unknown kwarg through ``**kwargs`` is safe.
+    """
+    if func is None:
+        return False
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C builtins etc.
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# ``CheckpointConfig`` is re-exported at the crewai root (1.14+); its canonical
+# home is ``crewai.state.checkpoint_config``. Try the root first, then the
+# module, so a partial / future re-org still resolves.
+CheckpointConfig = getattr(_CREWAI_MODULE, "CheckpointConfig", None) if _CREWAI_MODULE else None
+_CKPT_STATE_MODULE, _CKPT_STATE_MODULE_NAME = _first_module(["crewai.state"])
+if CheckpointConfig is None and _CKPT_STATE_MODULE is not None:
+    CheckpointConfig = getattr(_CKPT_STATE_MODULE, "CheckpointConfig", None)
+
+# ``JsonProvider`` / ``SqliteProvider`` live on ``crewai.state`` (NOT the crewai
+# root, verified on the 1.15.7 wheel).
+JsonProvider = getattr(_CKPT_STATE_MODULE, "JsonProvider", None) if _CKPT_STATE_MODULE else None
+SqliteProvider = getattr(_CKPT_STATE_MODULE, "SqliteProvider", None) if _CKPT_STATE_MODULE else None
+
+# The Checkpoint*Event lifecycle types live at
+# ``crewai.events.types.checkpoint_events`` (not re-exported at the
+# ``crewai.events`` root on 1.15.x). Resolved for callers that surface them;
+# the persistence wiring here does not depend on them.
+_CKPT_EVENTS_MODULE, _CKPT_EVENTS_MODULE_NAME = _first_module(
+    ["crewai.events.types.checkpoint_events"]
+)
+_checkpoint_events_available = _CKPT_EVENTS_MODULE is not None and (
+    getattr(_CKPT_EVENTS_MODULE, "CheckpointCompletedEvent", None) is not None
+)
+
+# ``from_checkpoint`` / ``restore_from_state_id`` are probed on ``Flow`` (the
+# bridge only checkpoints flows; the crew endpoint wraps its crew in a
+# ``ChatWithCrewFlow``). These are the CLASS-level probes for the capability
+# table / warnings; the per-flow guard below re-probes the SPECIFIC instance so
+# test doubles that implement only ``kickoff_async(self, inputs=None)`` stay on
+# the no-checkpoint path.
+_flow_from_checkpoint_supported = _kwarg_in_signature(
+    getattr(_Flow, "kickoff_async", None), "from_checkpoint"
+)
+_flow_restore_from_state_id_supported = _kwarg_in_signature(
+    getattr(_Flow, "kickoff_async", None), "restore_from_state_id"
+)
+_checkpoint_fork_supported = callable(getattr(_Flow, "fork", None)) or callable(
+    getattr(_Crew, "fork", None)
+)
+# Checkpointing needs a config type AND at least one provider to build one. The
+# ``from_checkpoint`` kwarg alone (crewai 1.13) is inert without them.
+_checkpoint_config_available = CheckpointConfig is not None and (
+    JsonProvider is not None or SqliteProvider is not None
+)
+# The full persistence path is usable when we can both build a config and pass
+# it: i.e. the config type, a provider, and the kwarg are all present.
+_checkpointing_available = _checkpoint_config_available and _flow_from_checkpoint_supported
+
+
+def flow_supports_checkpointing(flow: Any) -> bool:
+    """Return True when THIS flow can be checkpointed via ``from_checkpoint``.
+
+    Two conditions, both required (mirrors ``flow_supports_stream_frames``):
+
+    * the installed crewai can build a ``CheckpointConfig`` and exposes the
+      ``from_checkpoint`` kwarg (crewai >= 1.14 for both), and
+    * this SPECIFIC flow object exposes a driving method (``astream`` or
+      ``kickoff_async``) whose signature actually accepts ``from_checkpoint``.
+
+    The per-flow re-probe is what keeps the cancellation test doubles in
+    ``tests/test_task_cancellation.py`` (which implement only
+    ``kickoff_async(self, inputs=None)``) on the no-checkpoint path, so their
+    27 cancellation / timeout tests are unaffected.
+    """
+    if not _checkpointing_available:
+        return False
+    for method_name in ("astream", "kickoff_async"):
+        if _kwarg_in_signature(getattr(flow, method_name, None), "from_checkpoint"):
+            return True
+    return False
+
+
+def supported_checkpoint_kwargs(method: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter ``kwargs`` to those the bound ``method`` actually declares.
+
+    The last line of defence at the call site: even after
+    ``flow_supports_checkpointing`` gates the build, the frame path calls
+    ``astream`` and the legacy path calls ``kickoff_async`` (different methods).
+    Filtering per-method means a flow that grew one kwarg but not the other (or
+    a test double that grew neither) degrades to a no-op instead of raising
+    ``TypeError: unexpected keyword argument``.
+    """
+    if not kwargs:
+        return {}
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C builtins etc.
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+# --------------------------------------------------------------------------
+# Async human-feedback (HITL) resolution
+# --------------------------------------------------------------------------
+# crewai's async HITL landed at 1.8: a flow method wrapped with
+# ``@human_feedback`` whose provider RAISES ``HumanFeedbackPending`` pauses the
+# run; the framework persists the pending state and ``Flow.from_pending(flow_id)``
+# + ``flow.resume_async(feedback)`` resume it. The pause / feedback lifecycle
+# events live on ``crewai.events.types.flow_events`` and are NOT re-exported at
+# the ``crewai.events`` root (verified on the 1.15.7 wheel), so resolve them
+# there first, with the root as a fallback for a future re-export.
+_FLOW_EVENTS_MODULE, _FLOW_EVENTS_MODULE_NAME = _first_module(
+    ["crewai.events.types.flow_events", "crewai.events"]
+)
+_HITL_EVENT_NAMES = [
+    "HumanFeedbackRequestedEvent",
+    "HumanFeedbackReceivedEvent",
+    "FlowPausedEvent",
+    "MethodExecutionPausedEvent",
+]
+if _FLOW_EVENTS_MODULE is not None:
+    _hitl_event_attrs = _resolve_attrs(_FLOW_EVENTS_MODULE, _HITL_EVENT_NAMES)
+else:  # pragma: no cover - crewai without a flow-events module is pre-HITL
+    _hitl_event_attrs = dict.fromkeys(_HITL_EVENT_NAMES, None)
+# Fall back to the crewai.events root for any name the primary module missed.
+_EVENTS_ROOT_MODULE, _ = _first_module(["crewai.events"])
+if _EVENTS_ROOT_MODULE is not None:
+    for _name, _value in list(_hitl_event_attrs.items()):
+        if _value is None:
+            _hitl_event_attrs[_name] = getattr(_EVENTS_ROOT_MODULE, _name, None)
+
+HumanFeedbackRequestedEvent = _hitl_event_attrs["HumanFeedbackRequestedEvent"]
+HumanFeedbackReceivedEvent = _hitl_event_attrs["HumanFeedbackReceivedEvent"]
+FlowPausedEvent = _hitl_event_attrs["FlowPausedEvent"]
+MethodExecutionPausedEvent = _hitl_event_attrs["MethodExecutionPausedEvent"]
+
+# The pause signal + provider protocol live on ``crewai.flow``.
+_FLOW_PKG_MODULE, _ = _first_module(["crewai.flow"])
+HumanFeedbackPending = (
+    getattr(_FLOW_PKG_MODULE, "HumanFeedbackPending", None) if _FLOW_PKG_MODULE else None
+)
+HumanFeedbackProvider = (
+    getattr(_FLOW_PKG_MODULE, "HumanFeedbackProvider", None) if _FLOW_PKG_MODULE else None
+)
+
+# Resume API, probed on the resolved Flow class (``from_pending`` is a
+# classmethod, ``resume_async`` an instance coroutine).
+_flow_from_pending_supported = callable(getattr(_Flow, "from_pending", None))
+_flow_resume_async_supported = callable(getattr(_Flow, "resume_async", None))
+
+
+def _model_has_field(model: Any, field_name: str) -> bool:
+    """True when a Pydantic ``model`` declares ``field_name``."""
+    fields = getattr(model, "model_fields", None)
+    return bool(fields) and field_name in fields
+
+
+# ``HumanFeedbackRequestedEvent.request_id`` (crewai 1.12.2+) is the stable,
+# non-synthesizable id the bridge maps onto ``AGUIInterrupt.id``. Probe for the
+# field rather than the version; below it there is no stable id and HITL is not
+# advertised.
+_human_feedback_request_id_supported = (
+    HumanFeedbackRequestedEvent is not None
+    and _model_has_field(HumanFeedbackRequestedEvent, "request_id")
+)
+
+# Two levels, so a pause that surfaces as an interrupt is never stranded by a
+# too-strict resume gate:
+#
+# * ``_human_feedback_resume_available`` gates the pause / resume LIFECYCLE. It
+#   needs the pause signal, the resume classmethod + coroutine, and the
+#   StreamFrame transport (async HITL >=1.8 always ships alongside StreamFrame
+#   >=1.6, and the bridge only drives the lifecycle on the frame path). It does
+#   NOT require a stable request id: the interrupt id falls back to the flow id
+#   (== thread_id), which resume keys by, so 1.8-1.12.1 pauses still resume.
+# * ``_human_feedback_available`` is the ADVERTISED capability (stable interrupt
+#   ids). It adds the request-event class and its ``request_id`` field (1.12.2+).
+#   Below that, the lifecycle still works with flow-id ids and a warning.
+_human_feedback_resume_available = (
+    HumanFeedbackPending is not None
+    and FlowPausedEvent is not None
+    and _flow_from_pending_supported
+    and _flow_resume_async_supported
+    and _stream_frame_available
+)
+_human_feedback_available = (
+    _human_feedback_resume_available
+    and HumanFeedbackRequestedEvent is not None
+    and _human_feedback_request_id_supported
+)
+
+# Named enabling versions for warning text only (never a code-path gate).
+HITL_ENABLING_VERSIONS: dict[str, str] = {
+    "human_feedback": "1.8.0",
+    "request_id": "1.12.2",
+    "stream_frame": "1.6.0",
+}
+
+
+def flow_supports_human_feedback(flow: Any) -> bool:
+    """Return True when THIS flow can pause / resume via async human feedback.
+
+    Mirrors ``flow_supports_stream_frames`` / ``flow_supports_checkpointing``:
+    the installed crewai must expose the async-HITL API (probed above) AND this
+    specific flow must expose the resume coroutine and the frame transport, so
+    the ``kickoff_async``-only test doubles in ``tests/test_task_cancellation.py``
+    stay off the HITL path.
+    """
+    if not _human_feedback_resume_available:
+        return False
+    return callable(getattr(flow, "resume_async", None)) and hasattr(flow, "astream")
+
+
+# --------------------------------------------------------------------------
+# crewai-files multimodal input resolution
+# --------------------------------------------------------------------------
+# crewai's ``input_files=`` (1.9.0+) is inert without the separate
+# ``crewai-files`` distribution (the ``crewai[file-processing]`` extra). Probe
+# the distribution, not ``crewai.__version__``; ``find_spec`` is side-effect free.
+try:
+    _crewai_files_available = importlib.util.find_spec("crewai_files") is not None
+except (ImportError, ValueError):  # pragma: no cover - defensive
+    _crewai_files_available = False
+
+# One-shot dedup guard for the lazy multimodal warning (reset in tests).
+_multimodal_files_gap_warned = False
+
+
+def warn_multimodal_files_gap() -> None:
+    """Warn once when non-image media arrives without the crewai-files extra.
+
+    Images ride ``image_url`` and work on any vision provider, so this is not
+    fired for them. Audio/video/document are forwarded as ``image_url`` too,
+    which many providers reject; native support needs the extra.
+    """
+    global _multimodal_files_gap_warned
+    if CAPABILITIES.crewai_files_available or _multimodal_files_gap_warned:
+        return
+    _multimodal_files_gap_warned = True
+    _LOGGER.warning(
+        "ag-ui-crewai received non-image media (audio/video/document) but the "
+        "optional 'crewai-files' distribution is not installed (crewai %s). It "
+        "is forwarded to the chat LLM as an image_url block, which many "
+        "providers reject; native support needs crewai>=1.9 with the "
+        "'crewai[file-processing]' extra.",
+        CAPABILITIES.crewai_version,
+    )
+
+
 @dataclass(frozen=True)
 class _Capabilities:
     """Cached, immutable snapshot of the detected crewai capabilities.
@@ -236,11 +580,35 @@ class _Capabilities:
     crew_chat_module: str | None
     crew_chat_available: bool
     litellm_available: bool
+    # Reasoning: available whenever ANY channel is live (litellm delta or the
+    # native thinking event), never gated to a single provider. Surfaced for
+    # the protocol capability table.
+    reasoning_available: bool = False
+    native_reasoning_event_available: bool = False
     stream_frame_available: bool = False
+    # Checkpointing: informational; the wiring keys off the resolved
+    # symbols / ``flow_supports_checkpointing`` per-flow probe, not these fields.
+    checkpoint_config_available: bool = False
+    checkpointing_available: bool = False
+    flow_from_checkpoint_supported: bool = False
+    flow_restore_from_state_id_supported: bool = False
+    checkpoint_fork_supported: bool = False
+    checkpoint_events_available: bool = False
+    checkpoint_state_module: str | None = None
+    # Async human-feedback (HITL): informational; the wiring keys off the
+    # resolved symbols / ``flow_supports_human_feedback`` per-flow probe.
+    flow_events_module: str | None = None
+    human_feedback_available: bool = False
+    human_feedback_resume_available: bool = False
+    human_feedback_request_id_supported: bool = False
+    crewai_files_available: bool = False
     missing: tuple[str, ...] = field(default_factory=tuple)
 
     def warn_on_gaps(self) -> None:
-        """Emit one WARNING per missing capability, naming the fix.
+        """Emit one message per missing capability, naming the fix.
+
+        WARNING for a real gap; INFO for the StreamFrame transport, whose absence
+        only downgrades the bridge to the legacy path (see the last branch).
 
         Kept idempotent-friendly (call once at import). Each message names the
         crewai version / extra that unlocks the missing capability so operators
@@ -280,6 +648,29 @@ class _Capabilities:
                 "Upgrade to crewai>=1.6 for the ordered StreamFrame transport.",
                 self.crewai_version,
             )
+        if not self.human_feedback_resume_available:
+            # NOT a hard gap; chat / tool-based HITL is unaffected. Emit an
+            # INFO note so operators know async interrupt (pause / resume) needs
+            # the async-HITL API + the StreamFrame transport.
+            _LOGGER.info(
+                "ag-ui-crewai: crewai %s does not expose the async human-feedback "
+                "interrupt API the bridge needs (async @human_feedback pause, "
+                "Flow.from_pending/resume_async, StreamFrame); interrupt/resume "
+                "is disabled. Upgrade to crewai>=%s for AG-UI interrupts.",
+                self.crewai_version,
+                HITL_ENABLING_VERSIONS["human_feedback"],
+            )
+        elif not self.human_feedback_request_id_supported:
+            # Lifecycle works, but without a stable per-request id the interrupt
+            # id falls back to the flow id (== thread_id). Fine for one pending
+            # per thread; upgrade for a stable id across multiple pauses.
+            _LOGGER.info(
+                "ag-ui-crewai: crewai %s supports async human-feedback but not "
+                "HumanFeedbackRequestedEvent.request_id; interrupt ids fall back "
+                "to the flow id. Upgrade to crewai>=%s for stable request ids.",
+                self.crewai_version,
+                HITL_ENABLING_VERSIONS["request_id"],
+            )
 
 
 def _detect() -> _Capabilities:
@@ -299,7 +690,21 @@ def _detect() -> _Capabilities:
         crew_chat_module=_CREW_CHAT_MODULE_NAME,
         crew_chat_available=_crew_chat_available,
         litellm_available=_litellm_available,
+        reasoning_available=_reasoning_available,
+        native_reasoning_event_available=_native_reasoning_event_available,
         stream_frame_available=_stream_frame_available,
+        checkpoint_config_available=_checkpoint_config_available,
+        checkpointing_available=_checkpointing_available,
+        flow_from_checkpoint_supported=_flow_from_checkpoint_supported,
+        flow_restore_from_state_id_supported=_flow_restore_from_state_id_supported,
+        checkpoint_fork_supported=_checkpoint_fork_supported,
+        checkpoint_events_available=_checkpoint_events_available,
+        checkpoint_state_module=_CKPT_STATE_MODULE_NAME,
+        flow_events_module=_FLOW_EVENTS_MODULE_NAME,
+        human_feedback_available=_human_feedback_available,
+        human_feedback_resume_available=_human_feedback_resume_available,
+        human_feedback_request_id_supported=_human_feedback_request_id_supported,
+        crewai_files_available=_crewai_files_available,
         missing=tuple(missing),
     )
     caps.warn_on_gaps()
@@ -308,3 +713,269 @@ def _detect() -> _Capabilities:
 
 # Run the probe ONCE at import time and cache the result.
 CAPABILITIES = _detect()
+
+
+# --------------------------------------------------------------------------
+# Native-Gemini resolution (informational reasoning fields)
+# --------------------------------------------------------------------------
+# The thinking-chunk event class + availability flags are resolved ONCE above
+# (before ``_detect``). Reasoning is now surfaced provider-agnostically via the
+# litellm channel and the native event, so ``get_capabilities`` no longer gates
+# reasoning on a native-Gemini LLM. The resolver below stays only to populate
+# the informational ``nativeGeminiProvider`` / ``resolvedProvider`` fields: the
+# native ``LLMThinkingChunkEvent`` (verified on the 1.15.7 wheel, emitted only by
+# ``crewai/llms/providers/gemini/completion.py``) is an EXTRA frame-path source,
+# not a requirement.
+
+# crewai's canonical name for the native Google Gen AI provider. ``LLM.__new__``
+# maps both the ``gemini/`` and ``google/`` model prefixes onto it and stamps it
+# on the constructed instance as ``.provider``.
+# crewai stamps EITHER name on a native Google Gen AI completion: ``gemini/...``
+# resolves to "gemini" and ``google/...`` keeps "google" (verified on 1.15.7 - a
+# ``provider="google"`` LLM is a real GeminiCompletion), so both must count.
+_NATIVE_GEMINI_PROVIDERS = frozenset({"gemini", "google"})
+
+
+# Depth cap for ``_resolve_llm``: an object graph with a cycle (an Agent whose
+# ``.llm`` points back at itself, or a wrapper pair that references each other)
+# would otherwise recurse until RecursionError inside a capability QUERY.
+
+_LLM_RESOLVE_MAX_DEPTH = 8
+
+
+def _resolve_llm(
+    candidate: Any, _depth: int = 0, _path: frozenset[int] = frozenset()
+) -> Any:
+    """Best-effort unwrap of an object into the crewai LLM instance it holds.
+
+    Accepts an LLM directly, or anything carrying one on a conventional attribute:
+    an Agent's ``.llm``, a Crew's ``.agents[*].llm`` / ``.chat_llm`` /
+    ``.manager_llm``, a Flow / ``ChatWithCrewFlow`` holding either. Returns ``None``
+    when no LLM can be found - the caller reports "not resolvable" rather than
+    guessing. Read-only: a callable (a ``@CrewBase`` ``crew`` factory) is never
+    invoked, and a property that raises is treated as absent.
+
+    A native-Gemini LLM WINS over any other candidate, because reasoning support is
+    the one capability that turns on it. The search is otherwise first-match.
+
+    Cycle safety tracks the ancestor PATH, not a shared visited set: a shared set is
+    never unwound, so a node reached down a dead-end branch would stay poisoned for
+    every other branch.
+    """
+    if candidate is None or _depth > _LLM_RESOLVE_MAX_DEPTH:
+        return None
+    marker = id(candidate)
+    if marker in _path:
+        return None
+    _path = _path | {marker}
+
+    if callable(candidate) and not _safe_hasattr(candidate, "provider"):
+        # A ``@CrewBase``'s ``crew`` is a factory method; calling it would execute
+        # user code inside a capability query.
+        return None
+    # A crewai 1.x LLM declares ``provider`` (native classes and the LiteLLM
+    # fallback alike), so that is the strongest "this IS the LLM" signal. Older 0.x
+    # LLMs may not, which is why the ``model`` fallback below still exists.
+    if _safe_hasattr(candidate, "provider"):
+        return candidate
+
+    # Otherwise unwrap before falling back to the weaker ``model`` signal: an
+    # Agent / Crew / Flow can itself carry a ``model`` attribute, and returning the
+    # wrapper would report "not native Gemini" for an LLM we never looked at.
+    fallback = None
+    agents = _safe_getattr(candidate, "agents")
+    candidates: list[Any] = []
+    if isinstance(agents, (list, tuple)):
+        # ``agents`` first: a Crew keeps its LLMs there, and ``chat_llm`` /
+        # ``manager_llm`` are None on a plain Crew.
+        candidates.extend(agents)
+    for attr in ("llm", "chat_llm", "manager_llm", "crew"):
+        nested = _safe_getattr(candidate, attr)
+        if nested is not None and nested is not candidate:
+            candidates.append(nested)
+    for nested in candidates:
+        resolved = _resolve_llm(nested, _depth + 1, _path)
+        if resolved is None:
+            continue
+        if _is_native_gemini(resolved):
+            # Search EVERY branch for a native-Gemini LLM before settling: an
+            # earlier revision returned the first agent's LLM without ever looking
+            # at chat_llm / manager_llm.
+            return resolved
+        if fallback is None:
+            fallback = resolved
+    if fallback is not None:
+        return fallback
+
+    if _safe_hasattr(candidate, "model") and not any(
+        _safe_hasattr(candidate, attr)
+        for attr in ("agents", "llm", "chat_llm", "manager_llm", "crew")
+    ):
+        # ``model`` alone is the crewai 0.x LLM signal, but an Agent / Crew / Flow can
+        # carry one too; returning such a wrapper would report
+        # ``provider_not_native_gemini`` for something that is not an LLM.
+        return candidate
+    return None
+
+
+def _is_native_gemini(llm: Any) -> bool:
+    """Whether ``llm`` is crewai's NATIVE Google Gen AI completion instance.
+
+    Two structural probes, no version gate and no module-name string match:
+
+    * ``provider == "gemini"`` - stamped by ``LLM.__new__`` only when it routes
+      to a native provider class.
+    * ``hasattr(llm, "thinking_config")`` - a field declared ONLY on
+      ``crewai.llms.providers.gemini.completion.GeminiCompletion`` (verified by
+      grep across ``crewai/llms/providers/`` on the 1.15.7 wheel). The LiteLLM
+      fallback ``LLM`` and every other native provider lack it.
+
+    Both are needed: a LiteLLM-routed ``gemini/<unlisted-model>`` can still carry
+    a gemini-ish provider string but has no thinking plumbing, and a future
+    provider could grow a ``thinking_config`` without being Gemini.
+    """
+    if llm is None:
+        return False
+    provider = _safe_getattr(llm, "provider")
+    if (
+        not isinstance(provider, str)
+        or provider.strip().casefold() not in _NATIVE_GEMINI_PROVIDERS
+    ):
+        return False
+    return _safe_hasattr(llm, "thinking_config")
+
+
+def _reasoning_capability(llm: Any = None) -> dict:
+    """Build the ``reasoning`` block of the capability declaration.
+
+    Reasoning surfaces as first-class ``REASONING_*`` events, provider-agnostic
+    and on BOTH transports: ``copilotkit_stream`` reads the litellm delta's
+    ``reasoning_content`` / ``thinking_blocks`` for any reasoning-capable model
+    (deepseek-reasoner, Anthropic extended thinking, Bedrock, xAI,
+    gemini-via-litellm, ...), and crewai's native Gemini provider additionally
+    emits ``LLMThinkingChunkEvent`` on the StreamFrame path. It needs NEITHER
+    ``emit_raw_events`` NOR the StreamFrame transport.
+
+    ``supported`` describes the bridge capability, not whether a given model will
+    actually reason: a non-reasoning model simply emits nothing (graceful
+    no-op). It is therefore True whenever a reasoning channel is live -- the
+    litellm channel is effectively always live (a direct dep).
+    ``nativeGeminiProvider`` / ``resolvedProvider`` are informational: the native
+    event is an EXTRA source, not a requirement.
+    """
+    resolved = _resolve_llm(llm)
+    return {
+        "supported": CAPABILITIES.reasoning_available,
+        # Provider-agnostic path (always live when litellm is installed).
+        "litellmChannel": CAPABILITIES.litellm_available,
+        # crewai's native Gemini thinking event: an extra frame-path source.
+        "thinkingEventAvailable": _thinking_event_available,
+        "nativeGeminiProvider": _is_native_gemini(resolved),
+        # A caller object: a raising property here would escape the whole query.
+        "resolvedProvider": _safe_getattr(resolved, "provider"),
+        # First-class REASONING_* mapping: reasoning does NOT ride RAW passthrough.
+        "requiresEmitRawEvents": False,
+        "reason": None if CAPABILITIES.reasoning_available else "litellm_unavailable",
+    }
+
+
+def get_capabilities(
+    *,
+    llm: Any = None,
+    emit_raw_events: bool | None = None,
+) -> dict:
+    """Return the CrewAI bridge's capability declaration.
+
+    Mirrors the shape of ``ag_ui_langgraph.LangGraphAgent.get_capabilities``
+    (``identity`` / ``humanInTheLoop`` / ``state`` / ``transport``) and adds the
+    CrewAI-specific blocks the parity lane needs: the resolved wire shape, RAW
+    passthrough, and reasoning.
+
+    No field is derived from ``crewai.__version__`` - the version string appears
+    only as informational ``crewaiVersion`` metadata (same rule as the rest of this
+    module). Within that, ``transport`` / ``rawEvents`` / ``reasoning`` / ``crewChat``
+    come from runtime probes, while ``humanInTheLoop`` and ``state`` are static
+    declarations of what the bridge implements today.
+
+    ``emission_shape`` / ``emit_raw_events`` default to re-reading the environment,
+    so a declaration fetched without arguments can disagree with an endpoint that
+    was registered with explicit ones. Pass the same values the endpoint was
+    registered with to describe THAT endpoint.
+
+    Raises
+    ------
+    ValueError
+        If ``emission_shape`` names an unknown shape, or ``emit_raw_events`` is not
+        a bool. Both are caller mistakes rather than environment conditions.
+
+    Parameters
+    ----------
+    llm:
+        The LLM, or an object carrying one: an Agent (``.llm``), a Crew
+        (``.agents[*].llm``, or ``chat_llm`` / ``manager_llm`` when set), or a Flow
+        holding either. Resolution is read-only and never calls a factory.
+        Optional for ``reasoning``: reasoning is now provider-agnostic (the
+        litellm channel), so it is reported supported regardless of the LLM. An
+        LLM only enriches the informational ``nativeGeminiProvider`` /
+        ``resolvedProvider`` fields.
+    emission_shape / emit_raw_events:
+        The values the endpoint was configured with. Defaults (``None``) resolve
+        the same way the endpoint factories resolve them, so a caller that
+        configured nothing sees what the endpoint will actually emit.
+    """
+    # ``_config`` is a leaf (``_env`` + stdlib only), imported locally purely to
+    # keep this module's "crewai / litellm / stdlib only" property for every path
+    # that never calls ``get_capabilities``.
+    from ._config import DEFAULT_EMIT_RAW_EVENTS, resolve_emit_raw_events
+
+    resolved_raw = resolve_emit_raw_events(emit_raw_events)
+    return {
+        "identity": {"type": "crewai", "crewaiVersion": CAPABILITIES.crewai_version},
+        "humanInTheLoop": {
+            # True because the shipped ``human_in_the_loop`` example round-trips a
+            # frontend tool call. What is missing is the interrupt mechanism
+            # (crewai's ``@human_feedback`` / flow-level pause), below.
+            "supported": True,
+            "mechanism": "frontend-tool-calls",
+            "interrupts": False,
+            "approveWithEdits": False,
+        },
+        "state": {
+            # STATE_SNAPSHOT on every method finish plus progressive snapshots via
+            # ``copilotkit_emit_state``; no JSON-Patch deltas, and no server-side
+            # persistence across runs.
+            "snapshots": True,
+            "deltas": False,
+            "persistentState": False,
+        },
+        "transport": {
+            "streaming": True,
+            # crewai >= 1.6 ordered StreamFrame envelopes, else the legacy
+            # event-bus-listener fallback.
+            "streamFrames": CAPABILITIES.stream_frame_available,
+        },
+        "wireShape": {
+            # This build streams LLM text / tool calls as CHUNK events. MCP tool
+            # executions are the exception: their name, args and result arrive
+            # together, so they already emit canonical TOOL_CALL_* triples.
+            "emissionShape": "chunks",
+            "textMessages": [EventType.TEXT_MESSAGE_CHUNK.value],
+            "toolCalls": [EventType.TOOL_CALL_CHUNK.value],
+            "mcpToolCalls": [
+                EventType.TOOL_CALL_START.value,
+                EventType.TOOL_CALL_ARGS.value,
+                EventType.TOOL_CALL_END.value,
+                EventType.TOOL_CALL_RESULT.value,
+            ],
+        },
+        "rawEvents": {
+            # RAW needs the StreamFrame transport's scoped sink. This is the
+            # process-level probe; the driver also probes each flow for ``astream``,
+            # so a flow without it takes the legacy path and emits no RAW.
+            "supported": CAPABILITIES.stream_frame_available,
+            "enabled": bool(resolved_raw and CAPABILITIES.stream_frame_available),
+            "default": DEFAULT_EMIT_RAW_EVENTS,
+        },
+        "reasoning": _reasoning_capability(llm),
+        "crewChat": {"supported": CAPABILITIES.crew_chat_available},
+    }
