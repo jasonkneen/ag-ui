@@ -39,6 +39,7 @@ from ._frames import (
     CREW_AGENT_LIFECYCLE_TYPES,
     EmissionShaper,
     StreamFrameTranslator,
+    capture_method_emit_context,
     is_backend_tool_event,
     is_recognized_event,
     log_raw_loss,
@@ -2018,6 +2019,9 @@ async def _run_flow_frame_stream(
         thread_id=input_data.thread_id,
         run_id=input_data.run_id,
         state_provider=lambda: getattr(flow_copy, "state", {}),
+        # Lets the translator honor the sdk emit_state/predict_state suppression
+        # flags stashed on this flow (legacy-listener parity).
+        flow_provider=lambda: flow_copy,
         hitl_options=hitl_options,
         emission_shape=emission_shape,
     )
@@ -2100,6 +2104,13 @@ async def _run_flow_frame_stream(
             or is_thinking_event(event)
             or getattr(event, "type", None) in CREW_AGENT_LIFECYCLE_TYPES
         ):
+            # Capture EMIT-TIME context (this sink runs synchronously on the
+            # flow's timeline) for method finished/failed events: the state
+            # snapshot AND the consumed suppression decision. The frame driver
+            # translates later, after the flow has run ahead, so both must be
+            # captured here or a later method rewrites this method's snapshot or
+            # steals its suppression. No-ops for every other event type.
+            capture_method_emit_context(event, flow_copy)
             raw_events[event_id] = event
         elif emit_raw_events:
             if len(foreign_events) >= _FOREIGN_EVENT_BUFFER_MAX:
@@ -2558,6 +2569,7 @@ async def _run_flow_resume_stream(
         thread_id=thread_id,
         run_id=run_id,
         state_provider=lambda: getattr(resumed_flow, "state", {}),
+        flow_provider=lambda: resumed_flow,
         hitl_options=hitl_options,
         resumed=True,
     )
@@ -2568,6 +2580,10 @@ async def _run_flow_resume_stream(
         # Outer-run isolation identical to the kickoff frame driver: only this
         # flow's own events (plus MCP events, emitted with the agent as source).
         if source is resumed_flow or is_mcp_event(event):
+            # Capture EMIT-TIME state + suppression on the flow timeline before
+            # the event is queued for later translation (no-ops except for
+            # method finished/failed). See the kickoff driver for the rationale.
+            capture_method_emit_context(event, resumed_flow)
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
     # Predeclared before the try so the finally teardown is always safe to
