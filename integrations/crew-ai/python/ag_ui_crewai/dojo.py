@@ -11,11 +11,13 @@ from .examples.tool_based_generative_ui import ToolBasedGenerativeUIFlow
 from .examples.agentic_generative_ui import AgenticGenerativeUIFlow
 from .examples.shared_state import SharedStateFlow
 from .examples.predictive_state_updates import PredictiveStateUpdatesFlow
-from .examples.error_flow import ErrorFlow
 from .examples.interrupt_flow import InterruptFlow
 from .examples.a2ui_dynamic_schema import A2UIDynamicSchemaFlow
 from .examples.a2ui_recovery import A2UIRecoveryFlow
 from .examples.a2ui_fixed_schema import A2UIFixedSchemaFlow
+from .examples.agentic_chat_multimodal import AgenticChatMultimodalFlow
+from .examples.agentic_chat_reasoning import AgenticChatReasoningFlow
+from .examples.subgraphs import SubgraphsFlow
 
 app = FastAPI(title="CrewAI Dojo Example Server")
 
@@ -67,12 +69,6 @@ add_crewai_crew_fastapi_endpoint(
     path="/crew_chat",
 )
 
-add_crewai_flow_fastapi_endpoint(
-    app=app,
-    flow=ErrorFlow(),
-    path="/error_flow",
-)
-
 # emit_interrupt_outcome=True: CopilotKit v2 `useInterrupt` (>=1.61.2) resumes
 # from the standard RUN_FINISHED.outcome. With the default (legacy on_interrupt
 # only) its resolve() does not round-trip a RunAgentInput.resume[], so the run
@@ -100,6 +96,28 @@ add_crewai_flow_fastapi_endpoint(
     app=app,
     flow=A2UIFixedSchemaFlow(),
     path="/a2ui_fixed_schema",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=AgenticChatMultimodalFlow(),
+    path="/agentic_chat_multimodal",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=AgenticChatReasoningFlow(),
+    path="/agentic_chat_reasoning",
+)
+
+# emit_interrupt_outcome=True: the flights/hotels steps suspend the flow for the
+# user's pick; modern CopilotKit resumes from the RUN_FINISHED.outcome. See the
+# interrupt endpoint above for the full rationale.
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=SubgraphsFlow(),
+    path="/subgraphs",
+    emit_interrupt_outcome=True,
 )
 
 def main():

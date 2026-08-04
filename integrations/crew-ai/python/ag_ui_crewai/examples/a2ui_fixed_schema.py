@@ -28,7 +28,7 @@ from ..sdk import copilotkit_emit_tool_result, copilotkit_stream
 
 logger = logging.getLogger("ag_ui_crewai")
 
-MODEL = "openai/gpt-4o"
+MODEL = "openai/gpt-5.4"
 
 # Both surfaces render against the dojo's fixed catalog (Row / FlightCard /
 # HotelCard / StarRating); the dojo page supplies the catalog components, we

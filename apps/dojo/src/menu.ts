@@ -273,6 +273,8 @@ export const menuIntegrations = [
     name: "CrewAI",
     features: [
       "agentic_chat",
+      "agentic_chat_reasoning",
+      "agentic_chat_multimodal",
       "v1_agentic_chat",
       "backend_tool_rendering",
       "interrupt",
@@ -281,8 +283,8 @@ export const menuIntegrations = [
       "predictive_state_updates",
       "shared_state",
       "tool_based_generative_ui",
+      "subgraphs",
       "crew_chat",
-      "error_flow",
       "a2ui_dynamic_schema",
       "a2ui_recovery",
       "a2ui_fixed_schema",

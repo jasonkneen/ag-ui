@@ -148,13 +148,6 @@ export const featureConfig: FeatureConfig[] = [
     description: "Chat with a CrewAI crew wrapped in a dict-state chat flow",
     tags: ["Chat", "CrewAI", "Streaming"],
   }),
-  createFeatureConfig({
-    id: "error_flow",
-    name: "Error Flow",
-    description:
-      "Backend flow that raises an error, surfaced to the client as a RunErrorEvent",
-    tags: ["CrewAI", "Error Handling"],
-  }),
 ];
 
 export default featureConfig;

@@ -413,6 +413,8 @@ export const agentsIntegrations = {
       (path) => new CrewAIAgent({ url: `${envVars.crewAiUrl}/${path}` }),
       {
         agentic_chat: "agentic_chat",
+        agentic_chat_reasoning: "agentic_chat_reasoning",
+        agentic_chat_multimodal: "agentic_chat_multimodal",
         backend_tool_rendering: "backend_tool_rendering",
         interrupt: "interrupt",
         human_in_the_loop: "human_in_the_loop",
@@ -420,8 +422,8 @@ export const agentsIntegrations = {
         agentic_generative_ui: "agentic_generative_ui",
         shared_state: "shared_state",
         predictive_state_updates: "predictive_state_updates",
+        subgraphs: "subgraphs",
         crew_chat: "crew_chat",
-        error_flow: "error_flow",
         a2ui_dynamic_schema: "a2ui_dynamic_schema",
         a2ui_recovery: "a2ui_recovery",
         a2ui_fixed_schema: "a2ui_fixed_schema",

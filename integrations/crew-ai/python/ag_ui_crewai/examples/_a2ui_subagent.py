@@ -17,7 +17,7 @@ from ..a2ui_tool import apply_a2ui_plan_to_tools, plan_a2ui_injection
 
 logger = logging.getLogger("ag_ui_crewai")
 
-MODEL = "openai/gpt-4o"
+MODEL = "openai/gpt-5.4"
 
 # The dojo registers its dynamic component catalog (Row / HotelCard /
 # ProductCard / TeamMemberCard) under this id; auto-injected surfaces must
