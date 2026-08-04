@@ -693,10 +693,28 @@ def _frame_translator(flow):
     )
 
 
+async def test_frame_method_finished_after_emit_suppresses_node_exit():
+    # A method that emit_state's then finishes must have its node-exit
+    # STATE_SNAPSHOT SUPPRESSED (only MESSAGES + STEP_FINISHED), so the rebuild
+    # does not clobber the progressive emit. Direct-translate exercises the live
+    # suppression fallback (no sink stamp).
+    flow = _FakeFlow(state={"messages": [], "v": "real"})
+    tr = _frame_translator(flow)
+    tr.translate(_fe("flow_started"))
+    tr.translate(_fe("method_execution_started", method_name="chat"))
+    token = flow_context.set(flow)
+    try:
+        await copilotkit_emit_state({"v": "emit"})
+    finally:
+        flow_context.reset(token)
+    finished = tr.translate(_fe("method_execution_finished", method_name="chat"))
+    assert _names(finished) == ["MessagesSnapshotEvent", "StepFinishedEvent"]
+
+
 async def test_frame_method_failed_after_emit_owes_terminal_snapshot():
     # A method emit_state's then FAILS while the flow continues to flow_finished.
     # The failed method emits no node-exit snapshot, so the terminal snapshot is
-    # the only carrier of the authoritative flow.state — the fail path must
+    # the only carrier of the authoritative flow.state, so the fail path must
     # record the owed terminal, not drop it.
     flow = _FakeFlow(state={"messages": [], "recipe": {"title": "Pho"}})
     tr = _frame_translator(flow)
@@ -717,7 +735,7 @@ async def test_frame_method_failed_after_emit_owes_terminal_snapshot():
 async def test_frame_prior_suppressed_then_later_method_fails_keeps_terminal():
     # Node A emit_state's and finishes (owed terminal = True). Node B then FAILS
     # without emitting. B's fail path must NOT clobber A's owed-terminal flag (it
-    # emits no snapshot of its own) — OR, not overwrite.
+    # emits no snapshot of its own): OR, not overwrite.
     flow = _FakeFlow(state={"messages": [], "recipe": {"title": "Laksa"}})
     tr = _frame_translator(flow)
     tr.translate(_fe("flow_started"))

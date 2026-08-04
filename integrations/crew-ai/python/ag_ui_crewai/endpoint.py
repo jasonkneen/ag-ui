@@ -1000,6 +1000,12 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
             _enqueue(source, None)
         @crewai_event_bus.on(MethodExecutionStartedEvent)
         def _(source, event):
+            # Same source gate every other handler has: a pooled off-thread
+            # dispatch can land for a flow whose run is not ours (or already torn
+            # down). Without it the reset below wipes suppression flags on a
+            # foreign flow, and those flags are now load-bearing.
+            if get_queue(source) is None:
+                return
             # Clear stale suppression flags from a prior node that raised.
             reset_node_snapshot_suppression(source)
             # Flat per-method attribution. The legacy bus path is dispatched on
@@ -2564,6 +2570,13 @@ async def _run_flow_resume_stream(
     # and its crew writes to memory like any other run.
     apply_thread_memory_scope(resumed_flow, thread_id)
 
+    # The method that paused for feedback emitted neither finished nor failed, so
+    # its node-exit suppression flags were never consumed. Clear them on the
+    # reloaded flow before resume_async runs (on the flow timeline, before any
+    # emit) so a stale predicted-tool / manual-emit flag cannot wrongly suppress
+    # the resumed run's first snapshot.
+    reset_node_snapshot_suppression(resumed_flow)
+
     token = flow_context.set(resumed_flow)
     translator = StreamFrameTranslator(
         thread_id=thread_id,
@@ -2707,6 +2720,8 @@ async def _run_flow_resume_stream(
                 ceiling_display,
                 ceiling_exc.args[0] if ceiling_exc.args else "",
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(
@@ -2727,6 +2742,8 @@ async def _run_flow_resume_stream(
                 ceiling_display,
                 type(upstream_exc).__name__,
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(
@@ -2745,6 +2762,8 @@ async def _run_flow_resume_stream(
                 run_id,
                 type(e).__name__,
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(

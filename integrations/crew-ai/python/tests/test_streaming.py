@@ -1287,7 +1287,7 @@ async def test_frame_path_progressive_state_snapshot_is_verbatim():
     assert snap["timestamp"] == "user-ts", snap
 
 
-# -- PNI-180: method-finished state emission (emit-time snapshot + suppression) --
+# -- method-finished state emission: emit-time snapshot + snapshot-suppression --
 
 
 class _MultiMethodMutatingState(FlowState):
@@ -1297,8 +1297,8 @@ class _MultiMethodMutatingState(FlowState):
 
 class _MultiMethodFlow(Flow[_MultiMethodMutatingState]):
     """Two methods mutating shared state: m1 appends 'one', m2 (listening on m1)
-    appends 'two'. Single-method and crew_chat flows never exercise this — which
-    is why PNI-180 defect 1 shipped with a green e2e."""
+    appends 'two'. Single-method and crew_chat flows never exercise this, which
+    is why the retroactive-rewrite defect shipped with a green e2e."""
 
     @start()
     async def m1(self):
@@ -1312,7 +1312,7 @@ class _MultiMethodFlow(Flow[_MultiMethodMutatingState]):
 
 @requires_stream_frames
 async def test_frame_path_per_method_snapshot_is_emit_time_not_retroactive():
-    """PNI-180 defect 1: a per-method STATE_SNAPSHOT must reflect state as of THAT
+    """A per-method STATE_SNAPSHOT must reflect state as of THAT
     method's finish (emit time), not a LATER method's mutation read from the live
     flow at translate time. The frame driver runs behind the flow, so pre-fix m1's
     snapshot was retroactively rewritten to ['one','two'] once m2 had appended."""
@@ -1351,8 +1351,8 @@ class _EmitThenMutateFlow(Flow[_SingleEmitStateFlow]):
 
 @requires_stream_frames
 async def test_frame_path_emit_state_suppresses_node_exit_snapshot():
-    """PNI-180 defect 2: a manual copilotkit_emit_state must survive method-finish
-    on the StreamFrame path — the node-exit STATE_SNAPSHOT is suppressed (else it
+    """A manual copilotkit_emit_state must survive method-finish
+    on the StreamFrame path: the node-exit STATE_SNAPSHOT is suppressed (else it
     clobbers the progressive emit with the rebuilt flow.state), and the
     authoritative state is redelivered as a terminal snapshot before RUN_FINISHED."""
     from ag_ui.encoder import EventEncoder
@@ -1378,7 +1378,7 @@ async def test_frame_path_emit_state_suppresses_node_exit_snapshot():
 
 
 class _TwoEmitStateFlow(Flow[_MultiMethodMutatingState]):
-    """Two sequential methods that each emit_state — the case that exercises the
+    """Two sequential methods that each emit_state: the case that exercises the
     per-method suppression DECISION (not just state content) captured at emit time."""
 
     @start()
@@ -1395,7 +1395,7 @@ class _TwoEmitStateFlow(Flow[_MultiMethodMutatingState]):
 
 @requires_stream_frames
 async def test_frame_path_two_emit_state_methods_each_suppress_node_exit():
-    """PNI-180 defect 2 (suppression half): with two consecutive emit_state
+    """Suppression half: with two consecutive emit_state
     methods, EACH method's node-exit STATE_SNAPSHOT must be suppressed so neither
     progressive emit is clobbered. Pre-fix the suppression flag was consumed at
     translate time from one shared flow flag, so m1's finish stole m2's flag and
@@ -1440,9 +1440,9 @@ class _PredictStateFlow(Flow[_SingleEmitStateFlow]):
 
 @requires_stream_frames
 async def test_frame_path_predicted_tool_suppresses_node_exit_snapshot():
-    """PNI-180 defect 2 (predicted-tool limb): a streamed predicted
+    """Predicted-tool limb: a streamed predicted
     copilotkit_predict_state tool must suppress the node-exit STATE_SNAPSHOT on
-    the StreamFrame path, exactly like copilotkit_emit_state — the authoritative
+    the StreamFrame path, exactly like copilotkit_emit_state; the authoritative
     state is redelivered as the terminal snapshot."""
     from ag_ui.encoder import EventEncoder
 
@@ -1463,6 +1463,53 @@ async def test_frame_path_predicted_tool_suppresses_node_exit_snapshot():
     assert types[-2:] == ["STATE_SNAPSHOT", "RUN_FINISHED"], types
     terminal = payloads[-2]["snapshot"]
     assert terminal.get("v") == "real", terminal
+
+
+class _EmitThenRaiseFlow(Flow[_SingleEmitStateFlow]):
+    """A method that emit_states an ephemeral value, writes the authoritative
+    value to flow.state, then raises, so the run terminates with RUN_ERROR."""
+
+    @start()
+    async def chat(self):
+        self.state.v = "authoritative"
+        await copilotkit_emit_state({"v": "emit"})
+        raise RuntimeError("boom")
+
+
+@requires_stream_frames
+async def test_frame_path_run_error_still_flushes_owed_terminal_snapshot():
+    """An errored run whose method suppressed its node-exit snapshot (via
+    emit_state) must STILL redeliver the authoritative flow.state as a terminal
+    snapshot before RUN_ERROR, not strand the client on the ephemeral emit.
+    Also exercises the method_execution_failed sink capture end-to-end."""
+    from ag_ui.encoder import EventEncoder
+
+    encoded = await _collect(ep._run_flow_frame_stream(
+        flow_copy=_EmitThenRaiseFlow(),
+        encoder=EventEncoder(),
+        input_data=_make_run_input(),
+        inputs={},
+        timeout=30.0,
+    ))
+    payloads = _decode_sse(encoded)
+    types = [p["type"] for p in payloads]
+    assert types[-1] == "RUN_ERROR", types
+    assert types[-2] == "STATE_SNAPSHOT", types
+    vs = [p["snapshot"].get("v") for p in payloads if p["type"] == "STATE_SNAPSHOT"]
+    # Progressive emit survives; the terminal (pre-RUN_ERROR) carries flow.state.
+    assert vs == ["emit", "authoritative"], vs
+
+
+def test_snapshot_state_deep_copies_plain_dict():
+    """_snapshot_state must deep-copy a plain-dict state (crewai returns the LIVE
+    dict): mutating the source after snapshotting must not change the snapshot."""
+    from ag_ui_crewai._frames import _snapshot_state
+
+    src = {"a": [1, 2], "b": {"c": 3}}
+    snap = _snapshot_state(src)
+    src["a"].append(99)
+    src["b"]["c"] = "CHANGED"
+    assert snap == {"a": [1, 2], "b": {"c": 3}}
 
 
 class _NestedNoLeakFlow(Flow):
