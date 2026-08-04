@@ -39,6 +39,7 @@ from ._frames import (
     CREW_AGENT_LIFECYCLE_TYPES,
     EmissionShaper,
     StreamFrameTranslator,
+    capture_method_emit_context,
     is_backend_tool_event,
     is_recognized_event,
     log_raw_loss,
@@ -999,6 +1000,12 @@ class FastAPICrewFlowEventListener(_EventListenerBase):
             _enqueue(source, None)
         @crewai_event_bus.on(MethodExecutionStartedEvent)
         def _(source, event):
+            # Same source gate every other handler has: a pooled off-thread
+            # dispatch can land for a flow whose run is not ours (or already torn
+            # down). Without it the reset below wipes suppression flags on a
+            # foreign flow, and those flags are now load-bearing.
+            if get_queue(source) is None:
+                return
             # Clear stale suppression flags from a prior node that raised.
             reset_node_snapshot_suppression(source)
             # Flat per-method attribution. The legacy bus path is dispatched on
@@ -2018,6 +2025,9 @@ async def _run_flow_frame_stream(
         thread_id=input_data.thread_id,
         run_id=input_data.run_id,
         state_provider=lambda: getattr(flow_copy, "state", {}),
+        # Lets the translator honor the sdk emit_state/predict_state suppression
+        # flags stashed on this flow (legacy-listener parity).
+        flow_provider=lambda: flow_copy,
         hitl_options=hitl_options,
         emission_shape=emission_shape,
     )
@@ -2100,6 +2110,13 @@ async def _run_flow_frame_stream(
             or is_thinking_event(event)
             or getattr(event, "type", None) in CREW_AGENT_LIFECYCLE_TYPES
         ):
+            # Capture EMIT-TIME context (this sink runs synchronously on the
+            # flow's timeline) for method finished/failed events: the state
+            # snapshot AND the consumed suppression decision. The frame driver
+            # translates later, after the flow has run ahead, so both must be
+            # captured here or a later method rewrites this method's snapshot or
+            # steals its suppression. No-ops for every other event type.
+            capture_method_emit_context(event, flow_copy)
             raw_events[event_id] = event
         elif emit_raw_events:
             if len(foreign_events) >= _FOREIGN_EVENT_BUFFER_MAX:
@@ -2553,11 +2570,19 @@ async def _run_flow_resume_stream(
     # and its crew writes to memory like any other run.
     apply_thread_memory_scope(resumed_flow, thread_id)
 
+    # The method that paused for feedback emitted neither finished nor failed, so
+    # its node-exit suppression flags were never consumed. Clear them on the
+    # reloaded flow before resume_async runs (on the flow timeline, before any
+    # emit) so a stale predicted-tool / manual-emit flag cannot wrongly suppress
+    # the resumed run's first snapshot.
+    reset_node_snapshot_suppression(resumed_flow)
+
     token = flow_context.set(resumed_flow)
     translator = StreamFrameTranslator(
         thread_id=thread_id,
         run_id=run_id,
         state_provider=lambda: getattr(resumed_flow, "state", {}),
+        flow_provider=lambda: resumed_flow,
         hitl_options=hitl_options,
         resumed=True,
     )
@@ -2568,6 +2593,10 @@ async def _run_flow_resume_stream(
         # Outer-run isolation identical to the kickoff frame driver: only this
         # flow's own events (plus MCP events, emitted with the agent as source).
         if source is resumed_flow or is_mcp_event(event):
+            # Capture EMIT-TIME state + suppression on the flow timeline before
+            # the event is queued for later translation (no-ops except for
+            # method finished/failed). See the kickoff driver for the rationale.
+            capture_method_emit_context(event, resumed_flow)
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
     # Predeclared before the try so the finally teardown is always safe to
@@ -2691,6 +2720,8 @@ async def _run_flow_resume_stream(
                 ceiling_display,
                 ceiling_exc.args[0] if ceiling_exc.args else "",
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(
@@ -2711,6 +2742,8 @@ async def _run_flow_resume_stream(
                 ceiling_display,
                 type(upstream_exc).__name__,
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(
@@ -2729,6 +2762,8 @@ async def _run_flow_resume_stream(
                 run_id,
                 type(e).__name__,
             )
+            for _pending in translator.close_pending():
+                yield encoder.encode(_pending)
             yield encoder.encode(
                 RunErrorEvent(
                     message=(

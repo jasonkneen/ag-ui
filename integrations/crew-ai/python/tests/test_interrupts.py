@@ -462,6 +462,42 @@ def test_translator_captures_pause_and_finalizes_interrupt():
     assert tail[0].value["id"] == "req-1"
 
 
+async def test_translator_terminal_snapshot_precedes_interrupt_tail():
+    # A method emit_states then pauses for async HITL (request + pause, no
+    # method_finished). finalize must redeliver the authoritative flow.state as a
+    # terminal STATE_SNAPSHOT BEFORE the interrupt tail (CUSTOM, RUN_FINISHED),
+    # not strand the client on the ephemeral emit payload.
+    from ag_ui_crewai.context import flow_context
+    from ag_ui_crewai.sdk import copilotkit_emit_state
+
+    class _F:
+        state = {"messages": [], "v": "authoritative"}
+
+    flow = _F()
+    tr = StreamFrameTranslator(
+        thread_id="t-1",
+        run_id="r-1",
+        state_provider=lambda: flow.state,
+        flow_provider=lambda: flow,
+    )
+    tr.translate(_flow_started())
+    tr.translate(SimpleNamespace(type="method_execution_started", method_name="propose"))
+    token = flow_context.set(flow)
+    try:
+        await copilotkit_emit_state({"v": "ephemeral"})  # sets the suppression flag
+    finally:
+        flow_context.reset(token)
+    tr.translate(_hf_requested())
+    tr.translate(_flow_paused())
+    tail = tr.finalize()
+    types = [e.type for e in tail]
+    assert EventType.STATE_SNAPSHOT in types, types
+    assert types[-2:] == [EventType.CUSTOM, EventType.RUN_FINISHED], types
+    assert types.index(EventType.STATE_SNAPSHOT) < types.index(EventType.CUSTOM), types
+    snap = next(e for e in tail if e.type == EventType.STATE_SNAPSHOT)
+    assert snap.snapshot == {"messages": [], "v": "authoritative"}
+
+
 def test_translator_no_pause_finalizes_plain_run_finished():
     tr = _translator()
     tr.translate(_flow_started())
@@ -630,6 +666,45 @@ async def test_e2e_kickoff_pause_outcome_opt_in(_isolated_cwd):
     # The reviewed method output round-trips into the interrupt metadata so the
     # client can render what the human is approving.
     assert interrupt["metadata"]["crewai"]["output"] == {"plan": ["a", "b"]}
+
+
+class _ResumeEmitFlow(Flow[_DemoState]):
+    """Pauses on ``propose``; the RESUMED ``apply`` method calls emit_state, so
+    the resume driver must honour emit-time snapshot-suppression too."""
+
+    @start()
+    @human_feedback(message="Approve?", provider=agui_feedback_provider)
+    def propose(self):
+        return {"plan": ["a"]}
+
+    @listen(propose)
+    async def apply(self, feedback):
+        from ag_ui_crewai.sdk import copilotkit_emit_state
+
+        self.state.result = "authoritative"
+        await copilotkit_emit_state({"result": "emit"})
+
+
+async def test_e2e_resume_emit_state_suppressed_on_resume_driver(_isolated_cwd):
+    # The resume driver must wire flow_provider + emit-time capture too: the
+    # resumed apply's emit_state must survive method-finish (node-exit
+    # STATE_SNAPSHOT suppressed), with the authoritative state redelivered as a
+    # terminal snapshot. Deleting the capture wiring on the resume sink regresses
+    # this (the node-exit rebuild clobbers 'emit' and no terminal is owed).
+    flow = _ResumeEmitFlow()
+    await _run_kickoff(flow, _mk_input("thr-remit"), HITLOptions())
+    resume = [ResumeEntry(interrupt_id="thr-remit", status="resolved", payload="ok")]
+    events = await _run_resume(flow, _mk_input("thr-remit", resume=resume), HITLOptions())
+    types = _types(events)
+    # apply's node-exit STATE_SNAPSHOT is suppressed: none sits between apply's
+    # (the last) MESSAGES_SNAPSHOT and the STEP_FINISHED that follows it.
+    mi = len(types) - 1 - types[::-1].index("MESSAGES_SNAPSHOT")
+    sf = types.index("STEP_FINISHED", mi)
+    assert "STATE_SNAPSHOT" not in types[mi:sf], types
+    # The authoritative state is redelivered as the terminal snapshot.
+    assert types[-2:] == ["STATE_SNAPSHOT", "RUN_FINISHED"], types
+    results = [e.get("snapshot", {}).get("result") for e in events if e.get("type") == "STATE_SNAPSHOT"]
+    assert "emit" in results and results[-1] == "authoritative", results
 
 
 async def test_e2e_resume_completes_run(_isolated_cwd):
