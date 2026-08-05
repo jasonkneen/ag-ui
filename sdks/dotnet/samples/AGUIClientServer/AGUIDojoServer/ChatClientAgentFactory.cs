@@ -328,7 +328,12 @@ internal static class ChatClientAgentFactory
         // still balance a mid-stream failure.
         A2UIChatClientOptions resolved = new()
         {
-            InjectA2UITool = options.InjectA2UITool,
+            // Backend opt-in — the `config` half of the `forwarded ?? config` rule (ADK
+            // `a2ui["inject_a2ui_tool"]`, AWS Strands / Mastra / CrewAI `a2ui.injectA2UITool`),
+            // which exists precisely for a host that does not forward the runtime flag. The dojo
+            // forwards `injectA2UITool` only for langgraph* / mastra-agent-local, so these demos
+            // opt in server-side. A client-sent `false` still wins.
+            InjectA2UITool = options.InjectA2UITool ?? true,
             ToolParams = options.ToolParams,
             StreamingToolCallArgumentExtractor = OpenAIStreamingToolArguments.Extract,
         };
@@ -367,9 +372,11 @@ internal static class ChatClientAgentFactory
     });
 
     /// <summary>
-    /// Zero-config / advanced demo: no backend catalog or guide. The catalog schema and the
-    /// per-run injectA2UITool flag arrive on the forwarded <c>RunAgentInput</c>; A2UIChatClient
-    /// reads them and auto-injects — the easy-devex path.
+    /// Zero-config / advanced demo: no backend catalog or guide. The catalog schema arrives on
+    /// the forwarded <c>RunAgentInput</c> and A2UIChatClient reads it — the easy-devex path.
+    /// Injection itself comes from the backend opt-in in <see cref="CreateA2UIChatClient"/>: the
+    /// dojo forwards <c>injectA2UITool</c> only for langgraph* / mastra-agent-local, so it never
+    /// arrives for <c>ag-ui-dotnet</c>.
     /// </summary>
     public static IChatClient CreateA2UIAdvanced() => CreateA2UIChatClient(new A2UIChatClientOptions());
 

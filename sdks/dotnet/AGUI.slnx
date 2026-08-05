@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/AGUI.Abstractions/AGUI.Abstractions.csproj" />
     <Project Path="src/AGUI.A2UI/AGUI.A2UI.csproj" />
+    <Project Path="src/AGUI.A2UI.Toolkit/AGUI.A2UI.Toolkit.csproj" />
     <Project Path="src/AGUI.Client/AGUI.Client.csproj" />
     <Project Path="src/AGUI.Formatting/AGUI.Formatting.csproj" />
     <Project Path="src/AGUI.Server/AGUI.Server.csproj" />

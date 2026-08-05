@@ -9,10 +9,10 @@ namespace AGUI.A2UI;
 
 /// <summary>
 /// An <see cref="IChatClient"/> decorator that adds A2UI (agent-generated UI) surface
-/// generation. Every streamed run advertises a <c>generate_a2ui</c> tool; when the wrapped
-/// model calls it, the decorator drives a <c>render_a2ui</c> structured-output subagent
-/// through the shared validate-and-retry recovery loop and feeds the resulting A2UI
-/// operations envelope back as the tool result.
+/// generation. When injection is enabled for the run, the streamed run advertises a
+/// <c>generate_a2ui</c> tool; when the wrapped model calls it, the decorator drives a
+/// <c>render_a2ui</c> structured-output subagent through the shared validate-and-retry
+/// recovery loop and feeds the resulting A2UI operations envelope back as the tool result.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -45,6 +45,7 @@ public sealed class A2UIChatClient : DelegatingChatClient
     private readonly IChatClient _subagentChatClient;
     private readonly A2UIResolvedToolParams _parameters;
     private readonly bool? _injectOption;
+    private readonly string? _injectedRenderToolName;
     private readonly Func<ChatResponseUpdate, IEnumerable<AGUIToolCallArgumentFragment>?>? _streamingArgExtractor;
 
     /// <summary>
@@ -65,6 +66,7 @@ public sealed class A2UIChatClient : DelegatingChatClient
         this._subagentChatClient = subagentChatClient;
         this._parameters = A2UIToolDefinitions.ResolveA2UIToolParams(options?.ToolParams);
         this._injectOption = options?.InjectA2UITool;
+        this._injectedRenderToolName = options?.InjectedRenderToolName;
         this._streamingArgExtractor = options?.StreamingToolCallArgumentExtractor;
     }
 
@@ -93,9 +95,12 @@ public sealed class A2UIChatClient : DelegatingChatClient
         bool devWired = options?.Tools is { } tools &&
             tools.Any(t => string.Equals(t.Name, toolName, StringComparison.Ordinal));
 
+        (bool inject, string renderToolName) = ResolveInjection(
+            this._injectOption, this._injectedRenderToolName, options);
+
         // USER PREVAILS: a developer-wired generate_a2ui tool owns the behavior — do not
         // clobber it. Likewise honor a resolved opt-out. Either way, delegate untouched.
-        if (devWired || !ShouldInject(this._injectOption, options))
+        if (devWired || !inject)
         {
             await foreach (ChatResponseUpdate update in base.InnerClient
                 .GetStreamingResponseAsync(messages, options, cancellationToken)
@@ -112,7 +117,15 @@ public sealed class A2UIChatClient : DelegatingChatClient
 
         ChatOptions plannerOptions = options?.Clone() ?? new ChatOptions();
         var generateTool = new GenerateA2UIToolDeclaration(toolName, this._parameters.ToolDescription);
+
+        // Drop the A2UI middleware's injected render proxy before advertising generate_a2ui. The
+        // middleware adds render_a2ui to RunAgentInput.Tools in the SAME step that forwards
+        // injectA2UITool, and the hosting layer maps those onto ChatOptions.Tools — so whenever
+        // the flag arrives, the proxy does too. Left in place the planner would see both tools and
+        // could call the proxy directly, painting a surface that skips the subagent and the
+        // validate-and-retry loop entirely.
         plannerOptions.Tools = (plannerOptions.Tools ?? Enumerable.Empty<AITool>())
+            .Where(t => !string.Equals(t.Name, renderToolName, StringComparison.Ordinal))
             .Append(generateTool)
             .ToList();
 
@@ -328,18 +341,67 @@ public sealed class A2UIChatClient : DelegatingChatClient
     // Resolves the per-run injection decision. The forwarded runtime flag wins when present
     // (an explicit client false beats a backend opt-in); otherwise the
     // backend option; otherwise on, because wrapping is itself the opt-in.
-    private static bool ShouldInject(bool? injectOption, ChatOptions? options)
+    // Resolves the per-run injection decision plus the name of the middleware-injected render
+    // proxy to drop. The forwarded runtime flag wins when present (an explicit client false beats
+    // a backend opt-in); otherwise the backend option; otherwise off, matching the
+    // "no injectA2UITool, no injection" contract the sibling adapters share — a host that does not
+    // forward the flag opts in via the backend option (or an explicit .UseA2UI configuration).
+    //
+    // The wire flag is boolean | string (a string names the injected render proxy), and an empty
+    // string is falsy in the TS/Python adapters, so it reads as an opt-out here too.
+    internal static (bool Inject, string RenderToolName) ResolveInjection(
+        bool? injectOption,
+        string? injectedRenderToolName,
+        ChatOptions? options)
     {
-        if (options is not null &&
-            options.TryGetRunAgentInput(out RunAgentInput? input) &&
-            input.ForwardedProperties.ValueKind == JsonValueKind.Object &&
-            input.ForwardedProperties.TryGetProperty("injectA2UITool", out JsonElement flag) &&
-            flag.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        string fallbackName = string.IsNullOrEmpty(injectedRenderToolName)
+            ? A2UIConstants.RenderA2UIToolName
+            : injectedRenderToolName!;
+
+        if (TryReadForwardedFlag(options, out bool forwarded, out string? forwardedName))
         {
-            return flag.GetBoolean();
+            return (forwarded, forwardedName ?? fallbackName);
         }
 
-        return injectOption ?? true;
+        return (injectOption ?? false, fallbackName);
+    }
+
+    // Reads the forwarded injectA2UITool flag. Returns false when the run carries no usable flag,
+    // so the caller falls back to the backend option. A non-boolean, non-string value
+    // (null/number/array/object) is not a usable flag and is treated as absent.
+    private static bool TryReadForwardedFlag(ChatOptions? options, out bool inject, out string? renderToolName)
+    {
+        inject = false;
+        renderToolName = null;
+        if (options is null ||
+            !options.TryGetRunAgentInput(out RunAgentInput? input) ||
+            input.ForwardedProperties.ValueKind != JsonValueKind.Object ||
+            !input.ForwardedProperties.TryGetProperty("injectA2UITool", out JsonElement flag))
+        {
+            return false;
+        }
+
+        switch (flag.ValueKind)
+        {
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+                inject = flag.GetBoolean();
+                return true;
+            case JsonValueKind.String:
+                string? name = flag.GetString();
+                if (string.IsNullOrEmpty(name))
+                {
+                    // "" is falsy in the adapters' `if (!flag) skip` gate — an opt-out.
+                    inject = false;
+                    return true;
+                }
+
+                inject = true;
+                renderToolName = name;
+                return true;
+            default:
+                return false;
+        }
     }
 
     // Reads the A2UI state (catalog schema + forwarded context entries) from the
