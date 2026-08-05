@@ -59,6 +59,75 @@ public sealed class A2UIChatClientTest
         Assert.Contains("a2ui_recovery_exhausted", envelope.GetRawText());
     }
 
+    [Fact]
+    public async Task RoundTwoHistory_PreservesDeveloperToolCallAndResultAsync()
+    {
+        // A planner whose first turn both calls a developer tool (get_weather, resolved by the
+        // inner function-invocation layer) and then calls generate_a2ui. The decorator loops for
+        // a second round to let the planner consume the generation result; the history it hands
+        // back must still carry the get_weather call and its result, or the round-2 planner is
+        // stranded without the tool context it just produced.
+        var planner = new DevToolThenGenerateClient();
+        var subagent = new MidStreamThrowingSubagentClient();
+        var options = new A2UIChatClientOptions
+        {
+            InjectA2UITool = true,
+            StreamingToolCallArgumentExtractor = u => u.RawRepresentation as IEnumerable<AGUIToolCallArgumentFragment>,
+        };
+        var client = new A2UIChatClient(planner, subagent, options);
+
+        await foreach (var _ in client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "weather then a card")]))
+        {
+        }
+
+        var roundTwoContents = planner.RoundTwoHistory.SelectMany(m => m.Contents).ToList();
+        Assert.Contains(
+            roundTwoContents.OfType<FunctionCallContent>(),
+            c => c.Name == "get_weather");
+        Assert.Contains(
+            roundTwoContents.OfType<FunctionResultContent>(),
+            r => r.CallId == "dev-1");
+    }
+
+    // A planner IChatClient whose first turn is a developer tool call + result (as the inner
+    // function-invocation layer would surface it) followed by a generate_a2ui call; round 2
+    // records the history it was given, then ends with text so the loop terminates.
+    private sealed class DevToolThenGenerateClient : IChatClient
+    {
+        public IReadOnlyList<ChatMessage> RoundTwoHistory { get; private set; } = [];
+        private int _round;
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask.ConfigureAwait(false);
+            if (_round++ == 0)
+            {
+                yield return new ChatResponseUpdate(
+                    ChatRole.Assistant,
+                    [new FunctionCallContent("dev-1", "get_weather", new Dictionary<string, object?> { ["city"] = "SF" })]);
+                yield return new ChatResponseUpdate(
+                    ChatRole.Tool,
+                    [new FunctionResultContent("dev-1", "sunny")]);
+                yield return new ChatResponseUpdate(
+                    ChatRole.Assistant,
+                    [new FunctionCallContent("gen-1", A2UIConstants.GenerateA2UIToolName, new Dictionary<string, object?> { ["intent"] = "create" })]);
+            }
+            else
+            {
+                RoundTwoHistory = messages.ToList();
+                yield return new ChatResponseUpdate(ChatRole.Assistant, "Done.");
+            }
+        }
+
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
+    }
+
     // A planner IChatClient: round 1 emits a single generate_a2ui tool call; later rounds emit only
     // text so the decorator's planner loop terminates.
     private sealed class ScriptedPlannerClient : IChatClient

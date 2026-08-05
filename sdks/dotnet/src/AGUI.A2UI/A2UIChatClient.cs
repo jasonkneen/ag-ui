@@ -131,40 +131,38 @@ public sealed class A2UIChatClient : DelegatingChatClient
 
         for (int round = 1; round <= MaxPlannerRounds; round++)
         {
-            var generateCalls = new List<FunctionCallContent>();
-            var assistantContents = new List<AIContent>();
+            var plannerUpdates = new List<ChatResponseUpdate>();
             await foreach (ChatResponseUpdate update in base.InnerClient
                 .GetStreamingResponseAsync(history, plannerOptions, cancellationToken)
                 .ConfigureAwait(false))
             {
-                foreach (AIContent content in update.Contents)
-                {
-                    // Preserve the planner's own narration alongside its generate_a2ui
-                    // calls so the message fed back to it next round is not lossy.
-                    if (content is TextContent text)
-                    {
-                        assistantContents.Add(text);
-                    }
-                    else if (content is FunctionCallContent call &&
-                        string.Equals(call.Name, toolName, StringComparison.Ordinal))
-                    {
-                        assistantContents.Add(call);
-                        generateCalls.Add(call);
-                    }
-                }
-
+                plannerUpdates.Add(update);
                 yield return update;
             }
+
+            // Coalesce the planner's streamed turn into whole messages so the history fed
+            // back next round is faithful: assistant narration, the terminal generate_a2ui
+            // call(s), AND any of the developer's own tool call/result pairs the inner
+            // function-invocation layer resolved this turn. Hand-picking only text +
+            // generate_a2ui (as an earlier version did) stranded the round-2 planner without
+            // the tools it had just called and their results.
+            IList<ChatMessage> plannerMessages = plannerUpdates.ToChatResponse().Messages;
+            List<FunctionCallContent> generateCalls = plannerMessages
+                .SelectMany(m => m.Contents)
+                .OfType<FunctionCallContent>()
+                .Where(c => string.Equals(c.Name, toolName, StringComparison.Ordinal))
+                .ToList();
 
             if (generateCalls.Count == 0)
             {
                 yield break;
             }
 
-            // Record the planner's assistant turn (narration + calls) before running the
-            // generations, so a same-round create -> update finds the freshly created
-            // surface: each call's result is appended to history immediately below.
-            history.Add(new ChatMessage(ChatRole.Assistant, assistantContents));
+            // Record the planner's full turn before running the generations, so a same-round
+            // create -> update finds the freshly created surface: each call's result is
+            // appended to history immediately below. The terminal generate_a2ui call is left
+            // unanswered here on purpose — its result is what the generation produces.
+            history.AddRange(plannerMessages);
 
             foreach (FunctionCallContent call in generateCalls)
             {
