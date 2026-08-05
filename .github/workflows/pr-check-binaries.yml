@@ -95,6 +95,7 @@ jobs:
         run: bash .github/scripts/check-config-allowlist.sh
 
   check-lfs-pointers:
+    name: Git LFS pointers
     runs-on: ubuntu-latest
     steps:
       # lfs: false is deliberate. The check reads blobs from the index, where
