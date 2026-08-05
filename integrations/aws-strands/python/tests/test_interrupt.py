@@ -11,33 +11,39 @@ AG-UI interrupt lifecycle:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from ag_ui.core import EventType, ResumeEntry, RunAgentInput, Tool, ToolMessage, UserMessage
+from strands import Agent as StrandsAgentCore
+from strands import ToolContext, tool
 from strands.agent.state import AgentState
-from strands.interrupt import Interrupt as StrandsInterrupt, _InterruptState
+from strands.interrupt import Interrupt as StrandsInterrupt
+from strands.interrupt import _InterruptState
+from strands.models.model import Model as StrandsModel
 
-from ag_ui.core import EventType, ResumeEntry, RunAgentInput
 from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
-from ag_ui_strands.config import StrandsAgentConfig
-
+from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_run_input(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
     messages=None,
     resume=None,
+    tools=None,
 ) -> RunAgentInput:
     return RunAgentInput(
         thread_id=thread_id,
         run_id=run_id,
         state={},
         messages=messages or [],
-        tools=[],
+        tools=tools or [],
         context=[],
         forwarded_props={},
         resume=resume,
@@ -104,6 +110,7 @@ def _agent_result_with_interrupt(interrupts):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestInterruptOutcome:
     @pytest.mark.asyncio
     async def test_pause_emits_interrupt_outcome(self):
@@ -131,22 +138,6 @@ class TestInterruptOutcome:
         assert agui_interrupt.reason == "confirm"
         # The free-form Strands reason object is preserved under metadata.
         assert agui_interrupt.metadata == {"strands_reason": {"summary": "delete all"}}
-
-    @pytest.mark.asyncio
-    async def test_detects_interrupt_from_state_when_result_missing(self):
-        """Falls back to _interrupt_state when no terminal result event arrives."""
-        strands_interrupt = StrandsInterrupt(id="int-2", name="approve", reason=None)
-        # No {"result": ...} event this time — only the live interrupt state.
-        core = _MockStrandsCore(terminal_events=[], interrupts=[strands_interrupt])
-        agent = _make_base_agent()
-
-        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
-            events = await _collect_events(agent, _make_run_input())
-
-        finished = next(e for e in events if e.type == EventType.RUN_FINISHED)
-        assert finished.outcome is not None
-        assert finished.outcome.type == "interrupt"
-        assert finished.outcome.interrupts[0].id == "int-2"
 
     @pytest.mark.asyncio
     async def test_no_interrupt_finishes_bare(self):
@@ -212,3 +203,136 @@ class TestResumeConsumption:
                 {"interruptResponse": {"interruptId": "b", "response": INTERRUPT_CANCELLED}},
             ]
         ]
+
+
+# ---------------------------------------------------------------------------
+# Real-agent end-to-end regression
+#
+# The tests above replay canned events through ``_MockStrandsCore`` and never
+# drive the real Strands event loop, tool executor, or interrupt machinery.
+# This section runs a real ``strands.Agent`` with a scripted stub ``Model``
+# and a real ``@tool(context=True)`` tool so the interrupt/resume round-trip
+# is exercised for real.
+# ---------------------------------------------------------------------------
+
+
+@tool(context=True)
+def confirm_action(key: str, tool_context: ToolContext) -> dict:
+    approval = tool_context.interrupt("confirm_action", reason={"key": key})
+    if approval:
+        return {"status": "success", "content": [{"text": f"confirmed {key}"}]}
+    return {"status": "success", "content": [{"text": f"denied {key}"}]}
+
+
+class _InterruptFlowModel(StrandsModel):
+    """Turn 1: calls the frontend proxy tool and the interrupting native tool
+    in the same batch. Turn 2+: narrates a final answer."""
+
+    def __init__(self):
+        self.turn = 0
+        self.stream_calls_messages = []
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(self, output_model, prompt=None, system_prompt=None, **kwargs):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.turn += 1
+        self.stream_calls_messages.append(messages)
+        if self.turn == 1:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {
+                "contentBlockStart": {
+                    "start": {"toolUse": {"toolUseId": "native-approve", "name": "approveTool"}}
+                }
+            }
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+            yield {"contentBlockStop": {}}
+            yield {
+                "contentBlockStart": {
+                    "start": {"toolUse": {"toolUseId": "native-confirm", "name": "confirm_action"}}
+                }
+            }
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": '{"key": "widget-1"}'}}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+        else:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+@pytest.mark.asyncio
+async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors():
+    """Regression for docs/round1.md items #1, #2, #3 — real Agent, real
+    tool, scripted model, no network. Intentionally failing until those are
+    fixed; see docs/round1.md."""
+    model = _InterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    config = StrandsAgentConfig(
+        tool_behaviors={
+            "confirm_action": ToolBehavior(
+                state_from_result=lambda ctx: {"confirmed_key": ctx.result_data}
+            )
+        }
+    )
+    agent = StrandsAgent(core, name="e2e-interrupt", config=config)
+
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+    inp1 = _make_run_input(
+        messages=[UserMessage(id="u1", role="user", content="please handle widget-1")],
+        tools=[approve_tool],
+    )
+    events1 = await _collect_events(agent, inp1)
+
+    finished1 = next(e for e in events1 if e.type == EventType.RUN_FINISHED)
+    assert finished1.outcome is not None
+    assert finished1.outcome.type == "interrupt"
+    interrupt_id = finished1.outcome.interrupts[0].id
+    fe_wire_id = next(
+        e.tool_call_id
+        for e in events1
+        if e.type == EventType.TOOL_CALL_START and e.tool_call_name == "approveTool"
+    )
+
+    inp2 = _make_run_input(
+        run_id="run-2",
+        messages=[
+            ToolMessage(
+                id="t-fe",
+                role="tool",
+                tool_call_id=fe_wire_id,
+                content='{"approved": true}',
+            )
+        ],
+        resume=[ResumeEntry(interrupt_id=interrupt_id, status="resolved", payload=False)],
+        tools=[approve_tool],
+    )
+    events2 = await _collect_events(agent, inp2)
+
+    # --- A falsy-but-explicit resume payload must resolve, not loop. ---
+    finished2 = next(e for e in events2 if e.type == EventType.RUN_FINISHED)
+    still_stuck = (
+        finished2.outcome is not None
+        and finished2.outcome.type == "interrupt"
+        and finished2.outcome.interrupts[0].id == interrupt_id
+    )
+    assert not still_stuck, "falsy resume payload re-emitted the same interrupt (round1.md #1)"
+
+    # --- The frontend tool's REAL result must reach the model. ---
+    assert model.turn >= 2, "resume never advanced the event loop past the interrupt"
+    last_messages_text = json.dumps(model.stream_calls_messages[-1])
+    assert "approved" in last_messages_text
+    assert "Forwarded to client" not in last_messages_text
+
+    # --- state_from_result must fire for a tool resolved on resume. ---
+    assert any(
+        e.type == EventType.STATE_SNAPSHOT and e.snapshot.get("confirmed_key") for e in events2
+    ), "state_from_result did not fire for confirm_action on the resume run (round1.md #3)"
