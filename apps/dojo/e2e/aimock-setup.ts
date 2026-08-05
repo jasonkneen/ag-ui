@@ -2,7 +2,10 @@ import { LLMock, type ChatMessage } from "@copilotkit/aimock";
 import * as path from "node:path";
 import { registerA2UIRecoveryFixtures } from "./a2ui-recovery-fixtures";
 import { registerA2UIADKFixtures } from "./a2ui-adk-fixtures";
-import { registerA2UICrewAIFixtures } from "./a2ui-crewai-fixtures";
+import {
+  crewAIA2UIAnswersToolResultTurn,
+  registerA2UICrewAIFixtures,
+} from "./a2ui-crewai-fixtures";
 import { registerInterruptCrewAIFixtures } from "./interrupt-crewai-fixtures";
 
 // Configurable so parallel worktrees / runs don't collide on one aimock port.
@@ -34,7 +37,7 @@ export async function setupLLMock(): Promise<void> {
   // the generic loadFixtureFile below).
   registerA2UIRecoveryFixtures(mockServer);
 
-  // CrewAI A2UI fixtures (gpt-4o, scoped to CrewAI-unique prompts so
+  // CrewAI A2UI fixtures (openai/gpt-5.4, scoped to CrewAI-unique prompts so
   // they never intercept the LangGraph/ADK demos). Predicate fixtures, before
   // the generic loader.
   registerA2UICrewAIFixtures(mockServer);
@@ -1440,6 +1443,12 @@ export async function setupLLMock(): Promise<void> {
         // dedicated fixture keyed on the crew output string.
         if (hasCrewRunTool(req) && textOf(last.content) === CREW_RUN_OUTPUT)
           return false;
+        // Don't match a CrewAI A2UI turn that a2ui-crewai-fixtures.ts answers
+        // itself (a surface-action click, or the closing turn over a render
+        // result): a generic acknowledgment would mask the reply under test.
+        // The predicate is scoped to that file's own prompts, so every other
+        // integration's A2UI demo keeps this fallback.
+        if (crewAIA2UIAnswersToolResultTurn(req)) return false;
         return true;
       },
     },

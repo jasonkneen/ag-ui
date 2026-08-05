@@ -1,21 +1,28 @@
 """Provider-agnostic reasoning extraction for the CrewAI AG-UI bridge.
 
-Two channels carry model reasoning to the bridge and both funnel through the
+Three channels carry model reasoning to the bridge and all funnel through the
 helpers here:
 
-* the litellm streaming delta (``copilotkit_stream``): ``delta.reasoning_content``
-  (a string; o1/o3, deepseek-reasoner, and most reasoning models normalised by
-  litellm) and ``delta.thinking_blocks`` (Anthropic extended thinking: ``thinking``
-  text + ``signature``, and ``redacted_thinking`` blocks carrying encrypted
-  ``data``). ``reasoning_from_delta`` projects one delta onto text + encrypted
-  blobs; ``reasoning_content`` wins as the text source per delta, since litellm
-  mirrors the same text into a thinking block for Anthropic.
+* the litellm chat-completions streaming delta (``copilotkit_stream``):
+  ``delta.reasoning_content`` (a string; o1/o3, deepseek-reasoner, and most
+  reasoning models normalised by litellm) and ``delta.thinking_blocks``
+  (Anthropic extended thinking: ``thinking`` text + ``signature``, and
+  ``redacted_thinking`` blocks carrying encrypted ``data``).
+  ``reasoning_from_delta`` projects one delta onto text + encrypted blobs;
+  ``reasoning_content`` wins as the text source per delta, since litellm mirrors
+  the same text into a thinking block for Anthropic.
 * crewai's native ``LLMThinkingChunkEvent`` (its Gemini provider, crewai
   >= 1.10.1), whose text rides on the ``chunk`` attribute. ``is_thinking_event``
   / ``thinking_event_text`` read it by ``type`` string so the frame translator
   stays decoupled from importing crewai.
+* the OpenAI Responses-API stream (``copilotkit_responses``), whose reasoning
+  summaries never appear on the chat-completions delta at all.
+  ``reasoning_from_responses_event`` projects one Responses stream event onto
+  the same ``DeltaReasoning``, so all three channels share one shape and one
+  emission lifecycle.
 
-This module is a LEAF: it imports only the stdlib, so ``sdk`` / ``_frames`` can
+This module is a LEAF: it imports only the stdlib and the stdlib-only
+``_responses_events`` vocabulary, so ``sdk`` / ``_frames`` / ``_responses`` can
 import it at module-load time without a circular dependency.
 """
 
@@ -23,6 +30,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from ._responses_events import (
+    RESPONSES_OUTPUT_ITEM_DONE,
+    RESPONSES_REASONING_TEXT_DELTAS,
+)
 
 # crewai's native thinking-chunk event ``type`` discriminator (its Gemini
 # provider emits it via ``BaseLLM._emit_thinking_chunk_event``, crewai
@@ -105,3 +117,64 @@ def reasoning_from_delta(delta: Any) -> DeltaReasoning:
                 encrypted.append(str(signature))
 
     return DeltaReasoning(text="".join(text_parts), encrypted=tuple(encrypted))
+
+
+# --------------------------------------------------------------------------
+# OpenAI Responses-API channel
+# --------------------------------------------------------------------------
+# OpenAI streams reasoning SUMMARIES only over the Responses API; the
+# chat-completions delta above carries none for its reasoning models. The event
+# ``type`` discriminators below are matched as STRINGS rather than against
+# litellm's ``ResponsesAPIStreamEvents`` enum: a litellm build that predates an
+# event type maps it onto its extras-allowing ``GenericEvent``, so the payload
+# still arrives on ``.delta`` / ``.item`` and reading the string keeps the
+# projection working on old and new builds alike.
+#
+# The two type strings this projection reads are imported from
+# ``_responses_events``, which keeps every Responses type next to the ROLE it
+# plays for this bridge: ``RESPONSES_REASONING_TEXT_DELTAS`` are the
+# reasoning-summary deltas (``summary_text`` is what ``reasoning.summary``
+# produces, ``reasoning_text`` the raw variant some models emit), and
+# ``RESPONSES_OUTPUT_ITEM_DONE`` is the completed output item carrying the
+# encrypted reasoning blob when the caller asked for
+# ``include=["reasoning.encrypted_content"]``.
+
+
+def responses_event_type(event: Any) -> str | None:
+    """Return a Responses stream event's ``type`` as a plain string.
+
+    litellm types the field as a ``str``-mixin enum on the events it knows and
+    as a plain string on ``GenericEvent``; normalise both to the wire string.
+    """
+    raw = getattr(event, "type", None)
+    if raw is None:
+        return None
+    return str(getattr(raw, "value", raw))
+
+
+def reasoning_from_responses_event(event: Any) -> DeltaReasoning:
+    """Project one OpenAI Responses-API stream event onto its reasoning content.
+
+    A summary/reasoning text delta yields ``text``; a finished ``reasoning``
+    output item yields its ``encrypted_content`` as an encrypted blob. Every
+    other event is a no-op, so a non-reasoning model simply emits nothing.
+    """
+    event_type = responses_event_type(event)
+    if event_type is None:
+        return DeltaReasoning()
+
+    if event_type in RESPONSES_REASONING_TEXT_DELTAS:
+        delta = getattr(event, "delta", None)
+        if isinstance(delta, str) and delta:
+            return DeltaReasoning(text=delta)
+        return DeltaReasoning()
+
+    if event_type == RESPONSES_OUTPUT_ITEM_DONE:
+        item = getattr(event, "item", None)
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            return DeltaReasoning()
+        encrypted = item.get("encrypted_content")
+        if encrypted:
+            return DeltaReasoning(encrypted=(str(encrypted),))
+
+    return DeltaReasoning()
