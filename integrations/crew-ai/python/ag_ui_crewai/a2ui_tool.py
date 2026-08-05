@@ -459,7 +459,13 @@ class A2UITool:
             )
             await yield_control()
 
-    def _emit_tool_result(self, flow: Any, tool_call_id: Optional[str], envelope: str) -> None:
+    def _emit_tool_result(
+        self,
+        flow: Any,
+        tool_call_id: Optional[str],
+        envelope: str,
+        message_id: Optional[str] = None,
+    ) -> None:
         """Emit the TOOL_CALL_RESULT for this generate_a2ui call so the a2ui
         middleware closes the outer call and can commit / hard-fail from the
         envelope. Emitted here (not left to the caller) so a flow that forgets
@@ -470,7 +476,7 @@ class A2UITool:
             flow,
             BridgedToolCallResultEvent(
                 type=EventType.TOOL_CALL_RESULT,
-                message_id=str(uuid.uuid4()),
+                message_id=message_id or str(uuid.uuid4()),
                 tool_call_id=tool_call_id,
                 content=envelope,
                 role="tool",
@@ -482,6 +488,7 @@ class A2UITool:
         args: Optional[dict],
         *,
         tool_call_id: Optional[str] = None,
+        result_message_id: Optional[str] = None,
         flow: Any = None,
     ) -> str:
         """Generate (or update) an A2UI surface and return the operations
@@ -493,6 +500,12 @@ class A2UITool:
         ``render_a2ui`` progress to the wire; on validation failure the toolkit
         recovery loop retries, each attempt re-streaming render so the middleware
         shows building -> retrying -> paint.
+
+        ``result_message_id`` is the id to stream that result under. Pass the id
+        the caller stamps onto the tool message it persists, so the terminal
+        MESSAGES_SNAPSHOT updates that message in place; left unset, the streamed
+        result and the persisted one carry different ids and the client remounts
+        the surface card from the snapshot.
         """
         flow = flow if flow is not None else flow_context.get(None)
         if flow is None:
@@ -527,7 +540,7 @@ class A2UITool:
         if prep.get("error"):
             logger.warning("A2UI request prep failed: %s", prep["error"])
             envelope = wrap_error_envelope(prep["error"])
-            self._emit_tool_result(flow, tool_call_id, envelope)
+            self._emit_tool_result(flow, tool_call_id, envelope, result_message_id)
             return envelope
 
         if cfg["model_kwargs"] is None:
@@ -645,7 +658,7 @@ class A2UITool:
             raise
 
         envelope = future.result()["envelope"]
-        self._emit_tool_result(flow, tool_call_id, envelope)
+        self._emit_tool_result(flow, tool_call_id, envelope, result_message_id)
         return envelope
 
 
