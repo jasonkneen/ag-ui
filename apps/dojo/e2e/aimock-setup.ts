@@ -622,8 +622,13 @@ export async function setupLLMock(): Promise<void> {
   // "Your personal goal is" catch-all below (first registered wins). The
   // final-answer turn is also excluded from the generic tool-result catch-all
   // further down so this dedicated summary wins over it.
+  // Require the CrewAI agent's backstory phrase alongside the role. sysIncludes is
+  // case-insensitive and other frameworks (e.g. Mastra) also ship a "weather
+  // assistant" backend-tool demo, so matching the role alone would hijack their
+  // requests; this phrase is unique to the CrewAI agent's backstory.
   const isWeatherAgentCall = (req: { messages: ChatMessage[] }) =>
-    sysIncludes(req.messages, "Weather Assistant");
+    sysIncludes(req.messages, "Weather Assistant") &&
+    sysIncludes(req.messages, "look up the weather before you answer");
   const isWeatherAgentToolResultTurn = (req: { messages: ChatMessage[] }) =>
     isWeatherAgentCall(req) && hasToolResult(req);
   const weatherToolCall = (location: string, id: string) => ({
