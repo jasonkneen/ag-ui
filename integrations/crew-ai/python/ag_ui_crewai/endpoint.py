@@ -27,6 +27,7 @@ from ._capabilities import (
     BaseEventListener,
     crewai_event_bus,
     flow_supports_stream_frames,
+    flow_supports_conversational_stream,
     flow_supports_human_feedback,
     supported_checkpoint_kwargs,
     add_stream_sink,
@@ -113,6 +114,14 @@ from .sdk import (
   reset_node_snapshot_suppression,
 )
 from .crews import ChatWithCrewFlow, CrewBaseInstance
+from ._conversation import (
+    ConversationalTurn,
+    SyncStreamSessionAdapter,
+    hydrate_conversational_flow,
+    force_per_turn_trace_finalization,
+    overlay_conversational_persistence,
+    prepare_conversational_turn,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1978,6 +1987,7 @@ async def _run_flow_frame_stream(
     hitl_options: HITLOptions | None = None,
     emit_raw_events: bool = False,
     emission_shape: str = DEFAULT_EMISSION_SHAPE,
+    conversational_turn: ConversationalTurn | None = None,
 ):
     """StreamFrame-path driver: drive ``flow.astream`` and yield encoded AG-UI
     events.
@@ -2158,22 +2168,39 @@ async def _run_flow_frame_stream(
             # already be in scope to reach the flow's emits. Guarded so a partial
             # install (no sink API) degrades rather than crashing.
             sink_token = add_stream_sink(_sink) if callable(add_stream_sink) else None
-            # ``astream`` returns an AsyncStreamSession; iterating it spawns
-            # crewai's background kickoff task and streams ordered frames.
-            # Filter against astream's own signature so an unsupported kwarg
-            # degrades cleanly instead of raising.
-            _ckpt = supported_checkpoint_kwargs(
-                flow_copy.astream, checkpoint_kwargs or {}  # type: ignore[attr-defined]
-            )
-            if checkpoint_kwargs and not _ckpt:
-                # Checkpointing enabled but this flow's astream does not accept
-                # it: warn so the no-op is visible.
-                _LOGGER.warning(
-                    "ag-ui-crewai: checkpointing is enabled but flow.astream "
-                    "does not accept from_checkpoint; nothing will be persisted "
-                    "for this run."
+            if conversational_turn is None:
+                # ``astream`` returns an AsyncStreamSession; iterating it spawns
+                # crewai's background kickoff task and streams ordered frames.
+                # Filter against astream's own signature so an unsupported kwarg
+                # degrades cleanly instead of raising.
+                _ckpt = supported_checkpoint_kwargs(
+                    flow_copy.astream, checkpoint_kwargs or {}  # type: ignore[attr-defined]
                 )
-            session = flow_copy.astream(inputs=inputs, **_ckpt)  # type: ignore[attr-defined]
+                if checkpoint_kwargs and not _ckpt:
+                    # Checkpointing enabled but this flow's astream does not accept
+                    # it: warn so the no-op is visible.
+                    _LOGGER.warning(
+                        "ag-ui-crewai: checkpointing is enabled but flow.astream "
+                        "does not accept from_checkpoint; nothing will be persisted "
+                        "for this run."
+                    )
+                session = flow_copy.astream(  # type: ignore[attr-defined]
+                    inputs=inputs,
+                    **_ckpt,
+                )
+            else:
+                force_per_turn_trace_finalization(flow_copy)
+                hydrated_inputs = hydrate_conversational_flow(
+                    flow_copy,
+                    inputs,
+                    conversational_turn,
+                )
+                overlay_conversational_persistence(flow_copy, hydrated_inputs)
+                sync_session = flow_copy.stream_turn(  # type: ignore[attr-defined]
+                    conversational_turn.message,
+                    session_id=input_data.thread_id,
+                )
+                session = SyncStreamSessionAdapter(sync_session)
             aiter = session.__aiter__()
             deadline = (
                 time.monotonic() + timeout if timeout is not None else None
@@ -2426,6 +2453,7 @@ def _run_flow_stream(
     hitl_options: HITLOptions | None = None,
     emit_raw_events: bool = False,
     emission_shape: str = DEFAULT_EMISSION_SHAPE,
+    conversational_turn: ConversationalTurn | None = None,
 ):
     """Select the StreamFrame path (crewai >= 1.6 + a real ``astream`` flow) or
     the legacy bus-listener path, returning the chosen async generator.
@@ -2438,7 +2466,7 @@ def _run_flow_stream(
     ``checkpoint_kwargs`` is forwarded to whichever driver is chosen; each
     driver filters it against the exact method it invokes.
     """
-    if flow_supports_stream_frames(flow_copy):
+    if conversational_turn is not None or flow_supports_stream_frames(flow_copy):
         return _run_flow_frame_stream(
             flow_copy=flow_copy,
             encoder=encoder,
@@ -2449,6 +2477,7 @@ def _run_flow_stream(
             hitl_options=hitl_options,
             emit_raw_events=emit_raw_events,
             emission_shape=emission_shape,
+            conversational_turn=conversational_turn,
         )
     return _run_flow_event_stream(
         flow_copy=flow_copy,
@@ -2490,6 +2519,29 @@ async def _reject_unsupported_resume(input_data: RunAgentInput, encoder: EventEn
                 f"the StreamFrame transport"
             ),
             code="AGUI_CREWAI_RESUME_UNSUPPORTED",
+            **_run_error_extras(input_data),
+        )
+    )
+
+
+async def _reject_unsupported_conversational_flow(
+    input_data: RunAgentInput,
+    encoder: EventEncoder,
+):
+    """Fail loudly when conversational execution was explicitly requested."""
+    _LOGGER.warning(
+        "CrewAI conversational Flow requested but unavailable thread=%s run=%s",
+        input_data.thread_id,
+        input_data.run_id,
+    )
+    yield encoder.encode(
+        RunErrorEvent(
+            message=(
+                f"thread={input_data.thread_id} run={input_data.run_id}: "
+                "CrewAI conversational Flow execution is unsupported; the flow "
+                "must set conversational=True and expose stream_turn"
+            ),
+            code="AGUI_CREWAI_CONVERSATIONAL_FLOW_UNSUPPORTED",
             **_run_error_extras(input_data),
         )
     )
@@ -2802,6 +2854,7 @@ def add_crewai_flow_fastapi_endpoint(
     enable_legacy_on_interrupt_event: bool = True,
     emit_raw_events: bool | None = None,
     emission_shape: str | None = None,
+    conversational: bool = False,
 ):
     """Adds a CrewAI endpoint to the FastAPI app.
 
@@ -2815,6 +2868,10 @@ def add_crewai_flow_fastapi_endpoint(
     CHUNK form); ``None`` reads ``AGUI_CREWAI_EMISSION_SHAPE``. Both it and
     ``emit_raw_events`` resolve at registration, so a bad value fails once at
     startup rather than per request.
+
+    ``conversational=True`` drives CrewAI's public ``stream_turn`` API and maps
+    AG-UI ``thread_id`` to CrewAI ``session_id``. It fails loudly when the
+    supplied flow has not opted into CrewAI conversational mode.
 
     Async human-in-the-loop: when the flow pauses on an ``@human_feedback``
     method whose provider raises ``HumanFeedbackPending`` (see
@@ -2876,6 +2933,12 @@ def add_crewai_flow_fastapi_endpoint(
 
         timeout = _flow_timeout_seconds()
 
+        if conversational and not flow_supports_conversational_stream(flow):
+            return StreamingResponse(
+                _reject_unsupported_conversational_flow(input_data, encoder),
+                media_type=encoder.get_content_type(),
+            )
+
         # Resume a paused flow. ``from_pending`` reloads persisted pending state
         # (not a per-request copy), so the resume driver takes the ORIGINAL flow
         # (for its class) rather than a fresh ``_copy_flow``.
@@ -2916,6 +2979,11 @@ def add_crewai_flow_fastapi_endpoint(
         inputs["id"] = input_data.thread_id
 
         checkpoint_kwargs = build_checkpoint_kwargs(flow_copy, input_data)
+        conversational_turn = (
+            prepare_conversational_turn(input_data.messages)
+            if conversational
+            else None
+        )
 
         return StreamingResponse(
             _run_flow_stream(
@@ -2928,6 +2996,7 @@ def add_crewai_flow_fastapi_endpoint(
                 hitl_options=hitl_options,
                 emit_raw_events=resolved_emit_raw_events,
                 emission_shape=resolved_emission_shape,
+                conversational_turn=conversational_turn,
             ),
             media_type=encoder.get_content_type(),
         )
