@@ -37,7 +37,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version-file: ".node-version"
 
       # The uv.lock re-lock test skips itself when uv is absent, so without this
       # it would pass vacuously here and give false confidence.

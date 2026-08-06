@@ -55,6 +55,18 @@ If you'd confirmed that the **[x]** work hasn't been started yet, please file an
 
 ---
 
+## Toolchain
+
+This repository is developed and tested on the Node version in `.node-version` at the root. `fnm` reads it directly and resolves a bare major, so `fnm use` in the repository root gets you the right Node. `nvm` reads only `.nvmrc`, so pass the version through (`nvm use "$(cat .node-version)"`). `nodenv` and `asdf` read `.node-version` too — `asdf` only with `legacy_version_file = yes` in `~/.asdfrc` — but both resolve it to an exactly-installed version name, so under plain `nodenv` a bare major does not resolve at all: install an exact version (`nodenv install 22.11.0`) and either add the [`nodenv-aliases`](https://github.com/jasonkarns/nodenv-aliases) plugin or set `NODENV_VERSION`.
+
+In CI, all 12 `actions/setup-node` steps read that file via `node-version-file` rather than naming a version inline. Nothing enforces that automatically yet, so a new step that types a version in would not be caught — if you are adding one, copy an existing step rather than writing the input from scratch. The same is true of pnpm, which is pinned two different ways today: 9 of 11 `pnpm/action-setup` steps pin `version:` inline and 2 rely on `package.json#packageManager`.
+
+To bump the Node major, edit `.node-version` — every `actions/setup-node` step follows it automatically. Then review `publish-release.yml`'s npm-OIDC workaround, which exists only because the npm bundled with Node 22 cannot use OIDC trusted publishing, so a later major should probably delete it. Nothing will remind you about that one, so it is written down here.
+
+None of this is `package.json#engines.node`. The root manifest is private and never published, so its `>=18` is a floor on installs *in this repository* — and it is what `node-version-file: "package.json"` used to resolve before this was centralized. The published `@ag-ui/*` packages mostly declare no engines range at all, so changing the root value is not a consumer-compatibility decision.
+
+---
+
 ## Step-by-Step Guide to Adding an Integration PR
 
 This guide walks you through everything needed to submit an integration PR to AG-UI. It covers adding the integration code, examples, dojo configuration, end-to-end tests, and CI setup.
