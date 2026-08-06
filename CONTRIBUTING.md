@@ -164,9 +164,9 @@ The end-to-end tests need to run in CI as well. Update the GitHub Actions workfl
 
 **Note:** Tests won't run by default on external PRs. The team will open a separate PR from within the repo to trigger CI, then merge the original contributor PR once tests pass.
 
-**Python integrations:** CI pins one uv version and one CPython version for every Python job, recorded in [`.github/python-toolchain.env`](.github/python-toolchain.env). Two things follow from that — the first is a convention, the second is enforced.
+**Python integrations:** CI pins one uv version and one CPython version for every Python job, recorded in [`.github/python-toolchain.env`](.github/python-toolchain.env). Two things follow from that, and CI enforces both.
 
-**1. New Python CI steps must use the pin.** Nothing enforces this automatically — it is a convention reviewers check, so please get it right. Declare the two values in your workflow's top-level `env:` (a workflow cannot read them from the file), then reference them:
+**1. New Python CI steps must use the pin.** The `python-toolchain-pins` job fails if any workflow's literal disagrees with that file, or if a `setup-uv` invocation takes its version any other way. Declare the two values in your workflow's top-level `env:` (a workflow cannot read them from the file), then reference them:
 
 ```yaml
 env:
@@ -187,6 +187,14 @@ py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}
 ```
 
 `actions/setup-python` steps take `python-version` from the same pin. Watch the scope: `env:` is per-workflow/job/step, so a `${{ env.UV_VERSION }}` with no declaration a step can see expands to nothing and the job silently installs whatever uv is latest.
+
+To check your work before pushing, or to find every file still to update when moving the pin:
+
+```bash
+bash scripts/release/verify-python-toolchain-pins.sh
+```
+
+It names each file and line that disagrees. Note what it does *not* verify: that the pinned versions are the right ones. That comes from a green run, which is why `python-toolchain.env` records the run its values came from — update that too when you move the pin.
 
 **2. Lockfiles are checked, not repaired.** Python jobs install with `uv sync --locked`, the `lockfiles` job runs `uv lock --check` over every first-party `uv.lock`, and each Python job that installs dependencies ends with `.github/actions/assert-lockfiles-unchanged`, so a job that rewrites a committed lockfile fails instead of hiding the drift. If CI reports lockfile drift, run `uv lock` in the package directory and commit the result.
 
@@ -218,7 +226,7 @@ Use this checklist to verify your PR is complete before submitting:
 - [ ] End-to-end test spec files added for every supported feature
 - [ ] Tests pass locally
 - [ ] CI workflow matrix updated in `.github/workflows/dojo-e2e.yml` (entry name matches `agents.ts`)
-- [ ] **Python only:** new CI steps use `${{ env.UV_VERSION }}` / `${{ env.PYTHON_VERSION }}` matching `.github/python-toolchain.env`, and any venv cache key carries both versions (see Step 7 — not checked automatically)
+- [ ] **Python only:** new CI steps use `${{ env.UV_VERSION }}` / `${{ env.PYTHON_VERSION }}` matching `.github/python-toolchain.env`, and any venv cache key carries both versions — verify with `bash scripts/release/verify-python-toolchain-pins.sh` (see Step 7)
 - [ ] **Python only:** `uv.lock` committed alongside `pyproject.toml`, and `uv lock --check` passes in the package directory
 
 ---

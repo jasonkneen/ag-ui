@@ -73,10 +73,12 @@ permissions:
 
 env:
   NX_VERBOSE_LOGGING: true
-  # Pinned Python build toolchain — see .github/python-toolchain.env, kept in step
-  # across workflows by convention, not by an enforced check. UV_VERSION is needed
-  # here because prepare-release.ts re-locks the packages it bumps (#2314), so this
-  # workflow does run uv.
+  # Pinned Python build toolchain — see .github/python-toolchain.env. Kept in step
+  # across workflows by the python-toolchain-pins job in lint-release-workflows.yml.
+  # UV_VERSION is needed here because prepare-release.ts re-locks the packages it
+  # bumps (#2314), so this workflow does run uv — and its output lands in a COMMITTED
+  # lockfile, which makes an exact version load-bearing here in a way it is not
+  # elsewhere.
   UV_VERSION: "0.12.1"
   PYTHON_VERSION: "3.12"
 

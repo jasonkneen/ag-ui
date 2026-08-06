@@ -14,8 +14,8 @@ permissions:
 
 # Pinned Python build toolchain — see .github/python-toolchain.env, which is the
 # single place these two values are recorded, along with the green run they came
-# from. Keeping them equal across workflows is a convention, not an enforced check:
-# change one, change them all.
+# from. Change one, change them all: the python-toolchain-pins job in
+# lint-release-workflows.yml fails if any workflow's literal disagrees with that file.
 #
 # Audited alongside build-python-preview.yml: this job only uploads the wheels
 # that workflow already built, so it never touches a lockfile.

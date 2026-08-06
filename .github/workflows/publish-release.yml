@@ -137,8 +137,8 @@ env:
   NX_VERBOSE_LOGGING: true
   # Pinned Python build toolchain — see .github/python-toolchain.env, which also
   # records the green run these versions came from. Kept in step with every other
-  # Python job by convention, not by an enforced check. PYTHON_VERSION is
-  # the same 3.12 the `Setup Python` step already pins.
+  # Python job by the python-toolchain-pins job in lint-release-workflows.yml.
+  # PYTHON_VERSION is the same 3.12 the `Setup Python` step already pins.
   #
   # Audited for frozen mode: prerelease builds rewrite package versions on
   # purpose, but the only uv commands here are `uv build` and `uv publish`,
