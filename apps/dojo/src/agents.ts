@@ -177,7 +177,9 @@ export const agentsIntegrations = {
     return MastraAgent.getRemoteAgents({
       // Cast needed: pnpm may resolve separate @mastra/client-js installations
       // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
-      mastraClient: mastraClient as any,
+      mastraClient: mastraClient as unknown as Parameters<
+        typeof MastraAgent.getRemoteAgents
+      >[0]["mastraClient"],
       resourceId: "mastra-agent-remote",
       // Surface Observational Memory background work as AG-UI activity events
       // for the `observational_memory` demo only (default OFF for all others).
@@ -205,7 +207,9 @@ export const agentsIntegrations = {
     const base = MastraAgent.getLocalAgents({
       // Cast needed: pnpm may resolve separate @mastra/core installations
       // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
-      mastra: mastra as any,
+      mastra: mastra as unknown as Parameters<
+        typeof MastraAgent.getLocalAgents
+      >[0]["mastra"],
       resourceId: "mastra-agent-local",
       // Surface Observational Memory background work as AG-UI activity events
       // for the `observational_memory` demo only (default OFF for all others).
@@ -217,7 +221,7 @@ export const agentsIntegrations = {
     // so the runtime's per-request `clone()` preserves it.
     const wrapA2UI = (agent: unknown): AbstractAgent =>
       new MastraAgent({
-        agent: agent as any,
+        agent: agent as ConstructorParameters<typeof MastraAgent>[0]["agent"],
         resourceId: "mastra-agent-local",
         a2ui: a2uiInjectConfig,
       }) as unknown as AbstractAgent;
@@ -225,7 +229,7 @@ export const agentsIntegrations = {
     // bridge never adds generate_a2ui alongside search_flights/search_hotels.
     const wrapA2UIFixed = (agent: unknown): AbstractAgent =>
       new MastraAgent({
-        agent: agent as any,
+        agent: agent as ConstructorParameters<typeof MastraAgent>[0]["agent"],
         resourceId: "mastra-agent-local",
         a2ui: { injectA2UITool: false },
       }) as unknown as AbstractAgent;
