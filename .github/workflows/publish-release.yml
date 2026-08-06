@@ -135,6 +135,17 @@ concurrency:
 
 env:
   NX_VERBOSE_LOGGING: true
+  # Pinned Python build toolchain — see .github/python-toolchain.env, which also
+  # records the green run these versions came from. Kept in step with every other
+  # Python job by the python-toolchain-pins job in lint-release-workflows.yml.
+  # PYTHON_VERSION is the same 3.12 the `Setup Python` step already pins.
+  #
+  # Audited for frozen mode: prerelease builds rewrite package versions on
+  # purpose, but the only uv commands here are `uv build` and `uv publish`,
+  # neither of which reads or rewrites uv.lock (verified against uv 0.12.1), so
+  # this file needs no frozen-mode exemption.
+  UV_VERSION: "0.12.1"
+  PYTHON_VERSION: "3.12"
 
 permissions:
   contents: read
@@ -208,7 +219,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: "22"
+          node-version-file: ".node-version"
 
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b  # v3.0.0
@@ -219,12 +230,13 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Poetry
         run: pip install poetry
@@ -673,7 +685,7 @@ jobs:
         if: needs.build.outputs.ts_count != '0' || needs.build.outputs.pre_ts_count != '0'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: "22"
+          node-version-file: ".node-version"
           registry-url: https://registry.npmjs.org
 
       # Stable: download stable ts artifacts.
@@ -964,7 +976,8 @@ jobs:
         if: needs.build.outputs.py_count != '0' || needs.build.outputs.pre_has_py_packages == 'true'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Download Python build artifacts (stable)
         if: needs.build.outputs.mode == 'stable' && needs.build.outputs.py_count != '0'
@@ -1741,7 +1754,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version-file: ".node-version"
 
       - name: Install dependencies (no lifecycle scripts)
         run: pnpm install --frozen-lockfile --ignore-scripts
