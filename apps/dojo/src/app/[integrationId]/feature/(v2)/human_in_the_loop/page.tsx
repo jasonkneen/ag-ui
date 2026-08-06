@@ -394,8 +394,12 @@ const StepsFeedback = ({ args, respond, status }: StepsFeedbackProps) => {
   const [accepted, setAccepted] = useState<boolean | null>(null);
 
   // Snapshot the incoming steps the first time the tool call starts executing.
-  // Adjusted during render rather than in an effect (the `localSteps.length`
-  // guard makes it run once), which avoids rendering an empty list first.
+  // Adjusted during render rather than in an effect; the `localSteps.length`
+  // guard makes it run once, exactly as the effect's own guard did, so both
+  // versions pin the first non-empty executing value. What this avoids is
+  // committing an EMPTY `localSteps` while rendering `args.steps` — in that
+  // window a checkbox toggle mapped over an empty array and Confirm could
+  // respond with `steps: []`.
   if (
     status === "executing" &&
     localSteps.length === 0 &&

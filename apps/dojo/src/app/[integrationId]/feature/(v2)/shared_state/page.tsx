@@ -275,7 +275,14 @@ function Recipe() {
 
   const newRecipeState = { ...recipe };
   const newChangedKeys = [];
-  const [changedKeys, setChangedKeys] = useState<string[]>([]);
+  // NOTE (PNI-272): this stays a ref, written and read within the same render,
+  // and the `setRecipe` sync below stays in an effect. Converting either to a
+  // render-phase state update loses the Ping entirely whenever the agent's final
+  // recipe change arrives with `isLoading` already false: the retry render sees
+  // the recipe already synchronised and `!isLoading`, clears the changed keys and
+  // commits without ever showing the indicator. The ref writes the value the same
+  // render reads, so the indicator always commits at least once.
+  const changedKeysRef = useRef<string[]>([]);
 
   // Iterating Recipe by dynamic key needs an index-signature view of it.
   const agentRecipe = agentState?.recipe as unknown as Record<string, unknown> | undefined;
@@ -299,24 +306,18 @@ function Recipe() {
     }
   }
 
-  // Which keys the agent most recently changed, so the matching sections can
-  // flash a Ping. Held in state and adjusted during render rather than in a ref:
-  // a ref written and read during render is what `react-hooks/refs` forbids.
-  // While a run is in flight and this render found no changes, the previous set
-  // is kept, matching the earlier ref behaviour.
-  const nextChangedKeys =
-    newChangedKeys.length > 0 ? newChangedKeys : !isLoading ? [] : changedKeys;
-  if (JSON.stringify(nextChangedKeys) !== JSON.stringify(changedKeys)) {
-    setChangedKeys(nextChangedKeys);
+  if (newChangedKeys.length > 0) {
+    // eslint-disable-next-line react-hooks/refs -- see the note on the ref above
+    changedKeysRef.current = newChangedKeys;
+  } else if (!isLoading) {
+    // eslint-disable-next-line react-hooks/refs -- see the note on the ref above
+    changedKeysRef.current = [];
   }
 
-  // Fold agent-driven recipe changes back into local state. Adjusted during
-  // render for the same reason as `changedKeys` above; the comparison guard is
-  // what the `JSON.stringify` dependency was doing, and it converges because
-  // `newRecipeState` is `recipe` plus the agent's differing keys.
-  if (JSON.stringify(newRecipeState) !== JSON.stringify(recipe)) {
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- see the note on the ref above
     setRecipe(newRecipeState);
-  }
+  }, [JSON.stringify(newRecipeState)]);
 
   const handleTitleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     updateRecipe({
@@ -478,7 +479,8 @@ function Recipe() {
 
       {/* Dietary Preferences */}
       <div className="section-container relative">
-        {changedKeys.includes("special_preferences") && <Ping />}
+        {/* eslint-disable-next-line react-hooks/refs -- see the note on the ref above */}
+        {changedKeysRef.current.includes("special_preferences") && <Ping />}
         <h2 className="section-title">Dietary Preferences</h2>
         <div className="dietary-options">
           {Object.values(SpecialPreferences).map((option) => (
@@ -498,7 +500,8 @@ function Recipe() {
 
       {/* Ingredients */}
       <div className="section-container relative">
-        {changedKeys.includes("ingredients") && <Ping />}
+        {/* eslint-disable-next-line react-hooks/refs -- see the note on the ref above */}
+        {changedKeysRef.current.includes("ingredients") && <Ping />}
         <div className="section-header">
           <h2 className="section-title">Ingredients</h2>
           <button
@@ -545,7 +548,8 @@ function Recipe() {
 
       {/* Instructions */}
       <div className="section-container relative">
-        {changedKeys.includes("instructions") && <Ping />}
+        {/* eslint-disable-next-line react-hooks/refs -- see the note on the ref above */}
+        {changedKeysRef.current.includes("instructions") && <Ping />}
         <div className="section-header">
           <h2 className="section-title">Instructions</h2>
           <button type="button" className="add-step-button" onClick={addInstruction}>
