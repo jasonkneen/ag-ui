@@ -786,6 +786,13 @@ class StrandsAgent:
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
                         if tool_name and tool_name in frontend_tool_names:
+                            # Forward the ACTUAL result so the model can act on the
+                            # human's decision (e.g. an approval resolving to
+                            # {"approved": false}). Hardcoding a success string here
+                            # silently breaks HITL — the model would be told the tool
+                            # "executed successfully with no return value" regardless
+                            # of what the human returned. Only use that synthetic
+                            # acknowledgement when the result is genuinely empty.
                             result_text = (
                                 msg.content
                                 if isinstance(msg.content, str)
@@ -798,6 +805,13 @@ class StrandsAgent:
                                     f"{tool_name} executed successfully with no return value."
                                 )
                         else:
+                            # Could not resolve this tool's name from input messages
+                            # or session history (e.g. a delta-only payload with no
+                            # assistant tool_calls). Skip it rather than guessing:
+                            # picking an arbitrary frontend tool would feed false
+                            # context to the LLM when several frontend tools exist.
+                            # Strands still has the real result in session history to
+                            # conclude the round-trip from.
                             logger.warning(
                                 f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
                                 f"from input messages or session history (delta-only payload). "
