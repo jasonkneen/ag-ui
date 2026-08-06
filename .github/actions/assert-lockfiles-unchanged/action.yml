@@ -1,0 +1,58 @@
+name: Assert lockfiles unchanged
+description: >-
+  Fails the job if any step modified a committed lockfile. This is the direct check
+  that CI never silently repairs lockfile drift instead of reporting it.
+
+# Why this is an outcome check rather than a rule about which commands ran:
+# an earlier version of this change had a CI script that read the shell inside every
+# `run:` block looking for a uv command that might rewrite a lockfile. Three review
+# rounds found new shell shapes that slipped past its regexes — `$(uv sync)`,
+# `$((1<<n))` read as a heredoc opener, `shell: python` bodies scanned as bash — so
+# that approach was abandoned in favour of measuring the thing itself. A lockfile
+# that changed during the job is the property it was trying to infer, and git
+# answers that directly.
+#
+# Run this LAST in a job. `uv sync --locked` refuses to rewrite in the first place,
+# so on a healthy job this asserts what already holds; it earns its keep when a step
+# is added that syncs without `--locked`.
+#
+# NOT used by jobs that sync the `examples/` apps: five of those lockfiles are
+# knowingly stale and dojo-e2e rewrites them on purpose. See the `lockfiles` job
+# comment in .github/workflows/unit-python-sdk.yml.
+
+runs:
+  using: composite
+  steps:
+    - name: Assert no committed lockfile was modified
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Refuse to pass vacuously. If the pathspec matches nothing the assertion
+        # below is trivially true, which is the one outcome a guard must never
+        # silently produce.
+        tracked=$(git ls-files -- '*uv.lock' '*poetry.lock' | wc -l | tr -d ' ')
+        if [ "$tracked" -eq 0 ]; then
+          echo "::error::No lockfiles are tracked at $(pwd) — this check would pass by" \
+               "inspecting nothing. Is the repository checked out?"
+          exit 1
+        fi
+
+        # git status, NOT git diff. `git diff` compares worktree against the INDEX and
+        # only reports tracked files, so it missed the two likeliest ways a lockfile
+        # changes: a step that staged it (`git add`), and a NEW lock created where none
+        # existed — which is exactly what `uv sync` in sdks/python/a2ui_toolkit, the one
+        # first-party package with no committed lock, would produce. Both printed
+        # "unchanged". `--porcelain` reports modified, staged and untracked in one pass.
+        changed=$(git status --porcelain -- '*uv.lock' '*poetry.lock')
+        if [ -n "$changed" ]; then
+          echo "::error::A step in this job modified a committed lockfile:"
+          echo "$changed" | sed 's/^/  /'
+          echo
+          echo "CI must not repair lockfile drift. Run the equivalent command locally," \
+               "commit the updated lockfile, and push it."
+          git --no-pager diff --stat -- '*uv.lock' '*poetry.lock'
+          exit 1
+        fi
+
+        echo "All $tracked tracked lockfile(s) unchanged."

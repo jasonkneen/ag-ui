@@ -22,6 +22,7 @@ on:
       - "**/pyproject.toml"
       - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
+      - ".github/actions/**"
   pull_request:
     branches: [main]
     paths:
@@ -39,6 +40,7 @@ on:
       - "**/pyproject.toml"
       - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
+      - ".github/actions/**"
 
 permissions:
   contents: read
@@ -98,6 +100,12 @@ jobs:
         working-directory: sdks/python
         run: uv run --locked python -m unittest discover tests -v
 
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
   langgraph-python:
     runs-on: ubuntu-latest
 
@@ -139,6 +147,12 @@ jobs:
       - name: Run tests
         working-directory: integrations/langgraph/python
         run: uv run --locked python -m unittest discover tests -v
+
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
 
   watsonx-python:
     runs-on: ubuntu-latest
@@ -182,6 +196,12 @@ jobs:
         working-directory: integrations/watsonx/python
         run: uv run --locked python -m pytest tests/ -v
 
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
   adk-middleware-python:
     runs-on: ubuntu-latest
 
@@ -223,6 +243,12 @@ jobs:
       - name: Run tests
         working-directory: integrations/adk-middleware/python
         run: uv run --locked python -m pytest tests/ -v
+
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
 
   # Exercises the suite against google-adk 2.x. pyproject advertises
   # google-adk>=1.16.0,<3.0.0 ("compatible with 1.x and 2.x"), but the lockfile
@@ -289,6 +315,12 @@ jobs:
             echo "This leg runs the suite against \`google-adk>=2,<3\` and is allowed to fail until the 2.x failures are burned down. It does not block merges." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
   aws-strands-python:
     runs-on: ubuntu-latest
 
@@ -330,6 +362,12 @@ jobs:
       - name: Run tests
         working-directory: integrations/aws-strands/python
         run: uv run --locked python -m pytest tests/ -v
+
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
 
   langroid-python:
     runs-on: ubuntu-latest
@@ -373,6 +411,12 @@ jobs:
         working-directory: integrations/langroid/python
         run: uv run --locked python -m unittest discover tests -v
 
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
   crewai-python:
     runs-on: ubuntu-latest
 
@@ -414,6 +458,12 @@ jobs:
       - name: Run tests
         working-directory: integrations/crew-ai/python
         run: uv run --locked python -m pytest tests/ -v
+
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
 
   claude-managed-agents-python:
     name: claude-managed-agents-python
@@ -459,3 +509,134 @@ jobs:
       - name: Run tests
         working-directory: integrations/claude-managed-agents/python
         run: uv run --locked python -m pytest tests/ -v
+
+      - name: Assert no lockfile was rewritten
+        # always(): a job that rewrote a lockfile AND then failed its tests would
+        # otherwise skip this step and report only the test failure, losing the signal.
+        if: always()
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
+  # Every job above installs with `uv sync --locked`, which already fails when a
+  # lockfile disagrees with its pyproject — but only for the packages that have a
+  # test lane. agent-spec and claude-agent-sdk ship committed lockfiles with no
+  # lane at all, which is how the drift repaired in #2313 went unnoticed. This
+  # job checks every first-party **uv** lockfile in one place, and separately
+  # asserts that no first-party package is missing one.
+  #
+  # Two limits, stated because the step name would otherwise read as full coverage:
+  #   - poetry.lock is NOT checked. Four are committed
+  #     (adk-middleware, aws-strands, and two under examples/), but every package in
+  #     scripts/release/release.config.json builds with uv, so those files are stale
+  #     leftovers rather than a build input. Deleting them is a separate change.
+  #   - a package that never committed a lockfile is invisible to `find`, because
+  #     there is no lock to be out of date. The second step below closes that.
+  #
+  # The 13 examples/ lockfiles are deliberately out of scope, and this is a known
+  # gap rather than a clean bill of health: they are demo scaffolds synced by
+  # apps/dojo/scripts/prep-dojo-everything.js, which dojo-e2e runs and which
+  # syncs non-frozen (the script is shared with local dev, where relocking is the
+  # wanted behaviour). So dojo-e2e can still rewrite a committed example lockfile
+  # in CI. Five of the 13 are stale today, which is why closing this needs its own
+  # change: freezing them as-is turns dojo-e2e red, and relocking all 13
+  # pulls in dependency churn well beyond a toolchain pin.
+  lockfiles:
+    name: lockfiles
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify every first-party uv lockfile matches its manifest
+        run: |
+          set -euo pipefail
+          mapfile -t locks < <(
+            find . -name uv.lock \
+              -not -path "*/node_modules/*" \
+              -not -path "*/examples/*" \
+              -not -path "*/.venv/*" \
+              | sort
+          )
+          if [ ${#locks[@]} -eq 0 ]; then
+            echo "::error::No first-party uv.lock files found — the search is wrong, not the repo"
+            exit 1
+          fi
+          failed=""
+          for lock in "${locks[@]}"; do
+            dir=$(dirname "$lock")
+            echo "=== uv lock --check $dir"
+            if ! (cd "$dir" && uv lock --check); then
+              failed="${failed} ${dir}"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::Lockfile(s) out of date with their pyproject.toml:${failed}"
+            echo "Run \`uv lock\` in each directory and commit the result."
+            exit 1
+          fi
+          echo "All ${#locks[@]} first-party uv lockfiles match their manifests."
+
+      # The step above can only check locks that exist. A released package with no
+      # lockfile at all passes it silently — which is the state ag-ui-a2ui-toolkit is
+      # in today, so this asserts the exception list rather than trusting `find`.
+      - name: Verify no first-party package is missing a lockfile
+        run: |
+          set -euo pipefail
+          # Packages knowingly without a uv.lock. Adding one here is a decision, not
+          # a workaround: it means nothing verifies that package's dependency graph.
+          known_missing=(
+            "./sdks/python/a2ui_toolkit"
+          )
+          mapfile -t manifests < <(
+            find . -name pyproject.toml \
+              -not -path "*/node_modules/*" \
+              -not -path "*/examples/*" \
+              -not -path "*/.venv/*" \
+              | sort
+          )
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "::error::No first-party pyproject.toml files found — the search is wrong"
+            exit 1
+          fi
+          missing=""
+          stale_exception=""
+          for manifest in "${manifests[@]}"; do
+            dir=$(dirname "$manifest")
+            # Only a manifest that declares a distribution is a package. A pyproject.toml
+            # holding nothing but tool config (ruff, pytest) needs no lockfile, and
+            # demanding one would fail this job with the remedy "add it to known_missing"
+            # — recording a non-package as a knowingly-unlocked package.
+            if ! grep -qE '^\[(project|tool\.poetry)\]' "$manifest"; then
+              continue
+            fi
+            excepted=""
+            for known in "${known_missing[@]}"; do
+              [ "$dir" = "$known" ] && excepted="yes"
+            done
+            if [ -f "$dir/uv.lock" ]; then
+              # An exception that grew a lockfile should leave the list, or the list
+              # rots into a permanent waiver.
+              [ -n "$excepted" ] && stale_exception="${stale_exception} ${dir}"
+            elif [ -z "$excepted" ]; then
+              missing="${missing} ${dir}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Package(s) ship no uv.lock, so nothing verifies their dependencies:${missing}"
+            echo "Run \`uv lock\` there and commit it, or add it to known_missing in this step."
+            exit 1
+          fi
+          if [ -n "$stale_exception" ]; then
+            echo "::error::These are listed as known_missing but now have a uv.lock:${stale_exception}"
+            echo "Remove them from the list in this step."
+            exit 1
+          fi
+          echo "All ${#manifests[@]} first-party package(s) accounted for."
