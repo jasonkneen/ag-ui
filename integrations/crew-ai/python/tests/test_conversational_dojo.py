@@ -2,6 +2,7 @@
 
 import importlib
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,3 +110,62 @@ def test_conversational_examples_keep_litellm_compatible_message_dicts():
 
     assert flow.state.current_user_message == "hello"
     assert flow.state.messages[-1] == {"role": "user", "content": "hello"}
+
+
+def test_hitl_tool_contract_respects_the_requested_step_count():
+    hitl = importlib.import_module("ag_ui_crewai.examples.human_in_the_loop")
+    function = hitl.DEFINE_TASK_TOOL["function"]
+    contract = " ".join(
+        [
+            function["description"],
+            function["parameters"]["properties"]["steps"]["description"],
+        ]
+    ).lower()
+
+    assert "requested" in contract
+    assert "10 steps" not in contract
+
+
+@pytest.mark.parametrize("conversational", [False, True])
+async def test_hitl_flow_sends_rejection_and_terse_revision_semantics(
+    monkeypatch,
+    conversational,
+):
+    hitl = importlib.import_module("ag_ui_crewai.examples.human_in_the_loop")
+    examples = _conversational_examples()
+    flow_type = (
+        examples.CONVERSATIONAL_FLOW_TYPES["human_in_the_loop"]
+        if conversational
+        else hitl.HumanInTheLoopFlow
+    )
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    async def fake_stream(_response):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message={"role": "assistant", "content": "waiting"}
+                )
+            ]
+        )
+
+    monkeypatch.setattr(hitl, "acompletion", fake_acompletion)
+    monkeypatch.setattr(hitl, "copilotkit_stream", fake_stream)
+
+    await flow_type().chat()
+
+    prompt = captured["messages"][0]["content"].lower()
+    tool_contract = captured["tools"][-1]["function"]["description"].lower()
+
+    assert prompt == hitl.HITL_SYSTEM_PROMPT.lower()
+    assert "critical:" in prompt
+    assert "accepted" in prompt
+    assert "false" in prompt
+    assert "do not perform" in prompt
+    assert "numeric" in prompt
+    assert "step count" in prompt
+    assert "requested" in tool_contract
