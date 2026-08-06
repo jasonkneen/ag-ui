@@ -119,7 +119,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: "10.33.4"
 
@@ -132,6 +132,14 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      # prepare-release.ts re-locks any uv-managed Python package it bumps, so uv
+      # must be on PATH or the bump aborts rather than shipping a stale lock.
+      # Same pinned action and floor as unit-python-sdk.yml.
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ">=0.8.0"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
