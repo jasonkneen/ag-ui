@@ -12,6 +12,15 @@ on:
       - "integrations/langroid/python/**"
       - "integrations/crew-ai/python/**"
       - "integrations/claude-managed-agents/python/**"
+      # agent-spec and claude-agent-sdk have no test lane, but they ship
+      # committed lockfiles that the `lockfiles` job below verifies.
+      - "integrations/agent-spec/python/**"
+      - "integrations/claude-agent-sdk/python/**"
+      # Globs, not another hand-maintained list: the lockfiles job discovers locks
+      # repo-wide, so a new package outside the paths above must still trigger it.
+      - "**/uv.lock"
+      - "**/pyproject.toml"
+      - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
   pull_request:
     branches: [main]
@@ -24,10 +33,23 @@ on:
       - "integrations/langroid/python/**"
       - "integrations/crew-ai/python/**"
       - "integrations/claude-managed-agents/python/**"
+      - "integrations/agent-spec/python/**"
+      - "integrations/claude-agent-sdk/python/**"
+      - "**/uv.lock"
+      - "**/pyproject.toml"
+      - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
 
 permissions:
   contents: read
+
+# Pinned Python build toolchain. These two values must equal the ones recorded in
+# .github/python-toolchain.env, which also records the green run they came from.
+# GitHub cannot read a file into `env:`, which is why they are repeated here — and
+# why keeping them in step is a convention rather than something CI checks.
+env:
+  UV_VERSION: "0.12.1"
+  PYTHON_VERSION: "3.12"
 
 jobs:
   python:
@@ -54,14 +76,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: sdks/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-${{ hashFiles('sdks/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('sdks/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: sdks/python
@@ -73,7 +96,7 @@ jobs:
 
       - name: Run tests
         working-directory: sdks/python
-        run: uv run python -m unittest discover tests -v
+        run: uv run --locked python -m unittest discover tests -v
 
   langgraph-python:
     runs-on: ubuntu-latest
@@ -99,14 +122,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/langgraph/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-langgraph-${{ hashFiles('integrations/langgraph/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-langgraph-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/langgraph/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/langgraph/python
@@ -114,7 +138,7 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/langgraph/python
-        run: uv run python -m unittest discover tests -v
+        run: uv run --locked python -m unittest discover tests -v
 
   watsonx-python:
     runs-on: ubuntu-latest
@@ -140,14 +164,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/watsonx/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-watsonx-${{ hashFiles('integrations/watsonx/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-watsonx-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/watsonx/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/watsonx/python
@@ -155,7 +180,7 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/watsonx/python
-        run: uv run python -m pytest tests/ -v
+        run: uv run --locked python -m pytest tests/ -v
 
   adk-middleware-python:
     runs-on: ubuntu-latest
@@ -181,14 +206,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/adk-middleware/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-adk-middleware-${{ hashFiles('integrations/adk-middleware/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-adk-middleware-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/adk-middleware/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/adk-middleware/python
@@ -196,14 +222,16 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/adk-middleware/python
-        run: uv run python -m pytest tests/ -v
+        run: uv run --locked python -m pytest tests/ -v
 
   # Exercises the suite against google-adk 2.x. pyproject advertises
   # google-adk>=1.16.0,<3.0.0 ("compatible with 1.x and 2.x"), but the lockfile
   # resolves 1.x (see #1946), so CI never sees 2.x. The suite is currently red
   # under 2.x (#1947). This leg is INFORMATIONAL: the test step is
   # continue-on-error, so the job stays green and never blocks a merge, while a
-  # failing 2.x run is surfaced as a warning annotation and a job summary. Once
+  # failing 2.x run is surfaced as a warning annotation and a job summary. Note the
+  # install and force steps are NOT exempt: if forcing 2.x cannot resolve, this job
+  # fails. Once
   # the 2.x failures are burned down, drop the step's continue-on-error to make
   # this a required, blocking check.
   adk-middleware-python-adk-2x:
@@ -230,7 +258,8 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         working-directory: integrations/adk-middleware/python
@@ -284,14 +313,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/aws-strands/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-aws-strands-${{ hashFiles('integrations/aws-strands/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-aws-strands-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/aws-strands/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/aws-strands/python
@@ -299,7 +329,7 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/aws-strands/python
-        run: uv run python -m pytest tests/ -v
+        run: uv run --locked python -m pytest tests/ -v
 
   langroid-python:
     runs-on: ubuntu-latest
@@ -325,14 +355,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/langroid/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-langroid-${{ hashFiles('integrations/langroid/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-langroid-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/langroid/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/langroid/python
@@ -340,7 +371,7 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/langroid/python
-        run: uv run python -m unittest discover tests -v
+        run: uv run --locked python -m unittest discover tests -v
 
   crewai-python:
     runs-on: ubuntu-latest
@@ -366,14 +397,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/crew-ai/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-crewai-${{ hashFiles('integrations/crew-ai/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-crewai-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/crew-ai/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/crew-ai/python
@@ -381,7 +413,7 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/crew-ai/python
-        run: uv run python -m pytest tests/ -v
+        run: uv run --locked python -m pytest tests/ -v
 
   claude-managed-agents-python:
     name: claude-managed-agents-python
@@ -410,14 +442,15 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
-          version: ">=0.8.0"
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Load cached venv
         id: cached-uv-dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: integrations/claude-managed-agents/python/.venv
-          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-claude-managed-agents-${{ hashFiles('integrations/claude-managed-agents/python/uv.lock') }}
+          key: ${{ steps.fork-check.outputs.prefix }}venv-${{ runner.os }}-claude-managed-agents-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ hashFiles('integrations/claude-managed-agents/python/uv.lock') }}
 
       - name: Install dependencies
         working-directory: integrations/claude-managed-agents/python
@@ -425,4 +458,4 @@ jobs:
 
       - name: Run tests
         working-directory: integrations/claude-managed-agents/python
-        run: uv run python -m pytest tests/ -v
+        run: uv run --locked python -m pytest tests/ -v

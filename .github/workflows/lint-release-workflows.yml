@@ -1,39 +1,52 @@
 name: Lint Release Workflows
 
-# Runs actionlint + shellcheck against the release / create-pr, release /
-# publish, and canary / publish pipelines and the scripts they call. Keeps
-# these critical, retry-sensitive files from silently regressing on shell or
-# action-syntax bugs.
+# Runs actionlint + shellcheck against the release, canary, and Python CI
+# pipelines and the scripts they call. Keeps these critical, retry-sensitive files
+# from silently regressing on shell or action-syntax bugs.
 #
-# Scope is intentionally narrow: only the release workflows and
-# scripts/release/*. Expanding later is cheap; starting narrow avoids
-# drowning unrelated changes in pre-existing lint noise.
+# The actionlint file list below is explicit rather than repo-wide, so that adding
+# a workflow does not drown an unrelated PR in pre-existing lint noise — read that
+# list, not this comment, for the current scope. Everything else under
+# .github/workflows/ is unlinted; widening is a one-line change plus whatever it
+# turns up. shellcheck covers scripts/release/*.sh only.
+
 
 on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/prepare-release.yml"
-      - ".github/workflows/publish-release.yml"
-      - ".github/workflows/canary.yml"
-      - ".github/workflows/lint-release-workflows.yml"
-      - "scripts/release/**"
+      - ".github/workflows/**"
+      - ".github/actionlint.yaml"
+      - "scripts/**"
       - "nx.json"
   pull_request:
     paths:
-      - ".github/workflows/prepare-release.yml"
-      - ".github/workflows/publish-release.yml"
-      - ".github/workflows/canary.yml"
-      - ".github/workflows/lint-release-workflows.yml"
-      - "scripts/release/**"
+      - ".github/workflows/**"
+      - ".github/actionlint.yaml"
+      - "scripts/**"
       - "nx.json"
 
 permissions:
   contents: read
 
+# Pinned CPython — see .github/python-toolchain.env, which records this value and the
+# green run it came from. Keeping it equal across workflows is a convention, not an
+# enforced check.
+#
+# No UV_VERSION here: this workflow installs no uv, and an unused copy of the pin is
+# only somewhere for it to drift.
+env:
+  PYTHON_VERSION: "3.12"
+
 jobs:
   actionlint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # reviewdog's github-check reporter creates the check run that carries the
+      # annotations; without it, findings are enforced by exit code alone and nothing
+      # visible says why the job failed.
+      checks: write  # create the check run reviewdog reports annotations through
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -49,6 +62,12 @@ jobs:
             .github/workflows/publish-release.yml
             .github/workflows/canary.yml
             .github/workflows/lint-release-workflows.yml
+            .github/workflows/unit-python-sdk.yml
+            .github/workflows/dojo-e2e.yml
+            .github/workflows/build-python-preview.yml
+            .github/workflows/publish-python-preview.yml
+            .github/workflows/zizmor.yml
+            .github/workflows/test-release-scripts.yml
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -110,6 +129,6 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Verify config package names match manifests
         run: bash scripts/release/verify-config-manifest-names.sh
