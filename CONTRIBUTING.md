@@ -61,6 +61,8 @@ This repository is developed and tested on the Node version in `.node-version` a
 
 In CI, all 12 `actions/setup-node` steps read that file via `node-version-file` rather than naming a version inline. Nothing enforces that automatically yet, so a new step that types a version in would not be caught — if you are adding one, copy an existing step rather than writing the input from scratch. The same is true of pnpm, which is pinned two different ways today: 9 of 11 `pnpm/action-setup` steps pin `version:` inline and 2 rely on `package.json#packageManager`.
 
+The Python build toolchain is pinned the same way, in [`.github/python-toolchain.env`](.github/python-toolchain.env), but that one *is* enforced — `scripts/release/verify-python-toolchain-pins.sh` fails CI when a workflow's literal disagrees with the record. Closing the same gap for Node and pnpm is tracked in [PNI-280](https://linear.app/copilotkit/issue/PNI-280); see Step 7's Python note for the enforced version of this pattern.
+
 To bump the Node major, edit `.node-version` — every `actions/setup-node` step follows it automatically. Then review `publish-release.yml`'s npm-OIDC workaround, which exists only because the npm bundled with Node 22 cannot use OIDC trusted publishing, so a later major should probably delete it. Nothing will remind you about that one, so it is written down here.
 
 None of this is `package.json#engines.node`. The root manifest is private and never published, so its `>=18` is a floor on installs *in this repository* — and it is what `node-version-file: "package.json"` used to resolve before this was centralized. The published `@ag-ui/*` packages mostly declare no engines range at all, so changing the root value is not a consumer-compatibility decision.
