@@ -158,7 +158,11 @@ class TestInterruptOutcome:
 class TestResumeConsumption:
     @pytest.mark.asyncio
     async def test_resolved_resume_builds_interrupt_response_prompt(self):
-        """A resolved ResumeEntry is translated into the Strands resume prompt."""
+        """A resolved ResumeEntry is translated into the Strands resume prompt.
+
+        The raw payload is wrapped in ``{"response": ...}`` so Strands' truthiness
+        gate always passes; the tool destructures via ``.get("response")``.
+        """
         core = _MockStrandsCore(terminal_events=[])
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload="yes")]
@@ -167,8 +171,33 @@ class TestResumeConsumption:
             await _collect_events(agent, _make_run_input(resume=resume))
 
         assert core.stream_prompts == [
-            [{"interruptResponse": {"interruptId": "int-1", "response": "yes"}}]
+            [{"interruptResponse": {"interruptId": "int-1", "response": {"response": "yes"}}}]
         ]
+
+    @pytest.mark.parametrize("falsy_payload", [None, False, "", 0, [], {}])
+    @pytest.mark.asyncio
+    async def test_resolved_resume_wraps_falsy_payload_in_truthy_envelope(
+        self, falsy_payload
+    ):
+        """Falsy resume payloads must be wrapped so Strands' ``if response:`` gate passes.
+
+        Regression for ``round1.md`` #1: without the envelope, ``None``/``False``/
+        ``""``/``0``/``[]``/``{}`` re-emit the same interrupt id on the resume
+        run, re-running the tool body forever.
+        """
+        core = _MockStrandsCore(terminal_events=[])
+        agent = _make_base_agent()
+        resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload=falsy_payload)]
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            await _collect_events(agent, _make_run_input(resume=resume))
+
+        [wrapped] = core.stream_prompts
+        assert wrapped == [
+            {"interruptResponse": {"interruptId": "int-1", "response": {"response": falsy_payload}}}
+        ]
+        # The envelope itself must be truthy — that is the whole point.
+        assert bool(wrapped[0]["interruptResponse"]["response"])
 
     @pytest.mark.asyncio
     async def test_cancelled_resume_uses_sentinel(self):
@@ -199,7 +228,7 @@ class TestResumeConsumption:
 
         assert core.stream_prompts == [
             [
-                {"interruptResponse": {"interruptId": "a", "response": {"k": 1}}},
+                {"interruptResponse": {"interruptId": "a", "response": {"response": {"k": 1}}}},
                 {"interruptResponse": {"interruptId": "b", "response": INTERRUPT_CANCELLED}},
             ]
         ]
@@ -218,8 +247,13 @@ class TestResumeConsumption:
 
 @tool(context=True)
 def confirm_action(key: str, tool_context: ToolContext) -> dict:
-    approval = tool_context.interrupt("confirm_action", reason={"key": key})
-    if approval:
+    # Resume envelope: {"cancelled": True} on cancel, {"response": <raw>} on
+    # resolve. Destructure — do NOT truthiness-check the envelope, since it is
+    # always truthy on resolve (that's the whole point of the wrap).
+    envelope = tool_context.interrupt("confirm_action", reason={"key": key})
+    if envelope.get("cancelled"):
+        return {"status": "success", "content": [{"text": f"denied {key}"}]}
+    if envelope.get("response"):
         return {"status": "success", "content": [{"text": f"confirmed {key}"}]}
     return {"status": "success", "content": [{"text": f"denied {key}"}]}
 

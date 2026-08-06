@@ -72,6 +72,20 @@ _WIRE_MAP_MAX = 512
 INTERRUPT_CANCELLED = {"cancelled": True}
 
 
+def _wrap_resume_response(status: str, payload: Any) -> dict:
+    """Package a ``ResumeEntry`` for Strands' ``interruptResponse`` shape.
+
+    Strands' resume gate is truthiness-based (i.e. ``if interrupt_.response:``),
+    so a raw falsy payload (``None``, ``False``, ``""``, ``0``, ``[]``, ``{}``)
+    re-raises the same interrupt and re-runs the tool body — an infinite approve loop.
+    Always hand Strands a truthy envelope; up to the tool implementation to properly
+    destructures it (e.g. via ``.get("cancelled")`` / ``.get("response")``).
+    """
+    if status == "cancelled":
+        return INTERRUPT_CANCELLED
+    return {"response": payload}
+
+
 def _get_strands_session_manager(agent: Any) -> Any:
     """Return the agent's Strands ``SessionManager``, or ``None``.
 
@@ -1002,8 +1016,8 @@ class StrandsAgent:
                 and has_nonvoid_frontend_result
             )
 
-            # A client answering a native Strands interrupt sends its responses
-            # in ``RunAgentInput.resume`` (per the AG-UI interrupt round-trip),
+            # A client answering to an interrupt sends its responses
+            # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
             # not as a new user message. Translate those into the Strands resume
             # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
             # and drive the stream with it — this takes precedence over every
@@ -1015,10 +1029,8 @@ class StrandsAgent:
                     {
                         "interruptResponse": {
                             "interruptId": entry.interrupt_id,
-                            "response": (
-                                INTERRUPT_CANCELLED
-                                if entry.status == "cancelled"
-                                else entry.payload
+                            "response": _wrap_resume_response(
+                                entry.status, entry.payload
                             ),
                         }
                     }
