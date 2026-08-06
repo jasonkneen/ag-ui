@@ -121,8 +121,8 @@ const fromProtoSource = (source: unknown): unknown => {
     return undefined;
   }
 
-  const data = asRecord(rec.data);
-  if (data) {
+  if (rec.data) {
+    const data = rec.data as LooseRecord;
     return {
       type: "data",
       value: data.value,
@@ -130,8 +130,8 @@ const fromProtoSource = (source: unknown): unknown => {
     };
   }
 
-  const url = asRecord(rec.url);
-  if (url) {
+  if (rec.url) {
+    const url = rec.url as LooseRecord;
     return {
       type: "url",
       value: url.value,
@@ -148,16 +148,16 @@ const fromProtoContentPart = (part: unknown): unknown => {
     return undefined;
   }
 
-  const text = asRecord(rec.text);
-  if (text) {
+  if (rec.text) {
+    const text = rec.text as LooseRecord;
     return {
       type: "text",
       text: text.text,
     };
   }
 
-  const image = asRecord(rec.image);
-  if (image) {
+  if (rec.image) {
+    const image = rec.image as LooseRecord;
     return {
       type: "image",
       source: fromProtoSource(image.source),
@@ -165,8 +165,8 @@ const fromProtoContentPart = (part: unknown): unknown => {
     };
   }
 
-  const audio = asRecord(rec.audio);
-  if (audio) {
+  if (rec.audio) {
+    const audio = rec.audio as LooseRecord;
     return {
       type: "audio",
       source: fromProtoSource(audio.source),
@@ -174,8 +174,8 @@ const fromProtoContentPart = (part: unknown): unknown => {
     };
   }
 
-  const video = asRecord(rec.video);
-  if (video) {
+  if (rec.video) {
+    const video = rec.video as LooseRecord;
     return {
       type: "video",
       source: fromProtoSource(video.source),
@@ -183,8 +183,8 @@ const fromProtoContentPart = (part: unknown): unknown => {
     };
   }
 
-  const document = asRecord(rec.document);
-  if (document) {
+  if (rec.document) {
+    const document = rec.document as LooseRecord;
     return {
       type: "document",
       source: fromProtoSource(document.source),
@@ -272,8 +272,10 @@ export function encode(event: BaseEvent): Uint8Array {
   if (type === EventType.STATE_DELTA && Array.isArray(rest.delta)) {
     rest.delta = (rest.delta as LooseRecord[]).map((operation) => ({
       ...operation,
+      // Cast, not coercion: `String(op)` would turn malformed values such as
+      // `["add"]` into a valid enum member, where this previously threw.
       op: protoPatch.JsonPatchOperationType[
-        String(operation.op).toUpperCase() as keyof typeof protoPatch.JsonPatchOperationType
+        (operation.op as string).toUpperCase() as keyof typeof protoPatch.JsonPatchOperationType
       ],
     }));
   }
@@ -325,7 +327,7 @@ export function decode(data: Uint8Array): BaseEvent {
         untypedMessage.contentParts = undefined;
       }
 
-      if (Array.isArray(untypedMessage.toolCalls) && untypedMessage.toolCalls.length === 0) {
+      if ((untypedMessage.toolCalls as { length?: number } | undefined)?.length === 0) {
         untypedMessage.toolCalls = undefined;
       }
     }

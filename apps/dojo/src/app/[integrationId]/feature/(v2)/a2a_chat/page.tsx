@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Plus, MessageSquare, Users, Settings } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import A2AChat from "./a2a_chat";
@@ -14,6 +14,7 @@ interface PageProps {
 function Page({ params }: PageProps) {
   const [activeTab, setActiveTab] = useState("chat-1");
   const [tabs, setTabs] = useState([{ id: "chat-1", label: "Main Chat", icon: MessageSquare }]);
+  const [chatInstances, setChatInstances] = useState<Record<string, React.ReactElement>>({});
   const [tabNotifications, setTabNotifications] = useState<Record<string, boolean>>({});
 
   const activeTabRef = useRef(activeTab);
@@ -43,6 +44,31 @@ function Page({ params }: PageProps) {
       [tabId]: false,
     }));
   }, []);
+
+  // Initialize chat instances when tabs change
+  useEffect(() => {
+    const newInstances = { ...chatInstances };
+
+    tabs.forEach((tab) => {
+      if (!newInstances[tab.id]) {
+        newInstances[tab.id] = (
+          <A2AChat key={tab.id} params={params} onNotification={() => addNotification(tab.id)} />
+        );
+      }
+    });
+
+    // DEFERRED (PNI-272): `react-hooks/set-state-in-effect`. Caching the chat
+    // elements here is load-bearing, not incidental: it pins each chat's
+    // `onNotification` closure for the lifetime of the tab. Rendering <A2AChat>
+    // directly instead creates a fresh closure every parent render, which
+    // re-fires the notification effect in a2a_chat.tsx (it lists
+    // `onNotification` in its deps); that calls `setTabNotifications`, which
+    // always allocates a new object, re-renders this component and loops
+    // forever for any inactive tab holding messages. Left as-is until the
+    // notification wiring is reshaped to pass a stable callback.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setChatInstances(newInstances);
+  }, [tabs, params, addNotification]);
 
   const handleAddTab = () => {
     const newTab = {
@@ -119,10 +145,7 @@ function Page({ params }: PageProps) {
                 {/* Chat Content */}
                 <div className="relative h-full p-6">
                   <div className="h-full bg-white/50 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20">
-                    <A2AChat
-                      params={params}
-                      onNotification={() => addNotification(tab.id)}
-                    />
+                    {chatInstances[tab.id]}
                   </div>
                 </div>
               </div>
