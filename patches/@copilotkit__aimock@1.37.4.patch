@@ -1,8 +1,8 @@
 diff --git a/dist/responses.js b/dist/responses.js
-index 6289e55..99762bb 100644
+index 0a9817d6c0a328769077e2baa61760c6cc9a2bca..140342048f16b23ae649bf10eba24017aa5b8ca7 100644
 --- a/dist/responses.js
 +++ b/dist/responses.js
-@@ -170,6 +170,21 @@ function buildTextStreamEvents(content, model, chunkSize, reasoning, webSearches
+@@ -174,5 +174,20 @@ function buildTextStreamEvents(content, model, chunkSize, reasoning, webSearches
  			model: overrides?.model ?? model,
  			status: responsesStatus(overrides?.finishReason, "completed"),
 +			error: null,
@@ -23,7 +23,7 @@ index 6289e55..99762bb 100644
  			output: [...prefixOutputItems, msgItem],
  			usage: responsesUsage(overrides)
  		}
-@@ -235,6 +250,21 @@ function buildToolCallStreamEvents(toolCalls, model, chunkSize, reasoning, webSe
+@@ -239,5 +254,20 @@ function buildToolCallStreamEvents(toolCalls, model, chunkSize, reasoning, webSe
  			model: overrides?.model ?? model,
  			status: responsesStatus(overrides?.finishReason, "completed"),
 +			error: null,
@@ -44,7 +44,7 @@ index 6289e55..99762bb 100644
  			output: [...prefixOutputItems, ...fcOutputItems],
  			usage: responsesUsage(overrides)
  		}
-@@ -631,6 +661,21 @@ function buildContentWithToolCallsStreamEvents(content, toolCalls, model, chunkS
+@@ -635,5 +665,20 @@ function buildContentWithToolCallsStreamEvents(content, toolCalls, model, chunkS
  			model: overrides?.model ?? model,
  			status: responsesStatus(overrides?.finishReason, "completed"),
 +			error: null,
