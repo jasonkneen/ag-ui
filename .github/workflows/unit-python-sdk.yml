@@ -20,6 +20,11 @@ on:
       # repo-wide, so a new package outside the paths above must still trigger it.
       - "**/uv.lock"
       - "**/pyproject.toml"
+      # ...but not the examples/ apps. Their locks are deliberately out of scope for
+      # the lockfiles job (prep-dojo-everything.js relocks them on purpose), so an
+      # examples-only lockfile change would spin up all nine test lanes to verify
+      # nothing. Negation must follow the two globs above to override them.
+      - "!examples/**"
       - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
       - ".github/actions/**"
@@ -38,6 +43,11 @@ on:
       - "integrations/claude-agent-sdk/python/**"
       - "**/uv.lock"
       - "**/pyproject.toml"
+      # ...but not the examples/ apps. Their locks are deliberately out of scope for
+      # the lockfiles job (prep-dojo-everything.js relocks them on purpose), so an
+      # examples-only lockfile change would spin up all nine test lanes to verify
+      # nothing. Negation must follow the two globs above to override them.
+      - "!examples/**"
       - ".github/python-toolchain.env"
       - ".github/workflows/unit-python-sdk.yml"
       - ".github/actions/**"
@@ -48,7 +58,8 @@ permissions:
 # Pinned Python build toolchain. These two values must equal the ones recorded in
 # .github/python-toolchain.env, which also records the green run they came from.
 # GitHub cannot read a file into `env:`, which is why they are repeated here — and
-# why keeping them in step is a convention rather than something CI checks.
+# the python-toolchain-pins job in lint-release-workflows.yml is what keeps the
+# repetition honest. That file's header records the alternative that was weighed.
 env:
   UV_VERSION: "0.12.1"
   PYTHON_VERSION: "3.12"
@@ -59,6 +70,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -101,9 +115,21 @@ jobs:
         run: uv run --locked python -m unittest discover tests -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   langgraph-python:
@@ -111,6 +137,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -149,9 +178,21 @@ jobs:
         run: uv run --locked python -m unittest discover tests -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   watsonx-python:
@@ -159,6 +200,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -197,9 +241,21 @@ jobs:
         run: uv run --locked python -m pytest tests/ -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   adk-middleware-python:
@@ -207,6 +263,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -245,9 +304,21 @@ jobs:
         run: uv run --locked python -m pytest tests/ -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   # Exercises the suite against google-adk 2.x. pyproject advertises
@@ -265,6 +336,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -316,9 +390,21 @@ jobs:
           fi
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   aws-strands-python:
@@ -326,6 +412,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -364,9 +453,21 @@ jobs:
         run: uv run --locked python -m pytest tests/ -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   langroid-python:
@@ -374,6 +475,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -412,9 +516,21 @@ jobs:
         run: uv run --locked python -m unittest discover tests -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   crewai-python:
@@ -422,6 +538,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -460,9 +579,21 @@ jobs:
         run: uv run --locked python -m pytest tests/ -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   claude-managed-agents-python:
@@ -471,6 +602,9 @@ jobs:
 
     steps:
       - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome — see
+        # the comment there for why !cancelled() alone is not enough.
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -511,9 +645,21 @@ jobs:
         run: uv run --locked python -m pytest tests/ -v
 
       - name: Assert no lockfile was rewritten
-        # always(): a job that rewrote a lockfile AND then failed its tests would
-        # otherwise skip this step and report only the test failure, losing the signal.
-        if: always()
+        # Must run when the tests FAIL: a job that rewrote a lockfile and then failed
+        # its tests would otherwise skip this step and report only the test failure,
+        # losing the signal this guard exists to produce.
+        #
+        # !cancelled() rather than always(), because always() also fires on
+        # cancellation, and concurrency cancels supersede runs constantly here — each
+        # one would otherwise spend a step re-checking a job nobody is waiting on.
+        #
+        # The checkout gate is NOT redundant with !cancelled(). !cancelled() is TRUE
+        # when an earlier step failed, including `Checkout code` — and this step is a
+        # local `uses:`, so with no repo on disk it dies with "Can't find 'action.yml'
+        # under .../assert-lockfiles-unchanged". That lands AFTER the real error and
+        # reads as though the guard itself is broken, which is precisely the misleading
+        # signal action.yml's header argues against.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
   # Every job above installs with `uv sync --locked`, which already fails when a
@@ -592,6 +738,24 @@ jobs:
           set -euo pipefail
           # Packages knowingly without a uv.lock. Adding one here is a decision, not
           # a workaround: it means nothing verifies that package's dependency graph.
+          #
+          # The single entry below is a PUBLISHED package, not an internal one:
+          # sdks/python/a2ui_toolkit is `ag-ui-a2ui-toolkit`, enrolled for release as
+          # sdk-py-a2ui-toolkit with "buildSystem": "uv" (release.config.json), so it
+          # ships to PyPI and users install it. relockPythonPackage
+          # (scripts/release/prepare-release.ts) early-returns for lock-less packages,
+          # so the release path will not grow one either — this waiver is permanent
+          # until something closes it deliberately.
+          #
+          # It is smaller than it reads: that pyproject.toml declares
+          # `dependencies = []`, so `uv lock` resolves one package (itself) and the
+          # committed lock would be near-empty. Nothing is going unverified today. The
+          # exposure is forward-looking — with no lock, the FIRST dependency anyone
+          # adds arrives unlocked and invisible to the step above.
+          #
+          # Tracked in PNI-279 with the release-behaviour and empty-array consequences
+          # of closing it written down:
+          # https://linear.app/copilotkit/issue/PNI-279
           known_missing=(
             "./sdks/python/a2ui_toolkit"
           )
