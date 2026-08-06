@@ -1,7 +1,12 @@
-import { expect } from "@playwright/test";
+import { expect, type Locator } from "@playwright/test";
 import * as path from "path";
 import { test } from "../../test-isolation-helper";
+import { A2UIPage } from "../../featurePages/A2UIPage";
 import { AgenticChatPage } from "../../featurePages/AgenticChatPage";
+import { SharedStatePage } from "../../featurePages/SharedStatePage";
+import { ToolBaseGenUIPage } from "../../featurePages/ToolBaseGenUIPage";
+import { V1AgenticChatPage } from "../../featurePages/V1AgenticChatPage";
+import { AgenticGenUIPage } from "../../pages/crewAIPages/AgenticUIGenPage";
 import { HumanInLoopPage } from "../../pages/crewAIPages/HumanInLoopPage";
 import { PredictiveStateUpdatesPage } from "../../pages/crewAIPages/PredictiveStateUpdatesPage";
 import { SubgraphsPage } from "../../pages/crewAIPages/SubgraphsPage";
@@ -35,7 +40,37 @@ const parityFeatures = [
   "a2ui_fixed_schema",
 ] as const;
 
+async function expectRenderedAfter(
+  earlier: Locator,
+  later: Locator,
+): Promise<void> {
+  await expect(earlier).toBeAttached();
+  await expect(later).toBeAttached();
+
+  const laterHandle = await later.elementHandle();
+  expect(laterHandle).not.toBeNull();
+  const followsInDocument = await earlier.evaluate(
+    (earlierElement, laterElement) =>
+      Boolean(
+        earlierElement.compareDocumentPosition(laterElement as Node) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    laterHandle,
+  );
+  expect(followsInDocument).toBe(true);
+
+  const [earlierBox, laterBox] = await Promise.all([
+    earlier.boundingBox(),
+    later.boundingBox(),
+  ]);
+  if (earlierBox && laterBox) {
+    expect(earlierBox.y).toBeLessThan(laterBox.y);
+  }
+}
+
 test.describe("CrewAI Conversational Flows feature parity", () => {
+  test.describe.configure({ mode: "serial" });
+
   for (const feature of parityFeatures) {
     test(`${feature} has a dedicated dojo cell`, async ({ page }) => {
       const response = await page.goto(`/${integrationId}/feature/${feature}`);
@@ -57,6 +92,10 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await chat.sendMessage("Can you remind me what my favorite fruit is?");
 
     await chat.assertAgentReplyVisible(/Mango/i);
+    await expectRenderedAfter(
+      CopilotSelectors.userMessages(page).last(),
+      CopilotSelectors.assistantMessages(page).last(),
+    );
   });
 
   test("reasoning renders between the user prompt and assistant answer", async ({
@@ -99,6 +138,54 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await expect(CopilotSelectors.assistantMessages(page).last()).toContainText(
       /image|visual|content|see|picture/i,
     );
+    await expectRenderedAfter(
+      CopilotSelectors.userMessages(page).last(),
+      CopilotSelectors.assistantMessages(page).last(),
+    );
+  });
+
+  test("v1 chat renders the assistant after its user turn", async ({ page }) => {
+    await page.goto(`/${integrationId}/feature/v1_agentic_chat`);
+    const chat = new V1AgenticChatPage(page);
+
+    await chat.sendMessage("Hi");
+    await chat.assertAgentReplyVisible(/Hello|Hi|hey|help|assist/i);
+
+    await expectRenderedAfter(chat.userMessages.last(), chat.assistantMessages.last());
+  });
+
+  test("backend tool cards render after the triggering user turn", async ({
+    page,
+  }) => {
+    await page.goto(`/${integrationId}/feature/backend_tool_rendering`);
+    await page
+      .getByRole("button", { name: "Weather in San Francisco" })
+      .click();
+
+    const weatherCard = page.getByTestId("weather-card").first();
+    await expect(weatherCard).toBeVisible({ timeout: 30_000 });
+    await expectRenderedAfter(
+      CopilotSelectors.userMessages(page).last(),
+      weatherCard,
+    );
+  });
+
+  test("native interrupt UI renders after the triggering user turn", async ({
+    page,
+  }) => {
+    await page.goto(`/${integrationId}/feature/interrupt`);
+    await openChat(page);
+    await sendChatMessage(
+      page,
+      "Book an intro call with the sales team to discuss pricing.",
+    );
+
+    const picker = page.getByTestId("interrupt-picker");
+    await expect(picker).toBeVisible({ timeout: 30_000 });
+    await expectRenderedAfter(
+      CopilotSelectors.userMessages(page).last(),
+      picker,
+    );
   });
 
   test("frontend HITL confirmation continues the public turn", async ({
@@ -110,10 +197,28 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await hitl.sendMessage(
       "Give me a plan to make brownies, there should be only one step with eggs and one step with oven, this is a strict requirement so adhere",
     );
+    await expectRenderedAfter(hitl.userMessage.last(), hitl.plan);
     await hitl.uncheckItem("eggs");
     await hitl.performStepsAndAwait();
 
     await hitl.assertAgentReplyVisible(/Done|completed/i);
+  });
+
+  test("agentic generative UI renders its task after the user turn", async ({
+    page,
+  }) => {
+    await page.goto(`/${integrationId}/feature/agentic_generative_ui`);
+    const generativeUI = new AgenticGenUIPage(page);
+    await generativeUI.openChat();
+
+    await generativeUI.sendMessage("Go to Mars");
+    await expect(generativeUI.agentPlannerContainer).toBeVisible({
+      timeout: 30_000,
+    });
+    await expectRenderedAfter(
+      generativeUI.userMessage.last(),
+      generativeUI.agentPlannerContainer,
+    );
   });
 
   test("predictive state accepts a document change", async ({ page }) => {
@@ -128,6 +233,37 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await predictive.getUserApproval();
 
     expect(await predictive.verifyAgentResponse("Atlantis")).not.toBeNull();
+    await expectRenderedAfter(
+      predictive.userMessage.last(),
+      predictive.confirmedChangesResponse,
+    );
+  });
+
+  test("shared-state replies render after the user turn", async ({ page }) => {
+    await page.goto(`/${integrationId}/feature/shared_state`);
+    const sharedState = new SharedStatePage(page);
+    await sharedState.openChat();
+
+    await sharedState.sendMessage("Give me all the ingredients");
+    await expect(sharedState.agentMessage.last()).toBeVisible();
+    await expectRenderedAfter(
+      sharedState.userMessage.last(),
+      sharedState.agentMessage.last(),
+    );
+  });
+
+  test("tool-based generative UI renders its card after the user turn", async ({
+    page,
+  }) => {
+    await page.goto(`/${integrationId}/feature/tool_based_generative_ui`);
+    const generativeUI = new ToolBaseGenUIPage(page);
+
+    await generativeUI.generateHaiku('Generate Haiku for "I will always win"');
+    await generativeUI.checkGeneratedHaiku();
+    await expectRenderedAfter(
+      CopilotSelectors.userMessages(page).last(),
+      generativeUI.haikuBlock.last(),
+    );
   });
 
   test("subgraphs resumes flight and hotel selections", async ({ page }) => {
@@ -137,10 +273,50 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await subgraphs.openChat();
     await subgraphs.sendMessage("Help me plan a trip to San Francisco");
     await subgraphs.waitForFlightsAgent();
+    await expectRenderedAfter(
+      subgraphs.userMessage.last(),
+      page.locator(".flight-option").first(),
+    );
     await subgraphs.selectFlight("KLM");
     await subgraphs.waitForHotelsAgent();
     await subgraphs.selectHotel("Zoe");
     await subgraphs.waitForExperiencesAgent();
     await subgraphs.verifyStaticExperienceData();
   });
+
+  for (const {
+    feature,
+    prompt,
+    surfaceId,
+  } of [
+    {
+      feature: "a2ui_fixed_schema",
+      prompt: "Search for hotels in downtown Manhattan for next weekend.",
+      surfaceId: "hotel-search-results",
+    },
+    {
+      feature: "a2ui_dynamic_schema",
+      prompt:
+        "Compare three boutique hotels - The Ritz, Holiday Inn, and Boutique Loft - with location, nightly price, and rating.",
+      surfaceId: "hotel-comparison",
+    },
+    {
+      feature: "a2ui_recovery",
+      prompt: "Compare 3 luxury hotels with ratings and prices.",
+      surfaceId: "hotel-comparison",
+    },
+  ] as const) {
+    test(`${feature} renders its surface after the user turn`, async ({ page }) => {
+      await page.goto(`/${integrationId}/feature/${feature}`);
+      const a2ui = new A2UIPage(page);
+      await a2ui.openChat();
+
+      await a2ui.sendMessage(prompt);
+      await a2ui.assertSurfaceWithIdVisible(surfaceId);
+      await expectRenderedAfter(
+        a2ui.userMessages.last(),
+        a2ui.visibleSurface(surfaceId),
+      );
+    });
+  }
 });
