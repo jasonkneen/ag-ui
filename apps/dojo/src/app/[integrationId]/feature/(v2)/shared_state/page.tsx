@@ -275,17 +275,17 @@ function Recipe() {
 
   const newRecipeState = { ...recipe };
   const newChangedKeys = [];
-  const changedKeysRef = useRef<string[]>([]);
+  const [changedKeys, setChangedKeys] = useState<string[]>([]);
+
+  // Iterating Recipe by dynamic key needs an index-signature view of it.
+  const agentRecipe = agentState?.recipe as unknown as Record<string, unknown> | undefined;
+  const recipeRecord = recipe as unknown as Record<string, unknown>;
+  const newRecipeRecord = newRecipeState as unknown as Record<string, unknown>;
 
   for (const key in recipe) {
-    if (
-      agentState &&
-      agentState.recipe &&
-      (agentState.recipe as any)[key] !== undefined &&
-      (agentState.recipe as any)[key] !== null
-    ) {
-      let agentValue = (agentState.recipe as any)[key];
-      const recipeValue = (recipe as any)[key];
+    if (agentRecipe && agentRecipe[key] !== undefined && agentRecipe[key] !== null) {
+      let agentValue = agentRecipe[key];
+      const recipeValue = recipeRecord[key];
 
       // Check if agentValue is a string and replace \n with actual newlines
       if (typeof agentValue === "string") {
@@ -293,21 +293,30 @@ function Recipe() {
       }
 
       if (JSON.stringify(agentValue) !== JSON.stringify(recipeValue)) {
-        (newRecipeState as any)[key] = agentValue;
+        newRecipeRecord[key] = agentValue;
         newChangedKeys.push(key);
       }
     }
   }
 
-  if (newChangedKeys.length > 0) {
-    changedKeysRef.current = newChangedKeys;
-  } else if (!isLoading) {
-    changedKeysRef.current = [];
+  // Which keys the agent most recently changed, so the matching sections can
+  // flash a Ping. Held in state and adjusted during render rather than in a ref:
+  // a ref written and read during render is what `react-hooks/refs` forbids.
+  // While a run is in flight and this render found no changes, the previous set
+  // is kept, matching the earlier ref behaviour.
+  const nextChangedKeys =
+    newChangedKeys.length > 0 ? newChangedKeys : !isLoading ? [] : changedKeys;
+  if (JSON.stringify(nextChangedKeys) !== JSON.stringify(changedKeys)) {
+    setChangedKeys(nextChangedKeys);
   }
 
-  useEffect(() => {
+  // Fold agent-driven recipe changes back into local state. Adjusted during
+  // render for the same reason as `changedKeys` above; the comparison guard is
+  // what the `JSON.stringify` dependency was doing, and it converges because
+  // `newRecipeState` is `recipe` plus the agent's differing keys.
+  if (JSON.stringify(newRecipeState) !== JSON.stringify(recipe)) {
     setRecipe(newRecipeState);
-  }, [JSON.stringify(newRecipeState)]);
+  }
 
   const handleTitleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     updateRecipe({
@@ -469,7 +478,7 @@ function Recipe() {
 
       {/* Dietary Preferences */}
       <div className="section-container relative">
-        {changedKeysRef.current.includes("special_preferences") && <Ping />}
+        {changedKeys.includes("special_preferences") && <Ping />}
         <h2 className="section-title">Dietary Preferences</h2>
         <div className="dietary-options">
           {Object.values(SpecialPreferences).map((option) => (
@@ -489,7 +498,7 @@ function Recipe() {
 
       {/* Ingredients */}
       <div className="section-container relative">
-        {changedKeysRef.current.includes("ingredients") && <Ping />}
+        {changedKeys.includes("ingredients") && <Ping />}
         <div className="section-header">
           <h2 className="section-title">Ingredients</h2>
           <button
@@ -536,7 +545,7 @@ function Recipe() {
 
       {/* Instructions */}
       <div className="section-container relative">
-        {changedKeysRef.current.includes("instructions") && <Ping />}
+        {changedKeys.includes("instructions") && <Ping />}
         <div className="section-header">
           <h2 className="section-title">Instructions</h2>
           <button type="button" className="add-step-button" onClick={addInstruction}>

@@ -4,8 +4,6 @@ import {
   State,
   RunAgentInput,
   BaseEvent,
-  ToolCall,
-  AssistantMessage,
   AgentCapabilities,
   Interrupt,
 } from "@ag-ui/core";
@@ -44,6 +42,10 @@ import {
 import packageJson from "../../package.json";
 
 export interface RunAgentResult {
+  // DEFERRED (PNI-272): tightening this to `unknown` is a breaking change for
+  // consumers of a published package, not a lint repair. Left for a deliberate
+  // API decision.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   result: any;
   newMessages: Message[];
 }
@@ -167,7 +169,7 @@ export abstract class AbstractAgent {
         threadId: this.threadId,
       });
 
-      let result: any = undefined;
+      let result: unknown = undefined;
       const currentMessageIds = new Set(this.messages.map((message) => message.id));
 
       const subscribers: AgentSubscriber[] = [
@@ -252,7 +254,7 @@ export abstract class AbstractAgent {
     }
   }
 
-  protected connect(input: RunAgentInput): Observable<BaseEvent> {
+  protected connect(_input: RunAgentInput): Observable<BaseEvent> {
     throw new AGUIConnectNotImplementedError();
   }
   public async connectAgent(
@@ -263,7 +265,7 @@ export abstract class AbstractAgent {
       this.isRunning = true;
       this.agentId = this.agentId ?? uuidv4();
       const input = this.prepareRunAgentInput(parameters);
-      let result: any = undefined;
+      let result: unknown = undefined;
       const currentMessageIds = new Set(this.messages.map((message) => message.id));
 
       const subscribers: AgentSubscriber[] = [

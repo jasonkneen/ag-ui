@@ -227,7 +227,7 @@ export interface PriorSurface {
  * matching surface is found.
  */
 export function findPriorSurface(
-  messages: Array<any>,
+  messages: Array<unknown>,
   surfaceId: string,
 ): PriorSurface | undefined {
   // Accumulate the surface's state across the walk, newest-to-oldest. For each
@@ -248,7 +248,10 @@ export function findPriorSurface(
   let matched = false;
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
+    // Messages cross a wire boundary and arrive in several shapes (AG-UI
+    // `type`, LangChain-style `role`), so they are narrowed here rather than
+    // constrained at the signature.
+    const msg = messages[i] as Record<string, unknown> | undefined;
     if (!msg) continue;
     const role = msg.type ?? msg.role;
     if (role !== "tool" && role !== "ToolMessage") continue;
@@ -732,7 +735,7 @@ export interface PrepareA2UIRequestInput {
   /** Raw ``changes`` arg from the planner. */
   changes?: string;
   /** Conversation history with the current (unbalanced) tool call stripped. */
-  messages: Array<any>;
+  messages: Array<unknown>;
   /** The agent's run state (read for context + catalog via buildContextPrompt). */
   state: Record<string, unknown>;
   /**

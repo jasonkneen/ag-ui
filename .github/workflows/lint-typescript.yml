@@ -1,19 +1,12 @@
 name: lint
 
-# Runs the repository-root `pnpm run lint` (`nx run-many -t lint`), which covers
-# every project declaring a `lint` target: @ag-ui/core, @ag-ui/encoder and
-# @ag-ui/proto.
+# Runs the repository-root `pnpm run lint` (`nx run-many -t lint`), covering the
+# six TypeScript SDK packages and demo-viewer (apps/dojo).
 #
 # That command failed for roughly ten months and no workflow ran it, so nothing
 # reported it (PNI-272). A lint target that only ever runs on a contributor's
 # machine is indistinguishable from one that does not run at all, so it lives
 # here now.
-#
-# `apps/dojo` is deliberately absent: its eslint config has thrown since the
-# Next 16 upgrade in #786, so it declared a `lint` script it could not execute
-# and that script has been removed rather than left claiming false coverage.
-# Restoring linting there means repairing the config and clearing ~90 findings,
-# which is its own piece of work.
 #
 # No protoc step: unlike the `unit` workflow, linting needs no build, and
 # `src/generated` is committed.
@@ -23,6 +16,7 @@ on:
     branches: [main]
     paths:
       - "sdks/typescript/**"
+      - "apps/**"
       - "eslint.config.base.mjs"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -33,6 +27,7 @@ on:
     branches: [main]
     paths:
       - "sdks/typescript/**"
+      - "apps/**"
       - "eslint.config.base.mjs"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"

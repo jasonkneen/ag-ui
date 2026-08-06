@@ -21,7 +21,9 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
   const posthog = usePostHog();
   const [copied, setCopied] = useState(false);
 
-  if (file?.language === "ts") file.language = "typescript";
+  // Monaco expects "typescript"; the feature files declare "ts". Derived rather
+  // than assigned back onto `file`, which would mutate the caller's object.
+  const language = file?.language === "ts" ? "typescript" : file?.language;
 
   const handleCopy = async () => {
     if (!file?.content) return;
@@ -31,7 +33,7 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
       setTimeout(() => setCopied(false), 1500);
       posthog?.capture("dojo.code_viewer.copied", {
         file_name: file.name,
-        language: file.language,
+        language,
         bytes: file.content.length,
       });
     } catch {
@@ -57,7 +59,7 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
       </button>
       <Editor
         height="100%"
-        language={file.language}
+        language={language}
         value={file.content}
         onChange={handleEditorChange}
         options={{

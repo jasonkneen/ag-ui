@@ -43,7 +43,7 @@ async function applySnapshot(initial: Message[], snapshotMessages: Message[]): P
       messages: snapshotMessages,
     });
   });
-  return updates[0]?.messages!;
+  return updates[0]!.messages!;
 }
 
 describe("defaultApplyEvents with activity events", () => {

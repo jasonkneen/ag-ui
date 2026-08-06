@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useCallback, useRef } from "react";
 import { Plus, MessageSquare, Users, Settings } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import A2AChat from "./a2a_chat";
@@ -14,7 +14,6 @@ interface PageProps {
 function Page({ params }: PageProps) {
   const [activeTab, setActiveTab] = useState("chat-1");
   const [tabs, setTabs] = useState([{ id: "chat-1", label: "Main Chat", icon: MessageSquare }]);
-  const [chatInstances, setChatInstances] = useState<Record<string, React.ReactElement>>({});
   const [tabNotifications, setTabNotifications] = useState<Record<string, boolean>>({});
 
   const activeTabRef = useRef(activeTab);
@@ -44,21 +43,6 @@ function Page({ params }: PageProps) {
       [tabId]: false,
     }));
   }, []);
-
-  // Initialize chat instances when tabs change
-  useEffect(() => {
-    const newInstances = { ...chatInstances };
-
-    tabs.forEach((tab) => {
-      if (!newInstances[tab.id]) {
-        newInstances[tab.id] = (
-          <A2AChat key={tab.id} params={params} onNotification={() => addNotification(tab.id)} />
-        );
-      }
-    });
-
-    setChatInstances(newInstances);
-  }, [tabs, params, addNotification]);
 
   const handleAddTab = () => {
     const newTab = {
@@ -135,7 +119,10 @@ function Page({ params }: PageProps) {
                 {/* Chat Content */}
                 <div className="relative h-full p-6">
                   <div className="h-full bg-white/50 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20">
-                    {chatInstances[tab.id]}
+                    <A2AChat
+                      params={params}
+                      onNotification={() => addNotification(tab.id)}
+                    />
                   </div>
                 </div>
               </div>

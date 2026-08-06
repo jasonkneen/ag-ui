@@ -1,6 +1,6 @@
 "use client";
 
-import React, { createContext, useContext, useState, useEffect, ReactNode } from "react";
+import React, { createContext, useContext, useState, ReactNode } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { View } from "@/types/interface";
 
@@ -140,12 +140,18 @@ export function URLParamsProvider({ children }: URLParamsProviderProps) {
     router.push(pathname + (queryString ? "?" + queryString : ""));
   };
 
-  // Sync state with URL changes (e.g., browser back/forward)
-  useEffect(() => {
-    const newState: URLParamsState = generateURLParamsState(searchParams);
-
-    setState(newState);
-  }, [searchParams]);
+  // Sync state with URL changes (e.g., browser back/forward).
+  //
+  // Adjusted during render rather than in an effect: React's documented pattern
+  // for "state derived from changing input" (https://react.dev/reference/react/useState
+  // #storing-information-from-previous-renders). Doing it in an effect renders
+  // once with stale state first, which `react-hooks/set-state-in-effect` flags.
+  const currentSearch = searchParams.toString();
+  const [prevSearch, setPrevSearch] = useState(currentSearch);
+  if (prevSearch !== currentSearch) {
+    setPrevSearch(currentSearch);
+    setState(generateURLParamsState(searchParams));
+  }
 
   // Context methods
   const setView = (view: View) => {
