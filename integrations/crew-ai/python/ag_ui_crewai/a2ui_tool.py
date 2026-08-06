@@ -29,6 +29,7 @@ chunks.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import json
 import logging
 import threading
@@ -429,9 +430,7 @@ class A2UITool:
             },
         }
 
-    async def _emit_chunk(
-        self, flow: Any, payload: dict, name_state: dict
-    ) -> None:
+    async def _emit_chunk(self, flow: Any, payload: dict, name_state: dict) -> None:
         """Translate one sub-agent stream payload into a bridged TOOL_CALL_CHUNK.
 
         ``start`` stashes the render tool name/id; the first following ``args``
@@ -533,7 +532,7 @@ class A2UITool:
             target_surface_id=target_surface_id,
             changes=changes,
             messages=agui_messages,
-            state=glue_state if isinstance(glue_state, dict) else {},
+            state=dict(glue_state) if isinstance(glue_state, Mapping) else {},
             guidelines=cfg["guidelines"],
         )
 
@@ -744,7 +743,7 @@ def plan_a2ui_injection(
     """
     log = log or logger
     config = config or {}
-    ag_ui = state.get("ag-ui") if isinstance(state, dict) else None
+    ag_ui = state.get("ag-ui") if isinstance(state, Mapping) else None
     ag_ui = ag_ui if isinstance(ag_ui, dict) else {}
 
     flag = ag_ui.get("inject_a2ui_tool")
@@ -768,7 +767,7 @@ def plan_a2ui_injection(
 
     render_tool_name = flag if isinstance(flag, str) else RENDER_A2UI_TOOL_NAME
 
-    resolved = resolve_a2ui_catalog(state) if isinstance(state, dict) else None
+    resolved = resolve_a2ui_catalog(state) if isinstance(state, Mapping) else None
     runtime_schema, runtime_catalog_id = resolved if resolved else (None, None)
 
     catalog = config.get("catalog")
@@ -791,9 +790,9 @@ def plan_a2ui_injection(
         },
         glue={
             "messages": list(state.get("messages") or [])
-            if isinstance(state, dict)
+            if isinstance(state, Mapping)
             else [],
-            "state": state if isinstance(state, dict) else {},
+            "state": dict(state) if isinstance(state, Mapping) else {},
         },
     )
     setattr(tool, _A2UI_AUTOINJECT_ATTR, True)

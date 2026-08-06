@@ -85,6 +85,16 @@ class CopilotKitState(FlowState):
     """CopilotKit state"""
     messages: List[Any] = Field(default_factory=list)
     copilotkit: CopilotKitProperties = Field(default_factory=CopilotKitProperties)
+    # CrewAI's experimental conversational runtime writes these fields while a
+    # turn is being routed. Exclude them from AG-UI state snapshots so enabling
+    # the runtime contract does not change regular Flow wire state.
+    current_user_message: Optional[str] = Field(default=None, exclude=True)
+    last_user_message: Optional[str] = Field(default=None, exclude=True)
+    last_intent: Optional[str] = Field(default=None, exclude=True)
+    ended: bool = Field(default=False, exclude=True)
+    events: List[Any] = Field(default_factory=list, exclude=True)
+    agent_threads: Dict[str, List[Any]] = Field(default_factory=dict, exclude=True)
+    session_ready: bool = Field(default=False, exclude=True)
 
 class PredictStateConfig(TypedDict):
     """

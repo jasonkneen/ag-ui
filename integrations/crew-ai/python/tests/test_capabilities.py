@@ -26,6 +26,11 @@ import pytest
 from ag_ui_crewai import _capabilities as cap
 
 
+def test_conversational_stream_probe_is_publicly_available():
+    """Conversational mode is selected by capability, never by version."""
+    assert callable(getattr(cap, "flow_supports_conversational_stream", None))
+
+
 def _run_isolated(script: str) -> subprocess.CompletedProcess:
     """Run ``script`` in a fresh interpreter (this venv's python).
 

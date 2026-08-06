@@ -217,6 +217,15 @@ def flow_supports_stream_frames(flow: Any) -> bool:
     return _stream_frame_available and hasattr(flow, "astream")
 
 
+def flow_supports_conversational_stream(flow: Any) -> bool:
+    """Return whether ``flow`` exposes CrewAI's public turn stream API."""
+    return (
+        _stream_frame_available
+        and _safe_getattr(flow, "conversational") is True
+        and callable(_safe_getattr(flow, "stream_turn"))
+    )
+
+
 # --------------------------------------------------------------------------
 # crew-chat helper resolution
 # --------------------------------------------------------------------------
@@ -599,6 +608,11 @@ CHECKPOINT_ENABLING_VERSIONS: dict[str, str] = {
 _CREWAI_MODULE, _ = _first_module(["crewai"])
 _Flow = getattr(_CREWAI_MODULE, "Flow", None) if _CREWAI_MODULE else None
 _Crew = getattr(_CREWAI_MODULE, "Crew", None) if _CREWAI_MODULE else None
+_conversational_stream_available = bool(
+    _stream_frame_available
+    and _Flow is not None
+    and callable(_safe_getattr(_Flow, "stream_turn"))
+)
 
 # ``BaseAgent`` is the base every crewai agent derives from, including a user's
 # own subclass, so it is the wider net for "this attribute is an agent".
@@ -1298,13 +1312,14 @@ def get_capabilities(
     Mirrors the shape of ``ag_ui_langgraph.LangGraphAgent.get_capabilities``
     (``identity`` / ``humanInTheLoop`` / ``state`` / ``transport``) and adds the
     CrewAI-specific blocks the parity lane needs: the resolved wire shape, RAW
-    passthrough, and reasoning.
+    passthrough, reasoning, and Conversational Flow transport.
 
     No field is derived from ``crewai.__version__`` - the version string appears
     only as informational ``crewaiVersion`` metadata (same rule as the rest of this
-    module). Within that, ``transport`` / ``rawEvents`` / ``reasoning`` / ``crewChat``
-    come from runtime probes, while ``humanInTheLoop`` and ``state`` are static
-    declarations of what the bridge implements today.
+    module). Within that, ``transport`` / ``rawEvents`` / ``reasoning`` /
+    ``conversationalFlows`` / ``crewChat`` come from runtime probes, while
+    ``humanInTheLoop`` and ``state`` are static declarations of what the bridge
+    implements today.
 
     ``emission_shape`` / ``emit_raw_events`` default to re-reading the environment,
     so a declaration fetched without arguments can disagree with an endpoint that
@@ -1409,5 +1424,10 @@ def get_capabilities(
             "default": DEFAULT_EMIT_RAW_EVENTS,
         },
         "reasoning": _reasoning_capability(llm),
+        "conversationalFlows": {
+            "supported": _conversational_stream_available,
+            "entrypoint": "stream_turn",
+            "sessionId": "threadId",
+        },
         "crewChat": {"supported": CAPABILITIES.crew_chat_available},
     }

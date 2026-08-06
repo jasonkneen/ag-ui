@@ -18,6 +18,7 @@ from .examples.a2ui_fixed_schema import A2UIFixedSchemaFlow
 from .examples.agentic_chat_multimodal import AgenticChatMultimodalFlow
 from .examples.agentic_chat_reasoning import AgenticChatReasoningFlow
 from .examples.subgraphs import SubgraphsFlow
+from .examples.conversational import CONVERSATIONAL_FLOW_TYPES
 
 app = FastAPI(title="CrewAI Dojo Example Server")
 
@@ -119,6 +120,15 @@ add_crewai_flow_fastapi_endpoint(
     path="/subgraphs",
     emit_interrupt_outcome=True,
 )
+
+for feature, flow_type in CONVERSATIONAL_FLOW_TYPES.items():
+    add_crewai_flow_fastapi_endpoint(
+        app=app,
+        flow=flow_type(),
+        path=f"/conversational_flows/{feature}",
+        conversational=True,
+        emit_interrupt_outcome=feature in {"interrupt", "subgraphs"},
+    )
 
 def main():
     """Run the uvicorn server."""

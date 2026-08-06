@@ -8,13 +8,35 @@ import dataclasses
 import pytest
 from fastapi import FastAPI
 
-from ag_ui_crewai import get_capabilities
+from ag_ui_crewai import _capabilities as capability_module
 from ag_ui_crewai import _capabilities as caps_mod
 from ag_ui_crewai import _config as config_mod
 from ag_ui_crewai import endpoint as ep
+from ag_ui_crewai import get_capabilities
 
 
 # -- shape of the declaration ----------------------------------------------
+
+
+def test_get_capabilities_declares_conversational_flow_transport():
+    conversational = get_capabilities()["conversationalFlows"]
+
+    assert conversational == {
+        "supported": capability_module._conversational_stream_available,
+        "entrypoint": "stream_turn",
+        "sessionId": "threadId",
+    }
+
+
+def test_conversational_capability_requires_public_stream_turn(monkeypatch):
+    monkeypatch.setattr(
+        capability_module,
+        "_conversational_stream_available",
+        False,
+        raising=False,
+    )
+
+    assert get_capabilities()["conversationalFlows"]["supported"] is False
 
 @pytest.fixture(autouse=True)
 def _clean_protocol_env(monkeypatch):
