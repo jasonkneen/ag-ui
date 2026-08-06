@@ -9,25 +9,35 @@ import {
 import * as protoEvents from "./generated/events";
 import * as protoPatch from "./generated/patch";
 
-const toProtoSource = (source: any): any => {
-  if (!source || typeof source !== "object") {
+/**
+ * These converters run against values that have crossed a wire boundary, so
+ * they accept `unknown` and narrow once rather than trusting a static type.
+ */
+type LooseRecord = Record<string, unknown>;
+
+const asRecord = (value: unknown): LooseRecord | undefined =>
+  value && typeof value === "object" ? (value as LooseRecord) : undefined;
+
+const toProtoSource = (source: unknown): unknown => {
+  const rec = asRecord(source);
+  if (!rec) {
     return undefined;
   }
 
-  if (source.type === "data") {
+  if (rec.type === "data") {
     return {
       data: {
-        value: source.value,
-        mimeType: source.mimeType,
+        value: rec.value,
+        mimeType: rec.mimeType,
       },
     };
   }
 
-  if (source.type === "url") {
+  if (rec.type === "url") {
     return {
       url: {
-        value: source.value,
-        mimeType: source.mimeType,
+        value: rec.value,
+        mimeType: rec.mimeType,
       },
     };
   }
@@ -35,53 +45,54 @@ const toProtoSource = (source: any): any => {
   return undefined;
 };
 
-const toProtoContentPart = (part: any): any => {
-  if (!part || typeof part !== "object") {
+const toProtoContentPart = (part: unknown): unknown => {
+  const rec = asRecord(part);
+  if (!rec) {
     return undefined;
   }
 
-  switch (part.type) {
+  switch (rec.type) {
     case "text":
       return {
         text: {
-          text: part.text,
+          text: rec.text,
         },
       };
     case "image":
       return {
         image: {
-          source: toProtoSource(part.source),
-          metadata: part.metadata,
+          source: toProtoSource(rec.source),
+          metadata: rec.metadata,
         },
       };
     case "audio":
       return {
         audio: {
-          source: toProtoSource(part.source),
-          metadata: part.metadata,
+          source: toProtoSource(rec.source),
+          metadata: rec.metadata,
         },
       };
     case "video":
       return {
         video: {
-          source: toProtoSource(part.source),
-          metadata: part.metadata,
+          source: toProtoSource(rec.source),
+          metadata: rec.metadata,
         },
       };
     case "document":
       return {
         document: {
-          source: toProtoSource(part.source),
-          metadata: part.metadata,
+          source: toProtoSource(rec.source),
+          metadata: rec.metadata,
         },
       };
     case "binary": {
-      const source = part.data
-        ? { data: { value: part.data, mimeType: part.mimeType } }
-        : part.url
-          ? { url: { value: part.url, mimeType: part.mimeType } }
-          : part.id
-            ? { url: { value: part.id, mimeType: part.mimeType } }
+      const source = rec.data
+        ? { data: { value: rec.data, mimeType: rec.mimeType } }
+        : rec.url
+          ? { url: { value: rec.url, mimeType: rec.mimeType } }
+          : rec.id
+            ? { url: { value: rec.id, mimeType: rec.mimeType } }
             : undefined;
 
       if (!source) {
@@ -93,8 +104,8 @@ const toProtoContentPart = (part: any): any => {
           source,
           metadata: {
             legacyBinary: true,
-            filename: part.filename,
-            id: part.id,
+            filename: rec.filename,
+            id: rec.id,
           },
         },
       };
@@ -104,71 +115,80 @@ const toProtoContentPart = (part: any): any => {
   }
 };
 
-const fromProtoSource = (source: any): any => {
-  if (!source || typeof source !== "object") {
+const fromProtoSource = (source: unknown): unknown => {
+  const rec = asRecord(source);
+  if (!rec) {
     return undefined;
   }
 
-  if (source.data) {
+  const data = asRecord(rec.data);
+  if (data) {
     return {
       type: "data",
-      value: source.data.value,
-      mimeType: source.data.mimeType,
+      value: data.value,
+      mimeType: data.mimeType,
     };
   }
 
-  if (source.url) {
+  const url = asRecord(rec.url);
+  if (url) {
     return {
       type: "url",
-      value: source.url.value,
-      mimeType: source.url.mimeType,
+      value: url.value,
+      mimeType: url.mimeType,
     };
   }
 
   return undefined;
 };
 
-const fromProtoContentPart = (part: any): any => {
-  if (!part || typeof part !== "object") {
+const fromProtoContentPart = (part: unknown): unknown => {
+  const rec = asRecord(part);
+  if (!rec) {
     return undefined;
   }
 
-  if (part.text) {
+  const text = asRecord(rec.text);
+  if (text) {
     return {
       type: "text",
-      text: part.text.text,
+      text: text.text,
     };
   }
 
-  if (part.image) {
+  const image = asRecord(rec.image);
+  if (image) {
     return {
       type: "image",
-      source: fromProtoSource(part.image.source),
-      metadata: part.image.metadata,
+      source: fromProtoSource(image.source),
+      metadata: image.metadata,
     };
   }
 
-  if (part.audio) {
+  const audio = asRecord(rec.audio);
+  if (audio) {
     return {
       type: "audio",
-      source: fromProtoSource(part.audio.source),
-      metadata: part.audio.metadata,
+      source: fromProtoSource(audio.source),
+      metadata: audio.metadata,
     };
   }
 
-  if (part.video) {
+  const video = asRecord(rec.video);
+  if (video) {
     return {
       type: "video",
-      source: fromProtoSource(part.video.source),
-      metadata: part.video.metadata,
+      source: fromProtoSource(video.source),
+      metadata: video.metadata,
     };
   }
 
-  if (part.document) {
+  const document = asRecord(rec.document);
+  if (document) {
     return {
       type: "document",
-      source: fromProtoSource(part.document.source),
-      metadata: part.document.metadata,
+      source: fromProtoSource(document.source),
+      metadata: document.metadata,
     };
   }
 
@@ -206,18 +226,18 @@ export function encode(event: BaseEvent): Uint8Array {
     validatedEvent = event;
   }
   const oneofField = toCamelCase(validatedEvent.type);
-  const { type, timestamp, rawEvent, ...rest } = validatedEvent as AGUIEvent as Record<string, any>;
+  const { type, timestamp, rawEvent, ...rest } = validatedEvent as AGUIEvent as LooseRecord;
 
   // since protobuf does not support optional arrays, we need to ensure that the toolCalls array is always present
   if (type === EventType.MESSAGES_SNAPSHOT && Array.isArray(rest.messages)) {
     rest.messages = (rest.messages as Message[]).map((message) => {
-      const untypedMessage = message as any;
-      const normalizedMessage: any = { ...untypedMessage, contentParts: [] };
+      const untypedMessage = message as LooseRecord;
+      const normalizedMessage: LooseRecord = { ...untypedMessage, contentParts: [] };
 
       if (Array.isArray(untypedMessage.content)) {
         const contentParts = untypedMessage.content
-          .map((part: any) => toProtoContentPart(part))
-          .filter((part: any) => part !== undefined);
+          .map((part: unknown) => toProtoContentPart(part))
+          .filter((part: unknown) => part !== undefined);
 
         normalizedMessage.contentParts = contentParts;
         normalizedMessage.content = undefined;
@@ -235,7 +255,7 @@ export function encode(event: BaseEvent): Uint8Array {
   // proto's `outcome` (string) and `interrupts` (repeated) fields. The wire
   // shape stays stable; the TS layer just exposes a richer object.
   if (type === EventType.RUN_FINISHED) {
-    const outcome: RunFinishedOutcome | undefined = rest.outcome;
+    const outcome = rest.outcome as RunFinishedOutcome | undefined;
     if (outcome === undefined) {
       rest.outcome = "";
       rest.interrupts = [];
@@ -250,9 +270,11 @@ export function encode(event: BaseEvent): Uint8Array {
 
   // custom mapping for json patch operations
   if (type === EventType.STATE_DELTA && Array.isArray(rest.delta)) {
-    rest.delta = (rest.delta as any[]).map((operation: any) => ({
+    rest.delta = (rest.delta as LooseRecord[]).map((operation) => ({
       ...operation,
-      op: protoPatch.JsonPatchOperationType[operation.op.toUpperCase()],
+      op: protoPatch.JsonPatchOperationType[
+        String(operation.op).toUpperCase() as keyof typeof protoPatch.JsonPatchOperationType
+      ],
     }));
   }
 
@@ -286,13 +308,13 @@ export function decode(data: Uint8Array): BaseEvent {
 
   // we want tool calls to be optional, so we need to remove them if they are empty
   if (decoded.type === EventType.MESSAGES_SNAPSHOT) {
-    for (const message of (decoded as any).messages as Message[]) {
-      const untypedMessage = message as any;
+    for (const message of (decoded as LooseRecord).messages as Message[]) {
+      const untypedMessage = message as LooseRecord;
 
       if (untypedMessage.role === "user" && Array.isArray(untypedMessage.contentParts)) {
         const contentParts = untypedMessage.contentParts
-          .map((part: any) => fromProtoContentPart(part))
-          .filter((part: any) => part !== undefined);
+          .map((part: unknown) => fromProtoContentPart(part))
+          .filter((part: unknown) => part !== undefined);
 
         if (contentParts.length > 0) {
           untypedMessage.content = contentParts;
@@ -303,7 +325,7 @@ export function decode(data: Uint8Array): BaseEvent {
         untypedMessage.contentParts = undefined;
       }
 
-      if (untypedMessage.toolCalls?.length === 0) {
+      if (Array.isArray(untypedMessage.toolCalls) && untypedMessage.toolCalls.length === 0) {
         untypedMessage.toolCalls = undefined;
       }
     }
@@ -314,12 +336,12 @@ export function decode(data: Uint8Array): BaseEvent {
   // event); "success" decodes to `{ type: "success" }`; "interrupt" decodes to
   // `{ type: "interrupt", interrupts }`.
   if (decoded.type === EventType.RUN_FINISHED) {
-    const runFinished = decoded as any;
+    const runFinished = decoded as LooseRecord;
     const wireOutcome: string | undefined =
       typeof runFinished.outcome === "string" && runFinished.outcome !== ""
         ? runFinished.outcome
         : undefined;
-    const wireInterrupts: any[] = Array.isArray(runFinished.interrupts)
+    const wireInterrupts: unknown[] = Array.isArray(runFinished.interrupts)
       ? runFinished.interrupts
       : [];
 
@@ -336,8 +358,10 @@ export function decode(data: Uint8Array): BaseEvent {
 
   // custom mapping for json patch operations
   if (decoded.type === EventType.STATE_DELTA) {
-    for (const operation of (decoded as any).delta) {
-      operation.op = protoPatch.JsonPatchOperationType[operation.op].toLowerCase();
+    for (const operation of (decoded as LooseRecord).delta as LooseRecord[]) {
+      operation.op = protoPatch.JsonPatchOperationType[
+        operation.op as protoPatch.JsonPatchOperationType
+      ].toLowerCase();
       Object.keys(operation).forEach((key) => {
         if (operation[key] === undefined) {
           delete operation[key];

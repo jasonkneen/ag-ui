@@ -1,0 +1,90 @@
+name: lint
+
+# Runs the repository-root `pnpm run lint` (`nx run-many -t lint`), which covers
+# every project declaring a `lint` target: @ag-ui/core, @ag-ui/encoder and
+# @ag-ui/proto.
+#
+# That command failed for roughly ten months and no workflow ran it, so nothing
+# reported it (PNI-272). A lint target that only ever runs on a contributor's
+# machine is indistinguishable from one that does not run at all, so it lives
+# here now.
+#
+# `apps/dojo` is deliberately absent: its eslint config has thrown since the
+# Next 16 upgrade in #786, so it declared a `lint` script it could not execute
+# and that script has been removed rather than left claiming false coverage.
+# Restoring linting there means repairing the config and clearing ~90 findings,
+# which is its own piece of work.
+#
+# No protoc step: unlike the `unit` workflow, linting needs no build, and
+# `src/generated` is committed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdks/typescript/**"
+      - "eslint.config.base.mjs"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "nx.json"
+      - ".github/workflows/lint-typescript.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "sdks/typescript/**"
+      - "eslint.config.base.mjs"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "nx.json"
+      - ".github/workflows/lint-typescript.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect fork PR
+        id: fork-check
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && \
+                "${GITHUB_EVENT_PULL_REQUEST_HEAD_REPO_FULL_NAME}" != "${{ github.repository }}" ]]; then
+            echo "prefix=fork-" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_EVENT_PULL_REQUEST_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.4
+
+      - name: Setup pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ${{ steps.fork-check.outputs.prefix }}${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ steps.fork-check.outputs.prefix }}${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run lint
+        run: pnpm run lint

@@ -6,7 +6,6 @@
     "dev": "npm run generate-content-json && next dev",
     "build": "next build",
     "start": "npm run generate-content-json && next start",
-    "lint": "eslint .",
     "mastra:dev": "mastra dev",
     "generate-content-json": "npx tsx scripts/generate-content-json.ts",
     "run-everything": "./scripts/prep-dojo-everything.js && ./scripts/run-dojo-everything.js",
