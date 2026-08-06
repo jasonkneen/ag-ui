@@ -348,7 +348,7 @@ async def test_sync_stream_session_adapter_propagates_producer_error():
 
 
 @pytest.mark.asyncio
-async def test_sync_stream_session_adapter_aclose_is_non_blocking():
+async def test_sync_stream_session_adapter_aclose_is_non_blocking(caplog):
     from ag_ui_crewai._conversation import SyncStreamSessionAdapter
 
     release = threading.Event()
@@ -365,10 +365,26 @@ async def test_sync_stream_session_adapter_aclose_is_non_blocking():
     await asyncio.sleep(0)
 
     await asyncio.wait_for(adapter.aclose(), timeout=0.1)
+    assert "requested cooperative cancellation" in caplog.text
     release.set()
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
+
+
+@pytest.mark.asyncio
+async def test_sync_stream_session_adapter_logs_close_failures(caplog):
+    from ag_ui_crewai._conversation import SyncStreamSessionAdapter
+
+    class _CloseFailingSession(_SyncSession):
+        def close(self):
+            raise RuntimeError("close failed")
+
+    adapter = SyncStreamSessionAdapter(_CloseFailingSession(["one"]))
+
+    assert [frame async for frame in adapter] == ["one"]
+    assert "failed to close a conversational StreamSession" in caplog.text
+    assert "close failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -523,17 +539,50 @@ async def test_frame_driver_opens_public_conversational_turn():
     assert events[0]["type"] == "RUN_STARTED"
     assert events[-1]["type"] == "RUN_FINISHED"
     assert [
-        event["delta"]
-        for event in events
-        if event["type"] == "TEXT_MESSAGE_CONTENT"
+        event["delta"] for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
     ] == ["hello back"]
+    current_user_snapshot = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "MESSAGES_SNAPSHOT"
+        and any(
+            message.get("role") == "user" and message.get("content") == "hello"
+            for message in event["messages"]
+        )
+    )
+    first_assistant_content = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "TEXT_MESSAGE_CONTENT"
+    )
+    assert current_user_snapshot < first_assistant_content
+    assert {
+        message["id"]
+        for event in events
+        if event["type"] == "MESSAGES_SNAPSHOT"
+        for message in event["messages"]
+        if message["role"] == "user" and message["content"] == "hello"
+    } == {"u1"}
     assert flow.state.id == "thread-1"
-    assert sum(
-        1
-        for message in flow.state.messages
-        if getattr(message, "role", None) == "user"
-        and getattr(message, "content", None) == "hello"
-    ) == 1
+    assert (
+        sum(
+            1
+            for message in flow.state.messages
+            if (
+                message.get("role")
+                if isinstance(message, dict)
+                else getattr(message, "role", None)
+            )
+            == "user"
+            and (
+                message.get("content")
+                if isinstance(message, dict)
+                else getattr(message, "content", None)
+            )
+            == "hello"
+        )
+        == 1
+    )
 
 
 def test_fastapi_endpoint_exposes_conversational_mode():

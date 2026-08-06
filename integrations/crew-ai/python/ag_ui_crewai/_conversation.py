@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from dataclasses import dataclass
+import logging
 import threading
 from typing import Any, Sequence
 
 from pydantic import BaseModel
 
 from .utils import dump_agui_message
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,9 +30,7 @@ def prepare_conversational_turn(messages: Sequence[Any]) -> ConversationalTurn:
     """Prepare one public ``stream_turn`` invocation from AG-UI history."""
     dumped = [dump_agui_message(message) for message in messages]
     current_index = (
-        len(dumped) - 1
-        if dumped and dumped[-1].get("role") == "user"
-        else None
+        len(dumped) - 1 if dumped and dumped[-1].get("role") == "user" else None
     )
 
     if current_index is None:
@@ -36,9 +38,7 @@ def prepare_conversational_turn(messages: Sequence[Any]) -> ConversationalTurn:
         return ConversationalTurn(message="", history=history, current_media=[])
 
     history = [
-        message
-        for message in dumped[:current_index]
-        if message.get("role") != "system"
+        message for message in dumped[:current_index] if message.get("role") != "system"
     ]
     content = dumped[current_index].get("content")
     if isinstance(content, str):
@@ -76,9 +76,7 @@ def hydrate_conversational_flow(
     """Seed regular AG-UI inputs before ``stream_turn`` adds current text."""
     seeded_messages = list(turn.history)
     if turn.current_media:
-        seeded_messages.append(
-            {"role": "user", "content": list(turn.current_media)}
-        )
+        seeded_messages.append({"role": "user", "content": list(turn.current_media)})
     hydrated = {**inputs, "messages": seeded_messages}
 
     state = getattr(flow, "_state", None)
@@ -154,6 +152,7 @@ class SyncStreamSessionAdapter:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._cooperative_stop_logged = False
 
     def __aiter__(self):
         return self._iterate()
@@ -190,8 +189,11 @@ class SyncStreamSessionAdapter:
                 if callable(close):
                     try:
                         close()
-                    except Exception:  # noqa: BLE001 - best-effort teardown
-                        pass
+                    except Exception:  # noqa: BLE001 - teardown boundary
+                        _LOGGER.exception(
+                            "ag-ui-crewai failed to close a conversational "
+                            "StreamSession after its worker stopped"
+                        )
                 publish("done")
 
         self._thread = threading.Thread(
@@ -218,9 +220,23 @@ class SyncStreamSessionAdapter:
             await self.aclose()
 
     async def aclose(self) -> None:
-        """Request cooperative stop without blocking on CrewAI's sync thread."""
+        """Request a cooperative stop without blocking the request loop.
+
+        CrewAI's synchronous generator cannot be closed safely from this event-
+        loop thread while its worker is executing (Python raises ``ValueError:
+        generator already executing``). A blocked provider turn may therefore
+        continue until it emits or returns; make that limitation observable.
+        """
         self._stop.set()
         if self._thread is None:
             close = getattr(self._session, "close", None)
             if callable(close):
                 close()
+        elif self._thread.is_alive() and not self._cooperative_stop_logged:
+            _LOGGER.warning(
+                "ag-ui-crewai requested cooperative cancellation of a "
+                "conversational StreamSession; the CrewAI sync worker remains "
+                "active until its current upstream operation emits or returns",
+                extra={"worker_thread": self._thread.name},
+            )
+            self._cooperative_stop_logged = True

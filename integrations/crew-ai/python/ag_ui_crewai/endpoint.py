@@ -1886,9 +1886,9 @@ async def _aclose_stream_session(
     """Best-effort ``aclose()`` teardown for a crewai ``AsyncStreamSession``.
 
     ``aclose()`` replaces the legacy ``_cancel_and_join`` machinery on the
-    StreamFrame path — it cancels the background kickoff task crewai spawns
-    inside ``astream`` and closes the frame iterator. The OBSERVABLE behavior
-    (client-disconnect tears the run down, no leaked kickoff) must not regress.
+    StreamFrame path. CrewAI's async session cancels its kickoff task; the
+    conversational sync adapter requests cooperative cancellation and logs
+    when a blocked upstream operation must return before its worker can stop.
 
     Mirrors the ``_cancel_and_join`` uncancel dance: on Python 3.11+ a bare
     ``await session.aclose()`` in a ``finally`` reached via outer cancellation
@@ -2041,6 +2041,13 @@ async def _run_flow_frame_stream(
         hitl_options=hitl_options,
         emission_shape=emission_shape,
     )
+    # ``stream_turn`` records the current user message inside CrewAI, after the
+    # run has opened. Its first normal MESSAGES_SNAPSHOT therefore arrives only
+    # when the first flow method finishes. Reasoning/text can stream before that
+    # snapshot and would be anchored above the user's prompt in AG-UI. Establish
+    # the request conversation immediately after RUN_STARTED so all streamed
+    # activity for this turn is rendered beneath the current user message.
+    current_turn_snapshot_pending = conversational_turn is not None
 
     def _closing_reasoning_frames():
         """Encoded REASONING_* END events for any reasoning left open at error.
@@ -2072,6 +2079,14 @@ async def _run_flow_frame_stream(
     # starts, and a RAW first event makes @ag-ui/client's verifyEvents throw
     # "First event must be 'RUN_STARTED'".
     pending_raw: list[Any] = []
+    conversational_user_id: str | None = None
+    conversational_user_id_applied = False
+    if conversational_turn is not None and input_data.messages:
+        latest_input_message = dump_agui_message(input_data.messages[-1])
+        if latest_input_message.get("role") == "user":
+            candidate_id = latest_input_message.get("id")
+            if isinstance(candidate_id, str):
+                conversational_user_id = candidate_id
 
     def _hold_pending_raw(raw_mirror: Any) -> None:
         """Park a RAW mirror until the run has opened, logging an overflow drop."""
@@ -2096,6 +2111,46 @@ async def _run_flow_frame_stream(
         return encoder.encode(raw_mirror)
 
     def _sink(source: Any, event: Any) -> None:
+        nonlocal conversational_user_id_applied
+        # CrewAI's conversational runtime reconstructs the pending user turn as
+        # a ConversationMessage, whose schema has no ``id`` field. Preserve the
+        # AG-UI request id at the synchronous message-added boundary; otherwise
+        # every method-finish MESSAGES_SNAPSHOT invents a fresh id and re-anchors
+        # the user prompt below any reasoning that already streamed.
+        if (
+            conversational_user_id is not None
+            and not conversational_user_id_applied
+            and source is flow_copy
+            and getattr(event, "type", None) == "conversation_message_added"
+            and getattr(event, "role", None) == "user"
+        ):
+            state = getattr(source, "state", None)
+            messages = (
+                getattr(state, "messages", None)
+                if state is not None and not isinstance(state, dict)
+                else (state or {}).get("messages")
+            )
+            message_index = getattr(event, "message_index", None)
+            if (
+                isinstance(messages, list)
+                and isinstance(message_index, int)
+                and 0 <= message_index < len(messages)
+            ):
+                stored_message = messages[message_index]
+                if isinstance(stored_message, dict):
+                    stabilized_message = dict(stored_message)
+                else:
+                    dump_message = getattr(stored_message, "model_dump", None)
+                    stabilized_message = (
+                        dump_message(exclude_none=True)
+                        if callable(dump_message)
+                        else None
+                    )
+                if isinstance(stabilized_message, dict):
+                    stabilized_message["id"] = conversational_user_id
+                    messages[message_index] = stabilized_message
+                    conversational_user_id_applied = True
+
         # source is flow_copy isolates the outer run: its own lifecycle/method
         # events and our Bridged* events carry flow_copy as source, while a
         # nested crew.kickoff's own flow's lifecycle/method events leak here
@@ -2209,8 +2264,9 @@ async def _run_flow_frame_stream(
                 # Enforce the wall-clock ceiling per frame read via
                 # ``asyncio.wait_for``: on timeout it cancels the in-flight
                 # ``__anext__`` AND awaits its unwind before raising, so crewai's
-                # scoped stream sink / background kickoff task tear down cleanly;
-                # ``aclose()`` in the ``finally`` then fully drains the task.
+                # in-flight read unwinds cleanly; ``aclose()`` in the ``finally``
+                # then cancels the async session or requests a cooperative stop
+                # from the conversational sync adapter.
                 #
                 # Cross-version note (``requires-python`` floor is 3.10):
                 # ``wait_for`` internals differ. On 3.12+ it awaits the
@@ -2292,6 +2348,21 @@ async def _run_flow_frame_stream(
                         run_id=input_data.run_id,
                     )
                     yield encoder.encode(event)
+                    if (
+                        current_turn_snapshot_pending
+                        and event.type == EventType.RUN_STARTED
+                    ):
+                        initial_messages = MessagesSnapshotEvent(
+                            type=EventType.MESSAGES_SNAPSHOT,
+                            messages=input_data.messages,
+                        )
+                        _stamp_correlation_ids(
+                            initial_messages,
+                            thread_id=input_data.thread_id,
+                            run_id=input_data.run_id,
+                        )
+                        yield encoder.encode(initial_messages)
+                        current_turn_snapshot_pending = False
 
                 if pending_raw and translator.run_started:
                     # The run just opened: flush the mirrors held back so they land
@@ -2425,9 +2496,10 @@ async def _run_flow_frame_stream(
                 )
             )
     finally:
-        # aclose() replaces _cancel_and_join on this path; run it
-        # unconditionally (including under outer cancellation) so the kickoff
-        # task never leaks, then unregister the sink and reset the context var.
+        # Run aclose() unconditionally (including under outer cancellation)
+        # before unregistering the sink and resetting the context var. Async
+        # sessions cancel their kickoff task; the conversational sync adapter
+        # makes any still-blocked cooperative shutdown observable in its log.
         try:
             await _aclose_stream_session(
                 session,
