@@ -4,6 +4,7 @@ import base64
 import logging
 import urllib.request
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from ag_ui.core import (
     AudioInputContent,
@@ -23,6 +24,18 @@ _DOCUMENT_FORMATS: Set[str] = {"pdf", "csv", "doc", "docx", "xls", "xlsx", "html
 _VIDEO_FORMATS: Set[str] = {"flv", "mkv", "mov", "mpeg", "mpg", "mp4", "three_gp", "webm", "wmv"}
 
 
+# Common MIME subtype aliases that don't directly match the allowed format strings.
+# e.g. "text/plain" splits to "plain" but the allowed format is "txt".
+_MIME_FORMAT_ALIASES: Dict[str, str] = {
+    "plain": "txt",
+    "x-markdown": "md",
+    "msword": "doc",
+    "vnd.ms-excel": "xls",
+    "vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+}
+
+
 def _mime_to_format(mime_type: Optional[str], allowed: Set[str]) -> Optional[str]:
     """Parse a MIME type into a short format string.
 
@@ -35,6 +48,8 @@ def _mime_to_format(mime_type: Optional[str], allowed: Set[str]) -> Optional[str
         return None
     # Take the part after the last '/'
     fmt = mime_type.rsplit("/", 1)[-1].lower()
+    # Resolve well-known aliases before checking the allowed set
+    fmt = _MIME_FORMAT_ALIASES.get(fmt, fmt)
     if fmt in allowed:
         return fmt
     logger.warning(
@@ -49,10 +64,21 @@ def _mime_to_format(mime_type: Optional[str], allowed: Set[str]) -> Optional[str
 def _fetch_url_bytes(url: str) -> Optional[bytes]:
     """Fetch raw bytes from *url* using :mod:`urllib`.
 
+    Non-ASCII characters in the URL path (e.g. CJK filenames) are
+    percent-encoded before the request to avoid ``UnicodeEncodeError``.
+
     Returns ``None`` on any failure (network error, timeout, etc.).
     """
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        parts = urlsplit(url)
+        # Percent-encode non-ASCII chars in the path; preserve already-valid URL chars
+        # Include '%' in safe to avoid double-encoding existing percent sequences
+        encoded_path = quote(parts.path, safe="/:@!$&'()*+,;=-._~%")
+        safe_url = urlunsplit((
+            parts.scheme, parts.netloc, encoded_path,
+            parts.query, parts.fragment,
+        ))
+        with urllib.request.urlopen(safe_url, timeout=30) as resp:
             return resp.read()
     except Exception as exc:
         logger.warning("Failed to fetch URL %s: %s", url, exc)
