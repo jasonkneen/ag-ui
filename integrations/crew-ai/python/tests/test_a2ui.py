@@ -7,6 +7,7 @@ Covers the four pillars:
 - error recovery (validate -> retry through the shared toolkit loop).
 """
 
+import contextvars
 import json
 
 import pytest
@@ -303,6 +304,40 @@ async def test_run_recovers_after_invalid_attempt(monkeypatch):
     # Each attempt re-streams render_a2ui -> two opening chunks.
     openings = [e for e in bus.events if e.type == "TOOL_CALL_CHUNK" and e.tool_call_name]
     assert len(openings) == 2
+
+
+async def test_run_propagates_contextvars_into_recovery_worker(monkeypatch):
+    """Recovery runs in ``run_in_executor``, which does NOT carry ``contextvars``
+    into its worker thread. ``run()`` must dispatch it on a COPIED context, or the
+    request-scoped state the subagent resolves there (``flow_context`` and the
+    litellm/bus context an ``acompletion`` turn reads) is ``None`` mid-recovery
+    and the a2ui surface is dropped. Guards exactly that: the sub-agent
+    ``acompletion`` runs in the executor thread, so a var set on the request
+    coroutine must still be visible to it."""
+    probe = contextvars.ContextVar("a2ui_recovery_ctx_probe", default=None)
+    seen: dict = {}
+
+    base_fake, _ = _make_fake_acompletion([VALID_ARGS])
+
+    async def context_reading_fake(**kwargs):
+        # Runs inside the run_in_executor worker thread.
+        seen["value"] = probe.get()
+        return await base_fake(**kwargs)
+
+    monkeypatch.setattr(a2, "acompletion", context_reading_fake)
+    monkeypatch.setattr(a2, "crewai_event_bus", _RecordingBus())
+    tool = a2.get_a2ui_tools(
+        {"model": "openai/gpt-4o", "default_catalog_id": BASIC_CATALOG_ID}
+    )
+
+    token = probe.set("request-scoped-sentinel")
+    try:
+        await tool.run({"intent": "create"})
+    finally:
+        probe.reset(token)
+
+    # Without the copied context this is None (fresh worker-thread context).
+    assert seen["value"] == "request-scoped-sentinel"
 
 
 async def test_run_exhausts_recovery(monkeypatch):

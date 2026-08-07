@@ -29,6 +29,7 @@ chunks.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import Mapping
 import json
 import logging
@@ -593,9 +594,18 @@ class A2UITool:
                 default_catalog_id=cfg["default_catalog_id"],
             )
 
+        # Run the recovery on a COPY of the caller's context. ``run_in_executor``
+        # does not propagate ``contextvars`` into the worker thread, so without
+        # this the request-scoped state the subagent reads (``flow_context`` and
+        # the litellm/bus context an ``acompletion`` turn resolves) is ``None``
+        # there -- which drops the a2ui-recovery surface. Mirrors the conversational
+        # stream worker (``_conversation.SyncStreamSessionAdapter``), which copies
+        # the context onto its thread for the same reason.
+        recovery_context = contextvars.copy_context()
         future = loop.run_in_executor(
             None,
-            lambda: run_a2ui_generation_with_recovery(
+            lambda: recovery_context.run(
+                run_a2ui_generation_with_recovery,
                 base_prompt=prep["prompt"],
                 catalog=cfg["catalog"],
                 config=cfg["recovery"],
