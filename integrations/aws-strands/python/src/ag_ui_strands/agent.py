@@ -480,6 +480,7 @@ from ag_ui.core import (
     FunctionCall,
     Interrupt,
     MessagesSnapshotEvent,
+    RawEvent,
     ReasoningEncryptedValueEvent,
     ReasoningEndEvent,
     ReasoningMessageContentEvent,
@@ -619,6 +620,120 @@ def _coerce_text(content: Any) -> str:
 def _coerce_id(value: Any) -> str:
     """Return ``value`` if it is a non-empty string, else a fresh UUID."""
     return value if isinstance(value, str) and value else str(uuid.uuid4())
+
+
+# Separator for namespacing a sub-agent's tool call ids under the parent tool
+# call that owns them. Two agents mint toolUseIds independently, so an inner id
+# can be byte-identical to a parent one; without a namespace the inner result
+# would resolve the PARENT's tool card (and vice versa). "::" is not produced by
+# any Strands/Bedrock id generator, so the prefix is unambiguous.
+_INNER_TOOL_ID_SEP = "::"
+
+
+async def _forward_inner_agent_events(
+    inner_event: Any,
+    parent_tool_use: Dict[str, Any],
+    inner_tool_calls_seen: Dict[str, Dict[str, Any]],
+) -> AsyncIterator[Any]:
+    """Translate one agent-as-tool inner event into AG-UI tool-call events.
+
+    A Strands generator tool that wraps another ``Agent`` (the agent-as-tool
+    pattern) re-yields the inner agent's whole ``stream_async`` output; Strands
+    wraps each yield as ``tool_stream_event``. The inner agent's tool calls
+    therefore never reach the parent loop's ``current_tool_use`` /
+    ``contentBlockStop`` / tool-result branches, so without this the frontend
+    sees the sub-agent as an opaque black box (see issue #2304).
+
+    Only the tool-call lifecycle is forwarded, and only onto the wire —
+    inner calls are deliberately NOT spliced into ``MessagesSnapshotEvent``
+    history, which mirrors the parent conversation Strands actually persists.
+    """
+    if not isinstance(inner_event, dict):
+        return
+
+    parent_id = parent_tool_use.get("toolUseId") or "inner"
+
+    def _namespaced(inner_id: Any) -> str:
+        return f"{parent_id}{_INNER_TOOL_ID_SEP}{inner_id or uuid.uuid4()}"
+
+    # Inner tool call, streaming its args in.
+    tool_use = inner_event.get("current_tool_use")
+    if isinstance(tool_use, dict) and tool_use.get("name"):
+        call_id = _namespaced(tool_use.get("toolUseId"))
+        raw_input = tool_use.get("input", "")
+        raw_str = (
+            raw_input
+            if isinstance(raw_input, str)
+            else json.dumps(raw_input, default=str)
+        )
+        entry = inner_tool_calls_seen.get(call_id)
+        if entry is None:
+            entry = inner_tool_calls_seen[call_id] = {
+                "name": tool_use["name"],
+                "sent_len": 0,
+                "ended": False,
+            }
+            yield ToolCallStartEvent(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id=call_id,
+                tool_call_name=tool_use["name"],
+            )
+        if len(raw_str) > entry["sent_len"]:
+            yield ToolCallArgsEvent(
+                type=EventType.TOOL_CALL_ARGS,
+                tool_call_id=call_id,
+                delta=raw_str[entry["sent_len"] :],
+            )
+            entry["sent_len"] = len(raw_str)
+        return
+
+    # Inner content block closed — close the newest still-open inner call.
+    # Mirrors the parent loop, which also closes one call per contentBlockStop.
+    model_chunk = inner_event.get("event")
+    if isinstance(model_chunk, dict) and "contentBlockStop" in model_chunk:
+        for call_id, entry in reversed(list(inner_tool_calls_seen.items())):
+            if not entry["ended"]:
+                entry["ended"] = True
+                yield ToolCallEndEvent(
+                    type=EventType.TOOL_CALL_END,
+                    tool_call_id=call_id,
+                )
+                break
+        return
+
+    # Inner tool results.
+    message = inner_event.get("message")
+    if isinstance(message, dict) and message.get("role") == "user":
+        for item in message.get("content") or []:
+            if not isinstance(item, dict) or "toolResult" not in item:
+                continue
+            tool_result = item["toolResult"]
+            if not isinstance(tool_result, dict):
+                continue
+            call_id = _namespaced(tool_result.get("toolUseId"))
+            # Only resolve calls this forwarder actually opened, so a result we
+            # never announced can't leave a dangling tool card on the frontend.
+            if call_id not in inner_tool_calls_seen:
+                continue
+            texts = [
+                block["text"]
+                for block in tool_result.get("content") or []
+                if isinstance(block, dict) and "text" in block
+            ]
+            raw_text = "".join(texts)
+            try:
+                result_data = json.loads(raw_text)
+            except (json.JSONDecodeError, TypeError):
+                result_data = raw_text
+            yield ToolCallResultEvent(
+                type=EventType.TOOL_CALL_RESULT,
+                tool_call_id=call_id,
+                message_id=str(uuid.uuid4()),
+                content=json.dumps(result_data, default=str),
+                # role intentionally omitted — same as the parent-level result
+                # path, so the frontend closes the spinner without writing the
+                # inner call into conversation history.
+            )
 
 
 def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
@@ -1793,6 +1908,10 @@ class StrandsAgent:
             # tool-call AssistantMessage id.
             last_emitted_text_message_id: str | None = None
             tool_calls_seen = {}
+            # Tool calls made by a sub-agent running as a tool (issue #2304).
+            # Kept separate from ``tool_calls_seen`` so inner calls never take
+            # part in parent-level result lookup, snapshotting or halt logic.
+            inner_tool_calls_seen: Dict[str, Dict[str, Any]] = {}
             current_state = dict(input_data.state or {})  # Track state for final snapshot
             stop_text_streaming = False
             halt_event_stream = False
@@ -2146,8 +2265,15 @@ class StrandsAgent:
 
                     logger.debug(f"Received event: {event}")
 
-                    # Skip lifecycle events
-                    if event.get("init_event_loop") or event.get("start_event_loop"):
+                    # Skip lifecycle events. ``start`` is Strands' deprecated
+                    # alias of ``start_event_loop`` and is emitted alongside it;
+                    # listing it keeps the pair consistent so one half of a
+                    # duplicate does not surface as a RAW event.
+                    if (
+                        event.get("init_event_loop")
+                        or event.get("start_event_loop")
+                        or event.get("start")
+                    ):
                         continue
                     # ``force_stop`` means Strands caught an exception mid-cycle.
                     # It is a failed run, not assistant-authored content or a
@@ -2394,6 +2520,19 @@ class StrandsAgent:
                                     type=EventType.STATE_SNAPSHOT,
                                     snapshot=stream_data["state"],
                                 )
+                            else:
+                                # Agent-as-tool: a generator tool wrapping another
+                                # Agent re-yields that agent's own stream_async events
+                                # here. Forward the inner tool-call lifecycle so the
+                                # sub-agent isn't an opaque black box (issue #2304).
+                                # Reached only when no explicit handler claimed the
+                                # payload and it is not a state snapshot.
+                                async for inner_agui_event in _forward_inner_agent_events(
+                                    stream_data,
+                                    tool_stream.get("tool_use") or {},
+                                    inner_tool_calls_seen,
+                                ):
+                                    yield inner_agui_event
 
                     # Handle tool results from Strands for backend tool rendering
                     elif "message" in event and event["message"].get("role") == "user":
@@ -3224,6 +3363,22 @@ class StrandsAgent:
                                             f"Deferring halt after frontend tool call: tool_name={tool_name}, tool_call_id={tool_use_id}, thread_id={input_data.thread_id}"
                                         )
                                         pending_halt = True
+
+                    # Anything the chain above does not map gets forwarded
+                    # verbatim as a RAW event rather than being dropped without
+                    # a trace (issue #2291). Bedrock citation deltas arrive
+                    # here, as do provider extensions this adapter predates.
+                    # The deliberate lifecycle skips at the top of the loop
+                    # short-circuit before reaching this branch and stay silent.
+                    else:
+                        logger.debug(
+                            f"Unmapped Strands event forwarded as RAW (thread_id={input_data.thread_id}): {event}"
+                        )
+                        yield RawEvent(
+                            type=EventType.RAW,
+                            event=event,
+                            source="strands",
+                        )
 
                 # Defer hand-off (safety flush): if the stream ended without a
                 # backend tool-result message (e.g. a turn with ONLY frontend tool

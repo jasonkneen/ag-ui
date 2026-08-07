@@ -62,6 +62,28 @@ const LOG_PREFIX = "[@ag-ui/aws-strands]";
 const uuid = (): string => randomUUID();
 
 /**
+ * Lifecycle/plumbing events the RAW fallback deliberately stays silent about.
+ *
+ * The TS SDK surfaces hook brackets the Python `stream_async` generator never
+ * emits, so these are the TS counterpart of Python's `init_event_loop` /
+ * `start_event_loop` / `start` skips: they carry no payload of their own and
+ * only bracket work that is already reported through mapped events. Everything
+ * else falls through to a RAW event (issue #2291).
+ */
+const RAW_SKIPPED_EVENT_KINDS = new Set<string>([
+  "initializedEvent",
+  "beforeInvocationEvent",
+  "afterInvocationEvent",
+  "beforeModelCallEvent",
+  "afterModelCallEvent",
+  "beforeToolsEvent",
+  "afterToolsEvent",
+  "beforeToolCallEvent",
+  "modelMessageStartEvent",
+  "modelMessageStopEvent",
+]);
+
+/**
  * Structural interface for a Strands multi-agent orchestrator (Graph/Swarm).
  * TypeScript-only: the Python SDK currently has no orchestrator equivalent.
  */
@@ -2282,8 +2304,24 @@ export class StrandsAgent {
             };
             continue;
           }
-          // Ignore events we don't translate (BeforeInvocationEvent,
-          // ModelStreamEventHook wrappers, etc.).
+
+          // Terminal fallback: anything the dispatch above does not translate
+          // is forwarded verbatim as RAW rather than dropped without a trace
+          // (issue #2291) — provider extensions this adapter predates, Bedrock
+          // citations among them, arrive here. Mirrors the Python adapter's
+          // terminal `else`, and matches what every other streaming adapter
+          // (LangGraph, watsonx, a2a) already does. The lifecycle brackets in
+          // `RAW_SKIPPED_EVENT_KINDS` stay silent, as they do in Python.
+          if (kind && RAW_SKIPPED_EVENT_KINDS.has(kind)) continue;
+          this._log.debug(
+            `${LOG_PREFIX} Unmapped Strands event forwarded as RAW ` +
+              `(threadId=${inputData.threadId}, kind=${kind ?? "unknown"})`,
+          );
+          yield {
+            type: EventType.RAW,
+            event,
+            source: "strands",
+          } as unknown as BaseEvent;
         }
       } finally {
         // Consumer bailed (client disconnect, frontend-tool halt, error).
