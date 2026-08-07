@@ -39,7 +39,7 @@ from strands import Agent as StrandsAgentCore
 from strands import tool
 from strands.models.model import Model
 
-from ag_ui_strands.agent import StrandsAgent
+from ag_ui_strands.agent import StrandsAgent, _sanitize_raw_event
 from ag_ui_strands.config import StrandsAgentConfig
 
 
@@ -111,6 +111,29 @@ CITATION = {
     "sourceContent": [{"text": "revenue grew 12%"}],
     "location": {"documentChar": {"documentIndex": 0, "start": 10, "end": 26}},
 }
+
+
+def _find_citation_payload(event: Any) -> Optional[dict]:
+    """Locate the citation payload in a RAW event, whatever shape it arrives in.
+
+    Strands changed ``CitationStreamEvent``'s envelope mid-1.x: releases
+    1.15.0–1.20.0 emit ``{"callback": {"citation": ..., "delta": ...}}`` while
+    1.21.0 and later emit ``{"citation": ..., "delta": ...}``. This package
+    declares ``strands-agents>=1.15.0``, so both are in range and a test that
+    pins one of them is version-fragile rather than behavioural. Searching
+    recursively asserts what actually matters — the citation reached the wire
+    instead of being dropped — without coupling to the envelope.
+    """
+    if not isinstance(event, dict):
+        return None
+    citation = event.get("citation")
+    if isinstance(citation, dict):
+        return citation
+    for value in event.values():
+        found = _find_citation_payload(value)
+        if found is not None:
+            return found
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -239,18 +262,31 @@ async def test_bedrock_citation_event_is_emitted_as_raw():
     _assert_stream_encodes(events)
 
     raw_events = [e for e in events if e.type == EventType.RAW]
-    # Strands' ``CitationStreamEvent`` is ``{"citation": ..., "delta": ...}`` at
-    # the top level (strands/types/_events.py) — it is not wrapped in a
-    # ``callback`` key anywhere in the ``stream_async`` path.
-    citation_raws = [
-        e for e in raw_events if isinstance(e.event, dict) and "citation" in e.event
+    # ``CitationStreamEvent`` has TWO wire shapes across the range this package
+    # declares (``strands-agents>=1.15.0``), verified against every published
+    # 1.x wheel in that range:
+    #
+    #   1.15.0 – 1.20.0 : {"callback": {"citation": ..., "delta": ...}}
+    #   1.21.0 – latest : {"citation": ..., "delta": ...}
+    #
+    # The adapter is right either way — RAW forwards the provider's own payload
+    # verbatim rather than normalising a shape it does not own — so this test
+    # must accept both instead of pinning whichever one the lockfile happens to
+    # resolve. Asserting the top-level key alone made the suite fail on the
+    # locked 1.18.0 while passing locally on a newer resolution.
+    located = [
+        (e, payload)
+        for e in raw_events
+        for payload in [_find_citation_payload(e.event)]
+        if payload is not None
     ]
-    assert citation_raws, (
+    assert located, (
         "expected a RAW event carrying the Bedrock citation payload; "
         f"got RAW events: {[e.event for e in raw_events]}"
     )
-    assert citation_raws[0].source == "strands"
-    assert citation_raws[0].event["citation"] == CITATION
+    event, payload = located[0]
+    assert event.source == "strands"
+    assert payload == CITATION
 
 
 @pytest.mark.asyncio
@@ -361,6 +397,20 @@ async def test_terminal_lifecycle_events_are_not_emitted_as_raw():
     ]
     assert leaked == [], f"terminal lifecycle events leaked as RAW: {leaked}"
     assert events[-1].type == EventType.RUN_FINISHED
+
+    # The end-to-end half above cannot actually pin ``_RAW_TERMINAL_KEYS``: a
+    # real ``AgentResult`` is unserializable, so it is dropped by the strict
+    # round-trip whether or not the key exclusion exists. Delete the exclusion
+    # and the assertions above still pass. Exercise the sanitizer directly with
+    # a *plainly serializable* payload so the drop can only come from the
+    # exclusion this test is named for.
+    for terminal_key in ("result", "stop"):
+        serializable = {terminal_key: {"stop_reason": "end_turn", "metrics": {}}}
+        assert json.dumps(serializable)  # the payload itself round-trips fine
+        assert _sanitize_raw_event(serializable) is None, (
+            f"{terminal_key!r} must be excluded from RAW by name, not by "
+            "accidentally failing serialization"
+        )
 
 
 @pytest.mark.asyncio
@@ -708,3 +758,126 @@ async def test_parallel_agent_as_tool_calls_close_their_own_inner_calls():
     assert not [i for i in all_ends if i.startswith("parent_b::")], (
         f"sub-agent B opened no inner call yet closed one: {all_ends}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2291 — suppressed payloads must not re-enter through the RAW fallback
+# ---------------------------------------------------------------------------
+
+
+class _ReplayAgent:
+    """Yields a fixed event list, standing in for ``Agent.stream_async``.
+
+    The suppression gates under test key off flag values (``reasoning`` false,
+    ``current_tool_use`` empty) that Strands' own constructors never produce at
+    any version in range — ``ReasoningTextStreamEvent`` hardcodes
+    ``reasoning: True``. The gates exist precisely for the payload shapes a
+    provider or a future release could emit, so they can only be exercised by
+    feeding the dispatch chain directly. The genuinely reachable case (an empty
+    text delta) is covered below by a real ``strands.Agent``.
+    """
+
+    def __init__(self, events: list[dict]) -> None:
+        self._events = events
+        self.model = MagicMock()
+        self.system_prompt = "test"
+        self.tool_registry = MagicMock()
+        self.tool_registry.registry = {}
+        self.record_direct_tool_call = True
+
+    async def stream_async(self, message: Any):
+        for event in self._events:
+            yield event
+
+
+def _wrap_replay(events: list[dict], thread_id: str = "t1") -> StrandsAgent:
+    agent = StrandsAgent(
+        _template_agent(), name="test-agent", config=StrandsAgentConfig()
+    )
+    agent._agents_by_thread[thread_id] = _ReplayAgent(events)
+    return agent
+
+
+@pytest.mark.parametrize(
+    ("event", "secret"),
+    [
+        # Reasoning suppressed because the ``reasoning`` flag is off.
+        ({"reasoningText": "chain of thought", "reasoning": False}, "chain of thought"),
+        # Same, with the flag absent entirely.
+        ({"reasoningText": "chain of thought"}, "chain of thought"),
+        # Redacted reasoning is encrypted provider content; the adapter exposes
+        # it only as REASONING_ENCRYPTED_VALUE, never as a bare payload.
+        (
+            {"reasoningRedactedContent": "cipher-text", "reasoning": False},
+            "cipher-text",
+        ),
+        # The verification token is deliberately never surfaced to the UI.
+        ({"reasoning_signature": "sig-abc123", "reasoning": False}, "sig-abc123"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_suppressed_reasoning_payloads_do_not_leak_as_raw(event, secret):
+    """A mapped-but-suppressed payload must stay suppressed, not become RAW.
+
+    These branches are guarded suppression gates, e.g.
+    ``elif "reasoningText" in event and event.get("reasoning")``. When the guard
+    is false the branch is skipped — and with a terminal ``else`` added for
+    issue #2291, the event then falls all the way through, so the withheld text
+    is forwarded verbatim as RAW. The adapter would be publishing over RAW
+    exactly the content the reasoning gate exists to withhold.
+
+    The pre-existing reasoning tests miss this: they assert only that no
+    ``REASONING_*`` event fires, which stays true while the payload leaks out
+    the other door.
+    """
+    events = await _collect(_wrap_replay([event, {"data": "Visible answer."}]))
+    _assert_stream_encodes(events)
+
+    raw_events = [e.event for e in events if e.type == EventType.RAW]
+    leaked = [r for r in raw_events if secret in json.dumps(r)]
+    assert leaked == [], (
+        f"suppressed payload {secret!r} was forwarded as RAW anyway: {leaked}"
+    )
+    assert raw_events == [], f"suppressed event should be silent, got RAW: {raw_events}"
+
+    # The suppression must be surgical: ordinary output still streams.
+    assert any(e.type == EventType.TEXT_MESSAGE_CONTENT for e in events)
+
+
+@pytest.mark.asyncio
+async def test_empty_tool_use_update_is_not_emitted_as_raw():
+    """``current_tool_use`` is owned by the tool-call branch, empty or not.
+
+    Its handler is gated on the value being non-empty. An empty update carries
+    nothing a client can act on, so falling through to RAW is pure noise.
+    """
+    events = await _collect(
+        _wrap_replay([{"current_tool_use": None}, {"current_tool_use": {}}])
+    )
+    _assert_stream_encodes(events)
+
+    raw_events = [e.event for e in events if e.type == EventType.RAW]
+    assert raw_events == [], f"empty tool-use updates leaked as RAW: {raw_events}"
+
+
+@pytest.mark.asyncio
+async def test_empty_text_delta_is_not_emitted_as_raw():
+    """An empty text delta must be silent — proven against a real ``Agent``.
+
+    Unlike the gates above, this one is reachable today: on the locked
+    strands-agents 1.18.0 a real ``Agent`` streaming an empty text delta emits
+    ``TextStreamEvent`` as ``{"data": "", "delta": {"text": ""}}``. The text
+    branch is gated on ``event["data"]`` being truthy, so without this fix the
+    event falls through and every empty delta becomes a RAW event carrying no
+    information at all.
+    """
+    strands_agent = StrandsAgentCore(
+        model=ScriptedModel([_text_turn("")]),
+        callback_handler=None,
+    )
+
+    events = await _collect(_wrap(strands_agent))
+    _assert_stream_encodes(events)
+
+    raw_events = [e.event for e in events if e.type == EventType.RAW]
+    assert raw_events == [], f"empty text delta leaked as RAW: {raw_events}"

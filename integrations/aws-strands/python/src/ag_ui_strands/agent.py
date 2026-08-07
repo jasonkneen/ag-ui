@@ -656,6 +656,35 @@ _RAW_INVOCATION_STATE_KEYS = frozenset(
 # forwarding them would be duplicate noise even if they were serializable.
 _RAW_TERMINAL_KEYS = frozenset({"result", "stop"})
 
+# Keys the dispatch chain in ``run`` already owns. Each of their branches is
+# *conditionally* entered — ``"data" in event and event["data"]``,
+# ``"reasoningText" in event and event.get("reasoning")``,
+# ``"current_tool_use" in event and event["current_tool_use"]`` — so a payload
+# whose guard evaluates false matches no branch and, with the RAW fallback in
+# place, falls through to it.
+#
+# That conflates two different situations the fallback must keep apart:
+#
+#   unmapped            the adapter has no branch for this event at all, so
+#                       forwarding it as RAW is the whole point of issue #2291
+#   mapped-but-declined a branch exists and deliberately withheld the payload
+#
+# Only the first is RAW-eligible. Without this set the second leaks whatever
+# the guard exists to suppress: reasoning text with ``reasoning`` off,
+# encrypted ``reasoningRedactedContent``, and the ``reasoning_signature``
+# verification token would each be republished verbatim over RAW — the exact
+# content the gate withholds — while empty ``data`` and empty
+# ``current_tool_use`` updates would add a RAW event carrying no information.
+_RAW_SUPPRESSED_KEYS = frozenset(
+    {
+        "data",
+        "reasoningText",
+        "reasoningRedactedContent",
+        "reasoning_signature",
+        "current_tool_use",
+    }
+)
+
 
 def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a JSON-safe RAW payload for ``event``, or ``None`` to drop it.
@@ -3450,6 +3479,17 @@ class StrandsAgent:
                     elif isinstance(event.get("message"), dict) and event[
                         "message"
                     ].get("role") == "assistant":
+                        continue
+
+                    # A key the chain above owns, reached only because that
+                    # branch's guard declined it (see _RAW_SUPPRESSED_KEYS).
+                    # "Suppressed" must mean suppressed on every channel, so
+                    # this stays silent instead of handing the withheld payload
+                    # to the RAW fallback below.
+                    elif any(key in event for key in _RAW_SUPPRESSED_KEYS):
+                        logger.debug(
+                            f"Suppressing mapped-but-declined Strands event (thread_id={input_data.thread_id}, keys={sorted(event)})"
+                        )
                         continue
 
                     # Anything the chain above does not map gets forwarded as a

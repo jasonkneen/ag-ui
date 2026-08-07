@@ -1609,6 +1609,13 @@ export class StrandsAgent {
           // (type: 'modelStreamUpdateEvent', event: ModelStreamEvent) before
           // yielding them from `agent.stream()`. Unwrap once so the dispatch
           // below operates on the inner event shape.
+          // `contentBlockEvent` is the assembled form of deltas that have
+          // already streamed, so it must never reach the RAW fallback (see
+          // `isAssembledContentBlock`). The wrapper kind has to be captured
+          // BEFORE unwrapping, because unwrapping is exactly what erases it —
+          // the bare block's own `type` is `textBlock` / `reasoningBlock` /
+          // whatever the SDK adds next.
+          const isAssembledBlock = isAssembledContentBlock(next.value);
           const event = unwrapStrandsEvent(next.value);
           const kind = getEventKind(event);
 
@@ -2395,6 +2402,18 @@ export class StrandsAgent {
           // (LangGraph, watsonx, a2a) already does. The lifecycle brackets in
           // `RAW_SKIPPED_EVENT_KINDS` stay silent, as they do in Python.
           if (kind && RAW_SKIPPED_EVENT_KINDS.has(kind)) continue;
+          // An assembled content block duplicates content already on the wire,
+          // whatever kind of block it turned out to be. Keyed on the wrapper
+          // rather than on a list of block names so a block type added by a
+          // future SDK release is covered the day it ships.
+          if (isAssembledBlock) {
+            this._log.debug(
+              `${LOG_PREFIX} Skipping assembled content block for RAW ` +
+                `forwarding; its content already streamed ` +
+                `(threadId=${inputData.threadId}, block=${kind ?? "unknown"})`,
+            );
+            continue;
+          }
           const rawPayload = sanitizeRawEvent(event);
           if (rawPayload === undefined) {
             this._log.warn(
@@ -3226,6 +3245,32 @@ function getEventKind(event: unknown): string | undefined {
     return typeof t === "string" ? t : undefined;
   }
   return undefined;
+}
+
+/**
+ * True if `event` is a `ContentBlockEvent` — an assembled content block.
+ *
+ * `Agent.stream()` yields one of these for EVERY completed content block: any
+ * value from `model.streamAggregated` that is not a `ModelStreamEvent` gets
+ * wrapped as `new ContentBlockEvent({ contentBlock })`. A content block is by
+ * construction the assembled form of deltas the adapter has *already* streamed
+ * — `textBlock` is the finished text of a turn that went out chunk by chunk as
+ * `TEXT_MESSAGE_CONTENT`, `reasoningBlock` the finished reasoning that went out
+ * as `REASONING_MESSAGE_CONTENT`.
+ *
+ * The dispatch chain translates only `toolUseBlock`, so with a terminal RAW
+ * fallback in place every other block kind would fall through and re-deliver
+ * the whole assistant message a second time, immediately after it streamed.
+ * That is the same duplication the Python adapter's explicit
+ * `ModelMessageEvent` skip prevents.
+ *
+ * Tested against the real `ContentBlockEvent` / `TextBlock` / `ReasoningBlock`
+ * classes rather than object literals — see `raw-content-block.test.ts`.
+ *
+ * Must be evaluated before `unwrapStrandsEvent`, which discards the wrapper.
+ */
+function isAssembledContentBlock(event: unknown): boolean {
+  return getEventKind(event) === "contentBlockEvent";
 }
 
 /**
