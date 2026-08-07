@@ -2198,8 +2198,26 @@ class StrandsAgent:
                 self._pending_interrupts_by_thread.pop(thread_id, None)
                 self._parked_orchestrators_by_thread.pop(thread_id, None)
 
-    async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
-        """Run the Strands agent and yield AG-UI events."""
+    async def run(
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        """Run the Strands agent and yield AG-UI events.
+
+        Args:
+            input_data: The AG-UI run request.
+            invocation_state: Optional request-scoped state forwarded unchanged
+                to the underlying Strands invocation. The state is available to
+                hooks and tools but is not added to the model context.
+        """
+
+        stream_kwargs = (
+            {"invocation_state": invocation_state}
+            if invocation_state is not None
+            else {}
+        )
 
         if self._orchestrator is not None:
             # An orchestrator carries execution state on the instance and its
@@ -3367,7 +3385,7 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
-            agent_stream = strands_agent.stream_async(resume_prompt)
+            agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
                 async for event in agent_stream:
                     # Capture the terminal ``AgentResult`` (always emitted last
