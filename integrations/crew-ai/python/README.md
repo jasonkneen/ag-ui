@@ -48,16 +48,33 @@ add_crewai_flow_fastapi_endpoint(app, MyFlow(), "/flow")
 CrewAI 1.15.11's Conversational Flows use the same AG-UI event translation,
 state synchronization, tools, reasoning, multimodal content, interrupts, and
 generative UI support as regular Flows. Opt the Flow into CrewAI's public
-conversation API and register the endpoint with `conversational=True`:
+conversation API and register the endpoint with `conversational=True`.
+
+> **Important:** CrewAI builds a Flow's graph from the subclass's own
+> `__dict__`, so a subclass that only sets `conversational = True` inherits
+> **none** of the base Flow's `@start`/`@listen` methods and runs an empty graph
+> (your steps silently never fire). Re-copy the base's flow methods onto the
+> conversational type — this is exactly what the dojo's
+> `examples/conversational.py::_conversational_type` helper does:
 
 ```python
 from crewai.experimental.conversational import ConversationConfig
 
-class MyConversationalFlow(MyFlow):
-    conversational = True
-    conversational_config = ConversationConfig(
-        defer_trace_finalization=False,
-    )
+_flow_methods = {
+    name: value
+    for name, value in MyFlow.__dict__.items()
+    if not name.startswith("_") and hasattr(value, "__flow_method_definition__")
+}
+
+MyConversationalFlow = type(
+    "MyConversationalFlow",
+    (MyFlow,),
+    {
+        **_flow_methods,
+        "conversational": True,
+        "conversational_config": ConversationConfig(defer_trace_finalization=False),
+    },
+)
 
 add_crewai_flow_fastapi_endpoint(
     app,
@@ -288,6 +305,12 @@ process indefinitely.
 - When the ceiling fires, the stream yields a `RUN_ERROR` event with
   code `AGUI_CREWAI_FLOW_TIMEOUT` and a message carrying the configured
   ceiling plus thread/run correlation IDs.
+- **Conversational mode:** the ceiling bounds the AG-UI HTTP response, not
+  the CrewAI worker. Conversational Flows drive a synchronous `StreamSession`
+  on a background thread that cannot be closed from the request loop, so a
+  hung upstream call keeps that worker alive until it emits or returns. (The
+  async StreamFrame path cancels the CrewAI kickoff task and pins nothing; this
+  opt-in conversational path does not.)
 
 ### `AGUI_CREWAI_CANCEL_JOIN_TIMEOUT_SECONDS`
 

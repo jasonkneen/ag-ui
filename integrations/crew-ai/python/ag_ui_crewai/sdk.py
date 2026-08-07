@@ -772,14 +772,18 @@ async def _copilotkit_stream_responses(response):
                 continue
 
             if event_type == RESPONSES_OUTPUT_ITEM_ADDED:
+                # ``item`` is a dict on some builds and a
+                # ``BaseLiteLLMOpenAIResponseObject`` on real OpenAI, so read it
+                # shape-agnostically -- gating on ``dict`` alone dropped every
+                # function call the model made against a live Responses stream.
                 item = getattr(event, "item", None)
-                if not isinstance(item, dict) or item.get("type") != "function_call":
+                if item is None or _responses_attr(item, "type") != "function_call":
                     continue
-                item_id = item.get("id")
+                item_id = _responses_attr(item, "id")
                 # ``call_id`` is what a later ``function_call_output`` must
                 # reference, so it is the tool call's identity on the wire.
-                call_id = item.get("call_id") or item_id
-                name = item.get("name")
+                call_id = _responses_attr(item, "call_id") or item_id
+                name = _responses_attr(item, "name")
                 if not item_id or not call_id or not name:
                     _LOGGER.error(
                         "ag-ui-crewai dropped a Responses function_call item with "
@@ -793,7 +797,7 @@ async def _copilotkit_stream_responses(response):
                 # STATE_SNAPSHOT, which would otherwise rebuild from flow.state and
                 # clobber the predicted state the client is already rendering.
                 _mark_predicted_tool_streamed(flow, name)
-                seeded_arguments = item.get("arguments") or ""
+                seeded_arguments = _responses_attr(item, "arguments") or ""
                 calls_by_item[item_id] = {
                     "id": call_id,
                     "name": name,
@@ -896,7 +900,12 @@ async def _copilotkit_stream_responses(response):
 
     # A call whose arguments arrived complete on its output item and never streamed
     # a delta: put them on the wire now, so the streamed TOOL_CALL_ARGS still match
-    # the returned ModelResponse (the chat driver's invariant).
+    # the returned ModelResponse (the chat driver's invariant). This holds while
+    # the flush reaches the shaper before any answer text; a provider that emitted
+    # the complete-args item and THEN streamed text would have this tool call
+    # already closed by the shaper (see _frames.py) and this flush dropped (logged
+    # at ERROR). Real OpenAI does not order it that way, so it is not reachable
+    # today -- but the match is conditional on that ordering, not absolute.
     for entry in calls_by_item.values():
         if entry["streamed"] or not entry["arguments"]:
             continue

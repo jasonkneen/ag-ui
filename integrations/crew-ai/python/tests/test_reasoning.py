@@ -1095,6 +1095,26 @@ requires_responses_types = pytest.mark.skipif(
 )
 
 
+def test_locked_litellm_exposes_the_responses_event_models():
+    """The pinned litellm actually resolves the Responses-API event models.
+
+    UNDECORATED on purpose. ``requires_responses_types`` skips ~70 tests when the
+    models cannot be imported, and CI runs a single ``uv sync --locked`` litellm,
+    so a build that re-homed those models would take that whole block dark on an
+    otherwise green job. This canary turns that silent hole into one red line
+    naming the cause: green on the locked build, red the moment the import — or
+    the production registry lookup — stops resolving on the build under test."""
+    assert _RESPONSES_TYPES_ERROR is None, _RESPONSES_TYPES_ERROR
+    # An import that succeeds but a registry lookup that re-homed would skip just
+    # as silently, so assert the production probe resolved too.
+    from ag_ui_crewai._capabilities import responses_event_modelling
+
+    modelling = responses_event_modelling()
+    assert modelling.resolver_available is True
+    assert modelling.usable is True
+    assert modelling.unmodellable_event_types == ()
+
+
 def _responses_symbol(module_path, name):
     """Return ``module_path.name``, skipping the calling test if it is absent.
 
@@ -1432,6 +1452,63 @@ async def test_copilotkit_stream_responses_tool_call_round_trip():
     )
     # Reasoning closed: the tool call is not swallowed into the reasoning message.
     assert EventType.REASONING_END in [e.type for e in items]
+
+    tool_calls = result.choices[0].message.tool_calls
+    assert len(tool_calls) == 1
+    assert tool_calls[0].id == "call_abc"
+    assert tool_calls[0].function.name == "change_background"
+    assert tool_calls[0].function.arguments == '{"background":"red"}'
+    assert result.choices[0].finish_reason == "tool_calls"
+
+
+@requires_responses_types
+async def test_copilotkit_stream_responses_tool_call_item_as_object():
+    """A function call streams even when ``item`` arrives as an OBJECT, not a dict.
+
+    Real OpenAI delivers ``output_item.added``'s ``item`` as a
+    ``BaseLiteLLMOpenAIResponseObject`` (litellm builds the event by construction,
+    not dict validation). Gating on ``isinstance(item, dict)`` dropped every such
+    call and returned a reasoning-only message; the item must be read by attribute
+    as well as by key."""
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(
+        id="fc_1",
+        call_id="call_abc",
+        type="function_call",
+        name="change_background",
+        arguments="",
+    )
+    events = [
+        ResponseCreatedEvent(
+            type="response.created", response=_responses_api_response("in_progress")
+        ),
+        OutputItemAddedEvent.model_construct(
+            type="response.output_item.added", output_index=0, item=item
+        ),
+        FunctionCallArgumentsDeltaEvent(
+            type="response.function_call_arguments.delta",
+            item_id="fc_1", output_index=0, delta='{"background":"red"}',
+        ),
+        ResponseCompletedEvent(
+            type="response.completed", response=_responses_api_response()
+        ),
+    ]
+    flow = _FakeFlow()
+    ep.FastAPICrewFlowEventListener()
+    queue = await ep.create_queue(flow)
+    flow_context.set(flow)
+    try:
+        result = await copilotkit_stream(_FakeResponsesStream(events))
+        await _settle_bus()
+        items = _drain(queue)
+    finally:
+        await ep.delete_queue(flow)
+
+    chunks = [e for e in items if e.type == EventType.TOOL_CALL_CHUNK]
+    assert chunks, [e.type for e in items]
+    assert {c.tool_call_id for c in chunks} == {"call_abc"}
+    assert {c.tool_call_name for c in chunks} == {"change_background"}
 
     tool_calls = result.choices[0].message.tool_calls
     assert len(tool_calls) == 1
@@ -2461,6 +2538,15 @@ async def test_responses_stream_handles_unknown_event_type_lookup_error():
     with pytest.raises(RuntimeError, match="failed to parse"):
         await copilotkit_stream(_ScriptedEventStream([nameless]))
 
+    # A future litellm that wraps the type in quotes must still be recognised as
+    # the load-bearing type it is, not silently skipped as an unknown one.
+    with pytest.raises(RuntimeError, match="no model for"):
+        await copilotkit_stream(
+            _ScriptedEventStream(
+                [ValueError("Unknown event type: 'response.output_text.delta'")]
+            )
+        )
+
 
 async def test_responses_stream_gives_up_when_nothing_parses():
     """A stream where every event fails to parse raises instead of silently
@@ -2746,16 +2832,17 @@ async def test_unparseable_event_is_reported_when_nothing_can_attribute_it():
 # -- a litellm build that RAISES for a type it has no model for ---------------
 #
 # litellm 1.63-1.67 (inside this package's declared ``litellm>=1.60.2`` floor)
-# raise ``ValueError("Unknown event type: <type>")`` from their event-type lookup,
-# and on those builds the reasoning-summary deltas and the answer text delta this
-# channel exists to read are exactly the unknown types. The channel cannot be read
-# there at all, so it must report UNAVAILABLE and callers must degrade to
-# chat-completions -- not fail once per turn on a channel declared as working.
+# raise ``ValueError("Unknown event type: <type>")`` from their event-type lookup
+# for the reasoning-summary deltas this channel exists to read -- the answer text
+# delta still resolves to ``OutputTextDeltaEvent`` there, so what those builds lose
+# is the reasoning trace, not the stream. Reasoning is a REQUIRED role, so the
+# channel must report UNAVAILABLE and callers must degrade to chat-completions --
+# which still carries the text -- not fail once per turn on a reasoning trace
+# declared as working.
 
 #: What litellm 1.63-1.67 have no model for, per the reproduction: the reasoning
-#: deltas and the answer text delta.
+#: deltas only (the answer text delta still resolves to ``OutputTextDeltaEvent``).
 _RAISING_BUILD_UNKNOWN_TYPES = (
-    "response.output_text.delta",
     "response.reasoning_summary_text.delta",
     "response.reasoning_text.delta",
 )
@@ -2819,7 +2906,6 @@ def test_responses_channel_unavailable_when_litellm_cannot_model_what_it_reads()
         _raising_event_registry(_RAISING_BUILD_UNKNOWN_TYPES)
     ) as caps:
         modelling = caps.responses_event_modelling()
-        assert modelling.tolerates_unknown_types is False
         assert set(modelling.unmodellable_event_types) == set(
             _RAISING_BUILD_UNKNOWN_TYPES
         )
@@ -2845,7 +2931,7 @@ async def test_copilotkit_responses_refuses_a_build_that_cannot_model_what_it_re
                 messages=[{"role": "user", "content": "hi"}],
                 reasoning={"effort": "medium", "summary": "auto"},
             )
-    assert "response.output_text.delta" in str(caught.value)
+    assert "response.reasoning_summary_text.delta" in str(caught.value)
     assert "acompletion" in str(caught.value)
 
 

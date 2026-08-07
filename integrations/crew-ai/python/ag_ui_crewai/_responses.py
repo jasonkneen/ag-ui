@@ -119,7 +119,11 @@ def _classify_parse_failure(exc: ValueError) -> Tuple[str, str]:
             # the event, so it cannot be shown harmless to drop.
             return _UNATTRIBUTABLE, message
         return _PROPAGATE, message
-    event_type = match.group(1)
+    # Strip quotes/punctuation a future litellm might wrap the type in
+    # (``Unknown event type: 'response.output_text.delta'``): only the ends are
+    # stripped, so the dotted type survives, and a load-bearing type is still
+    # recognised instead of silently downgraded to a harmless skip.
+    event_type = match.group(1).strip("\"'`.,;:!?()[]{}<>")
     role = event_role(event_type)
     if role is None:
         return _SKIP, event_type
@@ -147,10 +151,11 @@ def responses_channel_available() -> bool:
     * litellm can MODEL every Responses event type this bridge must read. litellm
       1.63-1.67 (inside this package's declared ``litellm>=1.60.2`` floor) raise
       ``ValueError("Unknown event type: <type>")`` for a type they have no model
-      for, and on those builds the reasoning-summary deltas and the answer text
-      delta this channel exists to read are exactly those types. Such a stream
-      cannot be read at all, so the channel reports unavailable there rather than
-      failing once per turn on a channel we advertised as working.
+      for, and on those builds the reasoning-summary deltas this bridge must read
+      are exactly those types (the answer text delta still models). Reasoning is a
+      REQUIRED role, so the channel reports unavailable there and callers degrade
+      to chat-completions -- which still carries the text -- rather than failing
+      once per turn on a reasoning trace we advertised as working.
 
     False means callers must stay on chat-completions.
     """

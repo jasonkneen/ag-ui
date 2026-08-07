@@ -371,12 +371,14 @@ def responses_entrypoint():
 # NO model for is the difference that decides whether this channel is usable:
 #
 # * litellm 1.63-1.67 (inside this package's declared ``litellm>=1.60.2`` floor)
-#   RAISE ``ValueError("Unknown event type: <type>")`` out of the stream
-#   iterator, and on those builds the reasoning-summary deltas and the answer
-#   text delta this channel exists to read are exactly the unknown types. The
-#   bridge cannot read such a stream at all, so the honest declaration is
-#   "channel unavailable" and the honest behaviour is for callers to degrade to
-#   chat-completions -- not to die once per turn on a channel we advertised.
+#   RAISE ``ValueError("Unknown event type: <type>")`` out of the stream iterator
+#   for the reasoning-summary deltas this channel exists to read -- they are
+#   exactly the types those builds have no model for. (The answer text delta
+#   still models there, so what is lost is the reasoning trace, not the stream.)
+#   Reasoning is a REQUIRED role, so the honest declaration is "channel
+#   unavailable" and the honest behaviour is for callers to degrade to
+#   chat-completions -- which still carries the text -- not to die once per turn
+#   on a reasoning trace we advertised.
 # * Newer builds return their extras-allowing catch-all model instead, so an
 #   unknown type still arrives with its payload intact and the channel works.
 #
@@ -386,17 +388,14 @@ def responses_entrypoint():
 # type (``model_roles`` below), which is what keeps that decision off a
 # hand-maintained list of model names.
 _RESPONSES_EVENT_MODEL_RESOLVERS = [
-    # (module, holder class or None, attribute)
+    # (module, holder class or None, attribute). One home today: the lookup lives
+    # only on ``OpenAIResponsesAPIConfig``. The list stays a list so a build that
+    # re-homes it can be added here, but a base-class fallback was dropped -- it
+    # never carried this method (``hasattr`` is False on 1.63, 1.72 and 1.80), so
+    # it only hid that this is a single point of failure.
     ("litellm.llms.openai.responses.transformation", "OpenAIResponsesAPIConfig",
      "get_event_model_class"),
-    ("litellm.llms.base_llm.responses.transformation", "BaseResponsesAPIConfig",
-     "get_event_model_class"),
 ]
-
-#: A type no registry can have a model for, used to ask the installed litellm what
-#: it does with an unknown one. Namespaced so it cannot collide with a real event
-#: type a future Responses API adds.
-_UNKNOWN_EVENT_TYPE_PROBE = "response.__ag_ui_crewai_capability_probe__"
 
 
 def _resolve_responses_event_model_resolver() -> Any:
@@ -420,7 +419,10 @@ def _resolve_responses_event_model_resolver() -> Any:
         except Exception:  # noqa: BLE001 - an optional probe must not fail the import
             _LOGGER.warning(
                 "ag-ui-crewai could not probe %s for the Responses event-model "
-                "lookup; the Responses channel reports unavailable.",
+                "lookup; the channel stays available (see "
+                "probe_responses_event_modelling), but a parse failure can no "
+                "longer be attributed to an event role and is reported rather "
+                "than assumed harmless.",
                 module_name,
                 exc_info=True,
             )
@@ -459,9 +461,6 @@ def _resolve_event_model(resolver: Any, event_type: str) -> Any:
 class ResponsesEventModelling:
     """What the installed litellm can MODEL of the Responses event vocabulary.
 
-    ``tolerates_unknown_types``
-        The registry answers for a type it has no model for (the newer builds'
-        catch-all) instead of raising.
     ``unmodellable_event_types``
         The types in ``REQUIRED_ROLES`` this build can neither model nor serve
         with a catch-all. Non-empty means the channel cannot be read.
@@ -479,7 +478,6 @@ class ResponsesEventModelling:
     """
 
     resolver_available: bool
-    tolerates_unknown_types: bool
     unmodellable_event_types: Tuple[str, ...]
     model_roles: Mapping[str, str]
 
@@ -502,12 +500,10 @@ def probe_responses_event_modelling(resolver: Any) -> ResponsesEventModelling:
     if resolver is None:
         return ResponsesEventModelling(
             resolver_available=False,
-            tolerates_unknown_types=False,
             unmodellable_event_types=(),
             model_roles={},
         )
 
-    catch_all = _resolve_event_model(resolver, _UNKNOWN_EVENT_TYPE_PROBE)
     model_roles: Dict[str, str] = {}
     unmodellable: list[str] = []
     for event_type, role in EVENT_ROLES.items():
@@ -523,7 +519,6 @@ def probe_responses_event_modelling(resolver: Any) -> ResponsesEventModelling:
             model_roles[name] = role
     return ResponsesEventModelling(
         resolver_available=True,
-        tolerates_unknown_types=catch_all is not None,
         unmodellable_event_types=tuple(sorted(unmodellable)),
         model_roles=model_roles,
     )

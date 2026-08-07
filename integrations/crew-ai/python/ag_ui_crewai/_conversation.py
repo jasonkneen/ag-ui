@@ -127,20 +127,19 @@ def overlay_conversational_persistence(
 
 
 def force_per_turn_trace_finalization(flow: Any) -> None:
-    """Make each AG-UI request own a complete CrewAI flow trace lifecycle."""
-    object.__setattr__(flow, "defer_trace_finalization", False)
-    definition_factory = getattr(type(flow), "flow_definition", None)
-    definition = definition_factory() if callable(definition_factory) else None
-    conversational = getattr(definition, "conversational", None)
-    if conversational is not None and hasattr(
-        conversational,
-        "defer_trace_finalization",
-    ):
-        conversational.defer_trace_finalization = False
+    """Make each AG-UI request own a complete CrewAI flow trace lifecycle.
 
-    config = getattr(type(flow), "conversational_config", None)
-    if config is not None and hasattr(config, "defer_trace_finalization"):
-        config.defer_trace_finalization = False
+    CrewAI reads the deferral decision through ``_should_defer_trace_finalization``
+    (base Flow: the instance ``defer_trace_finalization`` attr; the conversational
+    mixin: that OR the static ``conversational`` definition). Override the seam on
+    the INSTANCE and set the instance attr, rather than flipping the shared
+    ``conversational_config`` / class-cached flow definition -- serving one request
+    must not permanently rewrite deferral for every other instance of the flow
+    class in the same process.
+    """
+    object.__setattr__(flow, "defer_trace_finalization", False)
+    if hasattr(type(flow), "_should_defer_trace_finalization"):
+        object.__setattr__(flow, "_should_defer_trace_finalization", lambda: False)
 
 
 class SyncStreamSessionAdapter:
