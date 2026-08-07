@@ -116,7 +116,9 @@ class TestInterruptOutcome:
     async def test_pause_emits_interrupt_outcome(self):
         """A native interrupt produces RUN_FINISHED with an interrupt outcome."""
         strands_interrupt = StrandsInterrupt(
-            id="int-1", name="confirm", reason={"summary": "delete all"}
+            id="v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+            reason={"summary": "delete all"},
         )
         core = _MockStrandsCore(
             terminal_events=[{"result": _agent_result_with_interrupt([strands_interrupt])}],
@@ -133,11 +135,15 @@ class TestInterruptOutcome:
         assert len(finished.outcome.interrupts) == 1
 
         agui_interrupt = finished.outcome.interrupts[0]
-        assert agui_interrupt.id == "int-1"
-        # Strands interrupt *name* maps to the categorical AG-UI reason.
-        assert agui_interrupt.reason == "confirm"
-        # The free-form Strands reason object is preserved under metadata.
-        assert agui_interrupt.metadata == {"strands_reason": {"summary": "delete all"}}
+        assert agui_interrupt.id == "v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000"
+        # Every Strands interrupt is tool-call-bound; id embeds the toolUseId.
+        assert agui_interrupt.tool_call_id == "tu-1"
+        assert agui_interrupt.reason == "tool_call"
+        # The free-form Strands name/reason are preserved under metadata.
+        assert agui_interrupt.metadata == {
+            "strands_name": "confirm",
+            "strands_reason": {"summary": "delete all"},
+        }
 
     @pytest.mark.asyncio
     async def test_no_interrupt_finishes_bare(self):
