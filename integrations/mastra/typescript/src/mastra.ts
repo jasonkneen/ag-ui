@@ -576,6 +576,15 @@ export class MastraAgent extends AbstractAgent {
   useProcessedFinalText: boolean;
 
   /**
+   * Abort controller for the in-flight run. Created per subscription in
+   * {@link run}, forwarded into Mastra as `abortSignal` (both `stream` and
+   * `resumeStream`, local and remote), and fired from the Observable teardown
+   * so unsubscribing actually stops generation instead of billing the run to
+   * completion. Also fired by {@link abortRun}.
+   */
+  private abortController?: AbortController;
+
+  /**
    * Suffix appended to a turn's base (Mastra-stored) messageId to key the
    * SEPARATE AG-UI message that carries assistant text streamed AFTER a tool
    * call in the same turn. See {@link continuationMessageId} and the ordering
@@ -657,6 +666,11 @@ export class MastraAgent extends AbstractAgent {
     const pendingInterrupts: Interrupt[] = [];
 
     return new Observable<BaseEvent>((subscriber) => {
+      // Cancellation channel for this subscription. The teardown below fires it
+      // so unsubscribing (or abortRun()) propagates into the Mastra stream.
+      const abortController = new AbortController();
+      this.abortController = abortController;
+
       const run = async () => {
         const runStartedEvent: RunStartedEvent = {
           type: EventType.RUN_STARTED,
@@ -762,6 +776,9 @@ export class MastraAgent extends AbstractAgent {
               resource: this.resourceId ?? input.threadId,
             },
             requestContext: resumeRequestContext,
+            // Forwarded to both the local and remote resumeStream so an
+            // unsubscribe mid-resume stops generation (#2288).
+            abortSignal: abortController.signal,
           };
           if (this.tracingOptions) {
             resumeOptions.tracingOptions = this.tracingOptions;
@@ -921,36 +938,62 @@ export class MastraAgent extends AbstractAgent {
             pendingInterrupts,
           );
 
-          await this.streamMastraAgent(input, {
-            ...streamCallbacks,
-            onError: (error) => {
-              subscriber.error(error);
-            },
-            onRunFinished: async (traceId) => {
-              await this.emitWorkingMemorySnapshot(subscriber, input.threadId);
-              subscriber.next(
-                this.makeRunFinishedEvent(
+          await this.streamMastraAgent(
+            input,
+            {
+              ...streamCallbacks,
+              onError: (error) => {
+                subscriber.error(error);
+              },
+              onRunFinished: async (traceId) => {
+                await this.emitWorkingMemorySnapshot(
+                  subscriber,
                   input.threadId,
-                  input.runId,
-                  pendingInterrupts,
-                  traceId,
-                ),
-              );
-              subscriber.complete();
+                );
+                subscriber.next(
+                  this.makeRunFinishedEvent(
+                    input.threadId,
+                    input.runId,
+                    pendingInterrupts,
+                    traceId,
+                  ),
+                );
+                subscriber.complete();
+              },
             },
-          });
+            abortController.signal,
+          );
         } catch (error) {
           subscriber.error(error);
         }
       };
 
-      run().catch((err) => {
-        if (subscriber.closed) return;
-        subscriber.error(err);
-      });
+      run()
+        .catch((err) => {
+          if (subscriber.closed) return;
+          subscriber.error(err);
+        })
+        .finally(() => {
+          if (this.abortController === abortController) {
+            this.abortController = undefined;
+          }
+        });
 
-      return () => {};
+      // Teardown runs on unsubscribe AND on normal completion; aborting an
+      // already-finished stream is a no-op, so this is safe in both cases.
+      return () => abortController.abort();
     });
+  }
+
+  /**
+   * Cancels the in-flight run, stopping generation at the Mastra side.
+   * Mirrors the teardown path so a programmatic abort and an unsubscribe
+   * behave identically.
+   */
+  public override abortRun(): void {
+    this.abortController?.abort();
+    this.abortController = undefined;
+    super.abortRun();
   }
 
   isLocalMastraAgent(
@@ -2612,6 +2655,7 @@ export class MastraAgent extends AbstractAgent {
       onError,
       onRunFinished,
     }: MastraAgentStreamOptions,
+    abortSignal?: AbortSignal,
   ): Promise<void> {
     const clientTools = tools.reduce(
       (acc, tool) => {
@@ -2710,6 +2754,8 @@ export class MastraAgent extends AbstractAgent {
           clientTools,
           requestContext,
           ...(a2uiToolsets ? { toolsets: a2uiToolsets } : {}),
+          // Cancellation from the run() Observable teardown (#2288).
+          ...(abortSignal ? { abortSignal } : {}),
         };
         // Pipe the background-task lifecycle into this run's fullStream (and
         // re-enter the loop on completion) when opted in. Only meaningful for
@@ -2780,6 +2826,8 @@ export class MastraAgent extends AbstractAgent {
           runId,
           clientTools,
           requestContext,
+          // Cancellation from the run() Observable teardown (#2288).
+          ...(abortSignal ? { abortSignal } : {}),
         };
         if (this.tracingOptions) {
           streamOptions.tracingOptions = this.tracingOptions;
