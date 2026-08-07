@@ -284,15 +284,19 @@ function Recipe() {
   // render reads, so the indicator always commits at least once.
   const changedKeysRef = useRef<string[]>([]);
 
-  // Iterating Recipe by dynamic key needs an index-signature view of it.
-  const agentRecipe = agentState?.recipe as unknown as Record<string, unknown> | undefined;
-  const recipeRecord = recipe as unknown as Record<string, unknown>;
-  const newRecipeRecord = newRecipeState as unknown as Record<string, unknown>;
-
+  // Iterating Recipe by dynamic key needs an index-signature view of it. The
+  // casts are repeated per access rather than hoisted: hoisting would read
+  // `agentState.recipe` once per render where this reads it per key, which is
+  // observable if that property is ever accessor- or Proxy-backed.
   for (const key in recipe) {
-    if (agentRecipe && agentRecipe[key] !== undefined && agentRecipe[key] !== null) {
-      let agentValue = agentRecipe[key];
-      const recipeValue = recipeRecord[key];
+    if (
+      agentState &&
+      agentState.recipe &&
+      (agentState.recipe as unknown as Record<string, unknown>)[key] !== undefined &&
+      (agentState.recipe as unknown as Record<string, unknown>)[key] !== null
+    ) {
+      let agentValue = (agentState.recipe as unknown as Record<string, unknown>)[key];
+      const recipeValue = (recipe as unknown as Record<string, unknown>)[key];
 
       // Check if agentValue is a string and replace \n with actual newlines
       if (typeof agentValue === "string") {
@@ -300,7 +304,7 @@ function Recipe() {
       }
 
       if (JSON.stringify(agentValue) !== JSON.stringify(recipeValue)) {
-        newRecipeRecord[key] = agentValue;
+        (newRecipeState as unknown as Record<string, unknown>)[key] = agentValue;
         newChangedKeys.push(key);
       }
     }
