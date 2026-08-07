@@ -126,7 +126,16 @@
       "runId": "run_Id_1",
       "outcome": {
         "type": "success"
-      }
+      },
+      "usage": [
+        {
+          "inputTokens": 184,
+          "outputTokens": 116,
+          "totalTokens": 300,
+          "reasoningTokens": 64,
+          "cachedInputTokens": 0
+        }
+      ]
     }
   },
   {
@@ -1392,7 +1401,16 @@
       "runId": "run_Id_2",
       "outcome": {
         "type": "success"
-      }
+      },
+      "usage": [
+        {
+          "inputTokens": 243,
+          "outputTokens": 172,
+          "totalTokens": 415,
+          "reasoningTokens": 128,
+          "cachedInputTokens": 0
+        }
+      ]
     }
   }
 ]
