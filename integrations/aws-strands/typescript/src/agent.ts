@@ -62,15 +62,40 @@ const LOG_PREFIX = "[@ag-ui/aws-strands]";
 const uuid = (): string => randomUUID();
 
 /**
- * Lifecycle/plumbing events the RAW fallback deliberately stays silent about.
+ * Events the RAW fallback deliberately stays silent about.
  *
- * The TS SDK surfaces hook brackets the Python `stream_async` generator never
- * emits, so these are the TS counterpart of Python's `init_event_loop` /
- * `start_event_loop` / `start` skips: they carry no payload of their own and
- * only bracket work that is already reported through mapped events. Everything
- * else falls through to a RAW event (issue #2291).
+ * Two groups, both of which would be noise rather than new information:
+ *
+ * 1. Lifecycle/plumbing brackets. The TS SDK surfaces hook brackets the Python
+ *    `stream_async` generator never emits, so these are the TS counterpart of
+ *    Python's `init_event_loop` / `start_event_loop` / `start` skips: they carry
+ *    no payload of their own and only bracket work already reported by mapped
+ *    events.
+ *
+ * 2. Payload-carrying events whose payload is *already* on the wire under a
+ *    mapped AG-UI event. Forwarding these as RAW duplicates content the client
+ *    has seen — the same class of bug as Python re-emitting `ModelMessageEvent`
+ *    after the text has already streamed:
+ *      - `agentResultEvent`  — terminal result; already `RUN_FINISHED`.
+ *      - `modelMessageEvent` — the assembled assistant message, already streamed
+ *                              as `TEXT_MESSAGE_CONTENT` / `TOOL_CALL_*`.
+ *      - `toolResultEvent`   — already mapped from `afterToolCallEvent` to
+ *                              `TOOL_CALL_RESULT`.
+ *      - `messageAddedEvent` — framework-side history bookkeeping; the client's
+ *                              history comes from `MESSAGES_SNAPSHOT`.
+ *
+ * Deliberately NOT skipped — these carry information no mapped AG-UI event
+ * conveys, which is exactly what the RAW fallback exists for (issue #2291):
+ *   - `modelMetadataEvent`  — token usage and latency metrics, which the AG-UI
+ *                             event set has no equivalent for.
+ *   - `modelRedactionEvent` — a guardrail redaction notice. Losing it silently
+ *                             would leave a client unable to tell redacted
+ *                             output from an ordinary short answer.
+ *
+ * Everything else falls through to a RAW event.
  */
 const RAW_SKIPPED_EVENT_KINDS = new Set<string>([
+  // 1. Lifecycle / plumbing brackets.
   "initializedEvent",
   "beforeInvocationEvent",
   "afterInvocationEvent",
@@ -81,7 +106,64 @@ const RAW_SKIPPED_EVENT_KINDS = new Set<string>([
   "beforeToolCallEvent",
   "modelMessageStartEvent",
   "modelMessageStopEvent",
+  // 2. Payloads already represented by a mapped AG-UI event.
+  "agentResultEvent",
+  "modelMessageEvent",
+  "toolResultEvent",
+  "messageAddedEvent",
 ]);
+
+/**
+ * Context keys Strands hangs off its events that are never model output.
+ *
+ * `agent` is a live `LocalAgent` — system prompt, full message history, model
+ * configuration — and `invocationState` transitively holds the same. Hook events
+ * define a `toJSON()` that drops both, but the model-layer events that reach the
+ * RAW fallback after unwrapping (`modelMetadataEvent` and friends) do not, so
+ * the keys are stripped by name rather than trusted to `toJSON()`.
+ *
+ * Mirrors `_RAW_INVOCATION_STATE_KEYS` in the Python adapter.
+ */
+const RAW_STRIPPED_EVENT_KEYS = new Set<string>([
+  "agent",
+  "invocationState",
+  "requestState",
+]);
+
+/**
+ * Reduce a Strands event to a JSON-safe RAW payload, or `undefined` to drop it.
+ *
+ * Two passes, both mandatory:
+ *  1. Drop the context keys above, so no agent internals reach a client.
+ *  2. Round-trip through JSON, so what we emit is plain data an in-process
+ *     consumer cannot follow back to a live object.
+ *
+ * Anything that will not serialize is dropped rather than coerced. Coercing
+ * unserializable values to strings is precisely how an agent's internals would
+ * end up on the wire, so it is never an option here.
+ */
+function sanitizeRawEvent(event: unknown): unknown | undefined {
+  if (!event || typeof event !== "object") return undefined;
+
+  const payload: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(event as Record<string, unknown>)) {
+    if (RAW_STRIPPED_EVENT_KEYS.has(key)) continue;
+    payload[key] = value;
+  }
+  if (Object.keys(payload).length === 0) return undefined;
+
+  try {
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) return undefined;
+    const decoded = JSON.parse(serialized) as Record<string, unknown>;
+    // A nested `toJSON()` could reintroduce a stripped key; strip once more on
+    // the decoded, plain-data copy.
+    for (const key of RAW_STRIPPED_EVENT_KEYS) delete decoded[key];
+    return decoded;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Structural interface for a Strands multi-agent orchestrator (Graph/Swarm).
@@ -2313,13 +2395,21 @@ export class StrandsAgent {
           // (LangGraph, watsonx, a2a) already does. The lifecycle brackets in
           // `RAW_SKIPPED_EVENT_KINDS` stay silent, as they do in Python.
           if (kind && RAW_SKIPPED_EVENT_KINDS.has(kind)) continue;
+          const rawPayload = sanitizeRawEvent(event);
+          if (rawPayload === undefined) {
+            this._log.warn(
+              `${LOG_PREFIX} Dropping unserializable Strands event from RAW ` +
+                `forwarding (threadId=${inputData.threadId}, kind=${kind ?? "unknown"})`,
+            );
+            continue;
+          }
           this._log.debug(
             `${LOG_PREFIX} Unmapped Strands event forwarded as RAW ` +
               `(threadId=${inputData.threadId}, kind=${kind ?? "unknown"})`,
           );
           yield {
             type: EventType.RAW,
-            event,
+            event: rawPayload,
             source: "strands",
           } as unknown as BaseEvent;
         }

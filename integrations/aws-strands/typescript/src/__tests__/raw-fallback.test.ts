@@ -98,4 +98,104 @@ describe("RAW fallback for unmapped Strands events", () => {
     expect(deltas).toBe("hello");
     expect(rawEvents(events as Array<{ type: string }>)).toHaveLength(1);
   });
+
+  it("does not duplicate payloads that a mapped AG-UI event already carries", async () => {
+    // Each of these carries content the client has already received under a
+    // mapped event; forwarding them as RAW re-sends it. `agentResultEvent` and
+    // `modelMessageEvent` in particular would re-deliver the whole assistant
+    // message that just streamed as TEXT_MESSAGE_CONTENT.
+    const duplicated = [
+      "agentResultEvent",
+      "modelMessageEvent",
+      "toolResultEvent",
+      "messageAddedEvent",
+    ];
+
+    const agent = scriptedStrandsAgent([
+      {
+        type: "modelContentBlockDeltaEvent",
+        delta: { type: "textDelta", text: "hello" },
+      } as unknown as AgentStreamEvent,
+      ...duplicated.map(
+        (type) =>
+          ({
+            type,
+            message: { role: "assistant", content: [{ text: "hello" }] },
+            result: { stopReason: "end_turn" },
+          }) as unknown as AgentStreamEvent,
+      ),
+    ]);
+    const events = await collect(agent);
+
+    const leaked = rawEvents(events as Array<{ type: string }>)
+      .map((e) => e.event?.type)
+      .filter((type) => type !== undefined && duplicated.includes(type));
+
+    expect(leaked).toEqual([]);
+  });
+
+  it("still forwards events carrying information no mapped event conveys", async () => {
+    // The counterpart of the skip list: usage metrics and guardrail redactions
+    // have no AG-UI equivalent, so dropping them silently is the very bug
+    // issue #2291 reports. This pins the deliberate decision to forward them.
+    const agent = scriptedStrandsAgent([
+      {
+        type: "modelMetadataEvent",
+        usage: { inputTokens: 12, outputTokens: 7, totalTokens: 19 },
+        metrics: { latencyMs: 42 },
+      } as unknown as AgentStreamEvent,
+      {
+        type: "modelRedactionEvent",
+        outputRedaction: { text: "[redacted]" },
+      } as unknown as AgentStreamEvent,
+    ]);
+    const events = await collect(agent);
+
+    const kinds = rawEvents(events as Array<{ type: string }>).map(
+      (e) => e.event?.type,
+    );
+    expect(kinds).toContain("modelMetadataEvent");
+    expect(kinds).toContain("modelRedactionEvent");
+  });
+
+  it("never forwards the live agent or invocationState on a RAW payload", async () => {
+    // Strands hook events hold a live `agent` reference (system prompt, message
+    // history, model config) next to their payload. It must not reach a client.
+    const liveAgent = {
+      systemPrompt: "TOP SECRET SYSTEM PROMPT",
+      messages: [{ role: "user", content: [{ text: "private history" }] }],
+    };
+    const agent = scriptedStrandsAgent([
+      {
+        type: "modelMetadataEvent",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        agent: liveAgent,
+        invocationState: { requestState: {}, agent: liveAgent },
+      } as unknown as AgentStreamEvent,
+    ]);
+    const events = await collect(agent);
+
+    const raws = rawEvents(events as Array<{ type: string }>);
+    expect(raws).toHaveLength(1);
+
+    const serialized = JSON.stringify(raws[0].event);
+    expect(serialized).not.toContain("TOP SECRET SYSTEM PROMPT");
+    expect(serialized).not.toContain("private history");
+    expect(raws[0].event).not.toHaveProperty("agent");
+    expect(raws[0].event).not.toHaveProperty("invocationState");
+  });
+
+  it("drops an unserializable payload instead of emitting it", async () => {
+    // A payload that cannot be encoded must not reach the encoder: on the
+    // Python side the equivalent failure aborts the whole SSE stream. Dropping
+    // is the only safe outcome — coercing values to strings is what would put
+    // an agent's internals on the wire.
+    const cyclic: Record<string, unknown> = { type: "modelMetadataEvent" };
+    cyclic.self = cyclic;
+
+    const agent = scriptedStrandsAgent([cyclic as unknown as AgentStreamEvent]);
+    const events = await collect(agent);
+
+    expect(rawEvents(events as Array<{ type: string }>)).toEqual([]);
+  });
 });

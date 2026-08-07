@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
-from typing import Any, AsyncIterator, Dict, List, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from strands import Agent as StrandsAgentCore
 from strands.session import SessionManager
@@ -630,6 +630,66 @@ def _coerce_id(value: Any) -> str:
 _INNER_TOOL_ID_SEP = "::"
 
 
+# Keys Strands' event loop injects into the *payload* of any event carrying a
+# ``delta``: ``ModelStreamEvent.prepare()`` does ``self.update(invocation_state)``
+# (strands/types/_events.py), which merges the live ``Agent`` object, telemetry
+# handles and cycle bookkeeping into the event dict. None of it is model output,
+# and ``agent`` in particular carries the system prompt, the full message history
+# and the model config — it must never reach a browser. Stripped by name so the
+# RAW payload keeps only the provider's own fields.
+_RAW_INVOCATION_STATE_KEYS = frozenset(
+    {
+        "agent",
+        "event_loop_cycle_id",
+        "event_loop_cycle_trace",
+        "event_loop_cycle_span",
+        "event_loop_parent_span",
+        "event_loop_parent_cycle_id",
+        "request_state",
+    }
+)
+
+# Terminal lifecycle events that carry no payload a frontend can use.
+# ``result`` is ``AgentResultEvent`` (an ``AgentResult`` holding
+# ``EventLoopMetrics``) and ``stop`` is ``EventLoopStopEvent`` (a tuple of the
+# same). Both are the end-of-run marker already represented by RUN_FINISHED, so
+# forwarding them would be duplicate noise even if they were serializable.
+_RAW_TERMINAL_KEYS = frozenset({"result", "stop"})
+
+
+def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a JSON-safe RAW payload for ``event``, or ``None`` to drop it.
+
+    Sanitizing is deliberately an allow-by-serializability filter, never a
+    coercion: nothing is stringified to force it through. Coercing (e.g.
+    ``json.dumps(..., default=str)``) would ship the ``repr`` of the live
+    ``Agent`` — system prompt, conversation history, model configuration — to
+    every connected client. A payload that will not encode is dropped instead.
+    """
+    if any(key in event for key in _RAW_TERMINAL_KEYS):
+        return None
+
+    payload = {
+        key: value
+        for key, value in event.items()
+        if key not in _RAW_INVOCATION_STATE_KEYS
+    }
+    if not payload:
+        return None
+
+    try:
+        # Strict round-trip: no ``default=`` hook, so any non-JSON-native object
+        # raises here rather than being silently rendered. The decoded result is
+        # what gets forwarded, guaranteeing only plain JSON types reach the wire.
+        return json.loads(json.dumps(payload))
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "Dropping unserializable Strands event from RAW forwarding "
+            f"(keys={sorted(payload)}): {exc}"
+        )
+        return None
+
+
 async def _forward_inner_agent_events(
     inner_event: Any,
     parent_tool_use: Dict[str, Any],
@@ -672,6 +732,11 @@ async def _forward_inner_agent_events(
                 "name": tool_use["name"],
                 "sent_len": 0,
                 "ended": False,
+                # Which parent tool call owns this inner call. The dict is
+                # shared across every parent agent-as-tool call in the run, so
+                # the contentBlockStop handler below needs this to avoid
+                # closing a sibling parent's inner call.
+                "parent_id": parent_id,
             }
             yield ToolCallStartEvent(
                 type=EventType.TOOL_CALL_START,
@@ -687,11 +752,21 @@ async def _forward_inner_agent_events(
             entry["sent_len"] = len(raw_str)
         return
 
-    # Inner content block closed — close the newest still-open inner call.
-    # Mirrors the parent loop, which also closes one call per contentBlockStop.
+    # Inner content block closed — close the newest still-open inner call
+    # *belonging to this parent*. Mirrors the parent loop, which also closes one
+    # call per contentBlockStop.
+    #
+    # The scoping is load-bearing: ``inner_tool_calls_seen`` is shared across
+    # every agent-as-tool call in the run, and Strands executes a parallel tool
+    # batch concurrently, so two sub-agents interleave their streams here. An
+    # unscoped "newest still-open call" search lets parent A's stop close
+    # parent B's inner call — B's tool card resolves early and A's never gets a
+    # TOOL_CALL_END at all, leaving it spinning forever on the frontend.
     model_chunk = inner_event.get("event")
     if isinstance(model_chunk, dict) and "contentBlockStop" in model_chunk:
         for call_id, entry in reversed(list(inner_tool_calls_seen.items())):
+            if entry.get("parent_id") != parent_id:
+                continue
             if not entry["ended"]:
                 entry["ended"] = True
                 yield ToolCallEndEvent(
@@ -3364,19 +3439,41 @@ class StrandsAgent:
                                         )
                                         pending_halt = True
 
-                    # Anything the chain above does not map gets forwarded
-                    # verbatim as a RAW event rather than being dropped without
-                    # a trace (issue #2291). Bedrock citation deltas arrive
-                    # here, as do provider extensions this adapter predates.
-                    # The deliberate lifecycle skips at the top of the loop
-                    # short-circuit before reaching this branch and stay silent.
+                    # Strands' ``ModelMessageEvent`` re-announces the assistant
+                    # turn as a whole once the model finishes it. Every part of
+                    # it has already been streamed — text via
+                    # TEXT_MESSAGE_CONTENT, tool calls via TOOL_CALL_* — and the
+                    # authoritative copy reaches the client through
+                    # MessagesSnapshotEvent. Letting it fall through to RAW would
+                    # re-send the full assistant text a second time, so it is
+                    # skipped explicitly rather than by omission.
+                    elif isinstance(event.get("message"), dict) and event[
+                        "message"
+                    ].get("role") == "assistant":
+                        continue
+
+                    # Anything the chain above does not map gets forwarded as a
+                    # RAW event rather than being dropped without a trace
+                    # (issue #2291). Bedrock citation deltas arrive here, as do
+                    # provider extensions this adapter predates. The deliberate
+                    # lifecycle skips at the top of the loop short-circuit
+                    # before reaching this branch and stay silent.
+                    #
+                    # Sanitizing is mandatory, not defensive: Strands merges the
+                    # live Agent and telemetry handles into delta-bearing events,
+                    # and an unserializable payload aborts the whole SSE stream
+                    # in ``endpoint.py`` (RunErrorEvent + break), costing the
+                    # client its TEXT_MESSAGE_END, snapshots and RUN_FINISHED.
                     else:
+                        raw_payload = _sanitize_raw_event(event)
+                        if raw_payload is None:
+                            continue
                         logger.debug(
-                            f"Unmapped Strands event forwarded as RAW (thread_id={input_data.thread_id}): {event}"
+                            f"Unmapped Strands event forwarded as RAW (thread_id={input_data.thread_id}): {raw_payload}"
                         )
                         yield RawEvent(
                             type=EventType.RAW,
-                            event=event,
+                            event=raw_payload,
                             source="strands",
                         )
 
