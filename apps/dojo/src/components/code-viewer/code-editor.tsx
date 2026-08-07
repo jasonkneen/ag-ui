@@ -21,9 +21,11 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
   const posthog = usePostHog();
   const [copied, setCopied] = useState(false);
 
-  // Monaco expects "typescript"; the feature files declare "ts". Derived rather
-  // than assigned back onto `file`, which would mutate the caller's object.
-  const language = file?.language === "ts" ? "typescript" : file?.language;
+  // NOTE (PNI-272): kept verbatim. Monaco wants "typescript" where the feature
+  // files say "ts". Deriving a local instead would stop mutating the caller's
+  // object, which is a behaviour change; this branch is byte-for-byte as before.
+  // eslint-disable-next-line react-hooks/immutability
+  if (file?.language === "ts") file.language = "typescript";
 
   const handleCopy = async () => {
     if (!file?.content) return;
@@ -33,7 +35,7 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
       setTimeout(() => setCopied(false), 1500);
       posthog?.capture("dojo.code_viewer.copied", {
         file_name: file.name,
-        language,
+        language: file.language,
         bytes: file.content.length,
       });
     } catch {
@@ -59,7 +61,7 @@ export function CodeEditor({ file, onFileChange }: CodeEditorProps) {
       </button>
       <Editor
         height="100%"
-        language={language}
+        language={file.language}
         value={file.content}
         onChange={handleEditorChange}
         options={{

@@ -281,144 +281,6 @@ export default function Subgraphs({ params }: SubgraphsProps) {
   );
 }
 
-interface TravelSectionProps {
-  agentState?: TravelAgentState;
-}
-
-// Current itinerary strip
-function ItineraryStrip({ agentState }: TravelSectionProps) {
-  const selectedFlight = agentState?.itinerary?.flight;
-  const selectedHotel = agentState?.itinerary?.hotel;
-  const hasExperiences = (agentState?.experiences?.length ?? 0) > 0;
-
-  return (
-    <div className="itinerary-strip">
-      <div className="itinerary-label">Current Itinerary:</div>
-      <div className="itinerary-items">
-        <div className="itinerary-item">
-          <span className="item-icon">📍</span>
-          <span>Amsterdam → San Francisco</span>
-        </div>
-        {selectedFlight && (
-          <div className="itinerary-item" data-testid="selected-flight">
-            <span className="item-icon">✈️</span>
-            <span>{selectedFlight.airline} - {selectedFlight.price}</span>
-          </div>
-        )}
-        {selectedHotel && (
-          <div className="itinerary-item" data-testid="selected-hotel">
-            <span className="item-icon">🏨</span>
-            <span>{selectedHotel.name}</span>
-          </div>
-        )}
-        {hasExperiences && (
-          <div className="itinerary-item">
-            <span className="item-icon">🎯</span>
-            <span>{agentState?.experiences?.length ?? 0} experiences planned</span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// Compact agent status - read active_agent from state instead of nodeName
-function AgentStatus({ agentState }: TravelSectionProps) {
-  const activeAgent = agentState?.active_agent || 'supervisor';
-
-  return (
-    <div className="agent-status">
-      <div className="status-label">Active Agent:</div>
-      <div className="agent-indicators">
-        <div className={`agent-indicator ${activeAgent === 'supervisor' ? 'active' : ''}`} data-testid="supervisor-indicator">
-          <span>👨‍💼</span>
-          <span>Supervisor</span>
-        </div>
-        <div className={`agent-indicator ${activeAgent === 'flights' ? 'active' : ''}`} data-testid="flights-agent-indicator">
-          <span>✈️</span>
-          <span>Flights</span>
-        </div>
-        <div className={`agent-indicator ${activeAgent === 'hotels' ? 'active' : ''}`} data-testid="hotels-agent-indicator">
-          <span>🏨</span>
-          <span>Hotels</span>
-        </div>
-        <div className={`agent-indicator ${activeAgent === 'experiences' ? 'active' : ''}`} data-testid="experiences-agent-indicator">
-          <span>🎯</span>
-          <span>Experiences</span>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// Travel details component
-function TravelDetails({ agentState }: TravelSectionProps) {
-  return (
-  <div className="travel-details">
-    <div className="details-section">
-      <h4>✈️ Flight Options</h4>
-      <div className="detail-items">
-        {(agentState?.flights?.length ?? 0) > 0 ? (
-          agentState!.flights.map((flight, index) => (
-            <div key={index} className="detail-item">
-              <strong>{flight.airline}:</strong>
-              <span>{flight.departure} → {flight.arrival} ({flight.duration}) - {flight.price}</span>
-            </div>
-          ))
-        ) : (
-          <p className="no-activities">No flights found yet</p>
-        )}
-        {agentState?.itinerary?.flight && (
-          <div className="detail-tips">
-            <strong>Selected:</strong> {agentState.itinerary.flight.airline} - {agentState.itinerary.flight.price}
-          </div>
-        )}
-      </div>
-    </div>
-
-    <div className="details-section">
-      <h4>🏨 Hotel Options</h4>
-      <div className="detail-items">
-        {(agentState?.hotels?.length ?? 0) > 0 ? (
-          agentState!.hotels.map((hotel, index) => (
-            <div key={index} className="detail-item">
-              <strong>{hotel.name}:</strong>
-              <span>{hotel.location} - {hotel.price_per_night} ({hotel.rating})</span>
-            </div>
-          ))
-        ) : (
-          <p className="no-activities">No hotels found yet</p>
-        )}
-        {agentState?.itinerary?.hotel && (
-          <div className="detail-tips">
-            <strong>Selected:</strong> {agentState.itinerary.hotel.name} - {agentState.itinerary.hotel.price_per_night}
-          </div>
-        )}
-      </div>
-    </div>
-
-    <div className="details-section">
-      <h4>🎯 Experiences</h4>
-      <div className="detail-items">
-        {(agentState?.experiences?.length ?? 0) > 0 ? (
-          agentState!.experiences.map((experience, index) => (
-            <div key={index} className="activity-item">
-              <div className="activity-name">{experience.name}</div>
-              <div className="activity-category">{experience.type}</div>
-              <div className="activity-description">{experience.description}</div>
-              <div className="activity-meta">Location: {experience.location}</div>
-            </div>
-          ))
-        ) : (
-          <p className="no-activities">No experiences planned yet</p>
-        )}
-      </div>
-    </div>
-  </div>
-  );
-}
-
-
 function TravelPlanner() {
   const { isMobile } = useMobileView();
   const { agent } = useAgent({
@@ -457,11 +319,148 @@ function TravelPlanner() {
     render: ({ event, resolve }) => <InterruptHumanInTheLoop event={event} resolve={resolve} />,
   });
 
+  // Current itinerary strip
+  const ItineraryStrip = () => {
+    const selectedFlight = agentState?.itinerary?.flight;
+    const selectedHotel = agentState?.itinerary?.hotel;
+    const hasExperiences = (agentState?.experiences?.length ?? 0) > 0;
+
+    return (
+      <div className="itinerary-strip">
+        <div className="itinerary-label">Current Itinerary:</div>
+        <div className="itinerary-items">
+          <div className="itinerary-item">
+            <span className="item-icon">📍</span>
+            <span>Amsterdam → San Francisco</span>
+          </div>
+          {selectedFlight && (
+            <div className="itinerary-item" data-testid="selected-flight">
+              <span className="item-icon">✈️</span>
+              <span>{selectedFlight.airline} - {selectedFlight.price}</span>
+            </div>
+          )}
+          {selectedHotel && (
+            <div className="itinerary-item" data-testid="selected-hotel">
+              <span className="item-icon">🏨</span>
+              <span>{selectedHotel.name}</span>
+            </div>
+          )}
+          {hasExperiences && (
+            <div className="itinerary-item">
+              <span className="item-icon">🎯</span>
+              <span>{agentState?.experiences?.length ?? 0} experiences planned</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // Compact agent status - read active_agent from state instead of nodeName
+  const AgentStatus = () => {
+    const activeAgent = agentState?.active_agent || 'supervisor';
+
+    return (
+      <div className="agent-status">
+        <div className="status-label">Active Agent:</div>
+        <div className="agent-indicators">
+          <div className={`agent-indicator ${activeAgent === 'supervisor' ? 'active' : ''}`} data-testid="supervisor-indicator">
+            <span>👨‍💼</span>
+            <span>Supervisor</span>
+          </div>
+          <div className={`agent-indicator ${activeAgent === 'flights' ? 'active' : ''}`} data-testid="flights-agent-indicator">
+            <span>✈️</span>
+            <span>Flights</span>
+          </div>
+          <div className={`agent-indicator ${activeAgent === 'hotels' ? 'active' : ''}`} data-testid="hotels-agent-indicator">
+            <span>🏨</span>
+            <span>Hotels</span>
+          </div>
+          <div className={`agent-indicator ${activeAgent === 'experiences' ? 'active' : ''}`} data-testid="experiences-agent-indicator">
+            <span>🎯</span>
+            <span>Experiences</span>
+          </div>
+        </div>
+      </div>
+    )
+  };
+
+  // Travel details component
+  const TravelDetails = () => (
+    <div className="travel-details">
+      <div className="details-section">
+        <h4>✈️ Flight Options</h4>
+        <div className="detail-items">
+          {(agentState?.flights?.length ?? 0) > 0 ? (
+            agentState!.flights.map((flight, index) => (
+              <div key={index} className="detail-item">
+                <strong>{flight.airline}:</strong>
+                <span>{flight.departure} → {flight.arrival} ({flight.duration}) - {flight.price}</span>
+              </div>
+            ))
+          ) : (
+            <p className="no-activities">No flights found yet</p>
+          )}
+          {agentState?.itinerary?.flight && (
+            <div className="detail-tips">
+              <strong>Selected:</strong> {agentState.itinerary.flight.airline} - {agentState.itinerary.flight.price}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="details-section">
+        <h4>🏨 Hotel Options</h4>
+        <div className="detail-items">
+          {(agentState?.hotels?.length ?? 0) > 0 ? (
+            agentState!.hotels.map((hotel, index) => (
+              <div key={index} className="detail-item">
+                <strong>{hotel.name}:</strong>
+                <span>{hotel.location} - {hotel.price_per_night} ({hotel.rating})</span>
+              </div>
+            ))
+          ) : (
+            <p className="no-activities">No hotels found yet</p>
+          )}
+          {agentState?.itinerary?.hotel && (
+            <div className="detail-tips">
+              <strong>Selected:</strong> {agentState.itinerary.hotel.name} - {agentState.itinerary.hotel.price_per_night}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="details-section">
+        <h4>🎯 Experiences</h4>
+        <div className="detail-items">
+          {(agentState?.experiences?.length ?? 0) > 0 ? (
+            agentState!.experiences.map((experience, index) => (
+              <div key={index} className="activity-item">
+                <div className="activity-name">{experience.name}</div>
+                <div className="activity-category">{experience.type}</div>
+                <div className="activity-description">{experience.description}</div>
+                <div className="activity-meta">Location: {experience.location}</div>
+              </div>
+            ))
+          ) : (
+            <p className="no-activities">No experiences planned yet</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="travel-content">
-      <ItineraryStrip agentState={agentState} />
-      <AgentStatus agentState={agentState} />
-      <TravelDetails agentState={agentState} />
+      {/* NOTE (PNI-272): these three stay defined inside TravelPlanner. Hoisting
+          them to module scope gives React stable component identities, which
+          stops the remount-per-render these currently do — a behaviour change. */}
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <ItineraryStrip />
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <AgentStatus />
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <TravelDetails />
     </div>
   );
 }

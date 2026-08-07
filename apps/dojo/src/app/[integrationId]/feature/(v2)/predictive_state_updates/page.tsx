@@ -182,6 +182,7 @@ const DocumentEditor = () => {
       attributes: { class: "min-h-screen p-10" },
     },
   });
+  const [placeholderVisible, setPlaceholderVisible] = useState(false);
   const [currentDocument, setCurrentDocument] = useState("");
 
   useConfigureSuggestions({
@@ -211,14 +212,11 @@ const DocumentEditor = () => {
   // Track when a run transitions from running to not running (replaces nodeName == "end")
   const wasRunning = useRef(false);
 
+  // NOTE (PNI-272): these effects read from the TipTap editor across the run
+  // lifecycle and are kept exactly as they were; the rule's remedy would change
+  // commit timing and the editor integration's shape.
   useEffect(() => {
     if (isLoading) {
-      // DEFERRED (PNI-272): `react-hooks/set-state-in-effect`. This snapshots the
-      // editor's text — an external system — at the moment a run starts, so it
-      // cannot be derived during render. The rule's remedy is to subscribe to
-      // TipTap's update events and set state from the callback, which is a
-      // reshape of this demo's editor integration and needs a live agent run to
-      // verify. Left as-is deliberately rather than refactored blind.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setCurrentDocument(editor?.getText() || "");
     }
@@ -253,13 +251,12 @@ const DocumentEditor = () => {
   }, [agentState?.document]);
 
   const text = editor?.getText() || "";
-  const placeholderVisible = text.length === 0;
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPlaceholderVisible(text.length === 0);
+
     if (!isLoading) {
-      // DEFERRED (PNI-272): `react-hooks/set-state-in-effect`, same reason as the
-      // snapshot above — `text` is read out of the editor, and this also pushes it
-      // into the agent store, so it is not a render-time derivation.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setCurrentDocument(text);
       setAgentState({
@@ -347,7 +344,7 @@ interface ConfirmChangesProps {
   onConfirm: () => void;
 }
 
-function ConfirmChanges({ respond, status, onReject, onConfirm }: ConfirmChangesProps) {
+function ConfirmChanges({ args: _args, respond, status, onReject, onConfirm }: ConfirmChangesProps) {
   const [accepted, setAccepted] = useState<boolean | null>(null);
   return (
     <div

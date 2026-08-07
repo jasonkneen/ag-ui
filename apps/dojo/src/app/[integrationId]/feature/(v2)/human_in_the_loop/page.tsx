@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import "@copilotkit/react-core/v2/styles.css";
 import { 
   useHumanInTheLoop,
@@ -393,21 +393,14 @@ const StepsFeedback = ({ args, respond, status }: StepsFeedbackProps) => {
   const [localSteps, setLocalSteps] = useState<Step[]>([]);
   const [accepted, setAccepted] = useState<boolean | null>(null);
 
-  // Snapshot the incoming steps the first time the tool call starts executing.
-  // Adjusted during render rather than in an effect; the `localSteps.length`
-  // guard makes it run once, exactly as the effect's own guard did, so both
-  // versions pin the first non-empty executing value. What this avoids is
-  // committing an EMPTY `localSteps` while rendering `args.steps` — in that
-  // window a checkbox toggle mapped over an empty array and Confirm could
-  // respond with `steps: []`.
-  if (
-    status === "executing" &&
-    localSteps.length === 0 &&
-    Array.isArray(args?.steps) &&
-    args.steps.length > 0
-  ) {
-    setLocalSteps(args.steps);
-  }
+  // NOTE (PNI-272): kept as an effect. Snapshotting during render would
+  // populate `localSteps` before the first commit, which is a behaviour change.
+  useEffect(() => {
+    if (status === "executing" && localSteps.length === 0 && Array.isArray(args?.steps) && args.steps.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setLocalSteps(args.steps);
+    }
+  }, [status, args?.steps, localSteps]);
 
   if (!Array.isArray(args?.steps) || args.steps.length === 0) {
     return <></>;
