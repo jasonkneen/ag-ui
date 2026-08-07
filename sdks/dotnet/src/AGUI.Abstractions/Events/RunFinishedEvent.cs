@@ -16,10 +16,8 @@ public sealed class RunFinishedEvent : BaseEvent
     public string RunId { get; set; } = string.Empty;
 
     [JsonPropertyName("result")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Result { get; set; }
 
     [JsonPropertyName("outcome")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public RunFinishedOutcome? Outcome { get; set; }
 }

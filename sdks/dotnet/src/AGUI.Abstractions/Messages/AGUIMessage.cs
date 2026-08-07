@@ -10,7 +10,6 @@ namespace AGUI.Abstractions;
 public abstract class AGUIMessage
 {
     [JsonPropertyName("id")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Id { get; set; }
 
     [JsonPropertyName("role")]

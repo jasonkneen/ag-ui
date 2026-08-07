@@ -15,6 +15,5 @@ public sealed class AGUIToolCall
     public AGUIToolCallFunction Function { get; set; } = new();
 
     [JsonPropertyName("encryptedValue")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? EncryptedValue { get; set; }
 }

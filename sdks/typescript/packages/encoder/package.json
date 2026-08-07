@@ -31,6 +31,7 @@
     "@ag-ui/proto": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^20.11.19",
     "@vitest/coverage-istanbul": "^4.0.18",
     "publint": "^0.3.12",
     "@arethetypeswrong/cli": "^0.17.4",
@@ -44,5 +45,15 @@
       "import": "./dist/index.mjs"
     },
     "./package.json": "./package.json"
+  },
+  "nx": {
+    "targets": {
+      "test": {
+        "cache": false
+      },
+      "test:coverage": {
+        "cache": false
+      }
+    }
   }
 }

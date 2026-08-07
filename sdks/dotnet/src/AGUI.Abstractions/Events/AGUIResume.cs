@@ -13,6 +13,5 @@ public sealed class AGUIResume
     public string Status { get; set; } = ResumeStatus.Resolved;
 
     [JsonPropertyName("payload")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Payload { get; set; }
 }

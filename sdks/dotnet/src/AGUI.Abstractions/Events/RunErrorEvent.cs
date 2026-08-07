@@ -12,6 +12,5 @@ public sealed class RunErrorEvent : BaseEvent
     public string Message { get; set; } = string.Empty;
 
     [JsonPropertyName("code")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Code { get; set; }
 }

@@ -20,13 +20,11 @@ public abstract class BaseEvent
     /// Gets or sets the optional timestamp.
     /// </summary>
     [JsonPropertyName("timestamp")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? Timestamp { get; set; }
 
     /// <summary>
     /// Gets or sets the optional raw event data.
     /// </summary>
     [JsonPropertyName("rawEvent")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? RawEvent { get; set; }
 }
