@@ -227,7 +227,8 @@ export interface PriorSurface {
  * matching surface is found.
  */
 export function findPriorSurface(
-  messages: Array<unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- published signature; see PrepareA2UIRequestInput.messages
+  messages: Array<any>,
   surfaceId: string,
 ): PriorSurface | undefined {
   // Accumulate the surface's state across the walk, newest-to-oldest. For each
@@ -735,7 +736,12 @@ export interface PrepareA2UIRequestInput {
   /** Raw ``changes`` arg from the planner. */
   changes?: string;
   /** Conversation history with the current (unbalanced) tool call stripped. */
-  messages: Array<unknown>;
+  // DEFERRED (PNI-272): stays `any` because this is published API. Narrowing it
+  // to `unknown` compiles for callers that construct this, but breaks any
+  // consumer that reads a message back off it — a deliberate API decision, not a
+  // lint repair.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  messages: Array<any>;
   /** The agent's run state (read for context + catalog via buildContextPrompt). */
   state: Record<string, unknown>;
   /**

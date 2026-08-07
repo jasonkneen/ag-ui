@@ -254,7 +254,10 @@ export abstract class AbstractAgent {
     }
   }
 
-  protected connect(_input: RunAgentInput): Observable<BaseEvent> {
+  // `input` is part of the published signature: renaming it to `_input` changes
+  // the emitted .d.ts that consumers see, so the directive goes here instead.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected connect(input: RunAgentInput): Observable<BaseEvent> {
     throw new AGUIConnectNotImplementedError();
   }
   public async connectAgent(
