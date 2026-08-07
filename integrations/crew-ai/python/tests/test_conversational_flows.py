@@ -365,6 +365,10 @@ async def test_sync_stream_session_adapter_aclose_is_non_blocking(caplog):
     await asyncio.sleep(0)
 
     await asyncio.wait_for(adapter.aclose(), timeout=0.1)
+    # The cooperative-stop flag must actually be set, not just logged: the worker
+    # observes it between frames. Without this assertion, deleting
+    # ``self._stop.set()`` leaves the whole mechanism silently removable.
+    assert adapter._stop.is_set()
     assert "requested cooperative cancellation" in caplog.text
     release.set()
     pending.cancel()

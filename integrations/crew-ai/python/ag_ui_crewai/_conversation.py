@@ -221,10 +221,18 @@ class SyncStreamSessionAdapter:
     async def aclose(self) -> None:
         """Request a cooperative stop without blocking the request loop.
 
-        CrewAI's synchronous generator cannot be closed safely from this event-
-        loop thread while its worker is executing (Python raises ``ValueError:
-        generator already executing``). A blocked provider turn may therefore
-        continue until it emits or returns; make that limitation observable.
+        Deliberately weak teardown, stated plainly. CrewAI's synchronous
+        generator cannot be closed safely from this event-loop thread while its
+        worker is executing (Python raises ``ValueError: generator already
+        executing``), so this only sets a flag. Two limits follow: ``_stop`` is
+        observed only BETWEEN frames -- after ``next()`` returns (see the produce
+        loop) -- so a provider call that emits nothing never sees it; and even
+        once seen, the worker still blocks in ``session.close()`` -> CrewAI's
+        ``finally: thread.join()`` for the remainder of the turn. This is weaker
+        than the async StreamFrame path, which cancels the kickoff task outright;
+        conversational is opt-in behind ``conversational=True``. The point of the
+        flag and the warning is to make the limitation observable, not to
+        guarantee prompt cancellation.
         """
         self._stop.set()
         if self._thread is None:
@@ -234,8 +242,9 @@ class SyncStreamSessionAdapter:
         elif self._thread.is_alive() and not self._cooperative_stop_logged:
             _LOGGER.warning(
                 "ag-ui-crewai requested cooperative cancellation of a "
-                "conversational StreamSession; the CrewAI sync worker remains "
-                "active until its current upstream operation emits or returns",
+                "conversational StreamSession; the CrewAI sync worker stays "
+                "active until its current upstream operation emits or returns, "
+                "then blocks in session.close() for the rest of the turn",
                 extra={"worker_thread": self._thread.name},
             )
             self._cooperative_stop_logged = True
