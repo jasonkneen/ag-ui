@@ -12,6 +12,15 @@ import { TokenUsage } from "./events";
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
+/**
+ * Read a property from a value of unknown shape, yielding `undefined` for
+ * anything that is not an object. Lets the mappers take `unknown` rather than
+ * `any` — vendor payloads are untrusted, so every access should be narrowed
+ * rather than assumed.
+ */
+const prop = (v: unknown, key: string): unknown =>
+  typeof v === "object" && v !== null ? (v as Record<string, unknown>)[key] : undefined;
+
 const COUNT_KEYS = [
   "inputTokens",
   "outputTokens",
@@ -53,21 +62,21 @@ function buildEntry(
  * report zeros.
  */
 export function tokenUsageFromLangChainMetadata(
-  usageMetadata: any,
+  usageMetadata: unknown,
   { provider, model }: { provider?: string; model?: string },
 ): TokenUsage | undefined {
   if (!usageMetadata) return undefined;
 
-  const inputDetails = usageMetadata.input_token_details ?? {};
-  const outputDetails = usageMetadata.output_token_details ?? {};
+  const inputDetails = prop(usageMetadata, "input_token_details");
+  const outputDetails = prop(usageMetadata, "output_token_details");
 
   return buildEntry(
     {
-      inputTokens: num(usageMetadata.input_tokens),
-      outputTokens: num(usageMetadata.output_tokens),
-      totalTokens: num(usageMetadata.total_tokens),
-      reasoningTokens: num(outputDetails.reasoning),
-      cachedInputTokens: num(inputDetails.cache_read),
+      inputTokens: num(prop(usageMetadata, "input_tokens")),
+      outputTokens: num(prop(usageMetadata, "output_tokens")),
+      totalTokens: num(prop(usageMetadata, "total_tokens")),
+      reasoningTokens: num(prop(outputDetails, "reasoning")),
+      cachedInputTokens: num(prop(inputDetails, "cache_read")),
     },
     { provider, model },
   );
@@ -82,18 +91,18 @@ export function tokenUsageFromLangChainMetadata(
  * `undefined` when no finite count is present (so callers omit empty usage).
  */
 export function tokenUsageFromAiSdkUsage(
-  usage: any,
+  usage: unknown,
   { provider, model }: { provider?: string; model?: string },
 ): TokenUsage | undefined {
   if (!usage) return undefined;
 
   return buildEntry(
     {
-      inputTokens: num(usage.inputTokens),
-      outputTokens: num(usage.outputTokens),
-      totalTokens: num(usage.totalTokens),
-      reasoningTokens: num(usage.reasoningTokens),
-      cachedInputTokens: num(usage.cachedInputTokens),
+      inputTokens: num(prop(usage, "inputTokens")),
+      outputTokens: num(prop(usage, "outputTokens")),
+      totalTokens: num(prop(usage, "totalTokens")),
+      reasoningTokens: num(prop(usage, "reasoningTokens")),
+      cachedInputTokens: num(prop(usage, "cachedInputTokens")),
     },
     { provider, model },
   );
