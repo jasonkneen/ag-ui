@@ -49,11 +49,17 @@ class TokenUsage(ConfiguredBaseModel):
     """
     provider: Optional[str] = None
     model: Optional[str] = None
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-    reasoning_tokens: Optional[int] = None
-    cached_input_tokens: Optional[int] = None
+    # Counts are non-negative integers in every binding. Pydantic already rejects
+    # a fractional value for an `int` field, but an explicit bound is needed for
+    # the negative case: without it Python could emit a value the TypeScript
+    # schema refuses to parse, and because TS consumers validate every incoming
+    # event and raise on failure, that would surface as a dead run at the
+    # consumer rather than an actionable error at the producer.
+    input_tokens: Optional[int] = Field(default=None, ge=0)
+    output_tokens: Optional[int] = Field(default=None, ge=0)
+    total_tokens: Optional[int] = Field(default=None, ge=0)
+    reasoning_tokens: Optional[int] = Field(default=None, ge=0)
+    cached_input_tokens: Optional[int] = Field(default=None, ge=0)
 
 
 class EventType(str, Enum):

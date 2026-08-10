@@ -80,5 +80,45 @@ class RunErrorUsageTest(unittest.TestCase):
         self.assertEqual(e.usage[0].input_tokens, 100)
 
 
+class TokenUsageCountConstraintsTest(unittest.TestCase):
+    """
+    Counts are non-negative in every binding. Pydantic already rejects a
+    fractional value for an `int` field, but without an explicit bound it
+    accepts a negative one — which would make Python able to emit a value the
+    TypeScript schema now refuses to parse. Since TS consumers validate every
+    incoming event and raise on failure, that asymmetry would surface as a
+    dead run at the consumer rather than an actionable error at the producer.
+    """
+
+    COUNT_FIELDS = (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "reasoning_tokens",
+        "cached_input_tokens",
+    )
+
+    def test_rejects_negative_counts(self):
+        for field in self.COUNT_FIELDS:
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError):
+                    TokenUsage(**{field: -1})
+
+    def test_accepts_zero_and_positive_counts(self):
+        for field in self.COUNT_FIELDS:
+            with self.subTest(field=field):
+                self.assertEqual(getattr(TokenUsage(**{field: 0}), field), 0)
+                self.assertEqual(getattr(TokenUsage(**{field: 7}), field), 7)
+
+    def test_still_rejects_fractional_counts(self):
+        with self.assertRaises(ValidationError):
+            TokenUsage(input_tokens=1.5)
+
+    def test_counts_remain_optional(self):
+        usage = TokenUsage(provider="openai", model="gpt-4o")
+        for field in self.COUNT_FIELDS:
+            self.assertIsNone(getattr(usage, field))
+
+
 if __name__ == "__main__":
     unittest.main()
