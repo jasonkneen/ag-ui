@@ -1135,6 +1135,920 @@ public sealed class ProtocolRuleTest
     }
 
     // ────────────────────────────────────────────────
+    // Subagent lifecycle and attribution rules
+    // ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Subagent_WellFormedLifecycle_PassesThrough()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "found it", SubagentRunId = "s1" },
+            new TextMessageEndEvent { MessageId = "m1", SubagentRunId = "s1" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+
+        // The lifecycle events reach the caller as RawRepresentation, and the attribution
+        // survives the SSE round trip this helper performs.
+        var started = Assert.Single(result.Select(u => u.RawRepresentation).OfType<SubagentStartedEvent>());
+        Assert.Equal("researcher", started.Name);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<SubagentFinishedEvent>());
+        Assert.Contains(result, u => u.RawRepresentation is TextMessageContentEvent { SubagentRunId: "s1" });
+    }
+
+    [Fact]
+    public async Task Subagent_DuplicateStarted_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("already active", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_FinishedWithoutStarted_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentFinishedEvent { SubagentRunId = "ghost" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("no active subagent", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ErrorWithoutStarted_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentErrorEvent { SubagentRunId = "ghost", Message = "boom" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("no active subagent", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_UnknownParent_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "child", Name = "inner", ParentSubagentRunId = "never-started" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("has not been started", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_RunFinishedWhileOpen_Throws()
+    {
+        // A subagent left open at RUN_FINISHED means the consumer would show it running
+        // forever, so the run is rejected instead.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("still active", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ErrorClosesTheSubagent_SoRunMayFinish()
+    {
+        // SUBAGENT_ERROR is terminal just like SUBAGENT_FINISHED: a failed subagent is a
+        // closed subagent, so the run is free to end.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentErrorEvent { SubagentRunId = "s1", Message = "boom" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<SubagentErrorEvent>());
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_NestedAndParallel_LinkByIdentityNotArrivalOrder()
+    {
+        // Two subagents run in parallel and one of them nests a child. The events are
+        // deliberately interleaved so that arrival order does NOT match the parent/child
+        // structure: if parents were inferred from "most recently started" rather than
+        // from the explicit ParentSubagentRunId, `child` would be attached to `b`.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "a", Name = "alpha" },
+            new SubagentStartedEvent { SubagentRunId = "b", Name = "beta" },
+            new SubagentStartedEvent { SubagentRunId = "child", Name = "inner", ParentSubagentRunId = "a" },
+            // Sequenced rather than interleaved: two concurrently-open text messages are
+            // not a shape this client supports (ToolCallBuilder tracks interleaved tool
+            // calls independently, but TextMessageBuilder handles one message at a time —
+            // see ConcurrentBuilderTest). The subagent lifecycle above is what is
+            // interleaved, which is what this test is about.
+            new TextMessageStartEvent { MessageId = "mb", Role = "assistant", SubagentRunId = "b" },
+            new TextMessageContentEvent { MessageId = "mb", Delta = "from beta", SubagentRunId = "b" },
+            new TextMessageEndEvent { MessageId = "mb", SubagentRunId = "b" },
+            new TextMessageStartEvent { MessageId = "mc", Role = "assistant", SubagentRunId = "child" },
+            new TextMessageContentEvent { MessageId = "mc", Delta = "from child", SubagentRunId = "child" },
+            new TextMessageEndEvent { MessageId = "mc", SubagentRunId = "child" },
+            new SubagentFinishedEvent { SubagentRunId = "child" },
+            new SubagentFinishedEvent { SubagentRunId = "b" },
+            new SubagentFinishedEvent { SubagentRunId = "a" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+
+        var child = result.Select(u => u.RawRepresentation)
+            .OfType<SubagentStartedEvent>()
+            .Single(e => e.SubagentRunId == "child");
+        Assert.Equal("a", child.ParentSubagentRunId);
+
+        // Each lane's messages keep their own attribution despite the interleaved
+        // lifecycle. TEXT_MESSAGE_START and _END are consumed by TextMessageBuilder, so
+        // TEXT_MESSAGE_CONTENT is what surfaces and carries the attribution through.
+        Assert.Contains(result, u => u.RawRepresentation is TextMessageContentEvent { MessageId: "mb", SubagentRunId: "b" });
+        Assert.Contains(result, u => u.RawRepresentation is TextMessageContentEvent { MessageId: "mc", SubagentRunId: "child" });
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_ClosingParentBeforeChild_IsAccepted_ChildStillBlocksRunFinish()
+    {
+        // Closing order is not constrained — nesting is an identity link, not a stack — but
+        // every subagent must still be closed before the run ends.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "a", Name = "alpha" },
+            new SubagentStartedEvent { SubagentRunId = "child", Name = "inner", ParentSubagentRunId = "a" },
+            new SubagentFinishedEvent { SubagentRunId = "a" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("child", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_AttributedStateEvents_AreAccepted()
+    {
+        // The protocol design lists STATE_SNAPSHOT / STATE_DELTA as carrying attribution,
+        // in the same standalone category as STEP_*, CUSTOM and RAW. Attribution on them
+        // is PROVENANCE -- which subagent produced the update -- not ownership; the state
+        // stays run-scoped and is applied run-scoped.
+        //
+        // An earlier revision THREW on these, which made this client stricter than the
+        // protocol and would have failed a conforming producer. This test keeps that from
+        // coming back, and mirrors the TypeScript verifier's equivalent test so the two
+        // SDKs cannot drift on what they accept.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new StateSnapshotEvent { Snapshot = JsonDocument.Parse("{\"a\":1}").RootElement, SubagentRunId = "s1" },
+            new StateDeltaEvent { Delta = JsonDocument.Parse("[]").RootElement, SubagentRunId = "s1" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        await ProcessEventsAsync(events);
+    }
+
+    [Fact]
+    public async Task Subagent_UnattributedStateFromParent_IsAccepted()
+    {
+        // The control for the two rejection cases above: state still flows normally while a
+        // subagent is running, as long as it is the parent's.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new StateSnapshotEvent { Snapshot = JsonDocument.Parse("{\"a\":1}").RootElement },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<StateSnapshotEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_StateIsClearedBetweenRuns()
+    {
+        // Run-scoped state: a subagent left open by an earlier run must not block the next
+        // one, matching how activeSteps resets.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" },
+            new RunStartedEvent { ThreadId = "t1", RunId = "r2" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r2" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+
+        // The same subagent id reused in the second run is not a duplicate.
+        Assert.Equal(2, result.Select(u => u.RawRepresentation).OfType<SubagentStartedEvent>().Count());
+        Assert.Equal(2, result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>().Count());
+    }
+
+    [Fact]
+    public async Task Subagent_NothingIsAcceptedAfterTheRunTerminal()
+    {
+        // Exactly one terminal event per run, and nothing after it: a trailing subagent
+        // event is rejected by the same guard that rejects any post-terminal event.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new RunErrorEvent { Message = "failed" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("already errored", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ToolCallAttribution_SurvivesTheWire()
+    {
+        // Tool calls are the consequential attribution path: their args and result are what
+        // travel back to the provider on the next turn.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallArgsEvent { ToolCallId = "tc1", Delta = "{\"q\":\"x\"}", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "m9", ToolCallId = "tc1", Content = "done", SubagentRunId = "s1" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        var raws = result.Select(u => u.RawRepresentation).ToList();
+
+        // TOOL_CALL_START and TOOL_CALL_ARGS are consumed by ToolCallBuilder, which turns
+        // them into FunctionCallContent; END and RESULT pass through, and both must still
+        // carry the attribution after the SSE round trip.
+        Assert.Contains(raws, r => r is ToolCallEndEvent { SubagentRunId: "s1" });
+        Assert.Contains(raws, r => r is ToolCallResultEvent { SubagentRunId: "s1" });
+        // The materialised call itself is what travels back to the provider next turn.
+        var call = Assert.Single(result.SelectMany(u => u.Contents.OfType<FunctionCallContent>()));
+        Assert.Equal("search", call.Name);
+    }
+
+    // These mirror verifyEvents in the TypeScript client one-for-one. The criterion is
+    // that both SDKs accept or reject the same stream; anywhere only one of them
+    // rejects, a producer is validated by one client and not the other.
+
+    [Fact]
+    public async Task Subagent_ToolCallArgsWithDifferentOwner_Throws()
+    {
+        // The consequential half of owner-mismatch: a tool call's args and result are
+        // what travel back to the provider next turn, so stitching a subagent's call
+        // onto another owner's is how a wrong call reaches the model.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallArgsEvent { ToolCallId = "tc1", Delta = "{}", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ToolCallEndWithDifferentOwner_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_TextMessageContentWithDifferentOwner_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "x", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_UntaggedContinuationOfATaggedOpener_IsAccepted()
+    {
+        // Omitting the tag is not a disagreement — attribution is optional per event —
+        // so producers that tag only openers stay valid in both SDKs.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallArgsEvent { ToolCallId = "tc1", Delta = "{}" },
+            new ToolCallEndEvent { ToolCallId = "tc1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_RestartingAFinishedSubagent_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("already finished in this run", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_EventTaggedWithAFinishedSubagent_IsAccepted()
+    {
+        // Pins a deliberate design decision, matching TypeScript. The rule is that a
+        // continuation must not DISAGREE with its opener; requiring a tag to name a
+        // still-live subagent was explicitly rejected so attribution-only producers stay
+        // valid. Tightening it here would make .NET stricter than TypeScript — the exact
+        // divergence this file exists to prevent.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "trailing" },
+            new TextMessageEndEvent { MessageId = "m1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_MissingRequiredIdentifier_Throws()
+    {
+        // TypeScript rejects this via zod. System.Text.Json has no equivalent, so a
+        // missing property arrives as string.Empty — which would otherwise register an
+        // active subagent named "" and corrupt the validation state.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { Name = "worker" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("'subagentRunId' is required", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_MissingRequiredName_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("'name' is required", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_MissingErrorMessage_Throws()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentErrorEvent { SubagentRunId = "s1" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("'message' is required", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ClosedSetIsPerRun()
+    {
+        // Run-scoped, like activeSteps: a second run may reuse an id the first closed.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" },
+            new RunStartedEvent { ThreadId = "t1", RunId = "r2" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r2" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Equal(2, result.Select(u => u.RawRepresentation).OfType<SubagentStartedEvent>().Count());
+    }
+
+    [Fact]
+    public async Task Subagent_ResponseMessages_CarryAttributionAcrossATurn()
+    {
+        // The full loop: GetResponseAsync builds its response from these updates via
+        // ToChatResponse (never AsChatMessages), so anything not stamped here comes back
+        // untagged and the next turn sends it to the agent as the parent's. Tool-call
+        // updates are the ones that broke: ToolCallBuilder emits them with a null
+        // MessageId, so keying on MessageId alone missed them entirely.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "s1", Name = "researcher" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "found it", SubagentRunId = "s1" },
+            new TextMessageEndEvent { MessageId = "m1", SubagentRunId = "s1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallArgsEvent { ToolCallId = "tc1", Delta = "{}", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new SubagentFinishedEvent { SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+
+        // Text and tool-call updates both carry it.
+        Assert.Contains(updates, u => u.Text is { Length: > 0 } && Owner(u) == "s1");
+        Assert.Contains(
+            updates,
+            u => u.Contents.OfType<FunctionCallContent>().Any() && Owner(u) == "s1");
+
+        // And it survives coalescing into the response, then back out to AG-UI messages —
+        // which is what the next turn actually sends.
+        var response = updates.ToChatResponse();
+        var roundTripped = response.Messages.AsAGUIMessages().ToList();
+        Assert.All(
+            roundTripped.Where(m => m.Role is "assistant" or "tool"),
+            m => Assert.Equal("s1", m.SubagentRunId));
+    }
+
+    [Fact]
+    public async Task Parent_ResponseMessages_StayUnattributed()
+    {
+        // Control: an unattributed run must not acquire the key.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "hi" },
+            new TextMessageEndEvent { MessageId = "m1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        Assert.All(updates, u => Assert.Null(Owner(u)));
+    }
+
+    [Fact]
+    public async Task Subagent_ReasoningContinuationWithDifferentOwner_Throws()
+    {
+        // Parity: TypeScript rejects this, so .NET must too.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ReasoningMessageStartEvent { MessageId = "r1", Role = "reasoning", SubagentRunId = "s1" },
+            new ReasoningMessageContentEvent { MessageId = "r1", Delta = "x", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ToolCallEncryptedValueWithDifferentOwner_Throws()
+    {
+        // `subtype` decides which entity is continued; a "tool-call" value belongs to the
+        // tool call, not a reasoning message.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ReasoningEncryptedValueEvent
+            {
+                Subtype = "tool-call",
+                EntityId = "tc1",
+                EncryptedValue = "opaque",
+                SubagentRunId = "s2"
+            }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_ChildOfAFinishedParent_IsAccepted()
+    {
+        // parentSubagentRunId must have been STARTED, not still be active.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new SubagentStartedEvent { SubagentRunId = "p", Name = "parent" },
+            new SubagentFinishedEvent { SubagentRunId = "p" },
+            new SubagentStartedEvent { SubagentRunId = "c", Name = "child", ParentSubagentRunId = "p" },
+            new SubagentFinishedEvent { SubagentRunId = "c" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_NonReplacingActivitySnapshot_DoesNotTakeOwnership()
+    {
+        var content = JsonDocument.Parse("{}").RootElement;
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = false, SubagentRunId = "s1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = false, SubagentRunId = "s2" },
+            new ActivityDeltaEvent { MessageId = "a1", ActivityType = "search", Patch = JsonDocument.Parse("[]").RootElement, SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_OpenerOnlyAttribution_ReachesTheResponse()
+    {
+        // TEXT_MESSAGE_START yields no update, so deriving owners from updates alone never
+        // saw it and an opener-only stream came back unattributed.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "hi" },
+            new TextMessageEndEvent { MessageId = "m1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        Assert.Contains(updates, u => u.Text is { Length: > 0 } && Owner(u) == "s1");
+    }
+
+    [Fact]
+    public async Task Subagent_UntaggedToolResult_IsParentOwned()
+    {
+        // TOOL_CALL_RESULT is a creation event carrying its own attribution (D5), so an
+        // untagged one belongs to the parent and must clear the call's recorded owner
+        // rather than inheriting it.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "m9", ToolCallId = "tc1", Content = "done" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var resultUpdate = Assert.Single(
+            updates, u => u.Contents.OfType<FunctionResultContent>().Any());
+        Assert.Null(Owner(resultUpdate));
+    }
+
+    [Fact]
+    public async Task Subagent_OwnershipDoesNotLeakBetweenRuns()
+    {
+        // Run 2 reuses the message id for a parent-owned message; the stamp must not carry
+        // run 1's owner across.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "from s1" },
+            new TextMessageEndEvent { MessageId = "m1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" },
+            new RunStartedEvent { ThreadId = "t1", RunId = "r2" },
+            new TextMessageStartEvent { MessageId = "m1", Role = "assistant" },
+            new TextMessageContentEvent { MessageId = "m1", Delta = "from the parent" },
+            new TextMessageEndEvent { MessageId = "m1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r2" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var secondRunText = updates.Last(u => u.Text == "from the parent");
+        Assert.Null(Owner(secondRunText));
+    }
+
+    [Fact]
+    public async Task Subagent_ToolResultOwner_DoesNotRestampTheCall()
+    {
+        // D5 gives TOOL_CALL_RESULT its own attribution so the executor can differ from
+        // the caller. It therefore owns only the minted tool message; writing it onto the
+        // call restamped the buffered FunctionCallContent and lost the caller's owner.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "m9", ToolCallId = "tc1", Content = "done" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var callUpdate = Assert.Single(updates, u => u.Contents.OfType<FunctionCallContent>().Any());
+        Assert.Equal("s1", Owner(callUpdate));
+    }
+
+    [Fact]
+    public async Task Subagent_ActivitySnapshotWithoutReplace_DefaultsToReplacing()
+    {
+        // The schemas default `replace` to true, so an omitted value means the snapshot
+        // re-mints (and re-owns) the activity. Treating null as false rejected a stream
+        // TypeScript accepts.
+        var content = JsonDocument.Parse("{}").RootElement;
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, SubagentRunId = "s1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, SubagentRunId = "s2" },
+            new ActivityDeltaEvent { MessageId = "a1", ActivityType = "search", Patch = JsonDocument.Parse("[]").RootElement, SubagentRunId = "s2" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var result = await ProcessEventsAsync(events);
+        Assert.Single(result.Select(u => u.RawRepresentation).OfType<RunFinishedEvent>());
+    }
+
+    [Fact]
+    public async Task Subagent_ReasoningStartIsAnOpener()
+    {
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ReasoningStartEvent { MessageId = "r1", SubagentRunId = "s1" },
+            new ReasoningEndEvent { MessageId = "r1", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_CompactReasoningChunkOwnerChange_Throws()
+    {
+        // The one compact stream this SDK models; TypeScript's chunk transform rejects the
+        // same disagreement.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ReasoningMessageChunkEvent { MessageId = "r1", Delta = "a", SubagentRunId = "s1" },
+            new ReasoningMessageChunkEvent { MessageId = "r1", Delta = "b", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_EncryptedToolCallValueAfterTheCallClosed_IsStillChecked()
+    {
+        // Nothing requires the encrypted continuation to arrive before TOOL_CALL_END, so
+        // the owner has to remain available after the close.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ReasoningEncryptedValueEvent
+            {
+                Subtype = "tool-call",
+                EntityId = "tc1",
+                EncryptedValue = "opaque",
+                SubagentRunId = "s2"
+            }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_EmptyMessageId_StillCarriesAttribution()
+    {
+        // An empty messageId is a valid string per the schemas, and the builders accept it.
+        // Skipping empty ids when recording owners lost the attribution, so the response
+        // came back parent-owned while TypeScript preserved it.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new TextMessageStartEvent { MessageId = "", Role = "assistant", SubagentRunId = "s1" },
+            new TextMessageContentEvent { MessageId = "", Delta = "hi" },
+            new TextMessageEndEvent { MessageId = "" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        Assert.Contains(updates, u => u.Text is { Length: > 0 } && Owner(u) == "s1");
+    }
+
+    [Fact]
+    public async Task Subagent_CompactReasoningChunkWithEmptyId_StillChecksOwner()
+    {
+        // The last instance of the same rule: an empty messageId is present, not absent,
+        // so the compact stream's owner is registered and a mismatched continuation is
+        // rejected — as TypeScript's transform already does.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ReasoningMessageChunkEvent { MessageId = "", Delta = "a", SubagentRunId = "s1" },
+            new ReasoningMessageChunkEvent { MessageId = "", Delta = "b", SubagentRunId = "s2" }
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ProcessEventsAsync(events));
+        Assert.Contains("does not match", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subagent_BufferedUpdates_KeepTheOwnerTheyHadAtCreation()
+    {
+        // Updates produced while a tool call is buffering are flushed later, after further
+        // events have moved the owner map on. Resolving at flush time stamped the earlier
+        // update with the later owner, so the first activity — genuinely s1's — was
+        // reported as s2's.
+        var content = JsonDocument.Parse("{}").RootElement;
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            // Open a tool call so subsequent pass-through updates are buffered.
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = true, SubagentRunId = "s1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = true, SubagentRunId = "s2" },
+            new ToolCallEndEvent { ToolCallId = "tc1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var activityUpdates = updates
+            .Where(u => u.RawRepresentation is ActivitySnapshotEvent)
+            .ToList();
+
+        Assert.Equal(2, activityUpdates.Count);
+        Assert.Equal("s1", Owner(activityUpdates[0]));
+        Assert.Equal("s2", Owner(activityUpdates[1]));
+    }
+
+    [Fact]
+    public async Task Subagent_BufferedParentOwnedUpdate_StaysParentOwned()
+    {
+        // The residual of freezing owners at creation: a marker was written only when an
+        // owner was FOUND, so a parent-owned buffered update got none and was re-resolved
+        // at flush — after s1 had taken the activity over — and the parent's snapshot came
+        // out as s1's. "Resolved to the parent" is a different state from "unresolved".
+        var content = JsonDocument.Parse("{}").RootElement;
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search" },
+            new ToolCallEndEvent { ToolCallId = "tc1" },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = true },
+            new ActivitySnapshotEvent { MessageId = "a1", ActivityType = "search", Content = content, Replace = true, SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "m9", ToolCallId = "tc1", Content = "done" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var activityUpdates = updates
+            .Where(u => u.RawRepresentation is ActivitySnapshotEvent)
+            .ToList();
+
+        Assert.Equal(2, activityUpdates.Count);
+        Assert.Null(Owner(activityUpdates[0]));
+        Assert.Equal("s1", Owner(activityUpdates[1]));
+    }
+
+    [Fact]
+    public async Task Subagent_InternalResolutionMarker_NeverReachesTheCaller()
+    {
+        // The marker is an implementation detail; leaking it would put a stray key on every
+        // buffered message's AdditionalProperties.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "m9", ToolCallId = "tc1", Content = "done", SubagentRunId = "s1" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        Assert.All(
+            updates,
+            u => Assert.False(u.AdditionalProperties?.ContainsKey("agui.__ownerResolved") == true));
+    }
+
+    [Fact]
+    public async Task Subagent_ResultReusingTheToolCallIdAsMessageId_DoesNotRestampTheCall()
+    {
+        // ToolCallResultEventExtensions in AGUI.Server emits MessageId == ToolCallId, so
+        // this is the DEFAULT shape this SDK produces, not an edge case. With one flat owner
+        // map the result's owner overwrote the call's, and the FunctionCallContent — still
+        // buffered until the result arrives — flushed with the wrong one. Message ids and
+        // tool call ids are separate namespaces.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            // Parent-owned result reusing the call id as its message id.
+            new ToolCallResultEvent { MessageId = "tc1", ToolCallId = "tc1", Content = "done" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+
+        var callUpdate = Assert.Single(updates, u => u.Contents.OfType<FunctionCallContent>().Any());
+        Assert.Equal("s1", Owner(callUpdate));
+
+        var resultUpdate = Assert.Single(updates, u => u.Contents.OfType<FunctionResultContent>().Any());
+        Assert.Null(Owner(resultUpdate));
+    }
+
+    [Fact]
+    public async Task Subagent_ToolCallEncryptedValue_ResolvesViaTheCallNamespace()
+    {
+        // `subtype` selects the namespace. With the SDK-default MessageId == ToolCallId
+        // shape, reading the message namespace returned the RESULT message's owner rather
+        // than the call's, so the encrypted update came out attributed to s2.
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", SubagentRunId = "s1" },
+            new ToolCallEndEvent { ToolCallId = "tc1", SubagentRunId = "s1" },
+            new ToolCallResultEvent { MessageId = "tc1", ToolCallId = "tc1", Content = "done", SubagentRunId = "s1" },
+            new ReasoningEncryptedValueEvent
+            {
+                Subtype = "tool-call",
+                EntityId = "tc1",
+                EncryptedValue = "opaque",
+                SubagentRunId = "s1"
+            },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var encrypted = Assert.Single(
+            updates, u => u.RawRepresentation is ReasoningEncryptedValueEvent);
+        Assert.Equal("s1", Owner(encrypted));
+    }
+
+    private static string? Owner(ChatResponseUpdate update) =>
+        update.AdditionalProperties?.TryGetValue("agui.subagentRunId", out string? v) == true ? v : null;
+
+    // ────────────────────────────────────────────────
     // Helpers — process events through EventStreamConverter.AsChatResponseUpdates
     // ────────────────────────────────────────────────
 

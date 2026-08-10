@@ -9,9 +9,163 @@ namespace AGUI.Client;
 
 internal static class EventStreamConverter
 {
+    /// <summary>
+    /// Converts an AG-UI event stream to <see cref="ChatResponseUpdate"/>s, stamping each
+    /// one with the subagent that produced it.
+    /// </summary>
+    /// <remarks>
+    /// Carried in <see cref="ChatResponseUpdate.AdditionalProperties"/> under the same key
+    /// <c>AsChatMessages</c> uses, because <c>ToChatResponse</c> preserves it onto the
+    /// coalesced <see cref="ChatMessage"/>. Without it only the request direction was
+    /// covered: AGUIChatClient.GetResponseAsync builds its response from these updates, so
+    /// a subagent's message came back untagged and the next turn sent it to the agent as
+    /// the parent's.
+    ///
+    /// The owner map is populated by the core loop, which sees every event — including the
+    /// openers that yield no update at all. Deriving it out here from updates alone missed
+    /// those, so an opener-only stream (tagged START, untagged content and end) was never
+    /// attributed.
+    /// </remarks>
     internal static async IAsyncEnumerable<ChatResponseUpdate> AsChatResponseUpdates(
         IAsyncEnumerable<BaseEvent> events,
         JsonSerializerOptions jsonSerializerOptions,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        // entityId -> owner, where an entity is a messageId or a toolCallId. Owned by the
+        // core loop and mutated as it validates, so it is reset with the rest of the
+        // per-run state on a new RUN_STARTED.
+        var owners = new Dictionary<string, string?>(StringComparer.Ordinal);
+
+        await foreach (var update in AsChatResponseUpdatesCore(events, jsonSerializerOptions, owners, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            // The marker means this update was buffered and its owner already frozen at
+            // creation — including when that owner is the parent. Re-resolving would read a
+            // map that has moved on since.
+            var alreadyResolved =
+                update.AdditionalProperties?.Remove(AGUIOwnerResolvedKey) == true;
+            if (!alreadyResolved && ResolveOwner(update, owners) is { } resolved)
+            {
+                update.AdditionalProperties ??= new AdditionalPropertiesDictionary();
+                update.AdditionalProperties[AGUISubagentRunIdKey] = resolved;
+            }
+
+            yield return update;
+        }
+    }
+
+    /// <summary>
+    /// Key matching <c>AGUIChatMessageExtensions</c>, so an update's attribution survives
+    /// into <see cref="ChatMessage.AdditionalProperties"/> and back out through
+    /// <c>AsAGUIMessages</c> on the next turn.
+    /// </summary>
+    internal const string AGUISubagentRunIdKey = "agui.subagentRunId";
+
+    /// <summary>
+    /// Transient marker saying an update's owner was already determined at creation, so the
+    /// wrapper must not re-resolve it. Needed as its own flag because "resolved to the
+    /// parent" carries no subagentRunId and would otherwise be indistinguishable from
+    /// "unresolved". Removed before the update is yielded.
+    /// </summary>
+    private const string AGUIOwnerResolvedKey = "agui.__ownerResolved";
+
+    /// <summary>
+    /// Owner for an update, tried in the order the update can identify its entity: its
+    /// MessageId; the entity id of the event that produced it (this is what covers
+    /// reasoning updates, which carry no MessageId); then the call id of any function call
+    /// or result it carries (tool-call updates, likewise without a MessageId).
+    /// </summary>
+    private static string? ResolveOwner(ChatResponseUpdate update, Dictionary<string, string?> owners)
+    {
+        if (update.MessageId is not null
+            && owners.TryGetValue(MessageKey(update.MessageId), out var byMessage))
+        {
+            return byMessage;
+        }
+
+        if (update.RawRepresentation is BaseEvent evt)
+        {
+            foreach (var entityKey in AttributedEntityKeys(evt))
+            {
+                if (owners.TryGetValue(entityKey, out var byEntity))
+                {
+                    return byEntity;
+                }
+            }
+        }
+
+        foreach (var content in update.Contents)
+        {
+            var callId = content switch
+            {
+                FunctionCallContent call => call.CallId,
+                FunctionResultContent result => result.CallId,
+                _ => null,
+            };
+
+            if (callId is not null && owners.TryGetValue(CallKey(callId), out var byCall))
+            {
+                return byCall;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Message-id key space for the owner map. Message ids and tool call ids are separate
+    /// namespaces that can legitimately collide — this SDK's own server helper emits
+    /// TOOL_CALL_RESULT with <c>MessageId == ToolCallId</c> — so a single flat map let a
+    /// result's owner overwrite its call's, and the still-buffered FunctionCallContent
+    /// flushed with the wrong one.
+    /// </summary>
+    private static string MessageKey(string id) => "msg:" + id;
+
+    /// <summary>Tool-call-id key space for the owner map. See <see cref="MessageKey"/>.</summary>
+    private static string CallKey(string id) => "call:" + id;
+
+    /// <summary>The namespaced entity keys an event refers to, most specific first.</summary>
+    private static IEnumerable<string> AttributedEntityKeys(BaseEvent evt)
+    {
+        switch (evt)
+        {
+            case TextMessageStartEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case TextMessageContentEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case TextMessageEndEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ReasoningStartEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ReasoningMessageStartEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ReasoningMessageContentEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ReasoningMessageEndEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ReasoningMessageChunkEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            // `subtype` selects the namespace: a "tool-call" value's entityId is a tool call
+            // id, not a message id. The validation path already made this distinction; the
+            // resolution path did not, so with the SDK-default MessageId == ToolCallId shape
+            // it read the RESULT message's owner instead of the call's.
+            case ReasoningEncryptedValueEvent e:
+                if (e.EntityId is not null)
+                {
+                    yield return e.Subtype == "tool-call" ? CallKey(e.EntityId) : MessageKey(e.EntityId);
+                }
+
+                break;
+            case ActivitySnapshotEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            case ActivityDeltaEvent e: if (e.MessageId is not null) yield return MessageKey(e.MessageId); break;
+            // The minted tool message first: that is what this update represents. The call
+            // key is a fallback for consumers that only see the call.
+            case ToolCallResultEvent e:
+                if (e.MessageId is not null) yield return MessageKey(e.MessageId);
+                if (e.ToolCallId is not null) yield return CallKey(e.ToolCallId);
+                break;
+            case ToolCallStartEvent e: if (e.ToolCallId is not null) yield return CallKey(e.ToolCallId); break;
+            case ToolCallArgsEvent e: if (e.ToolCallId is not null) yield return CallKey(e.ToolCallId); break;
+            case ToolCallEndEvent e: if (e.ToolCallId is not null) yield return CallKey(e.ToolCallId); break;
+        }
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> AsChatResponseUpdatesCore(
+        IAsyncEnumerable<BaseEvent> events,
+        JsonSerializerOptions jsonSerializerOptions,
+        Dictionary<string, string?> owners,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         string? conversationId = null;
@@ -21,6 +175,78 @@ internal static class EventStreamConverter
 
         // Event verification state
         var activeSteps = new HashSet<string>();
+        // Subagents open right now, mapped to the parent that spawned them (null for one
+        // the parent run started directly). Nesting is tracked by this identity link, not
+        // by the order events arrive in, so interleaved parallel subagents cannot swap
+        // parents.
+        var activeSubagents = new Dictionary<string, string?>();
+        // Ids closed by a terminal in this run. Needed because "no duplicate
+        // SUBAGENT_STARTED for the same id" holds for the whole run — a subagentRunId is a
+        // unique handle for ONE invocation — so tracking only the active set would make
+        // STARTED(s1)/FINISHED(s1)/STARTED(s1) legal. Deliberately NOT used to reject
+        // later events tagged with a closed id: requiring a tag to name a still-live
+        // subagent was explicitly rejected in the design so attribution-only producers
+        // stay valid, and TypeScript accepts those streams too. Cleared per run.
+        var closedSubagents = new HashSet<string>(StringComparer.Ordinal);
+        // Owner of each open message / tool call, so a continuation tagged with a
+        // different subagent is rejected here exactly as verifyEvents rejects it in
+        // TypeScript. Without this the two SDKs disagreed about the same stream.
+        var messageOwners = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var toolCallOwners = new Dictionary<string, string?>(StringComparer.Ordinal);
+        // Activities are opened by ACTIVITY_SNAPSHOT and continued by ACTIVITY_DELTA on
+        // the same messageId, so they need the same owner tracking. TypeScript checks
+        // these; without it .NET accepted a stream TypeScript rejects.
+        var activityOwners = new Dictionary<string, string?>(StringComparer.Ordinal);
+        // Reasoning, tracked like the others so .NET rejects the same continuation
+        // mismatches TypeScript does.
+        var reasoningOwners = new Dictionary<string, string?>(StringComparer.Ordinal);
+        // Id of the compact reasoning stream currently open, so a continuation chunk that
+        // omits messageId can still be checked against its opener.
+        string? openReasoningChunkId = null;
+
+        // Records the owner for an entity on a CREATION event. Creation events carry
+        // attribution explicitly (D3/D5), so an untagged one means the parent owns it —
+        // which must overwrite any stale entry, or an untagged TOOL_CALL_RESULT would
+        // inherit the tool call's subagent and mint a wrongly-attributed tool message.
+        // Buffered updates are flushed after later events have mutated the owner map, so
+        // resolving at yield time would stamp them with whoever owns the entity by then.
+        // Stamping here freezes the owner as of creation; the wrapper leaves an already
+        // stamped update alone.
+        static ChatResponseUpdate StampOwner(ChatResponseUpdate update, Dictionary<string, string?> map)
+        {
+            update.AdditionalProperties ??= new AdditionalPropertiesDictionary();
+            // The marker goes on even when the owner is the PARENT (null). "Resolved to the
+            // parent" and "not yet resolved" are different states, and conflating them let
+            // the wrapper re-resolve a parent-owned buffered update after the entity had
+            // been re-owned by a subagent — emitting the parent's snapshot as that
+            // subagent's. Stripped again in the wrapper so it never reaches the wire.
+            update.AdditionalProperties[AGUIOwnerResolvedKey] = true;
+            if (ResolveOwner(update, map) is { } owner)
+            {
+                update.AdditionalProperties[AGUISubagentRunIdKey] = owner;
+            }
+
+            return update;
+        }
+
+        // Null means the event has no such entity; an EMPTY id is a valid string the schemas
+        // accept, so skipping it lost the owner and the response came back parent-owned while
+        // TypeScript kept the attribution.
+        void RecordMessageOwner(string? messageId, string? subagentRunId)
+        {
+            if (messageId is not null)
+            {
+                owners[MessageKey(messageId)] = subagentRunId;
+            }
+        }
+
+        void RecordCallOwner(string? toolCallId, string? subagentRunId)
+        {
+            if (toolCallId is not null)
+            {
+                owners[CallKey(toolCallId)] = subagentRunId;
+            }
+        }
         var runStarted = false;
         var runFinished = false;
         var runError = false;
@@ -62,10 +288,261 @@ internal static class EventStreamConverter
                     textMessageBuilder.Reset();
                     toolCallBuilder.Reset();
                     activeSteps.Clear();
+                    activeSubagents.Clear();
+                    closedSubagents.Clear();
+                    messageOwners.Clear();
+                    toolCallOwners.Clear();
+                    activityOwners.Clear();
+                    reasoningOwners.Clear();
+                    openReasoningChunkId = null;
+                    owners.Clear();
                     runFinished = false;
                     runError = false;
                     runStarted = true;
                 }
+            }
+
+            // Subagent lifecycle and attribution rules. Kept beside the run/step rules
+            // above and mirroring verifyEvents in sdks/typescript/packages/client, so the
+            // same stream is accepted or rejected identically by both SDKs.
+            switch (evt)
+            {
+                case SubagentStartedEvent started:
+                    // Required by the protocol schema, which TypeScript enforces with
+                    // zod. System.Text.Json has no such notion and leaves a missing
+                    // string as the property initializer (string.Empty), so without
+                    // this an id-less event would register an active subagent named ""
+                    // and corrupt the validation state below — while the TypeScript
+                    // client rejected the very same payload.
+                    RequireProvided(started.SubagentRunId, "subagentRunId", AGUIEventTypes.SubagentStarted);
+                    RequireProvided(started.Name, "name", AGUIEventTypes.SubagentStarted);
+                    var startedId = started.SubagentRunId!;
+
+                    if (activeSubagents.ContainsKey(startedId))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"Cannot send 'SUBAGENT_STARTED': subagent '{startedId}' is already active. Finish it with 'SUBAGENT_FINISHED' first.");
+                    }
+
+                    if (closedSubagents.Contains(startedId))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"Cannot send 'SUBAGENT_STARTED': subagent '{startedId}' has already finished in this run. Subagent IDs are per-invocation and cannot be reused.");
+                    }
+
+                    // Started, not necessarily still active — requiring the parent to be
+                    // open was stricter than the protocol defines and rejected a valid
+                    // lifecycle where the parent finished before its child started.
+                    if (started.ParentSubagentRunId is not null
+                        && !activeSubagents.ContainsKey(started.ParentSubagentRunId)
+                        && !closedSubagents.Contains(started.ParentSubagentRunId))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"Cannot send 'SUBAGENT_STARTED': parentSubagentRunId '{started.ParentSubagentRunId}' has not been started in this run.");
+                    }
+
+                    activeSubagents[startedId] = started.ParentSubagentRunId;
+                    break;
+
+                case SubagentFinishedEvent finished:
+                    RequireProvided(finished.SubagentRunId, "subagentRunId", AGUIEventTypes.SubagentFinished);
+                    var finishedId = finished.SubagentRunId!;
+                    if (!activeSubagents.Remove(finishedId))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"Cannot send 'SUBAGENT_FINISHED': no active subagent found with ID '{finishedId}'. A 'SUBAGENT_STARTED' event must be sent first.");
+                    }
+
+                    closedSubagents.Add(finishedId);
+                    break;
+
+                case SubagentErrorEvent subagentErrored:
+                    RequireProvided(subagentErrored.SubagentRunId, "subagentRunId", AGUIEventTypes.SubagentError);
+                    RequireProvided(subagentErrored.Message, "message", AGUIEventTypes.SubagentError);
+                    var erroredId = subagentErrored.SubagentRunId!;
+                    if (!activeSubagents.Remove(erroredId))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"Cannot send 'SUBAGENT_ERROR': no active subagent found with ID '{erroredId}'. A 'SUBAGENT_STARTED' event must be sent first.");
+                    }
+
+                    closedSubagents.Add(erroredId);
+                    break;
+
+                // STATE_SNAPSHOT and STATE_DELTA are attributable, and attribution on
+                // them is PROVENANCE rather than ownership: it says which subagent
+                // produced the update, while the state stays run-scoped and is applied
+                // run-scoped. Same meaning attribution carries on the other standalone
+                // events (STEP_*, CUSTOM, RAW), none of which are checked either.
+                //
+                // An earlier revision threw here on an attributed state event, on the
+                // grounds that only the parent owns state. That was an invented rule:
+                // the protocol design lists STATE_SNAPSHOT / STATE_DELTA as carrying
+                // attribution, so throwing made this client stricter than the protocol
+                // and would fail a conforming producer. No case here on purpose.
+
+                case RunFinishedEvent when activeSubagents.Count > 0:
+                    throw new System.InvalidOperationException(
+                        $"Cannot send 'RUN_FINISHED' while subagents are still active: {string.Join(", ", activeSubagents.Keys)}");
+
+                // Attribution consistency for the two ID-keyed entities, mirroring
+                // verifyEvents. An opener records its owner; a continuation or close
+                // tagged with a different subagent is a contradiction, and for tool
+                // calls it is the consequential one — args and results are what travel
+                // back to the provider on the next turn.
+                case TextMessageStartEvent textStart:
+                    messageOwners[textStart.MessageId] = textStart.SubagentRunId;
+                    RecordMessageOwner(textStart.MessageId, textStart.SubagentRunId);
+                    break;
+
+                case TextMessageContentEvent textContent:
+                    RejectOwnerMismatch(
+                        textContent.Type, textContent.SubagentRunId, messageOwners, textContent.MessageId, "message");
+                    break;
+
+                case TextMessageEndEvent textEnd:
+                    RejectOwnerMismatch(
+                        textEnd.Type, textEnd.SubagentRunId, messageOwners, textEnd.MessageId, "message");
+                    break;
+
+                case ToolCallStartEvent toolStart:
+                    toolCallOwners[toolStart.ToolCallId] = toolStart.SubagentRunId;
+                    RecordCallOwner(toolStart.ToolCallId, toolStart.SubagentRunId);
+                    break;
+
+                // A creation event under D5: it both references the call and mints the tool
+                // message, and carries its own attribution — so an untagged one is
+                // parent-owned and must clear the call's recorded owner.
+                case ToolCallResultEvent toolResult:
+                    // Only the minted tool message. D5 gives this event its own attribution
+                    // precisely so the executor can differ from the caller (client-side tool
+                    // execution), so writing it onto the tool call would restamp the
+                    // buffered FunctionCallContent and lose the caller's owner.
+                    RecordMessageOwner(toolResult.MessageId, toolResult.SubagentRunId);
+                    break;
+
+                // Both open a reasoning entity, usually under the same id; first writer
+                // records the owner. Registering only REASONING_MESSAGE_START left
+                // REASONING_START(r, s1) / REASONING_END(r, s2) with nothing to compare.
+                case ReasoningStartEvent outerReasoningStart:
+                    if (!reasoningOwners.ContainsKey(outerReasoningStart.MessageId))
+                    {
+                        reasoningOwners[outerReasoningStart.MessageId] = outerReasoningStart.SubagentRunId;
+                    }
+
+                    RecordMessageOwner(outerReasoningStart.MessageId, outerReasoningStart.SubagentRunId);
+                    break;
+
+                case ReasoningMessageStartEvent reasoningStart:
+                    if (!reasoningOwners.ContainsKey(reasoningStart.MessageId))
+                    {
+                        reasoningOwners[reasoningStart.MessageId] = reasoningStart.SubagentRunId;
+                    }
+
+                    RecordMessageOwner(reasoningStart.MessageId, reasoningStart.SubagentRunId);
+                    break;
+
+                // #4 — the one compact stream this SDK models. Its opener establishes the
+                // owner and a later chunk must not disagree, exactly as the TypeScript
+                // chunk transform enforces.
+                case ReasoningMessageChunkEvent reasoningChunk:
+                    // Null means the chunk omits the id and so continues the open stream;
+                    // an EMPTY id is a present id, since messageId is an optional
+                    // z.string(). Treating empty as absent skipped both registration and
+                    // the open-stream cursor, so .NET accepted a mismatch TypeScript
+                    // rejects. Same distinction as RecordOwner above.
+                    if (reasoningChunk.MessageId is { } chunkId)
+                    {
+                        if (!reasoningOwners.ContainsKey(chunkId))
+                        {
+                            reasoningOwners[chunkId] = reasoningChunk.SubagentRunId;
+                            RecordMessageOwner(chunkId, reasoningChunk.SubagentRunId);
+                        }
+                        else
+                        {
+                            RejectOwnerMismatch(
+                                reasoningChunk.Type, reasoningChunk.SubagentRunId, reasoningOwners,
+                                chunkId, "reasoning message");
+                        }
+                    }
+                    else if (openReasoningChunkId is not null)
+                    {
+                        RejectOwnerMismatch(
+                            reasoningChunk.Type, reasoningChunk.SubagentRunId, reasoningOwners,
+                            openReasoningChunkId, "reasoning message");
+                    }
+
+                    if (reasoningChunk.MessageId is { } newOpen)
+                    {
+                        openReasoningChunkId = newOpen;
+                    }
+
+                    break;
+
+                case ReasoningMessageContentEvent reasoningContent:
+                    RejectOwnerMismatch(
+                        reasoningContent.Type, reasoningContent.SubagentRunId, reasoningOwners,
+                        reasoningContent.MessageId, "reasoning message");
+                    break;
+
+                case ReasoningMessageEndEvent reasoningEnd:
+                    RejectOwnerMismatch(
+                        reasoningEnd.Type, reasoningEnd.SubagentRunId, reasoningOwners,
+                        reasoningEnd.MessageId, "reasoning message");
+                    break;
+
+                case ReasoningEndEvent outerReasoningEnd:
+                    RejectOwnerMismatch(
+                        outerReasoningEnd.Type, outerReasoningEnd.SubagentRunId, reasoningOwners,
+                        outerReasoningEnd.MessageId, "reasoning message");
+                    break;
+
+                case ReasoningEncryptedValueEvent encrypted:
+                    // `subtype` decides which entity this continues: a "tool-call" value
+                    // belongs to a tool call, not a reasoning message.
+                    RejectOwnerMismatch(
+                        encrypted.Type,
+                        encrypted.SubagentRunId,
+                        encrypted.Subtype == "tool-call" ? toolCallOwners : reasoningOwners,
+                        encrypted.EntityId,
+                        encrypted.Subtype == "tool-call" ? "tool call" : "reasoning message");
+                    break;
+
+                case ActivitySnapshotEvent activitySnapshot:
+                    // Only a replacing snapshot re-mints the activity and so re-owns it;
+                    // with Replace=false the reducer leaves the existing message alone.
+                    // Absent means replace: the schemas default it to true, so a null here
+                    // is "replace", and treating it as false rejected valid streams that
+                    // TypeScript accepts.
+                    if (!activityOwners.ContainsKey(activitySnapshot.MessageId) || activitySnapshot.Replace != false)
+                    {
+                        activityOwners[activitySnapshot.MessageId] = activitySnapshot.SubagentRunId;
+                        RecordMessageOwner(activitySnapshot.MessageId, activitySnapshot.SubagentRunId);
+                    }
+
+                    break;
+
+                case ActivityDeltaEvent activityDelta:
+                    RejectOwnerMismatch(
+                        activityDelta.Type, activityDelta.SubagentRunId, activityOwners, activityDelta.MessageId, "activity");
+                    break;
+
+                case ToolCallArgsEvent toolArgs:
+                    RejectOwnerMismatch(
+                        toolArgs.Type, toolArgs.SubagentRunId, toolCallOwners, toolArgs.ToolCallId, "tool call");
+                    break;
+
+                case ToolCallEndEvent toolEnd:
+                    RejectOwnerMismatch(
+                        toolEnd.Type, toolEnd.SubagentRunId, toolCallOwners, toolEnd.ToolCallId, "tool call");
+                    // Deliberately NOT removed: a REASONING_ENCRYPTED_VALUE with
+                    // subtype "tool-call" may arrive after the close, and no rule requires
+                    // it to precede one. Dropping the owner here made that continuation
+                    // unmatchable and accepted a mismatched one. Cleared per run instead.
+                    break;
+
+                default:
+                    break;
             }
 
             switch (evt)
@@ -182,7 +659,7 @@ internal static class EventStreamConverter
                     var update = textMessageBuilder.EmitTextUpdate(textContent);
                     if (toolCallBuilder.IsBuffering)
                     {
-                        toolCallBuilder.BufferUpdate(update);
+                        toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                     }
                     else
                     {
@@ -212,7 +689,7 @@ internal static class EventStreamConverter
                         };
                         if (toolCallBuilder.IsBuffering)
                         {
-                            toolCallBuilder.BufferUpdate(update);
+                            toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                         }
                         else
                         {
@@ -238,7 +715,7 @@ internal static class EventStreamConverter
                         };
                         if (toolCallBuilder.IsBuffering)
                         {
-                            toolCallBuilder.BufferUpdate(update);
+                            toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                         }
                         else
                         {
@@ -297,7 +774,7 @@ internal static class EventStreamConverter
                     };
                     if (toolCallBuilder.IsBuffering)
                     {
-                        toolCallBuilder.BufferUpdate(update);
+                        toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                     }
                     else
                     {
@@ -318,7 +795,7 @@ internal static class EventStreamConverter
                     };
                     if (toolCallBuilder.IsBuffering)
                     {
-                        toolCallBuilder.BufferUpdate(update);
+                        toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                     }
                     else
                     {
@@ -327,7 +804,14 @@ internal static class EventStreamConverter
                     break;
                 }
 
-                // Pass-through events: state, reasoning lifecycle, activity, custom, raw
+                // Pass-through events: state, reasoning lifecycle, activity, custom, raw,
+                // and the subagent lifecycle. The subagent events reach the caller as
+                // RawRepresentation because Microsoft.Extensions.AI has no concept of
+                // delegated work; a consumer that cares reads them off the update, while
+                // the validation above has already rejected an inconsistent lifecycle.
+                case SubagentStartedEvent:
+                case SubagentFinishedEvent:
+                case SubagentErrorEvent:
                 case StateSnapshotEvent:
                 case StateDeltaEvent:
                 case ReasoningStartEvent:
@@ -350,7 +834,7 @@ internal static class EventStreamConverter
                     };
                     if (toolCallBuilder.IsBuffering)
                     {
-                        toolCallBuilder.BufferUpdate(update);
+                        toolCallBuilder.BufferUpdate(StampOwner(update, owners));
                     }
                     else
                     {
@@ -359,6 +843,54 @@ internal static class EventStreamConverter
                     break;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Throws when a protocol-required string was ABSENT from the payload.
+    /// </summary>
+    /// <remarks>
+    /// The TypeScript schemas mark these mandatory with <c>z.string()</c>, which
+    /// requires the key to be present but accepts an empty value — so this checks for
+    /// null, not for empty. The properties are declared nullable precisely to make that
+    /// distinction possible: were they non-nullable with a <c>string.Empty</c>
+    /// initializer, a missing property and an explicit <c>""</c> would be
+    /// indistinguishable, and rejecting both would make .NET stricter than TypeScript
+    /// and Python, which is the divergence this is here to prevent.
+    /// </remarks>
+    private static void RequireProvided(string? value, string propertyName, string eventType)
+    {
+        if (value is null)
+        {
+            throw new System.InvalidOperationException(
+                $"Cannot send '{eventType}': '{propertyName}' is required.");
+        }
+    }
+
+    /// <summary>
+    /// Throws when a continuation or close event names a different subagent than the
+    /// one that opened the entity. An absent tag is not a disagreement: attribution is
+    /// optional per event, so producers that tag only openers remain valid.
+    /// </summary>
+    private static void RejectOwnerMismatch(
+        string eventType,
+        string? subagentRunId,
+        Dictionary<string, string?> owners,
+        string entityId,
+        string entityKind)
+    {
+        if (subagentRunId is null)
+        {
+            return;
+        }
+
+        // A recorded owner of null means the entity belongs to the PARENT, which is just
+        // as much an owner as a subagent — so a tagged continuation on it is still a
+        // disagreement. Only the ABSENCE of an entry means "unknown opener".
+        if (owners.TryGetValue(entityId, out var owner) && owner != subagentRunId)
+        {
+            throw new System.InvalidOperationException(
+                $"Cannot send '{eventType}': subagentRunId '{subagentRunId}' does not match the {entityKind} '{entityId}' opener's subagent '{owner}'.");
         }
     }
 }
