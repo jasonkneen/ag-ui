@@ -99,13 +99,41 @@ interrupt round-trip:
 - `status="cancelled"` resumes the tool with the sentinel
   `{"cancelled": True}` (`ag_ui_strands.agent.INTERRUPT_CANCELLED`) so it can
   treat the pause as a denial.
+- **Re-execution on resume:** resuming a paused tool re-runs its body from
+  the top — any code before the `interrupt()` call executes again. Guard
+  side effects that must not repeat:
+
+  ```python
+  @tool
+  def charge_card(tool_context: ToolContext, amount: float) -> str:
+      # Unsafe: re-runs (and re-charges) on every resume.
+      charge(amount)
+      approved = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      return "charged" if approved else "cancelled"
+
+
+  @tool
+  def charge_card(tool_context: ToolContext, amount: float) -> str:
+      # Safe: side effect happens only after the pause resolves.
+      approved = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      if not approved:
+          return "cancelled"
+      charge(amount)
+      return "charged"
+  ```
 
 > **Persistence:** interrupt state lives on the per-thread agent instance. The
 > in-memory per-thread cache only preserves it within a single process, so
 > pause and resume must hit the same process. For stateless / multi-container
 > HTTP deployments, wire a durable `SessionManager` via
 > `StrandsAgentConfig.session_manager_provider` so interrupt state round-trips
-> across processes.
+> across processes. Keep interrupt payloads and tool results JSON-safe (no raw
+> `bytes`) when doing so: Strands' `SessionAgent.to_dict()` — unlike
+> `SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
+> `bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
+> `ToolResult` in the same turn, raises `TypeError: Object of type bytes is
+> not JSON serializable` from `FileSessionManager`/`S3SessionManager` and
+> aborts the run.
 
 ## Supported AG-UI Events
 

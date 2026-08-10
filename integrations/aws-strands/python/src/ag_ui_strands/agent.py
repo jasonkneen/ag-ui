@@ -72,6 +72,20 @@ _WIRE_MAP_MAX = 512
 INTERRUPT_CANCELLED = {"cancelled": True}
 
 
+def _wrap_resume_response(status: str, payload: Any) -> dict:
+    """Package a ``ResumeEntry`` for Strands' ``interruptResponse`` shape.
+
+    Strands' resume gate is truthiness-based (i.e. ``if interrupt_.response:``),
+    so a raw falsy payload (``None``, ``False``, ``""``, ``0``, ``[]``, ``{}``)
+    re-raises the same interrupt and re-runs the tool body — an infinite approve loop.
+    Always hand Strands a truthy envelope; up to the tool implementation to properly
+    destructures it (e.g. via ``.get("cancelled")`` / ``.get("response")``).
+    """
+    if status == "cancelled":
+        return INTERRUPT_CANCELLED
+    return {"response": payload}
+
+
 def _get_strands_session_manager(agent: Any) -> Any:
     """Return the agent's Strands ``SessionManager``, or ``None``.
 
@@ -86,19 +100,38 @@ def _get_strands_session_manager(agent: Any) -> Any:
 def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
     """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
 
-    Strands' ``reason`` is free-form (any JSON), whereas AG-UI's ``reason`` is a
-    categorical string. The interrupt *name* is the closest categorical fit, so
-    it becomes ``reason``; the original reason object is preserved verbatim under
-    ``metadata`` so no information is lost on the wire.
+    Every Strands interrupt originates from ``tool_context.interrupt()`` or a
+    ``BeforeToolCallEvent`` hook, so its id always embeds the triggering
+    ``toolUseId`` (``v1:<kind>:<toolUseId>:<uuid>``) and is inherently
+    tool-call-bound. This maps onto AG-UI's reserved ``reason="tool_call"``
+    core value, with ``tool_call_id`` extracted from the id.
+
+    Strands' free-form ``name`` and ``reason`` are preserved verbatim under
+    ``metadata`` (``strands_name`` / ``strands_reason``) so no information is
+    lost on the wire; ``message`` additionally carries ``reason`` when it is a
+    plain string, since AG-UI clients render ``message`` directly.
     """
+    s_id = getattr(strands_interrupt, "id", "")
+    name = getattr(strands_interrupt, "name", None) or "interrupt"
     raw_reason = getattr(strands_interrupt, "reason", None)
+
+    tool_call_id = None
+    s_id_parts = s_id.split(":") if isinstance(s_id, str) else []
+    if len(s_id_parts) >= 4:
+        # toolUseId is freeform and can itself contain ":" — slice the parts
+        # list to drop only the "v1"/"<kind>" prefix and the trailing uuid.
+        tool_call_id = ":".join(s_id_parts[2:-1])
+
+    metadata = {"strands_name": name}
+    if raw_reason is not None:
+        metadata["strands_reason"] = raw_reason
+
     return Interrupt(
-        id=getattr(strands_interrupt, "id", ""),
-        reason=getattr(strands_interrupt, "name", None) or "interrupt",
+        id=s_id,
+        tool_call_id=tool_call_id,
+        reason="tool_call",
         message=raw_reason if isinstance(raw_reason, str) else None,
-        metadata=(
-            {"strands_reason": raw_reason} if raw_reason is not None else None
-        ),
+        metadata=metadata,
     )
 
 
@@ -1002,8 +1035,8 @@ class StrandsAgent:
                 and has_nonvoid_frontend_result
             )
 
-            # A client answering a native Strands interrupt sends its responses
-            # in ``RunAgentInput.resume`` (per the AG-UI interrupt round-trip),
+            # A client answering to an interrupt sends its responses
+            # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
             # not as a new user message. Translate those into the Strands resume
             # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
             # and drive the stream with it — this takes precedence over every
@@ -1015,10 +1048,8 @@ class StrandsAgent:
                     {
                         "interruptResponse": {
                             "interruptId": entry.interrupt_id,
-                            "response": (
-                                INTERRUPT_CANCELLED
-                                if entry.status == "cancelled"
-                                else entry.payload
+                            "response": _wrap_resume_response(
+                                entry.status, entry.payload
                             ),
                         }
                     }
