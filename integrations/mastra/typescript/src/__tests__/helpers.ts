@@ -112,6 +112,9 @@ export class FakeLocalAgent {
       // be exercised. Additive; undefined by default so existing tests are
       // unaffected.
       ...(this.traceId !== undefined ? { traceId: this.traceId } : {}),
+      // A resumed run makes its own model calls and reports its own usage, so
+      // mirror stream()'s usage exposure here too.
+      ...(this.usage !== undefined ? { usage: this.usage } : {}),
       fullStream: (async function* () {
         for (const chunk of chunks) {
           yield chunk;

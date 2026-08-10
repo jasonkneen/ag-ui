@@ -255,11 +255,18 @@ export const RunFinishedOutcomeSchema = z.discriminatedUnion("type", [
 export const TokenUsageSchema = z.object({
   provider: z.string().optional(),
   model: z.string().optional(),
-  inputTokens: z.number().optional(),
-  outputTokens: z.number().optional(),
-  totalTokens: z.number().optional(),
-  reasoningTokens: z.number().optional(),
-  cachedInputTokens: z.number().optional(),
+  // Counts are non-negative integers in every representation: proto `int64`,
+  // C# `long?`, Python `int`. Constraining them here keeps TypeScript from
+  // admitting values the other bindings cannot encode — `proto.encode` parses
+  // against this schema and then writes via an int64 writer that throws on a
+  // non-integer, so an unconstrained `z.number()` turns a bad producer value
+  // into a mid-stream crash on the protobuf transport instead of a validation
+  // error at the source.
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  totalTokens: z.number().int().nonnegative().optional(),
+  reasoningTokens: z.number().int().nonnegative().optional(),
+  cachedInputTokens: z.number().int().nonnegative().optional(),
 });
 
 export const RunFinishedEventSchema = BaseEventSchema.extend({

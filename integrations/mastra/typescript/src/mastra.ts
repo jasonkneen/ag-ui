@@ -842,7 +842,10 @@ export class MastraAgent extends AbstractAgent {
               );
 
               if (!hadError) {
-                await finishResume(await this.resolveTraceId(response));
+                await finishResume(
+                  await this.resolveTraceId(response),
+                  await this.resolveUsage(response),
+                );
               }
             } else {
               // Remote resume round-trips the suspend state + resume command
@@ -895,7 +898,10 @@ export class MastraAgent extends AbstractAgent {
 
               if (!stopped) {
                 flush();
-                await finishResume(await this.resolveTraceId(response));
+                await finishResume(
+                  await this.resolveTraceId(response),
+                  await this.resolveUsage(response),
+                );
               }
             }
           } catch (error) {
