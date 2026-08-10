@@ -29,4 +29,12 @@ public sealed class ReasoningEncryptedValueEvent : BaseEvent
     /// </summary>
     [JsonPropertyName("encryptedValue")]
     public string EncryptedValue { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the subagent that produced this event, absent when the parent agent
+    /// produced it directly.
+    /// </summary>
+    [JsonPropertyName("subagentRunId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SubagentRunId { get; set; }
 }
