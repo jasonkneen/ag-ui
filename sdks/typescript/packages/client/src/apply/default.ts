@@ -30,6 +30,9 @@ import {
   type StateSnapshotEvent,
   type StepFinishedEvent,
   type StepStartedEvent,
+  type SubagentErrorEvent,
+  type SubagentFinishedEvent,
+  type SubagentStartedEvent,
   type TextMessageContentEvent,
   type TextMessageEndEvent,
   type TextMessageStartEvent,
@@ -165,7 +168,12 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId, role = "assistant", name } = event as TextMessageStartEvent;
+            const {
+              messageId,
+              role = "assistant",
+              name,
+              subagentRunId,
+            } = event as TextMessageStartEvent;
 
             // Check if a message with this ID already exists (e.g., created by TOOL_CALL_START
             // with the same parentMessageId)
@@ -179,6 +187,7 @@ export const defaultApplyEvents = (
                 role: role,
                 content: "",
                 ...(name !== undefined && { name }),
+                ...(subagentRunId !== undefined && { subagentRunId }),
               };
 
               // Add the new message to the messages array
@@ -288,7 +297,8 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { toolCallId, toolCallName, parentMessageId } = event as ToolCallStartEvent;
+            const { toolCallId, toolCallName, parentMessageId, subagentRunId } =
+              event as ToolCallStartEvent;
 
             // Applying a start event must be idempotent. The same start can
             // reach this reducer twice — a tool call already carried in
@@ -323,11 +333,16 @@ export const defaultApplyEvents = (
               return emitUpdates();
             }
 
+            const preexistingIds = new Set(messages.map((m) => m.id));
             const targetMessage = resolveOrCreateAssistantMessage(
               messages,
               parentMessageId,
               toolCallId,
             );
+            const wasCreated = !preexistingIds.has(targetMessage.id);
+            if (wasCreated && subagentRunId !== undefined && targetMessage.subagentRunId === undefined) {
+              targetMessage.subagentRunId = subagentRunId;
+            }
 
             targetMessage.toolCalls ??= [];
 
@@ -490,13 +505,15 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId, toolCallId, content, role } = event as ToolCallResultEvent;
+            const { messageId, toolCallId, content, role, subagentRunId } =
+              event as ToolCallResultEvent;
 
             const toolMessage: ToolMessage = {
               id: messageId,
               toolCallId,
               role: role || "tool",
               content: content,
+              ...(subagentRunId !== undefined && { subagentRunId }),
             };
 
             // Place the tool result immediately after the assistant message that
@@ -712,6 +729,9 @@ export const defaultApplyEvents = (
               role: "activity",
               activityType: activityEvent.activityType,
               content: structuredClone_(activityEvent.content),
+              ...(activityEvent.subagentRunId !== undefined && {
+                subagentRunId: activityEvent.subagentRunId,
+              }),
             };
 
             let createdMessage: ActivityMessage | undefined;
@@ -721,11 +741,21 @@ export const defaultApplyEvents = (
               createdMessage = activityMessage;
             } else if (existingActivityMessage) {
               if (replace) {
+                // A replace snapshot re-mints the activity, so it brings its own
+                // attribution with it (D4: a creation event's subagentRunId transfers to
+                // the message it mints). Spreading the old message kept the old owner,
+                // so replacing a parent activity with a subagent's snapshot left it
+                // parent-owned — and, in the other direction, a parent snapshot could
+                // never reclaim an activity a subagent had taken.
                 messages[existingIndex] = {
                   ...existingActivityMessage,
                   activityType: activityEvent.activityType,
                   content: structuredClone_(activityEvent.content),
+                  subagentRunId: activityEvent.subagentRunId,
                 };
+                if (activityEvent.subagentRunId === undefined) {
+                  delete (messages[existingIndex] as { subagentRunId?: string }).subagentRunId;
+                }
               }
             } else if (replace) {
               messages[existingIndex] = activityMessage;
@@ -1049,7 +1079,7 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId } = event as ReasoningMessageStartEvent;
+            const { messageId, subagentRunId } = event as ReasoningMessageStartEvent;
             const existingMessage = messages.find((m) => m.id === messageId);
 
             if (!existingMessage) {
@@ -1057,6 +1087,7 @@ export const defaultApplyEvents = (
                 id: messageId,
                 role: "reasoning",
                 content: "",
+                ...(subagentRunId !== undefined && { subagentRunId }),
               };
               messages.push(newMessage);
               applyMutation({ messages });
@@ -1207,6 +1238,60 @@ export const defaultApplyEvents = (
               currentMutation.messages = messages;
             }
           }
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_STARTED: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentStartedEvent?.({
+                event: event as SubagentStartedEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_FINISHED: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentFinishedEvent?.({
+                event: event as SubagentFinishedEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_ERROR: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentErrorEvent?.({
+                event: event as SubagentErrorEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
           return emitUpdates();
         }
       }
