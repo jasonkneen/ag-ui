@@ -38,6 +38,7 @@ import {
   BackwardCompatibility_0_0_39,
   BackwardCompatibility_0_0_45,
   BackwardCompatibility_0_0_47,
+  BackwardCompatibility_0_0_57,
 } from "@/middleware";
 import packageJson from "../../package.json";
 
@@ -128,6 +129,11 @@ export abstract class AbstractAgent {
       this.middlewares.unshift(new BackwardCompatibility_0_0_47());
     }
 
+    // Auto-insert BackwardCompatibility_0_0_57 for backward compatibility with
+    // pre-subagent agents: strips subagentRunId and drops SUBAGENT_* lifecycle events.
+    if (compareVersions(this.maxVersion, "0.0.57") <= 0) {
+      this.middlewares.unshift(new BackwardCompatibility_0_0_57());
+    }
   }
 
   public subscribe(subscriber: AgentSubscriber) {
