@@ -50,7 +50,9 @@ export class A2UIPage {
   }
 
   async assertAgentReplyVisible(expectedText: RegExp | RegExp[]) {
-    const patterns = Array.isArray(expectedText) ? expectedText : [expectedText];
+    const patterns = Array.isArray(expectedText)
+      ? expectedText
+      : [expectedText];
     let lastError: unknown = null;
     for (const pattern of patterns) {
       try {

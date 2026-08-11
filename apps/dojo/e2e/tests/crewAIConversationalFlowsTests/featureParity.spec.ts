@@ -144,14 +144,19 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     );
   });
 
-  test("v1 chat renders the assistant after its user turn", async ({ page }) => {
+  test("v1 chat renders the assistant after its user turn", async ({
+    page,
+  }) => {
     await page.goto(`/${integrationId}/feature/v1_agentic_chat`);
     const chat = new V1AgenticChatPage(page);
 
     await chat.sendMessage("Hi");
     await chat.assertAgentReplyVisible(/Hello|Hi|hey|help|assist/i);
 
-    await expectRenderedAfter(chat.userMessages.last(), chat.assistantMessages.last());
+    await expectRenderedAfter(
+      chat.userMessages.last(),
+      chat.assistantMessages.last(),
+    );
   });
 
   test("backend tool cards render after the triggering user turn", async ({
@@ -284,11 +289,7 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
     await subgraphs.verifyStaticExperienceData();
   });
 
-  for (const {
-    feature,
-    prompt,
-    surfaceId,
-  } of [
+  for (const { feature, prompt, surfaceId } of [
     {
       feature: "a2ui_fixed_schema",
       prompt: "Search for hotels in downtown Manhattan for next weekend.",
@@ -306,7 +307,9 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
       surfaceId: "hotel-comparison",
     },
   ] as const) {
-    test(`${feature} renders its surface after the user turn`, async ({ page }) => {
+    test(`${feature} renders its surface after the user turn`, async ({
+      page,
+    }) => {
       await page.goto(`/${integrationId}/feature/${feature}`);
       const a2ui = new A2UIPage(page);
       await a2ui.openChat();

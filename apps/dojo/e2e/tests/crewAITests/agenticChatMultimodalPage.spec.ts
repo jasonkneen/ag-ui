@@ -7,7 +7,10 @@ import {
 } from "../../utils/copilot-actions";
 import { CopilotSelectors } from "../../utils/copilot-selectors";
 
-const TEST_IMAGE = path.join(import.meta.dirname, "../../fixtures/test-image.png");
+const TEST_IMAGE = path.join(
+  import.meta.dirname,
+  "../../fixtures/test-image.png",
+);
 
 // The attached image is converted to LiteLLM's image_url shape by the bridge
 // before the CrewAI flow forwards it to a vision model.
@@ -23,8 +26,11 @@ test.describe("[Integration] CrewAI - Agentic Chat Multimodal", () => {
     await awaitLLMResponseDone(page);
 
     const lastAssistant = CopilotSelectors.assistantMessages(page).last();
-    await expect(lastAssistant).toContainText(/image|visual|content|see|picture/i, {
-      timeout: 10000,
-    });
+    await expect(lastAssistant).toContainText(
+      /image|visual|content|see|picture/i,
+      {
+        timeout: 10000,
+      },
+    );
   });
 });

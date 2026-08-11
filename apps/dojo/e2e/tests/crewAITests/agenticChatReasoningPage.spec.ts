@@ -22,7 +22,9 @@ test.describe("[Integration] CrewAI - Agentic Chat Reasoning", () => {
     await expect(dropdown).toBeVisible({ timeout: 10000 });
   });
 
-  test("should show reasoning indicator and then the response", async ({ page }) => {
+  test("should show reasoning indicator and then the response", async ({
+    page,
+  }) => {
     await page.goto("/crewai/feature/agentic_chat_reasoning");
     await openChat(page);
 

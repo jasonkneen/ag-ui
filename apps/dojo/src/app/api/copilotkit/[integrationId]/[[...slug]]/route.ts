@@ -108,7 +108,8 @@ export async function POST(request: NextRequest, context: RouteParams) {
   if (!handler) {
     return new Response("Integration not found", { status: 404 });
   }
-  const distinctId = request.headers.get("x-posthog-distinct-id") || "anonymous";
+  const distinctId =
+    request.headers.get("x-posthog-distinct-id") || "anonymous";
   const posthog = getPostHogClient();
   posthog?.capture({
     distinctId,

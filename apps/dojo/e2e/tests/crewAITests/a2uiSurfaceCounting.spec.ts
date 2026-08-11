@@ -32,14 +32,18 @@ test("[CrewAI] A2UIPage counts actions on ONE surface when the same id is painte
   // The hazard: `surface()` stays multi-element on purpose (callers count
   // surfaces with it), so a count through it doubles on a repaint.
   await expect(
-    a2ui.surface(SURFACE_ID).getByRole("button", { name: "Booked", exact: true }),
+    a2ui
+      .surface(SURFACE_ID)
+      .getByRole("button", { name: "Booked", exact: true }),
   ).toHaveCount(2);
 
   // The helpers the specs use are unaffected by the duplicate node.
   await expect(a2ui.surfaceActions("Booked", SURFACE_ID)).toHaveCount(1);
   await expect(a2ui.surfaceActions("Book", SURFACE_ID)).toHaveCount(2);
   await expect(
-    a2ui.visibleSurface(SURFACE_ID).getByRole("button", { name: "Booked", exact: true }),
+    a2ui
+      .visibleSurface(SURFACE_ID)
+      .getByRole("button", { name: "Booked", exact: true }),
   ).toHaveCount(1);
 });
 

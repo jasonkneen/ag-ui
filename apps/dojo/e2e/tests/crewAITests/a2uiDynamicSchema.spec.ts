@@ -53,6 +53,8 @@ test("[CrewAI] A2UI Dynamic Schema answers an action click about that choice", a
 
   // Counted inside ONE surface node: a repaint of the same surface id would
   // otherwise double the count.
-  await expect(a2ui.surfaceActions("Booked", "hotel-comparison")).toHaveCount(1);
+  await expect(a2ui.surfaceActions("Booked", "hotel-comparison")).toHaveCount(
+    1,
+  );
   await a2ui.assertAgentReplyVisible(/booked at Holiday Inn/i);
 });

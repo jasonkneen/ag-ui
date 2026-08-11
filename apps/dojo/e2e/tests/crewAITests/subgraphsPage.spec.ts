@@ -24,7 +24,9 @@ test.describe("Subgraphs Travel Agent Feature", () => {
     await expect(subgraphsPage.selectedFlight)
       .toContainText("KLM")
       .catch(async () => {
-        await expect(page.getByText(/KLM/i).first()).toBeVisible({ timeout: 2000 });
+        await expect(page.getByText(/KLM/i).first()).toBeVisible({
+          timeout: 2000,
+        });
       });
 
     await subgraphsPage.waitForHotelsAgent();
@@ -34,7 +36,9 @@ test.describe("Subgraphs Travel Agent Feature", () => {
     await expect(subgraphsPage.selectedHotel)
       .toContainText("Zoe")
       .catch(async () => {
-        await expect(page.getByText(/Hotel Zoe|Zoe/i).first()).toBeVisible({ timeout: 2000 });
+        await expect(page.getByText(/Hotel Zoe|Zoe/i).first()).toBeVisible({
+          timeout: 2000,
+        });
       });
 
     await subgraphsPage.waitForExperiencesAgent();
@@ -49,7 +53,9 @@ test.describe("Subgraphs Travel Agent Feature", () => {
     await page.goto("/crewai/feature/subgraphs");
     await subgraphsPage.openChat();
 
-    await subgraphsPage.sendMessage("I want to visit San Francisco from Amsterdam");
+    await subgraphsPage.sendMessage(
+      "I want to visit San Francisco from Amsterdam",
+    );
 
     await subgraphsPage.waitForFlightsAgent();
     await subgraphsPage.verifyStaticFlightData();
