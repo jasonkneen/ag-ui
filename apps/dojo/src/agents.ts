@@ -8,6 +8,14 @@ import { ServerStarterAgent } from "@ag-ui/server-starter";
 import { ServerStarterAllFeaturesAgent } from "@ag-ui/server-starter-all-features";
 import { MastraClient } from "@mastra/client-js";
 import { MastraAgent } from "@ag-ui/mastra";
+
+// pnpm may resolve separate @mastra/* installations for dojo vs @ag-ui/mastra,
+// which makes the client/agent types mismatch nominally on private fields. The
+// casts below are deliberate, but target these exact expected types rather than
+// widening to `any`.
+type RemoteAgentsOptions = Parameters<typeof MastraAgent.getRemoteAgents>[0];
+type LocalAgentsOptions = Parameters<typeof MastraAgent.getLocalAgents>[0];
+type MastraAgentOptions = ConstructorParameters<typeof MastraAgent>[0];
 // import { VercelAISDKAgent } from "@ag-ui/vercel-ai-sdk";
 // import { openai } from "@ai-sdk/openai";
 import { LangGraphAgent, LangGraphHttpAgent } from "@ag-ui/langgraph";
@@ -175,11 +183,8 @@ export const agentsIntegrations = {
     });
 
     return MastraAgent.getRemoteAgents({
-      // Cast needed: pnpm may resolve separate @mastra/client-js installations
-      // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
-      mastraClient: mastraClient as unknown as Parameters<
-        typeof MastraAgent.getRemoteAgents
-      >[0]["mastraClient"],
+      mastraClient:
+        mastraClient as unknown as RemoteAgentsOptions["mastraClient"],
       resourceId: "mastra-agent-remote",
       // Surface Observational Memory background work as AG-UI activity events
       // for the `observational_memory` demo only (default OFF for all others).
@@ -205,11 +210,7 @@ export const agentsIntegrations = {
 
   "mastra-agent-local": async () => {
     const base = MastraAgent.getLocalAgents({
-      // Cast needed: pnpm may resolve separate @mastra/core installations
-      // for dojo vs @ag-ui/mastra, causing nominal type mismatch on private fields
-      mastra: mastra as unknown as Parameters<
-        typeof MastraAgent.getLocalAgents
-      >[0]["mastra"],
+      mastra: mastra as unknown as LocalAgentsOptions["mastra"],
       resourceId: "mastra-agent-local",
       // Surface Observational Memory background work as AG-UI activity events
       // for the `observational_memory` demo only (default OFF for all others).
@@ -221,7 +222,7 @@ export const agentsIntegrations = {
     // so the runtime's per-request `clone()` preserves it.
     const wrapA2UI = (agent: unknown): AbstractAgent =>
       new MastraAgent({
-        agent: agent as ConstructorParameters<typeof MastraAgent>[0]["agent"],
+        agent: agent as unknown as MastraAgentOptions["agent"],
         resourceId: "mastra-agent-local",
         a2ui: a2uiInjectConfig,
       }) as unknown as AbstractAgent;
@@ -229,7 +230,7 @@ export const agentsIntegrations = {
     // bridge never adds generate_a2ui alongside search_flights/search_hotels.
     const wrapA2UIFixed = (agent: unknown): AbstractAgent =>
       new MastraAgent({
-        agent: agent as ConstructorParameters<typeof MastraAgent>[0]["agent"],
+        agent: agent as unknown as MastraAgentOptions["agent"],
         resourceId: "mastra-agent-local",
         a2ui: { injectA2UITool: false },
       }) as unknown as AbstractAgent;

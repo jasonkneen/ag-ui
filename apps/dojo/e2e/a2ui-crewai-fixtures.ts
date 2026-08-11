@@ -12,7 +12,12 @@
  *
  * Register via `registerA2UICrewAIFixtures(mockServer)` from aimock-setup.ts.
  */
-import type { LLMock, ChatMessage } from "@copilotkit/aimock";
+import type {
+  LLMock,
+  ChatMessage,
+  ChatCompletionRequest,
+  ToolDefinition,
+} from "@copilotkit/aimock";
 
 const textOf = (content: ChatMessage["content"] | undefined): string => {
   if (typeof content === "string") return content;
@@ -128,7 +133,8 @@ const actionReply = (action: SurfaceAction | null): string => {
     const flight = asText(context.flightNumber) ?? "your flight";
     const origin = asText(context.origin);
     const destination = asText(context.destination);
-    const route = origin && destination ? ` from ${origin} to ${destination}` : "";
+    const route =
+      origin && destination ? ` from ${origin} to ${destination}` : "";
     return `You are booked on ${flight}${route}${
       price ? ` for ${price}` : ""
     }. Your itinerary is on its way.`;
@@ -189,7 +195,12 @@ const CARD = {
 const HOTELS = [
   { name: "The Ritz", location: "Paris", rating: 4.8, price: "$450/night" },
   { name: "Holiday Inn", location: "Austin", rating: 4.1, price: "$180/night" },
-  { name: "Boutique Loft", location: "Lisbon", rating: 4.6, price: "$320/night" },
+  {
+    name: "Boutique Loft",
+    location: "Lisbon",
+    rating: 4.6,
+    price: "$320/night",
+  },
 ];
 const renderArgs = JSON.stringify({
   surfaceId: "hotel-comparison",
@@ -229,13 +240,25 @@ const FLIGHTS = [
   },
 ];
 const HOTELS_FIXED = [
-  { id: "1", name: "The Manhattan Grand", location: "Downtown Manhattan", rating: 4.5, price: "$350" },
-  { id: "2", name: "Downtown Boutique Hotel", location: "SoHo", rating: 4.0, price: "$280" },
+  {
+    id: "1",
+    name: "The Manhattan Grand",
+    location: "Downtown Manhattan",
+    rating: 4.5,
+    price: "$350",
+  },
+  {
+    id: "2",
+    name: "Downtown Boutique Hotel",
+    location: "SoHo",
+    rating: 4.0,
+    price: "$280",
+  },
 ];
 
 export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
-  const hasTool = (req: any, name: string) =>
-    req.tools?.some((t: any) => t.function.name === name);
+  const hasTool = (req: ChatCompletionRequest, name: string) =>
+    req.tools?.some((t: ToolDefinition) => t.function.name === name);
 
   // Surface action, any demo: reply about the item that was actually clicked.
   // The reply comes from a response FACTORY reading the forwarded action
@@ -247,7 +270,9 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   // becomes eligible for image/speech/transcription requests.
   mockServer.addFixture({
     match: { endpoint: "chat", predicate: isActionTurn },
-    response: (req: any) => ({ content: actionReply(pendingAction(req)) }),
+    response: (req: ChatCompletionRequest) => ({
+      content: actionReply(pendingAction(req)),
+    }),
   });
 
   // fixed_schema render follow-up: the closing reply the flow gets only by
@@ -255,7 +280,8 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   // fixtures below so a request already carrying the envelope cannot re-search.
   mockServer.addFixture({
     match: {
-      predicate: (req: any) => isRenderFollowUpTurn(req) && isFixedRun(req),
+      predicate: (req: ChatCompletionRequest) =>
+        isRenderFollowUpTurn(req) && isFixedRun(req),
     },
     response: { content: "Here are your results." },
   });
@@ -264,7 +290,8 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   // envelope. Must precede the generate_a2ui fixture for the same reason.
   mockServer.addFixture({
     match: {
-      predicate: (req: any) => isRenderFollowUpTurn(req) && isDynamicRun(req),
+      predicate: (req: ChatCompletionRequest) =>
+        isRenderFollowUpTurn(req) && isDynamicRun(req),
     },
     response: { content: "Here is the comparison you asked for." },
   });
@@ -279,11 +306,17 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   mockServer.addFixture({
     match: {
       hasToolResult: false,
-      predicate: (req: any) =>
-        hasTool(req, "search_flights") && isFixedFlightPrompt(userText(req.messages)),
+      predicate: (req: ChatCompletionRequest) =>
+        hasTool(req, "search_flights") &&
+        isFixedFlightPrompt(userText(req.messages)),
     },
     response: {
-      toolCalls: [{ name: "search_flights", arguments: JSON.stringify({ flights: FLIGHTS }) }],
+      toolCalls: [
+        {
+          name: "search_flights",
+          arguments: JSON.stringify({ flights: FLIGHTS }),
+        },
+      ],
     },
   });
 
@@ -291,11 +324,17 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   mockServer.addFixture({
     match: {
       hasToolResult: false,
-      predicate: (req: any) =>
-        hasTool(req, "search_hotels") && isFixedHotelPrompt(userText(req.messages)),
+      predicate: (req: ChatCompletionRequest) =>
+        hasTool(req, "search_hotels") &&
+        isFixedHotelPrompt(userText(req.messages)),
     },
     response: {
-      toolCalls: [{ name: "search_hotels", arguments: JSON.stringify({ hotels: HOTELS_FIXED }) }],
+      toolCalls: [
+        {
+          name: "search_hotels",
+          arguments: JSON.stringify({ hotels: HOTELS_FIXED }),
+        },
+      ],
     },
   });
 
@@ -303,17 +342,23 @@ export function registerA2UICrewAIFixtures(mockServer: LLMock): void {
   mockServer.addFixture({
     match: {
       hasToolResult: false,
-      predicate: (req: any) => hasTool(req, "generate_a2ui") && isDynamicRun(req),
+      predicate: (req: ChatCompletionRequest) =>
+        hasTool(req, "generate_a2ui") && isDynamicRun(req),
     },
     response: {
-      toolCalls: [{ name: "generate_a2ui", arguments: JSON.stringify({ intent: "create" }) }],
+      toolCalls: [
+        {
+          name: "generate_a2ui",
+          arguments: JSON.stringify({ intent: "create" }),
+        },
+      ],
     },
   });
 
   // dynamic_schema - sub-agent render_a2ui → valid hotel-comparison surface.
   mockServer.addFixture({
     match: {
-      predicate: (req: any) =>
+      predicate: (req: ChatCompletionRequest) =>
         hasTool(req, "render_a2ui") && isDynamicPrompt(allText(req.messages)),
     },
     response: { toolCalls: [{ name: "render_a2ui", arguments: renderArgs }] },
