@@ -147,6 +147,80 @@ class TestInterruptOutcome:
         }
 
     @pytest.mark.asyncio
+    async def test_terminal_result_captured_despite_halt_in_same_cycle(self):
+        """The terminal ``AgentResult`` capture must run before the
+        ``halt_event_stream`` break check — otherwise a native interrupt whose
+        terminal event arrives on/after the same cycle that triggers a
+        frontend-tool halt is silently dropped (the run finishes bare instead
+        of surfacing the interrupt).
+        """
+        open_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-native:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+        )
+        events = [
+            {
+                "current_tool_use": {
+                    "toolUseId": "tu-fe",
+                    "name": "get_cell",
+                    "input": '{"cell": "B4"}',
+                }
+            },
+            {"event": {"contentBlockStop": {}}},
+            # Empty content models the interrupted turn skipping
+            # ToolResultMessageEvent; pending_halt still
+            # latches halt_event_stream here regardless.
+            {"message": {"role": "user", "content": []}},
+            {"result": _agent_result_with_interrupt([open_interrupt])},
+        ]
+        core = _MockStrandsCore(terminal_events=events)
+        agent = _make_base_agent()
+        frontend_tool = Tool(name="get_cell", description="Read a cell", parameters={})
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events_out = await _collect_events(agent, _make_run_input(tools=[frontend_tool]))
+
+        finished = next(e for e in events_out if e.type == EventType.RUN_FINISHED)
+        assert (
+            finished.outcome is not None
+        ), "terminal interrupt result was dropped on the halt path (round1.md #7a)"
+        assert finished.outcome.type == "interrupt"
+        assert finished.outcome.interrupts[0].id == open_interrupt.id
+
+    @pytest.mark.asyncio
+    async def test_fallback_excludes_already_answered_interrupts(self):
+        """When the terminal ``AgentResult`` is unavailable and ``_extract_interrupts``
+        falls back to the live ``_interrupt_state``, an interrupt that was already
+        answered by a prior partial resume (truthy ``.response``) must not be
+        re-reported as still pending alongside the genuinely open one.
+        """
+        answered = StrandsInterrupt(
+            id="v1:tool_call:tu-answered:00000000-0000-0000-0000-000000000000",
+            name="answered",
+            response={"response": "yes"},
+        )
+        open_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-open:00000000-0000-0000-0000-000000000000",
+            name="open",
+        )
+        # No terminal ``{"result": ...}`` event — mirrors the halt-event-stream
+        # path where the stream breaks before a terminal AgentResult is captured.
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[answered, open_interrupt],
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input())
+
+        finished = next(e for e in events if e.type == EventType.RUN_FINISHED)
+        assert finished.outcome is not None
+        assert finished.outcome.type == "interrupt"
+        reported_ids = {i.id for i in finished.outcome.interrupts}
+        assert reported_ids == {open_interrupt.id}
+
+    @pytest.mark.asyncio
     async def test_no_interrupt_finishes_bare(self):
         """A normal run finishes with no outcome (back-compat, no behavior change)."""
         result = MagicMock()
@@ -350,9 +424,7 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
 
     ``False`` keeps coverage that a latched-but-unfired halt does not corrupt
     the interrupt path (moving the latch earlier would break this param and
-    not the other); ``True`` models immediate hand-off and is the only config
-    the TypeScript adapter — which latches per-tool on ``afterToolCallEvent``
-    — emits the interrupt outcome for at all.
+    not the other); ``True`` models immediate hand-off.
     """
     tool_behaviors = {
         "confirm_action": ToolBehavior(

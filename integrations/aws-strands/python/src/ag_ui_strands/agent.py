@@ -83,7 +83,7 @@ def _wrap_resume_response(status: str, payload: Any) -> dict:
     destructures it (e.g. via ``.get("cancelled")`` / ``.get("response")``).
     """
     if status == "cancelled":
-        return INTERRUPT_CANCELLED
+        return dict(INTERRUPT_CANCELLED)
     return {"response": payload}
 
 
@@ -151,7 +151,14 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
                 return list(interrupts)
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is not None and getattr(interrupt_state, "activated", False):
-        return list(getattr(interrupt_state, "interrupts", {}).values())
+        # Mirrors Strands' own gate (strands/types/interrupt.py: ``if interrupt_.response:``)
+        # — an interrupt with a truthy response was already answered by a prior partial
+        # resume and must not be re-reported as still pending.
+        return [
+            interrupt
+            for interrupt in getattr(interrupt_state, "interrupts", {}).values()
+            if not getattr(interrupt, "response", None)
+        ]
     return []
 
 
@@ -1250,6 +1257,13 @@ class StrandsAgent:
             agent_stream = strands_agent.stream_async(resume_prompt)
             try:
                 async for event in agent_stream:
+                    # Capture the terminal ``AgentResult`` (always emitted last
+                    # by ``stream_async``) so a native interrupt pause can be
+                    # detected after the loop. Recorded first so it is never
+                    # dropped, even on the halt-event-stream break below.
+                    if "result" in event and event["result"] is not None:
+                        terminal_result = event["result"]
+
                     # Frontend-tool halt: STOP the loop rather than muting the
                     # wire and draining it. The proxy tool returns a SUCCESSFUL
                     # "Forwarded to client" placeholder, so Strands has every
@@ -1272,13 +1286,6 @@ class StrandsAgent:
                         break
 
                     logger.debug(f"Received event: {event}")
-
-                    # Capture the terminal ``AgentResult`` (always emitted last
-                    # by ``stream_async``) so a native interrupt pause can be
-                    # detected after the loop. Recorded before the
-                    # ``complete``/``force_stop`` break so it is never dropped.
-                    if "result" in event and event["result"] is not None:
-                        terminal_result = event["result"]
 
                     # Skip lifecycle events
                     if event.get("init_event_loop") or event.get("start_event_loop"):
