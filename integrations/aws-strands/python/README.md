@@ -95,9 +95,15 @@ interrupt round-trip:
   `metadata.strands_reason`.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
-  payload=...)]`. The tool's `interrupt()` call returns exactly `payload`.
+  payload=...)]`. Strands' resume gate is truthiness-based (`if
+  interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
+  `[]`, `{}`) would otherwise re-raise the same interrupt and re-run the tool
+  body forever. To prevent that, `interrupt()` does **not** return `payload`
+  directly — it returns a truthy envelope: `{"response": payload}` on
+  resolve, `{"cancelled": True}` on cancel. Destructure it with
+  `.get("response")` / `.get("cancelled")`.
 - `status="cancelled"` resumes the tool with the sentinel
-  `{"cancelled": True}` (`ag_ui_strands.agent.INTERRUPT_CANCELLED`) so it can
+  `{"cancelled": True}` (`ag_ui_strands.INTERRUPT_CANCELLED`) so it can
   treat the pause as a denial.
 - **Re-execution on resume:** resuming a paused tool re-runs its body from
   the top — any code before the `interrupt()` call executes again. Guard
@@ -108,15 +114,15 @@ interrupt round-trip:
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Unsafe: re-runs (and re-charges) on every resume.
       charge(amount)
-      approved = tool_context.interrupt("confirm_charge", reason={"amount": amount})
-      return "charged" if approved else "cancelled"
+      envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      return "cancelled" if envelope.get("cancelled") or not envelope.get("response") else "charged"
 
 
   @tool
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Safe: side effect happens only after the pause resolves.
-      approved = tool_context.interrupt("confirm_charge", reason={"amount": amount})
-      if not approved:
+      envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      if envelope.get("cancelled") or not envelope.get("response"):
           return "cancelled"
       charge(amount)
       return "charged"

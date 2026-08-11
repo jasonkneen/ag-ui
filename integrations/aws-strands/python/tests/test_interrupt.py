@@ -22,6 +22,7 @@ from strands.agent.state import AgentState
 from strands.interrupt import Interrupt as StrandsInterrupt
 from strands.interrupt import _InterruptState
 from strands.models.model import Model as StrandsModel
+from strands.session import FileSessionManager
 
 from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
@@ -146,6 +147,80 @@ class TestInterruptOutcome:
         }
 
     @pytest.mark.asyncio
+    async def test_terminal_result_captured_despite_halt_in_same_cycle(self):
+        """The terminal ``AgentResult`` capture must run before the
+        ``halt_event_stream`` break check — otherwise a native interrupt whose
+        terminal event arrives on/after the same cycle that triggers a
+        frontend-tool halt is silently dropped (the run finishes bare instead
+        of surfacing the interrupt).
+        """
+        open_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-native:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+        )
+        events = [
+            {
+                "current_tool_use": {
+                    "toolUseId": "tu-fe",
+                    "name": "get_cell",
+                    "input": '{"cell": "B4"}',
+                }
+            },
+            {"event": {"contentBlockStop": {}}},
+            # Empty content models the interrupted turn skipping
+            # ToolResultMessageEvent; pending_halt still
+            # latches halt_event_stream here regardless.
+            {"message": {"role": "user", "content": []}},
+            {"result": _agent_result_with_interrupt([open_interrupt])},
+        ]
+        core = _MockStrandsCore(terminal_events=events)
+        agent = _make_base_agent()
+        frontend_tool = Tool(name="get_cell", description="Read a cell", parameters={})
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events_out = await _collect_events(agent, _make_run_input(tools=[frontend_tool]))
+
+        finished = next(e for e in events_out if e.type == EventType.RUN_FINISHED)
+        assert (
+            finished.outcome is not None
+        ), "terminal interrupt result was dropped on the halt path (round1.md #7a)"
+        assert finished.outcome.type == "interrupt"
+        assert finished.outcome.interrupts[0].id == open_interrupt.id
+
+    @pytest.mark.asyncio
+    async def test_fallback_excludes_already_answered_interrupts(self):
+        """When the terminal ``AgentResult`` is unavailable and ``_extract_interrupts``
+        falls back to the live ``_interrupt_state``, an interrupt that was already
+        answered by a prior partial resume (truthy ``.response``) must not be
+        re-reported as still pending alongside the genuinely open one.
+        """
+        answered = StrandsInterrupt(
+            id="v1:tool_call:tu-answered:00000000-0000-0000-0000-000000000000",
+            name="answered",
+            response={"response": "yes"},
+        )
+        open_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-open:00000000-0000-0000-0000-000000000000",
+            name="open",
+        )
+        # No terminal ``{"result": ...}`` event — mirrors the halt-event-stream
+        # path where the stream breaks before a terminal AgentResult is captured.
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[answered, open_interrupt],
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input())
+
+        finished = next(e for e in events if e.type == EventType.RUN_FINISHED)
+        assert finished.outcome is not None
+        assert finished.outcome.type == "interrupt"
+        reported_ids = {i.id for i in finished.outcome.interrupts}
+        assert reported_ids == {open_interrupt.id}
+
+    @pytest.mark.asyncio
     async def test_no_interrupt_finishes_bare(self):
         """A normal run finishes with no outcome (back-compat, no behavior change)."""
         result = MagicMock()
@@ -182,9 +257,7 @@ class TestResumeConsumption:
 
     @pytest.mark.parametrize("falsy_payload", [None, False, "", 0, [], {}])
     @pytest.mark.asyncio
-    async def test_resolved_resume_wraps_falsy_payload_in_truthy_envelope(
-        self, falsy_payload
-    ):
+    async def test_resolved_resume_wraps_falsy_payload_in_truthy_envelope(self, falsy_payload):
         """Falsy resume payloads must be wrapped so Strands' ``if response:`` gate passes.
 
         Regression for ``round1.md`` #1: without the envelope, ``None``/``False``/
@@ -309,21 +382,64 @@ class _InterruptFlowModel(StrandsModel):
             yield {"messageStop": {"stopReason": "end_turn"}}
 
 
-@pytest.mark.asyncio
-async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors():
-    """Regression for docs/round1.md items #1, #2, #3 — real Agent, real
-    tool, scripted model, no network. Intentionally failing until those are
-    fixed; see docs/round1.md."""
+def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _InterruptFlowModel]:
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    return StrandsAgent(core, name="e2e-interrupt", config=config), model
+
+
+@pytest.mark.parametrize("recreate_agent", [False, True])
+@pytest.mark.parametrize("fe_continues", [False, True])
+@pytest.mark.asyncio
+async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
+    tmp_path, recreate_agent, fe_continues
+):
+    """Regression for mixed FE tools & interrupts.
+
+    Uses a real ``FileSessionManager`` — the no-session-manager path (in-memory
+    ``replay_history_into_strands``) is out of scope for this regression.
+
+    Parametrized on ``recreate_agent``: ``False`` exercises resume through the
+    same in-memory ``StrandsAgent``/``StrandsAgentCore`` (the per-thread cache
+    still holds the paused agent); ``True`` discards them after turn 1 and
+    resumes through freshly constructed ones sharing the same
+    ``FileSessionManager``-backed session — the cross-process resume scenario
+    the README's "Persistence" caveat describes, where nothing survives in
+    memory from turn 1.
+
+    Parametrized on ``fe_continues`` (``continue_after_frontend_call`` for the
+    frontend tool) because in THIS batch shape the flag is near-moot, and both
+    settings must reach the same interrupt outcome:
+
+    * The model commits both ``toolUse`` blocks in ONE assistant message, so
+      the halt cannot pre-empt ``confirm_action`` — it is already dispatched
+      concurrently by Strands' ``ConcurrentToolExecutor``.
+    * ``confirm_action`` interrupts, so Strands returns early at
+      ``event_loop.py:501`` WITHOUT appending the ``role=user`` tool-result
+      message. That message is the only place ``pending_halt`` is promoted to
+      ``halt_event_stream`` (``agent.py:1479-1480``), so the halt latches but
+      never fires; the interrupt stops the loop instead. Measured consequence:
+      the flag only changes where the frontend ``TOOL_CALL_END`` lands on the
+      wire.
+
+    ``False`` keeps coverage that a latched-but-unfired halt does not corrupt
+    the interrupt path (moving the latch earlier would break this param and
+    not the other); ``True`` models immediate hand-off.
+    """
+    tool_behaviors = {
+        "confirm_action": ToolBehavior(
+            state_from_result=lambda ctx: {"confirmed_key": ctx.result_data}
+        )
+    }
+    if fe_continues:
+        tool_behaviors["approveTool"] = ToolBehavior(continue_after_frontend_call=True)
     config = StrandsAgentConfig(
-        tool_behaviors={
-            "confirm_action": ToolBehavior(
-                state_from_result=lambda ctx: {"confirmed_key": ctx.result_data}
-            )
-        }
+        tool_behaviors=tool_behaviors,
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
     )
-    agent = StrandsAgent(core, name="e2e-interrupt", config=config)
+    agent, model = _make_e2e_agent(config)
 
     approve_tool = Tool(name="approveTool", description="approve", parameters={})
     inp1 = _make_run_input(
@@ -341,6 +457,15 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors():
         for e in events1
         if e.type == EventType.TOOL_CALL_START and e.tool_call_name == "approveTool"
     )
+
+    if recreate_agent:
+        # Discard the wrapper and underlying core entirely — turn 2 must
+        # restore interrupt state, the wire->native map, and history purely
+        # from the FileSessionManager-backed session, not from memory. Carry
+        # over the turn count so it reads the same as the non-recreated case.
+        prior_turn = model.turn
+        agent, model = _make_e2e_agent(config)
+        model.turn = prior_turn
 
     inp2 = _make_run_input(
         run_id="run-2",
@@ -364,7 +489,7 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors():
         and finished2.outcome.type == "interrupt"
         and finished2.outcome.interrupts[0].id == interrupt_id
     )
-    assert not still_stuck, "falsy resume payload re-emitted the same interrupt (round1.md #1)"
+    assert not still_stuck, "falsy resume payload re-emitted the same interrupt"
 
     # --- The frontend tool's REAL result must reach the model. ---
     assert model.turn >= 2, "resume never advanced the event loop past the interrupt"
@@ -375,4 +500,4 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors():
     # --- state_from_result must fire for a tool resolved on resume. ---
     assert any(
         e.type == EventType.STATE_SNAPSHOT and e.snapshot.get("confirmed_key") for e in events2
-    ), "state_from_result did not fire for confirm_action on the resume run (round1.md #3)"
+    ), "state_from_result did not fire for confirm_action on the resume run"

@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List
 
 from strands import Agent as StrandsAgentCore
 from strands.session import SessionManager
+from strands.types.interrupt import InterruptResponseContent
 
 # Params handled explicitly by StrandsAgent — excluded from auto-forwarding.
 # "messages" is excluded: per-thread agents start with no history;
@@ -82,7 +83,7 @@ def _wrap_resume_response(status: str, payload: Any) -> dict:
     destructures it (e.g. via ``.get("cancelled")`` / ``.get("response")``).
     """
     if status == "cancelled":
-        return INTERRUPT_CANCELLED
+        return dict(INTERRUPT_CANCELLED)
     return {"response": payload}
 
 
@@ -150,7 +151,14 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
                 return list(interrupts)
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is not None and getattr(interrupt_state, "activated", False):
-        return list(getattr(interrupt_state, "interrupts", {}).values())
+        # Mirrors Strands' own gate (strands/types/interrupt.py: ``if interrupt_.response:``)
+        # — an interrupt with a truthy response was already answered by a prior partial
+        # resume and must not be re-reported as still pending.
+        return [
+            interrupt
+            for interrupt in getattr(interrupt_state, "interrupts", {}).values()
+            if not getattr(interrupt, "response", None)
+        ]
     return []
 
 
@@ -1122,36 +1130,28 @@ class StrandsAgent:
             replay_history = (
                 self.config.replay_history_into_strands and session_manager is None
             )
+            # An active interrupt means a sibling frontend tool's placeholder may
+            # be stashed in ``_interrupt_state.context["tool_results"]``; reconcile
+            # even when this turn's frontend result is void, since that stash has
+            # no other correction path and is destroyed once the interrupt resumes.
+            has_active_interrupt = bool(
+                getattr(getattr(strands_agent, "_interrupt_state", None), "activated", False)
+            )
             reconcile_session_results = (
                 session_manager is not None
                 and self.config.replay_history_into_strands
-                and has_nonvoid_frontend_result
+                and (has_nonvoid_frontend_result or has_active_interrupt)
             )
 
-            # A client answering to an interrupt sends its responses
-            # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
-            # not as a new user message. Translate those into the Strands resume
-            # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
-            # and drive the stream with it — this takes precedence over every
-            # other path, since a resume run carries no fresh prompt.
-            resume_prompt = None
-            resume_entries = getattr(input_data, "resume", None)
-            if isinstance(resume_entries, list) and resume_entries:
-                resume_prompt = [
-                    {
-                        "interruptResponse": {
-                            "interruptId": entry.interrupt_id,
-                            "response": _wrap_resume_response(
-                                entry.status, entry.payload
-                            ),
-                        }
-                    }
-                    for entry in resume_entries
-                ]
-
-            if resume_prompt is not None:
-                agent_stream = strands_agent.stream_async(resume_prompt)
-            elif replay_history:
+            # Default prompt: the legacy path, passing only the latest user
+            # message and trusting Strands (via session_manager) to track
+            # history. Each branch below may narrow this further; a resume run
+            # can carry BOTH a fresh frontend tool result and an interrupt
+            # response in the same batch, so the resume-entries translation
+            # below runs unconditionally after the other branches and layers
+            # on top, rather than short-circuiting them.
+            resume_prompt: str | List[Dict[str, Any]] | list[InterruptResponseContent] | None = user_message
+            if replay_history:
                 native_history = _build_strands_history(input_data.messages)
                 # Apply ``state_context_builder`` to the last user-text
                 # message in the reconciled history rather than to the
@@ -1178,11 +1178,11 @@ class StrandsAgent:
                                 )
                             break
                 strands_agent.messages = native_history
-                # ``stream_async(None)`` tells Strands to use existing
-                # ``self.messages`` as-is. The LLM sees real tool results
-                # (including ones produced by the frontend) and emits a
-                # proper follow-up turn instead of re-calling the tool.
-                agent_stream = strands_agent.stream_async(None)
+                # ``None`` tells Strands to use existing ``self.messages`` as-is.
+                # The LLM sees real tool results (including ones produced by the
+                # frontend) and emits a proper follow-up turn instead of
+                # re-calling the tool.
+                resume_prompt = None
             elif reconcile_session_results:
                 try:
                     corrected_native_ids = reconcile_frontend_tool_results(
@@ -1218,13 +1218,26 @@ class StrandsAgent:
                     getattr(strands_agent, "messages", None) or [],
                     only_ids=set(resolved_native_results),
                 )
-                agent_stream = strands_agent.stream_async(
-                    None if reconciled else user_message
-                )
-            else:
-                # Legacy path: pass only the latest user message and trust
-                # Strands (via session_manager) to track history.
-                agent_stream = strands_agent.stream_async(user_message)
+                resume_prompt = None if reconciled else user_message
+
+            # A client answering to an interrupt sends its responses
+            # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
+            # not as a new user message. Translate those into the Strands resume
+            # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
+            # and drive the stream with it — this runs after (and takes
+            # precedence over) every branch above, since a resume batch may
+            # still carry a fresh frontend tool result that needed reconciling.
+            resume_entries = getattr(input_data, "resume", None)
+            if isinstance(resume_entries, list) and resume_entries:
+                resume_prompt = [
+                    {
+                        "interruptResponse": {
+                            "interruptId": entry.interrupt_id,
+                            "response": _wrap_resume_response(entry.status, entry.payload),
+                        }
+                    }
+                    for entry in resume_entries
+                ]
 
             # Drop only the entries whose placeholder was actually corrected
             # this turn — they won't recur. Entries that were NOT corrected
@@ -1241,8 +1254,16 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
+            agent_stream = strands_agent.stream_async(resume_prompt)
             try:
                 async for event in agent_stream:
+                    # Capture the terminal ``AgentResult`` (always emitted last
+                    # by ``stream_async``) so a native interrupt pause can be
+                    # detected after the loop. Recorded first so it is never
+                    # dropped, even on the halt-event-stream break below.
+                    if "result" in event and event["result"] is not None:
+                        terminal_result = event["result"]
+
                     # Frontend-tool halt: STOP the loop rather than muting the
                     # wire and draining it. The proxy tool returns a SUCCESSFUL
                     # "Forwarded to client" placeholder, so Strands has every
@@ -1265,13 +1286,6 @@ class StrandsAgent:
                         break
 
                     logger.debug(f"Received event: {event}")
-
-                    # Capture the terminal ``AgentResult`` (always emitted last
-                    # by ``stream_async``) so a native interrupt pause can be
-                    # detected after the loop. Recorded before the
-                    # ``complete``/``force_stop`` break so it is never dropped.
-                    if "result" in event and event["result"] is not None:
-                        terminal_result = event["result"]
 
                     # Skip lifecycle events
                     if event.get("init_event_loop") or event.get("start_event_loop"):
