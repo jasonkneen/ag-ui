@@ -19,6 +19,7 @@ export const CREWAI_CONVERSATIONAL_FEATURES = [
 export const CREWAI_FLOW_FEATURES = [
   ...CREWAI_CONVERSATIONAL_FEATURES,
   "crew_chat",
+  "error_flow",
 ] as const;
 
 export const CREWAI_FLOW_AGENT_PATHS = {
@@ -34,6 +35,7 @@ export const CREWAI_FLOW_AGENT_PATHS = {
   predictive_state_updates: "predictive_state_updates",
   subgraphs: "subgraphs",
   crew_chat: "crew_chat",
+  error_flow: "error_flow",
   a2ui_dynamic_schema: "a2ui_dynamic_schema",
   a2ui_recovery: "a2ui_recovery",
   a2ui_fixed_schema: "a2ui_fixed_schema",
@@ -41,11 +43,11 @@ export const CREWAI_FLOW_AGENT_PATHS = {
 
 export const CREWAI_CONVERSATIONAL_AGENT_PATHS = Object.fromEntries(
   Object.entries(CREWAI_FLOW_AGENT_PATHS)
-    .filter(([feature]) => feature !== "crew_chat")
+    .filter(([feature]) => feature !== "crew_chat" && feature !== "error_flow")
     .map(([feature, path]) => [feature, `conversational_flows/${path}`]),
 ) as {
   [K in Exclude<
     keyof typeof CREWAI_FLOW_AGENT_PATHS,
-    "crew_chat"
+    "crew_chat" | "error_flow"
   >]: `conversational_flows/${(typeof CREWAI_FLOW_AGENT_PATHS)[K]}`;
 };

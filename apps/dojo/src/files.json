@@ -4085,6 +4085,26 @@
       "type": "file"
     }
   ],
+  "crewai::error_flow": [
+    {
+      "name": "page.tsx",
+      "content": "\"use client\";\nimport React from \"react\";\nimport \"@copilotkit/react-core/v2/styles.css\";\nimport { CopilotChat } from \"@copilotkit/react-core/v2\";\nimport { CopilotKit } from \"@copilotkit/react-core\";\n\ninterface ErrorFlowProps {\n  params: Promise<{\n    integrationId: string;\n  }>;\n}\n\nconst ErrorFlowPage: React.FC<ErrorFlowProps> = ({ params }) => {\n  const { integrationId } = React.use(params);\n\n  return (\n    <CopilotKit\n      runtimeUrl={`/api/copilotkit/${integrationId}`}\n      showDevConsole={false}\n      agent=\"error_flow\"\n    >\n      <div className=\"flex justify-center items-center h-full w-full\">\n        <div className=\"h-full w-full md:w-8/10 md:h-8/10 rounded-lg\">\n          <CopilotChat\n            agentId=\"error_flow\"\n            className=\"h-full rounded-2xl max-w-6xl mx-auto\"\n          />\n        </div>\n      </div>\n    </CopilotKit>\n  );\n};\n\nexport default ErrorFlowPage;\n",
+      "language": "typescript",
+      "type": "file"
+    },
+    {
+      "name": "README.mdx",
+      "content": "# ⚠️ Error Flow (RunErrorEvent Test)\n\n## What This Demo Shows\n\nThis demo exercises the **error handling path** in the CrewAI endpoint. The\nbackend flow intentionally raises a `RuntimeError` on every request, which\ntriggers the `except Exception` handler in `endpoint.py` that emits a\n`RunErrorEvent` via SSE.\n\n## How to Interact\n\nSend any message — the flow will raise immediately and no successful assistant\nresponse will be generated.\n\n## Technical Details\n\n- `ErrorFlow` raises `RuntimeError` in its `@start()` method before any LLM call\n- The `event_generator` exception handler catches it and emits `RunErrorEvent`\n- This verifies that backend exceptions are properly surfaced to the client\n  rather than silently swallowed\n",
+      "language": "markdown",
+      "type": "file"
+    },
+    {
+      "name": "error_flow.py",
+      "content": "\"\"\"Flow that intentionally raises to test the RunErrorEvent error handling path.\"\"\"\n\nfrom crewai.flow.flow import Flow, start\nfrom ..sdk import CopilotKitState\n\n\nclass ErrorFlow(Flow[CopilotKitState]):\n    \"\"\"A flow that always raises an exception on kickoff.\n    Used to test that endpoint.py's except handler emits RunErrorEvent correctly.\"\"\"\n\n    @start()\n    async def chat(self):\n        raise RuntimeError(\"Intentional error for testing RunErrorEvent handling\")\n",
+      "language": "python",
+      "type": "file"
+    }
+  ],
   "crewai-conversational-flows::agentic_chat": [
     {
       "name": "page.tsx",

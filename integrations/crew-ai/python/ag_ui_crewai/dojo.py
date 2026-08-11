@@ -11,6 +11,7 @@ from .examples.tool_based_generative_ui import ToolBasedGenerativeUIFlow
 from .examples.agentic_generative_ui import AgenticGenerativeUIFlow
 from .examples.shared_state import SharedStateFlow
 from .examples.predictive_state_updates import PredictiveStateUpdatesFlow
+from .examples.error_flow import ErrorFlow
 from .examples.interrupt_flow import InterruptFlow
 from .examples.a2ui_dynamic_schema import A2UIDynamicSchemaFlow
 from .examples.a2ui_recovery import A2UIRecoveryFlow
@@ -68,6 +69,12 @@ add_crewai_crew_fastapi_endpoint(
     app=app,
     crew=CrewChatCrew(),
     path="/crew_chat",
+)
+
+add_crewai_flow_fastapi_endpoint(
+    app=app,
+    flow=ErrorFlow(),
+    path="/error_flow",
 )
 
 # emit_interrupt_outcome=True: CopilotKit v2 `useInterrupt` (>=1.61.2) resumes

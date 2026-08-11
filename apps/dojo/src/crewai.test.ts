@@ -27,9 +27,13 @@ const parityFeatures = [
   "a2ui_fixed_schema",
 ] as const;
 
-test("conversational features match regular Flow parity without crew chat", () => {
+test("conversational features match regular Flow parity without regular-only demos", () => {
   assert.deepEqual(CREWAI_CONVERSATIONAL_FEATURES, parityFeatures);
-  assert.deepEqual(CREWAI_FLOW_FEATURES, [...parityFeatures, "crew_chat"]);
+  assert.deepEqual(CREWAI_FLOW_FEATURES, [
+    ...parityFeatures,
+    "crew_chat",
+    "error_flow",
+  ]);
 });
 
 test("conversational agents use their dedicated backend route prefix", () => {
@@ -39,7 +43,9 @@ test("conversational agents use their dedicated backend route prefix", () => {
     assert.equal(path, `conversational_flows/${feature}`);
   }
   assert.equal(CREWAI_FLOW_AGENT_PATHS.crew_chat, "crew_chat");
+  assert.equal(CREWAI_FLOW_AGENT_PATHS.error_flow, "error_flow");
   assert.equal("crew_chat" in CREWAI_CONVERSATIONAL_AGENT_PATHS, false);
+  assert.equal("error_flow" in CREWAI_CONVERSATIONAL_AGENT_PATHS, false);
 });
 
 test("dojo exposes separate stable framework identities", () => {
