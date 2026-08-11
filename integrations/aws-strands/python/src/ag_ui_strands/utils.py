@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import re
 import urllib.request
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -29,6 +30,8 @@ _VIDEO_FORMATS: Set[str] = {"flv", "mkv", "mov", "mpeg", "mpg", "mp4", "three_gp
 _MIME_FORMAT_ALIASES: Dict[str, str] = {
     "plain": "txt",
     "x-markdown": "md",
+    "markdown": "md",
+    "jpg": "jpeg",
     "msword": "doc",
     "vnd.ms-excel": "xls",
     "vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
@@ -46,8 +49,8 @@ def _mime_to_format(mime_type: Optional[str], allowed: Set[str]) -> Optional[str
     if not mime_type:
         logger.warning("No MIME type provided, cannot determine format")
         return None
-    # Take the part after the last '/'
-    fmt = mime_type.rsplit("/", 1)[-1].lower()
+    # Strip MIME parameters (e.g. "; charset=utf-8") before parsing the subtype
+    fmt = mime_type.split(";", 1)[0].strip().rsplit("/", 1)[-1].lower()
     # Resolve well-known aliases before checking the allowed set
     fmt = _MIME_FORMAT_ALIASES.get(fmt, fmt)
     if fmt in allowed:
@@ -71,12 +74,19 @@ def _fetch_url_bytes(url: str) -> Optional[bytes]:
     """
     try:
         parts = urlsplit(url)
-        # Percent-encode non-ASCII chars in the path; preserve already-valid URL chars
-        # Include '%' in safe to avoid double-encoding existing percent sequences
+        # Percent-encode non-ASCII chars in the path; preserve already-valid URL chars.
+        # '%' is kept in safe= so that existing percent-encoded sequences (e.g. %20,
+        # %2F in presigned URLs) are not double-encoded.  The trade-off is that a
+        # literal '%' not followed by two hex digits (e.g. "50%.txt") also passes
+        # through unescaped — the re.sub below fixes those up into valid %25 escapes.
         encoded_path = quote(parts.path, safe="/:@!$&'()*+,;=-._~%")
+        encoded_path = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", encoded_path)
+        # Apply the same encoding to the query string for non-ASCII values
+        encoded_query = quote(parts.query, safe="=&+%") if parts.query else ""
+        encoded_query = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", encoded_query) if encoded_query else ""
         safe_url = urlunsplit((
             parts.scheme, parts.netloc, encoded_path,
-            parts.query, parts.fragment,
+            encoded_query, parts.fragment,
         ))
         with urllib.request.urlopen(safe_url, timeout=30) as resp:
             return resp.read()
