@@ -2343,12 +2343,18 @@ class _ChannelSpy:
             )
 
 
-async def _drive_reasoning_demo(model):
+async def _drive_reasoning_demo(model, *, messages=None):
+    state_messages = [] if messages is None else messages
     payloads = _decode_sse(await _collect(ep._run_flow_frame_stream(
         flow_copy=AgenticChatReasoningFlow(),
         encoder=EventEncoder(),
         input_data=_run_input(),
-        inputs={"id": "t-1", "model": model, "messages": [], "copilotkit": {"actions": []}},
+        inputs={
+            "id": "t-1",
+            "model": model,
+            "messages": state_messages,
+            "copilotkit": {"actions": []},
+        },
         timeout=30.0,
     )))
     return payloads
@@ -2397,6 +2403,32 @@ async def test_reasoning_demo_keeps_chat_completions_channel(monkeypatch, provid
 
 
 @requires_stream_frames
+@pytest.mark.parametrize("provider", ["Anthropic", "Gemini"])
+async def test_reasoning_demo_omits_replayed_reasoning_from_chat_completions(
+    monkeypatch,
+    provider,
+):
+    """AG-UI reasoning history is not a valid chat-completions message role."""
+    spy = _ChannelSpy(monkeypatch)
+    await _drive_reasoning_demo(
+        provider,
+        messages=[
+            {"id": "user-1", "role": "user", "content": "Start"},
+            {"id": "rs-1", "role": "reasoning", "content": "private trace"},
+            {"id": "assistant-1", "role": "assistant", "content": "Answer"},
+            {"id": "user-2", "role": "user", "content": "Follow up"},
+        ],
+    )
+
+    assert [message["role"] for message in spy.chat_calls[0]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+@requires_stream_frames
 async def test_reasoning_demo_degrades_without_the_responses_channel(monkeypatch):
     """With the Responses channel unavailable, OpenAI falls back to
     chat-completions rather than raising."""
@@ -2405,9 +2437,19 @@ async def test_reasoning_demo_degrades_without_the_responses_channel(monkeypatch
     spy = _ChannelSpy(monkeypatch)
     # After the spy: it pins the probe live, and this test owns the dark branch.
     monkeypatch.setattr(demo, "responses_channel_available", lambda: False)
-    payloads = await _drive_reasoning_demo("OpenAI")
+    payloads = await _drive_reasoning_demo(
+        "OpenAI",
+        messages=[
+            {"id": "rs-1", "role": "reasoning", "content": "private trace"},
+            {"id": "user-2", "role": "user", "content": "Follow up"},
+        ],
+    )
     assert spy.responses_calls == []
     assert len(spy.chat_calls) == 1
+    assert [message["role"] for message in spy.chat_calls[0]["messages"]] == [
+        "system",
+        "user",
+    ]
     assert "RUN_ERROR" not in [p["type"] for p in payloads]
 
 
