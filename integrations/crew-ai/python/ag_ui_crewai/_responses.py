@@ -129,10 +129,9 @@ def _classify_parse_failure(exc: ValueError) -> Tuple[str, str]:
         return _SKIP, event_type
     if is_load_bearing(role):
         return _UNREADABLE_TYPE, event_type
-    # A reasoning delta or the optional encrypted-blob item: this build cannot
-    # read it, and the answer plus the outcome are unaffected. The channel is
-    # declared UNAVAILABLE on such a build (see ``responses_channel_available``),
-    # so a caller reaching here opened the stream without probing.
+    # One reasoning-summary delta costs a gap in the visible trace but leaves
+    # the replay item and answer intact. Builds that cannot model the reasoning
+    # channel at all are declared unavailable by the capability probe.
     return _SKIP, event_type
 
 
@@ -217,14 +216,13 @@ async def iter_responses_events(response: Any) -> AsyncIterator[Any]:
     * an event whose loss costs nothing this bridge maps is SKIPPED with a
       warning: stream bookkeeping (``response.created`` /
       ``response.in_progress``, whose fields all have fallbacks), one
-      reasoning-summary delta (a gap in a trace, with the answer and the outcome
-      intact), the optional encrypted-reasoning item, and any event of a type this
-      bridge never reads at all.
-    * an event carrying answer text, a tool call's identity or arguments, or the
-      stream's outcome is REPORTED as a ``RuntimeError`` the drivers' exception
-      taxonomy surfaces. Dropping one loses content or turns a failed stream into
-      an empty assistant message with no failure recorded, which is precisely the
-      bug this attribution exists to prevent.
+      reasoning-summary delta (a gap in a trace, with replay identity, the answer,
+      and the outcome intact), and any event of a type this bridge never reads.
+    * an event carrying reasoning continuation state, answer text, a tool call's
+      identity or arguments, or the stream's outcome is REPORTED as a
+      ``RuntimeError`` the drivers' exception taxonomy surfaces. Dropping one
+      loses replayability/content or turns a failed stream into an empty assistant
+      message with no failure recorded.
     * a failure that cannot be attributed to any event is reported too: it cannot
       be shown harmless, so it is not assumed to be.
     * litellm having NO model for a type this bridge must read is reported as the
@@ -258,25 +256,27 @@ async def iter_responses_events(response: Any) -> AsyncIterator[Any]:
                 raise RuntimeError(
                     "The installed litellm has no model for the OpenAI Responses "
                     f"stream event type {subject!r}, which this bridge reads for "
-                    "answer text, tool-call arguments or the stream's outcome, so "
-                    "this stream cannot be read on this build. Probe "
+                    "reasoning continuation, answer text, tool-call arguments or "
+                    "the stream's outcome, so this stream cannot be read on this "
+                    "build. Probe "
                     "responses_channel_available() and stream over "
                     "chat-completions instead, or upgrade litellm."
                 ) from exc
             if disposition == _SURFACE:
                 raise RuntimeError(
-                    "An OpenAI Responses stream event this bridge reads for answer "
-                    "text, tool-call arguments or the stream's outcome failed to "
-                    f"parse ({subject}); skipping it would drop content or the "
-                    "stream's outcome in silence"
+                    "An OpenAI Responses stream event this bridge reads for "
+                    "reasoning continuation, answer text, tool-call arguments or "
+                    f"the stream's outcome failed to parse ({subject}); skipping "
+                    "it would drop replay state, content or the stream's outcome "
+                    "in silence"
                 ) from exc
             if disposition == _UNATTRIBUTABLE:
                 raise RuntimeError(
                     f"An OpenAI Responses stream event failed to parse ({subject}) "
                     "and nothing identifies which event it was, so it cannot be "
-                    "shown harmless to skip: dropping one that carried answer "
-                    "text, tool-call arguments or the stream's outcome would lose "
-                    "it in silence"
+                    "shown harmless to skip: dropping one that carried reasoning "
+                    "continuation, answer text, tool-call arguments or the "
+                    "stream's outcome would lose it in silence"
                 ) from exc
             skipped += 1
             if skipped > _MAX_SKIPPED_EVENTS:
@@ -532,12 +532,55 @@ def _paired_call_ids(messages: List[Any]) -> Set[str]:
     return called & answered
 
 
+def _reasoning_message_to_responses_item(message: Any) -> dict:
+    """Rebuild one AG-UI reasoning message as an OpenAI Responses item."""
+    item_id = _message_field(message, "id")
+    if not isinstance(item_id, str) or not item_id:
+        raise ValueError(
+            "A reasoning message requires its OpenAI provider item id for replay"
+        )
+
+    content = _message_field(message, "content")
+    if content is None or content == "":
+        summary: List[dict] = []
+    elif isinstance(content, str):
+        summary = [{"type": "summary_text", "text": content}]
+    else:
+        raise ValueError("A reasoning message summary must be a string")
+
+    item = {
+        "id": item_id,
+        "type": "reasoning",
+        "summary": summary,
+    }
+    encrypted = _message_field(message, "encrypted_value")
+    if encrypted is None:
+        encrypted = _message_field(message, "encryptedValue")
+    if encrypted is not None:
+        if not isinstance(encrypted, str):
+            raise ValueError("A reasoning message encrypted value must be a string")
+        item["encrypted_content"] = encrypted
+    return item
+
+
+def _input_replays_reasoning(input_value: Any) -> bool:
+    """Whether explicit top-level Responses input contains reasoning history.
+
+    Strings are valid new input, and an arbitrary iterable may be one-shot, so
+    inspect only concrete list/tuple input without consuming or rewriting it.
+    """
+    if not isinstance(input_value, (list, tuple)):
+        return False
+    return any(_message_field(item, "type") == "reasoning" for item in input_value)
+
+
 def chat_messages_to_responses_input(messages: Iterable[Any]) -> List[dict]:
     """Convert chat-completions messages onto Responses ``input`` items.
 
-    Message content rides an input message item; an assistant tool call becomes
-    a ``function_call`` item keyed by ``call_id``, and a ``tool`` message
-    becomes the matching ``function_call_output``.
+    Message content rides an input message item; an AG-UI ``reasoning`` message
+    becomes the replayable Responses reasoning item; an assistant tool call
+    becomes a ``function_call`` item keyed by ``call_id``; and a ``tool``
+    message becomes the matching ``function_call_output``.
 
     Calls and outputs are only emitted IN PAIRS. The Responses API rejects the
     whole request over a call with no output AND over an output with no call, so
@@ -555,6 +598,10 @@ def chat_messages_to_responses_input(messages: Iterable[Any]) -> List[dict]:
     for message in materialised:
         role = _message_field(message, "role")
         content = _message_field(message, "content")
+
+        if role == "reasoning":
+            items.append(_reasoning_message_to_responses_item(message))
+            continue
 
         if role == "tool":
             call_id = _message_field(message, "tool_call_id")
@@ -684,6 +731,12 @@ async def copilotkit_responses(
     only when it carries a ``summary`` (``"auto"`` / ``"concise"`` /
     ``"detailed"``); without one the run succeeds but has no trace to surface.
 
+    Continuation has two exclusive shapes. Without ``previous_response_id``,
+    AG-UI message history is converted into stateless Responses input (including
+    replayable reasoning items). With ``previous_response_id``, callers must pass
+    explicit new ``input``; converted history is not sent, and including a
+    reasoning item in that explicit input is rejected as duplicate continuation.
+
     Raises ``RuntimeError`` when the channel is unavailable, naming which of the
     two probes failed: litellm exposes no ``aresponses`` entrypoint, or it cannot
     model event types this bridge must read. Probe
@@ -706,8 +759,9 @@ async def copilotkit_responses(
             "The OpenAI Responses channel is unavailable: the installed litellm "
             "has no model for these stream event types ("
             f"{', '.join(unmodellable)}) and raises on them, so the reasoning "
-            "summaries and answer deltas this channel exists to read cannot be "
-            "parsed at all. Upgrade litellm, or call litellm.acompletion instead "
+            "summaries, continuation items and answer deltas this channel exists "
+            "to read cannot be parsed at all. Upgrade litellm, or call "
+            "litellm.acompletion instead "
             "(chat-completions carries no OpenAI reasoning summaries)."
         )
 
@@ -718,9 +772,30 @@ async def copilotkit_responses(
             reasoning,
         )
 
+    raw_input_provided = "input" in kwargs
+    raw_input = kwargs.pop("input", None)
+    previous_response_id = kwargs.get("previous_response_id")
+    if previous_response_id is not None:
+        if not raw_input_provided:
+            raise ValueError(
+                "previous_response_id requires explicit new Responses input"
+            )
+        if _input_replays_reasoning(raw_input):
+            raise ValueError(
+                "previous_response_id cannot be combined with replayed reasoning "
+                "items in explicit input"
+            )
+        responses_input = raw_input
+    else:
+        responses_input = (
+            raw_input
+            if raw_input_provided
+            else chat_messages_to_responses_input(messages)
+        )
+
     call_kwargs: Dict[str, Any] = {
         "model": model,
-        "input": chat_messages_to_responses_input(messages),
+        "input": responses_input,
         "stream": True,
     }
     responses_tools = chat_tools_to_responses_tools(tools)

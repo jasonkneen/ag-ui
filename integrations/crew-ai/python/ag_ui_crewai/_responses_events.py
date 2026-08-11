@@ -26,10 +26,10 @@ The roles, and what losing one event of each costs:
     answer and the outcome stay intact, so it is not fatal. A litellm that cannot
     model them AT ALL is different: it defeats the only reason this channel
     exists, so these types are required for the channel to be available.
-``ENRICHMENT``
-    ``response.output_item.done``, read for the OPTIONAL encrypted-reasoning blob
-    (present only when the caller asked for
-    ``include=["reasoning.encrypted_content"]``). Nothing else rides it.
+``CONTINUATION``
+    ``response.output_item.done``, read for the reasoning item's replay identity
+    and its encrypted continuation state (when requested). Losing it produces a
+    turn that renders once but cannot be replayed safely on the next turn.
 ``PAYLOAD``
     Answer text, a tool call's identity, a tool call's argument deltas. Losing
     one drops answer text or truncates arguments to invalid JSON while the turn
@@ -78,7 +78,7 @@ RESPONSES_TERMINAL: FrozenSet[str] = frozenset(
 # Roles. See the module docstring for what losing one event of each role costs.
 ENVELOPE = "envelope"
 REASONING = "reasoning"
-ENRICHMENT = "enrichment"
+CONTINUATION = "continuation"
 PAYLOAD = "payload"
 TERMINAL = "terminal"
 
@@ -90,32 +90,35 @@ EVENT_ROLES: Dict[str, str] = {
     RESPONSES_IN_PROGRESS: ENVELOPE,
     RESPONSES_REASONING_SUMMARY_TEXT_DELTA: REASONING,
     RESPONSES_REASONING_TEXT_DELTA: REASONING,
-    RESPONSES_OUTPUT_ITEM_DONE: ENRICHMENT,
+    RESPONSES_OUTPUT_ITEM_DONE: CONTINUATION,
     RESPONSES_OUTPUT_ITEM_ADDED: PAYLOAD,
     RESPONSES_OUTPUT_TEXT_DELTA: PAYLOAD,
     RESPONSES_FUNCTION_CALL_ARGS_DELTA: PAYLOAD,
     **{event_type: TERMINAL for event_type in RESPONSES_TERMINAL},
 }
 
-#: Roles whose loss costs answer content or the stream's outcome. An event of one
-#: of these roles that fails to parse is REPORTED, never skipped: dropping it
-#: would lose content or turn a failure into an empty message in silence.
-LOAD_BEARING_ROLES: FrozenSet[str] = frozenset({PAYLOAD, TERMINAL})
+#: Roles whose loss costs replay continuity, answer content, or the stream's
+#: outcome. An event of one of these roles that fails to parse is REPORTED,
+#: never skipped.
+LOAD_BEARING_ROLES: FrozenSet[str] = frozenset(
+    {CONTINUATION, PAYLOAD, TERMINAL}
+)
 
 #: Roles the channel cannot do its job without, so the installed litellm must be
 #: able to model every type carrying one for the channel to be declared
-#: available. Reasoning is in here and ``ENRICHMENT`` is not: this channel exists
-#: because OpenAI streams reasoning summaries nowhere else, while the encrypted
-#: blob is optional even when the build can model its event.
-REQUIRED_ROLES: FrozenSet[str] = frozenset({REASONING, PAYLOAD, TERMINAL})
+#: available. Reasoning summaries are the visible trace; continuation items are
+#: what makes that trace replayable with tool outputs on the next turn.
+REQUIRED_ROLES: FrozenSet[str] = frozenset(
+    {REASONING, CONTINUATION, PAYLOAD, TERMINAL}
+)
 
 #: How bad it is to lose an event of each role, for the one case where a single
 #: litellm model class serves several types (its catch-all model): the most
 #: severe role any of those types carries is the one that must win.
 _ROLE_SEVERITY: Dict[str, int] = {
     ENVELOPE: 0,
-    ENRICHMENT: 1,
     REASONING: 2,
+    CONTINUATION: 3,
     PAYLOAD: 3,
     TERMINAL: 3,
 }

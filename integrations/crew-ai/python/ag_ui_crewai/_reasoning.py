@@ -63,14 +63,17 @@ class DeltaReasoning:
 
     ``text`` is the concatenated reasoning text in this delta;
     ``encrypted`` holds any signature / redacted-thinking blobs (Anthropic
-    extended thinking), surfaced as ``REASONING_ENCRYPTED_VALUE``.
+    extended thinking), surfaced as ``REASONING_ENCRYPTED_VALUE``; and
+    ``item_id`` is the provider's replayable reasoning-item identity when the
+    payload came from OpenAI Responses.
     """
 
     text: str = ""
     encrypted: tuple[str, ...] = field(default_factory=tuple)
+    item_id: str | None = None
 
     def __bool__(self) -> bool:
-        return bool(self.text or self.encrypted)
+        return bool(self.text or self.encrypted or self.item_id)
 
 
 def reasoning_from_delta(delta: Any) -> DeltaReasoning:
@@ -152,6 +155,31 @@ def responses_event_type(event: Any) -> str | None:
     return str(getattr(raw, "value", raw))
 
 
+def _responses_field(value: Any, key: str) -> Any:
+    """Read a field from a dict- or object-shaped Responses payload."""
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _reasoning_item_id(event: Any, *, item: Any = None) -> str | None:
+    """Return the provider identity carried flat or on a completed item."""
+    item_id = getattr(event, "item_id", None)
+    if not item_id and item is not None:
+        item_id = _responses_field(item, "id")
+    return item_id if isinstance(item_id, str) and item_id else None
+
+
+def _require_reasoning_item_id(event: Any, *, item: Any = None) -> str:
+    """Return a replayable reasoning id, failing rather than minting one."""
+    item_id = _reasoning_item_id(event, item=item)
+    if item_id is None:
+        raise RuntimeError(
+            "OpenAI Responses reasoning event is missing its reasoning item id"
+        )
+    return item_id
+
+
 def reasoning_from_responses_event(event: Any) -> DeltaReasoning:
     """Project one OpenAI Responses-API stream event onto its reasoning content.
 
@@ -166,15 +194,23 @@ def reasoning_from_responses_event(event: Any) -> DeltaReasoning:
     if event_type in RESPONSES_REASONING_TEXT_DELTAS:
         delta = getattr(event, "delta", None)
         if isinstance(delta, str) and delta:
-            return DeltaReasoning(text=delta)
+            return DeltaReasoning(
+                text=delta,
+                item_id=_require_reasoning_item_id(event),
+            )
         return DeltaReasoning()
 
     if event_type == RESPONSES_OUTPUT_ITEM_DONE:
         item = getattr(event, "item", None)
-        if not isinstance(item, dict) or item.get("type") != "reasoning":
+        if item is None or _responses_field(item, "type") != "reasoning":
             return DeltaReasoning()
-        encrypted = item.get("encrypted_content")
+        item_id = _require_reasoning_item_id(event, item=item)
+        encrypted = _responses_field(item, "encrypted_content")
         if encrypted:
-            return DeltaReasoning(encrypted=(str(encrypted),))
+            return DeltaReasoning(
+                encrypted=(str(encrypted),),
+                item_id=item_id,
+            )
+        return DeltaReasoning(item_id=item_id)
 
     return DeltaReasoning()

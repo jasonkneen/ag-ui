@@ -354,23 +354,51 @@ class _ReasoningChannel:
         A payload carrying reasoning TEXT always opens a message when none is
         open, so a genuine later thinking block still surfaces in full.
 
-        An encrypted-only payload may open the FIRST message of a turn (an
-        Anthropic ``redacted_thinking`` block is entirely encrypted, and the
-        client still has to learn that thinking happened) but never a later one:
-        with a block already ended, it carries nothing renderable and would
-        surface as an empty second trace. It rides an open message when there is
-        one, and is otherwise dropped on its own.
+        An id-less encrypted-only payload may open the FIRST message of a turn
+        (an Anthropic ``redacted_thinking`` block is entirely encrypted), but is
+        dropped after a prior block closes to avoid an empty second trace. A
+        Responses payload is different: its provider ID either attaches late
+        continuation state to that closed item or identifies a new empty item
+        that must remain replayable.
         """
         if not reasoning:
             return
+        if (
+            self.open
+            and reasoning.item_id is not None
+            and reasoning.item_id != self.message_id
+        ):
+            raise RuntimeError(
+                "OpenAI Responses changed reasoning item id while one reasoning "
+                f"message was open: {self.message_id!r} -> {reasoning.item_id!r}"
+            )
         if not self.open:
             if self.closed_once and not reasoning.text:
-                _LOGGER.debug(
-                    "Dropping an encrypted-only reasoning blob that arrived after "
-                    "its reasoning message closed"
-                )
-                return
-            self.message_id = str(uuid.uuid4())
+                if reasoning.item_id is None:
+                    _LOGGER.debug(
+                        "Dropping an encrypted-only reasoning blob that arrived "
+                        "after its reasoning message closed"
+                    )
+                    return
+                if reasoning.item_id == self.message_id:
+                    # Responses may deliver the completed item after answer/tool
+                    # output already closed its visible summary. Attach opaque
+                    # continuation state to that provider-owned message without
+                    # inventing a second empty lifecycle.
+                    for value in reasoning.encrypted:
+                        crewai_event_bus.emit(
+                            self._flow,
+                            BridgedReasoningEncryptedValueEvent(
+                                type=EventType.REASONING_ENCRYPTED_VALUE,
+                                subtype="message",
+                                entity_id=self.message_id,
+                                encrypted_value=value,
+                            ),
+                        )
+                    if reasoning.encrypted:
+                        await yield_control()
+                    return
+            self.message_id = reasoning.item_id or str(uuid.uuid4())
             crewai_event_bus.emit(
                 self._flow,
                 BridgedReasoningStartEvent(
@@ -411,8 +439,8 @@ class _ReasoningChannel:
     def close(self) -> None:
         """Close an open reasoning message. A no-op when nothing is open.
 
-        Records that a block ended, which is what stops a later encrypted-only
-        payload from opening an empty message of its own.
+        Retains the last message ID so late Responses continuation state can
+        still attach to the provider-owned item after its visible lifecycle ends.
         """
         if not self.open:
             return
@@ -432,7 +460,6 @@ class _ReasoningChannel:
         )
         self.open = False
         self.closed_once = True
-        self.message_id = None
 
 
 async def copilotkit_stream(response):
@@ -1083,11 +1110,19 @@ message_adapter = TypeAdapter(Message)
 
 def litellm_messages_to_ag_ui_messages(messages: List[LiteLLMMessage]) -> List[Message]:
     """
-    Converts a list of LiteLLM messages to a list of ag_ui messages.
+    Converts CrewAI/LiteLLM state messages for an AG-UI ``MESSAGES_SNAPSHOT``.
+
+    Reasoning is intentionally omitted. This adapter streams reasoning directly
+    and does not persist the current turn's complete reasoning set in CrewAI
+    state, so claiming the partial state is authoritative would make the client
+    replace (and lose) its complete client-owned reasoning history.
     """
     ag_ui_messages: List[Message] = []
     for message in messages:
         message_dict = message.model_dump() if not isinstance(message, Mapping) else message
+
+        if message_dict.get("role") == "reasoning":
+            continue
 
         # whitelist the fields we want to keep
         whitelist = ["content", "role", "tool_calls", "id", "name", "tool_call_id"]

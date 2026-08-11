@@ -18,7 +18,9 @@ import contextlib
 import importlib
 import json as _json
 import logging
+import uuid
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 
@@ -262,6 +264,7 @@ async def test_copilotkit_stream_emits_reasoning_then_text():
     assert len(rids) == 1
     rid = rids.pop()
     assert rid != "m1"
+    assert str(uuid.UUID(rid)) == rid
     contents = [r[2] for r in reasoning if r[0] == "content"]
     assert contents == ["thinking..."]
     roles = [r[2] for r in reasoning if r[0] == "msg_start"]
@@ -1259,6 +1262,26 @@ def _reasoning_item_done(encrypted="BLOB", *, item_id="rs_1"):
     )
 
 
+def _reasoning_item_done_object(encrypted="BLOB", *, item_id="rs_1"):
+    """A completed item with the object shape used by current LiteLLM."""
+    output_item_done_event = _responses_symbol(
+        "litellm.types.llms.openai", "OutputItemDoneEvent"
+    )
+    response_reasoning_item = _responses_symbol(
+        "openai.types.responses", "ResponseReasoningItem"
+    )
+    return output_item_done_event.model_construct(
+        type="response.output_item.done",
+        output_index=0,
+        item=response_reasoning_item(
+            id=item_id,
+            summary=[],
+            type="reasoning",
+            encrypted_content=encrypted,
+        ),
+    )
+
+
 def _text_delta(text, *, item_id="msg_1"):
     return OutputTextDeltaEvent(
         type="response.output_text.delta",
@@ -1294,9 +1317,10 @@ def test_responses_event_type_normalizes_enum_and_string():
 
 @requires_responses_types
 def test_reasoning_from_responses_summary_delta():
-    """A reasoning-summary delta yields its text and no encrypted blob."""
+    """A reasoning-summary delta keeps the provider reasoning-item identity."""
     r = reasoning_from_responses_event(_summary_delta("because X"))
-    assert r == DeltaReasoning(text="because X", encrypted=())
+    assert r == DeltaReasoning(text="because X", encrypted=(), item_id="rs_1")
+    assert r.item_id == "rs_1"
     assert bool(r) is True
 
 
@@ -1320,6 +1344,51 @@ def test_reasoning_from_responses_encrypted_content():
     r = reasoning_from_responses_event(event)
     assert r.text == ""
     assert r.encrypted == ("BLOB",)
+    assert r.item_id == "rs_1"
+
+
+@requires_responses_types
+def test_reasoning_from_responses_object_item_keeps_identity_and_encrypted_content():
+    """Current LiteLLM exposes completed output items as response objects.
+
+    ``model_construct`` lets the locked version's event model carry that current
+    object shape without weakening the test into a hand-written event double.
+    """
+    event = _reasoning_item_done_object(
+        "OBJECT_BLOB",
+        item_id="rs_object",
+    )
+
+    r = reasoning_from_responses_event(event)
+
+    assert r == DeltaReasoning(
+        encrypted=("OBJECT_BLOB",),
+        item_id="rs_object",
+    )
+
+
+@requires_responses_types
+@pytest.mark.parametrize(
+    "event_kind",
+    ["summary_delta", "completed_item"],
+)
+def test_reasoning_from_responses_requires_provider_item_id(event_kind):
+    """Silently minting an id makes the item impossible to replay correctly."""
+    if event_kind == "summary_delta":
+        event = GenericEvent(
+            type="response.reasoning_summary_text.delta",
+            output_index=0,
+            summary_index=0,
+            delta="orphaned",
+        )
+    else:
+        event = GenericEvent(
+            type="response.output_item.done",
+            output_index=0,
+            item={"type": "reasoning", "encrypted_content": "BLOB"},
+        )
+    with pytest.raises(RuntimeError, match="reasoning item id"):
+        reasoning_from_responses_event(event)
 
 
 @requires_responses_types
@@ -1764,6 +1833,67 @@ def test_chat_messages_to_responses_input_tool_round_trip():
     ]
 
 
+@pytest.mark.parametrize("encrypted_key", ["encrypted_value", "encryptedValue"])
+def test_chat_messages_to_responses_input_replays_reasoning_item_in_order(
+    encrypted_key,
+):
+    """A client-held reasoning message reconstructs the provider output item.
+
+    Position is part of the Responses contract: the reasoning item belongs
+    between the prior user input and the assistant answer it preceded.
+    """
+    reasoning_message = {
+        "id": "rs_replayable",
+        "role": "reasoning",
+        "content": "Weighing the options.",
+        encrypted_key: "ENCRYPTED_STATE",
+    }
+
+    items = responses_mod.chat_messages_to_responses_input([
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "Which option?"},
+        reasoning_message,
+        {"role": "assistant", "content": "Choose A."},
+        {"role": "user", "content": "Why?"},
+    ])
+
+    assert items == [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "Which option?"},
+        {
+            "id": "rs_replayable",
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "Weighing the options."}
+            ],
+            "encrypted_content": "ENCRYPTED_STATE",
+        },
+        {"role": "assistant", "content": "Choose A."},
+        {"role": "user", "content": "Why?"},
+    ]
+    _assert_valid_responses_input(items)
+
+
+def test_chat_messages_to_responses_input_keeps_empty_reasoning_summary():
+    """An id-only reasoning message remains replayable with an empty summary."""
+    items = responses_mod.chat_messages_to_responses_input([
+        {"id": "rs_empty", "role": "reasoning", "content": ""},
+    ])
+
+    assert items == [
+        {"id": "rs_empty", "type": "reasoning", "summary": []},
+    ]
+    _assert_valid_responses_input(items)
+
+
+def test_chat_messages_to_responses_input_rejects_reasoning_without_provider_id():
+    """A generated or missing id cannot refer back to OpenAI's reasoning item."""
+    with pytest.raises(ValueError, match="reasoning message.*provider item id"):
+        responses_mod.chat_messages_to_responses_input([
+            {"role": "reasoning", "content": "orphaned"},
+        ])
+
+
 def test_chat_messages_to_responses_input_drops_unresolved_call():
     """A tool call whose output never arrived is dropped: the Responses API rejects
     the whole request over one unmatched call, which would break every later turn."""
@@ -1975,27 +2105,196 @@ async def test_copilotkit_responses_requires_the_channel(monkeypatch):
         )
 
 
-async def test_copilotkit_responses_passes_reasoning_and_stream(monkeypatch):
-    """The helper streams, converts messages + tools, and forwards ``reasoning``
-    verbatim: without a ``summary`` OpenAI emits no reasoning deltas at all."""
-    captured = {}
+def _capture_responses_calls(monkeypatch):
+    """Install a no-network Responses entrypoint and return its call list."""
+    calls = []
 
     async def _fake_entrypoint(**kwargs):
-        captured.update(kwargs)
+        calls.append(kwargs)
         return _FakeResponsesStream([])
 
     monkeypatch.setattr(responses_mod, "responses_entrypoint", lambda: _fake_entrypoint)
+    return calls
+
+
+async def test_copilotkit_responses_passes_reasoning_and_stream(monkeypatch):
+    """The helper streams, converts messages + tools, and forwards ``reasoning``
+    verbatim: without a ``summary`` OpenAI emits no reasoning deltas at all."""
+    calls = _capture_responses_calls(monkeypatch)
     await responses_mod.copilotkit_responses(
         model="openai/gpt-5.4",
         messages=[{"role": "user", "content": "hi"}],
         tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
         reasoning={"effort": "medium", "summary": "auto"},
     )
+    captured = calls[0]
     assert captured["stream"] is True
     assert captured["model"] == "openai/gpt-5.4"
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert captured["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert captured["tools"][0]["name"] == "t"
+
+
+async def test_copilotkit_responses_replays_reasoning_in_stateless_mode(monkeypatch):
+    """A two-turn tool flow replays object-shaped encrypted reasoning in order."""
+    turn_one, wire_events = await _drive_responses([
+        _summary_delta("Weighing the options.", item_id="rs_turn_1"),
+        _reasoning_item_done_object("TURN_1_STATE", item_id="rs_turn_1"),
+        _function_call_added(arguments="{}"),
+        ResponseCompletedEvent(
+            type="response.completed", response=_responses_api_response()
+        ),
+    ])
+    start_events = [
+        event for event in wire_events if event.type == EventType.REASONING_START
+    ]
+    content_events = [
+        event
+        for event in wire_events
+        if event.type == EventType.REASONING_MESSAGE_CONTENT
+    ]
+    encrypted_events = [
+        event
+        for event in wire_events
+        if event.type == EventType.REASONING_ENCRYPTED_VALUE
+    ]
+    assert len(start_events) == 1
+    assert len(encrypted_events) == 1
+    reasoning_message = {
+        "id": start_events[0].message_id,
+        "role": "reasoning",
+        "content": "".join(event.delta for event in content_events),
+        "encrypted_value": encrypted_events[0].encrypted_value,
+    }
+    calls = _capture_responses_calls(monkeypatch)
+
+    await responses_mod.copilotkit_responses(
+        model="openai/gpt-5.4",
+        store=False,
+        messages=[
+            {"role": "user", "content": "Which option?"},
+            reasoning_message,
+            turn_one.choices[0].message,
+            {"role": "tool", "tool_call_id": "call_abc", "content": "done"},
+            {"role": "user", "content": "Why?"},
+        ],
+    )
+
+    assert calls[0]["input"] == [
+        {"role": "user", "content": "Which option?"},
+        {
+            "id": "rs_turn_1",
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "Weighing the options."}
+            ],
+            "encrypted_content": "TURN_1_STATE",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_abc",
+            "name": "change_background",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_abc", "output": "done"},
+        {"role": "user", "content": "Why?"},
+    ]
+    _assert_valid_responses_input(calls[0]["input"])
+    assert calls[0]["store"] is False
+
+
+async def test_copilotkit_responses_stateless_explicit_input_still_wins(monkeypatch):
+    """Raw stateless input remains an intentional escape hatch."""
+    calls = _capture_responses_calls(monkeypatch)
+
+    def _must_not_convert_history(_messages):
+        raise AssertionError("explicit raw input converted historical messages")
+
+    monkeypatch.setattr(
+        responses_mod,
+        "chat_messages_to_responses_input",
+        _must_not_convert_history,
+    )
+    raw_input = "new input"
+    await responses_mod.copilotkit_responses(
+        model="openai/gpt-5.4",
+        messages=[{"role": "user", "content": "historical"}],
+        input=raw_input,
+    )
+
+    assert calls[0]["input"] == raw_input
+
+
+async def test_copilotkit_responses_stored_mode_sends_only_explicit_new_input(
+    monkeypatch,
+):
+    """``previous_response_id`` and replayed history are alternative modes."""
+    calls = _capture_responses_calls(monkeypatch)
+
+    def _must_not_convert_history(_messages):
+        raise AssertionError("stored continuation converted historical messages")
+
+    monkeypatch.setattr(
+        responses_mod,
+        "chat_messages_to_responses_input",
+        _must_not_convert_history,
+    )
+    new_input = [{"role": "user", "content": "Why?"}]
+    await responses_mod.copilotkit_responses(
+        model="openai/gpt-5.4",
+        messages=[
+            {"id": "rs_old", "role": "reasoning", "content": "old trace"},
+        ],
+        previous_response_id="resp_turn_1",
+        input=new_input,
+    )
+
+    assert calls[0]["input"] is new_input
+    assert calls[0]["previous_response_id"] == "resp_turn_1"
+    assert calls[0]["stream"] is True
+
+
+@pytest.mark.parametrize("previous_response_id", ["resp_turn_1", ""])
+async def test_copilotkit_responses_stored_mode_requires_explicit_input(
+    monkeypatch,
+    previous_response_id,
+):
+    """Stored continuation never guesses that converted history is new input."""
+    calls = _capture_responses_calls(monkeypatch)
+
+    with pytest.raises(ValueError, match="previous_response_id.*explicit.*input"):
+        await responses_mod.copilotkit_responses(
+            model="openai/gpt-5.4",
+            messages=[{"role": "user", "content": "historical"}],
+            previous_response_id=previous_response_id,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "reasoning_item",
+    [
+        {"id": "rs_old", "type": "reasoning", "summary": []},
+        SimpleNamespace(id="rs_old", type="reasoning", summary=[]),
+    ],
+)
+async def test_copilotkit_responses_stored_mode_rejects_replayed_reasoning(
+    monkeypatch,
+    reasoning_item,
+):
+    """Mixing stored continuation with a replayed item would duplicate state."""
+    calls = _capture_responses_calls(monkeypatch)
+
+    with pytest.raises(ValueError, match="previous_response_id.*reasoning"):
+        await responses_mod.copilotkit_responses(
+            model="openai/gpt-5.4",
+            messages=[],
+            previous_response_id="resp_turn_1",
+            input=[reasoning_item, {"role": "user", "content": "Why?"}],
+        )
+
+    assert calls == []
 
 
 # -- the demo picks the channel that actually carries OpenAI reasoning -----
@@ -2744,9 +3043,8 @@ def test_parse_failure_attribution_comes_from_litellms_own_registry():
 async def test_unparseable_event_fatality_follows_its_role(event_type):
     """One table for the whole classification: an unparseable event is reported
     when its role is load-bearing (answer text, a tool call's identity or
-    arguments, the stream's outcome) and skipped when it is not (stream
-    bookkeeping, one reasoning-summary delta, the optional encrypted-reasoning
-    item).
+    arguments, replay continuity, or the stream's outcome) and skipped when it
+    is not (stream bookkeeping or one reasoning-summary delta).
 
     Driven per type through litellm's own model for that type, so the severity
     comes from the role rather than from which model names someone remembered to
@@ -2772,18 +3070,20 @@ async def test_unparseable_event_fatality_follows_its_role(event_type):
 
 
 @requires_responses_types
-async def test_responses_stream_survives_an_unparseable_output_item_done():
-    """``response.output_item.done`` carries ONE thing this bridge reads: the
-    OPTIONAL encrypted-reasoning blob, present only when the caller asked for
-    it. Losing it must not cost the run the answer it already streamed."""
+async def test_responses_stream_surfaces_an_unparseable_output_item_done():
+    """A completed reasoning item carries replay identity and encrypted state.
+
+    Letting the answer succeed after dropping it creates history that renders
+    correctly once but cannot continue on the next stateless turn.
+    """
     events = [
         _summary_delta("Weighing the options."),
         _litellm_validation_error("OutputItemDoneEvent"),
         _text_delta("Answer"),
         _completed_event(),
     ]
-    result = await copilotkit_stream(_ScriptedEventStream(events))
-    assert result.choices[0].message.content == "Answer"
+    with pytest.raises(RuntimeError, match="failed to parse"):
+        await copilotkit_stream(_ScriptedEventStream(events))
 
 
 @requires_responses_types
@@ -2915,6 +3215,16 @@ def test_responses_channel_unavailable_when_litellm_cannot_model_what_it_reads()
     # Restored: the installed litellm answers for unknown types, so the channel
     # is available again and the teardown did not leave a stale probe behind.
     assert responses_mod.responses_channel_available() is True
+
+
+@requires_responses_types
+def test_responses_channel_requires_completed_reasoning_items_for_continuation():
+    """A build that cannot model ``output_item.done`` cannot promise replay."""
+    event_type = "response.output_item.done"
+    with _litellm_event_registry(_raising_event_registry((event_type,))) as caps:
+        modelling = caps.responses_event_modelling()
+        assert event_type in modelling.unmodellable_event_types
+        assert responses_mod.responses_channel_available() is False
 
 
 @requires_responses_types
@@ -3431,7 +3741,9 @@ async def test_responses_reasoning_text_after_close_opens_a_second_block():
         ),
         _summary_delta("first"),
         _text_delta("Answer"),
-        _summary_delta("late"),
+        # A second reasoning block is a second provider output item. Reusing
+        # ``rs_1`` would describe two chunks of the same replayable item.
+        _summary_delta("late", item_id="rs_2"),
         ResponseCompletedEvent(
             type="response.completed", response=_responses_api_response()
         ),
@@ -3449,10 +3761,9 @@ async def test_responses_reasoning_text_after_close_opens_a_second_block():
     assert sorted(content_by_id.values()) == [["first"], ["late"]], content_by_id
 
 
-async def test_responses_encrypted_only_reasoning_after_close_does_not_reopen():
+async def test_responses_late_encrypted_reasoning_attaches_without_reopening():
     """An encrypted reasoning blob whose ``output_item.done`` lands AFTER the answer
-    text must not reopen the closed reasoning channel: it carries no text, so
-    reopening mints a SECOND, EMPTY reasoning message inside one turn."""
+    text attaches to the closed provider item without minting a second lifecycle."""
     _, items = await _drive_responses([
         ResponseCreatedEvent(
             type="response.created", response=_responses_api_response("in_progress")
@@ -3470,10 +3781,31 @@ async def test_responses_encrypted_only_reasoning_after_close_does_not_reopen():
     assert types.count(EventType.REASONING_MESSAGE_START) == 1, types
     assert types.count(EventType.REASONING_MESSAGE_END) == 1, types
     assert types.count(EventType.REASONING_END) == 1, types
-    # The late blob is dropped rather than reopening the channel. Real OpenAI
-    # orders the reasoning item BEFORE the message item, where it still surfaces
-    # (asserted by the companion test below).
-    assert EventType.REASONING_ENCRYPTED_VALUE not in types, types
+    encrypted = [e for e in items if e.type == EventType.REASONING_ENCRYPTED_VALUE]
+    assert len(encrypted) == 1, types
+    assert encrypted[0].entity_id == "rs_1"
+    assert encrypted[0].encrypted_value == "BLOB"
+
+
+async def test_responses_new_id_only_reasoning_after_close_opens_a_new_message():
+    """A completed provider item with a new ID is a new empty reasoning block."""
+    _, items = await _drive_responses([
+        _summary_delta("first", item_id="rs_1"),
+        _text_delta("Answer"),
+        _reasoning_item_done("SECOND_BLOB", item_id="rs_2"),
+        ResponseCompletedEvent(
+            type="response.completed", response=_responses_api_response()
+        ),
+    ])
+
+    starts = [e for e in items if e.type == EventType.REASONING_START]
+    ends = [e for e in items if e.type == EventType.REASONING_END]
+    encrypted = [e for e in items if e.type == EventType.REASONING_ENCRYPTED_VALUE]
+    assert [e.message_id for e in starts] == ["rs_1", "rs_2"]
+    assert [e.message_id for e in ends] == ["rs_1", "rs_2"]
+    assert [(e.entity_id, e.encrypted_value) for e in encrypted] == [
+        ("rs_2", "SECOND_BLOB")
+    ]
 
 
 async def test_responses_encrypted_reasoning_before_text_still_surfaces():
@@ -3499,3 +3831,62 @@ async def test_responses_encrypted_reasoning_before_text_still_surfaces():
     assert encrypted[0].encrypted_value == "BLOB"
     start = next(e for e in items if e.type == EventType.REASONING_START)
     assert encrypted[0].entity_id == start.message_id
+
+
+async def test_responses_reasoning_lifecycle_uses_the_provider_item_id():
+    """The AG-UI reasoning message is the replayable OpenAI ``rs_*`` item.
+
+    A generated UUID renders correctly for one turn but cannot identify the
+    reasoning item when the client sends history back on the next turn.
+    """
+    _, items = await _drive_responses([
+        _summary_delta("Weighing the options.", item_id="rs_replayable"),
+        _reasoning_item_done("BLOB", item_id="rs_replayable"),
+        ResponseCompletedEvent(
+            type="response.completed", response=_responses_api_response()
+        ),
+    ])
+
+    starts = [e for e in items if e.type == EventType.REASONING_START]
+    message_starts = [
+        e for e in items if e.type == EventType.REASONING_MESSAGE_START
+    ]
+    content = [e for e in items if e.type == EventType.REASONING_MESSAGE_CONTENT]
+    encrypted = [e for e in items if e.type == EventType.REASONING_ENCRYPTED_VALUE]
+    message_ends = [e for e in items if e.type == EventType.REASONING_MESSAGE_END]
+    ends = [e for e in items if e.type == EventType.REASONING_END]
+
+    assert [e.message_id for e in starts] == ["rs_replayable"]
+    assert [e.message_id for e in message_starts] == ["rs_replayable"]
+    assert [e.message_id for e in content] == ["rs_replayable"]
+    assert [e.entity_id for e in encrypted] == ["rs_replayable"]
+    assert [e.message_id for e in message_ends] == ["rs_replayable"]
+    assert [e.message_id for e in ends] == ["rs_replayable"]
+
+
+async def test_responses_reasoning_item_without_summary_still_preserves_identity():
+    """An id-only completed reasoning item must survive as an empty message.
+
+    OpenAI requires reasoning items to be replayed with later tool outputs even
+    when no visible summary or encrypted content was requested.
+    """
+    _, items = await _drive_responses([
+        _reasoning_item_done(None, item_id="rs_empty"),
+        ResponseCompletedEvent(
+            type="response.completed", response=_responses_api_response()
+        ),
+    ])
+
+    starts = [e for e in items if e.type == EventType.REASONING_START]
+    ends = [e for e in items if e.type == EventType.REASONING_END]
+    assert [e.message_id for e in starts] == ["rs_empty"]
+    assert [e.message_id for e in ends] == ["rs_empty"]
+
+
+async def test_responses_conflicting_reasoning_item_ids_fail_loudly():
+    """One open AG-UI reasoning message cannot represent two provider items."""
+    with pytest.raises(RuntimeError, match="reasoning item id"):
+        await _drive_responses([
+            _summary_delta("first", item_id="rs_first"),
+            _summary_delta("second", item_id="rs_second"),
+        ])
