@@ -9,7 +9,6 @@ import { V1AgenticChatPage } from "../../featurePages/V1AgenticChatPage";
 import { AgenticGenUIPage } from "../../pages/crewAIPages/AgenticUIGenPage";
 import { HumanInLoopPage } from "../../pages/crewAIPages/HumanInLoopPage";
 import { PredictiveStateUpdatesPage } from "../../pages/crewAIPages/PredictiveStateUpdatesPage";
-import { SubgraphsPage } from "../../pages/crewAIPages/SubgraphsPage";
 import {
   awaitLLMResponseDone,
   openChat,
@@ -34,7 +33,6 @@ const parityFeatures = [
   "predictive_state_updates",
   "shared_state",
   "tool_based_generative_ui",
-  "subgraphs",
   "a2ui_dynamic_schema",
   "a2ui_recovery",
   "a2ui_fixed_schema",
@@ -269,24 +267,6 @@ test.describe("CrewAI Conversational Flows feature parity", () => {
       CopilotSelectors.userMessages(page).last(),
       generativeUI.haikuBlock.last(),
     );
-  });
-
-  test("subgraphs resumes flight and hotel selections", async ({ page }) => {
-    test.slow();
-    await page.goto(`/${integrationId}/feature/subgraphs`);
-    const subgraphs = new SubgraphsPage(page);
-    await subgraphs.openChat();
-    await subgraphs.sendMessage("Help me plan a trip to San Francisco");
-    await subgraphs.waitForFlightsAgent();
-    await expectRenderedAfter(
-      subgraphs.userMessage.last(),
-      page.locator(".flight-option").first(),
-    );
-    await subgraphs.selectFlight("KLM");
-    await subgraphs.waitForHotelsAgent();
-    await subgraphs.selectHotel("Zoe");
-    await subgraphs.waitForExperiencesAgent();
-    await subgraphs.verifyStaticExperienceData();
   });
 
   for (const { feature, prompt, surfaceId } of [

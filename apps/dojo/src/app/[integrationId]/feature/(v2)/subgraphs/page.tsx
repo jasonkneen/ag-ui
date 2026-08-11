@@ -356,17 +356,9 @@ function TravelPlanner() {
   }, []);
 
   useLangGraphInterrupt({
-    render: ({ event, resolve }) => {
-      // CrewAI suspends the whole flow, so the specialist's payload arrives under
-      // metadata.crewai.output; LangGraph puts the raw value on event.value directly.
-      const raw = (event.value ?? {}) as InterruptEvent<AvailableAgents> & {
-        metadata?: {
-          crewai?: { output?: InterruptEvent<AvailableAgents> };
-        };
-      };
-      const value = raw?.metadata?.crewai?.output ?? raw;
-      return <InterruptHumanInTheLoop event={{ value }} resolve={resolve} />;
-    },
+    render: ({ event, resolve }) => (
+      <InterruptHumanInTheLoop event={event} resolve={resolve} />
+    ),
   });
 
   // Current itinerary strip

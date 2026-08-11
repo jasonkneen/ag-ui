@@ -18,7 +18,6 @@ EXPECTED_CONVERSATIONAL_FEATURES = {
     "predictive_state_updates",
     "shared_state",
     "tool_based_generative_ui",
-    "subgraphs",
     "a2ui_dynamic_schema",
     "a2ui_recovery",
     "a2ui_fixed_schema",
@@ -100,6 +99,8 @@ def test_dojo_registers_a_conversational_route_for_every_feature():
         f"/conversational_flows/{feature}"
         for feature in EXPECTED_CONVERSATIONAL_FEATURES
     }.issubset(paths)
+    assert "/subgraphs" not in paths
+    assert "/conversational_flows/subgraphs" not in paths
 
 
 def test_conversational_examples_keep_litellm_compatible_message_dicts():

@@ -25,7 +25,6 @@ from .human_in_the_loop import HumanInTheLoopFlow
 from .interrupt_flow import InterruptFlow
 from .predictive_state_updates import PredictiveStateUpdatesFlow
 from .shared_state import SharedStateFlow
-from .subgraphs import SubgraphsFlow
 from .tool_based_generative_ui import ToolBasedGenerativeUIFlow
 
 
@@ -108,7 +107,6 @@ CONVERSATIONAL_FLOW_TYPES = {
     "predictive_state_updates": _conversational_type(PredictiveStateUpdatesFlow),
     "shared_state": _conversational_type(SharedStateFlow),
     "tool_based_generative_ui": _conversational_type(ToolBasedGenerativeUIFlow),
-    "subgraphs": _conversational_type(SubgraphsFlow),
     "a2ui_dynamic_schema": _conversational_type(A2UIDynamicSchemaFlow),
     "a2ui_recovery": _conversational_type(A2UIRecoveryFlow),
     "a2ui_fixed_schema": _conversational_type(A2UIFixedSchemaFlow),

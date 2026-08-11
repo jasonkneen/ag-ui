@@ -18,7 +18,6 @@ from .examples.a2ui_recovery import A2UIRecoveryFlow
 from .examples.a2ui_fixed_schema import A2UIFixedSchemaFlow
 from .examples.agentic_chat_multimodal import AgenticChatMultimodalFlow
 from .examples.agentic_chat_reasoning import AgenticChatReasoningFlow
-from .examples.subgraphs import SubgraphsFlow
 from .examples.conversational import CONVERSATIONAL_FLOW_TYPES
 
 app = FastAPI(title="CrewAI Dojo Example Server")
@@ -118,23 +117,13 @@ add_crewai_flow_fastapi_endpoint(
     path="/agentic_chat_reasoning",
 )
 
-# emit_interrupt_outcome=True: the flights/hotels steps suspend the flow for the
-# user's pick; modern CopilotKit resumes from the RUN_FINISHED.outcome. See the
-# interrupt endpoint above for the full rationale.
-add_crewai_flow_fastapi_endpoint(
-    app=app,
-    flow=SubgraphsFlow(),
-    path="/subgraphs",
-    emit_interrupt_outcome=True,
-)
-
 for feature, flow_type in CONVERSATIONAL_FLOW_TYPES.items():
     add_crewai_flow_fastapi_endpoint(
         app=app,
         flow=flow_type(),
         path=f"/conversational_flows/{feature}",
         conversational=True,
-        emit_interrupt_outcome=feature in {"interrupt", "subgraphs"},
+        emit_interrupt_outcome=feature == "interrupt",
     )
 
 def main():

@@ -21,7 +21,6 @@ const parityFeatures = [
   "predictive_state_updates",
   "shared_state",
   "tool_based_generative_ui",
-  "subgraphs",
   "a2ui_dynamic_schema",
   "a2ui_recovery",
   "a2ui_fixed_schema",
@@ -46,6 +45,8 @@ test("conversational agents use their dedicated backend route prefix", () => {
   assert.equal(CREWAI_FLOW_AGENT_PATHS.error_flow, "error_flow");
   assert.equal("crew_chat" in CREWAI_CONVERSATIONAL_AGENT_PATHS, false);
   assert.equal("error_flow" in CREWAI_CONVERSATIONAL_AGENT_PATHS, false);
+  assert.equal("subgraphs" in CREWAI_FLOW_AGENT_PATHS, false);
+  assert.equal("subgraphs" in CREWAI_CONVERSATIONAL_AGENT_PATHS, false);
 });
 
 test("dojo exposes separate stable framework identities", () => {
