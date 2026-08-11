@@ -1731,7 +1731,6 @@ class StrandsAgent:
                         if (
                             persisted_tool_call_meta
                             and processed_result_native_ids
-                            and _get_strands_session_manager(strands_agent)
                         ):
                             _remaining = {
                                 _k: _v
