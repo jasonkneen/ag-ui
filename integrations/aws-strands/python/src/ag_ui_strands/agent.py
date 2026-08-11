@@ -9,7 +9,7 @@ import inspect
 import json
 import logging
 import uuid
-from typing import Any, AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Tuple
 
 from strands import Agent as StrandsAgentCore
 from strands.session import SessionManager
@@ -1015,7 +1015,16 @@ class StrandsAgent:
                     if isinstance(content, str)
                     else flatten_content_to_text(content)
                 )
-                frontend_results.append({"wire_id": wire_id, "text": text or ""})
+                frontend_results.append(
+                    {
+                        "wire_id": wire_id,
+                        "text": text or "",
+                        # Carry the client's failure signal alongside the text so
+                        # reconciliation can stamp the persisted toolResult status
+                        # too, not just its content.
+                        "is_error": bool(getattr(msg, "error", None)),
+                    }
+                )
 
             # Translate the client's wire tool_call_id back to the native
             # toolUseId Strands persisted (they differ for frontend tools — see
@@ -1026,7 +1035,7 @@ class StrandsAgent:
             # empty toolResult. When reconciling, void placeholders in the same
             # turn are still cleared (to "") so the literal "Forwarded to client"
             # is never fed to the model.
-            resolved_native_results: Dict[str, str] = {}
+            resolved_native_results: Dict[str, Tuple[str, bool]] = {}
             corrected_native_ids: set[str] = set()
             has_nonvoid_frontend_result = any(
                 (r["text"] or "").strip() for r in frontend_results
@@ -1112,7 +1121,7 @@ class StrandsAgent:
                 ]
                 resolved_non_void = {
                     native
-                    for native, text in resolved_native_results.items()
+                    for native, (text, _is_error) in resolved_native_results.items()
                     if (text or "").strip()
                 }
                 all_non_void_resolved = len(resolved_non_void) == len(non_void_results)
