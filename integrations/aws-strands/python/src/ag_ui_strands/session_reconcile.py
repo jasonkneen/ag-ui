@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 # user-managed state keys.
 AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 
+# Key under which the adapter stores every ``toolUseId`` tool call metadata
+# (name, args, input, strands_tool_id) on the Strands agent's session state.
+# On a native-interrupt RESUME run Strands does not re-invoke the model for the
+# interrupted tool, so no ``current_tool_use`` events fire and the in-run
+# ``tool_calls_seen`` dict is empty when the ``toolResult`` arrives. Reading
+# from this durable map at that point restores ``tool_name`` (and thus every
+# ``tool_behaviors`` gate + the frontend-placeholder skip) for the resumed
+# tool. Namespaced to avoid clashing with user-managed state keys.
+AG_UI_TOOL_CALL_MAP_STATE_KEY = "__ag_ui_tool_call_map__"
+
 
 def resolve_native_ids(
     wire_to_native: Mapping[str, str],

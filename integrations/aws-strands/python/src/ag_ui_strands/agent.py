@@ -67,6 +67,11 @@ def _extract_agent_kwargs(agent: StrandsAgentCore) -> dict:
 # outstanding frontend calls at once.
 _WIRE_MAP_MAX = 512
 
+# Upper bound on the per-agent tool-call metadata map held in session state.
+# It bounds abandoned entries (tool calls whose result never returns)
+# so state cannot grow without bound.
+_TOOL_CALL_MAP_MAX = 512
+
 # Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
 # cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
 # tool receives this in place of a real answer and can treat it as a denial.
@@ -205,6 +210,7 @@ from .a2ui_tool import (
 )
 from .client_proxy_tool import sync_proxy_tools
 from .session_reconcile import (
+    AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -1053,6 +1059,10 @@ class StrandsAgent:
             # client dispatching its follow-up run before the backend results
             # reach it, narrowing the ConcurrencyException race window.
             deferred_frontend_tool_ends = []
+            # Native ``toolUseId``s whose ``toolResult`` was processed this
+            # run. Drained after each result batch to prune the persisted
+            # tool-call meta map.
+            processed_result_native_ids: set[str] = set()
             # Terminal ``AgentResult`` from Strands (carried on the final
             # ``{"result": ...}`` stream event). Used after the loop to detect a
             # native interrupt pause (``stop_reason == "interrupt"``).
@@ -1081,6 +1091,23 @@ class StrandsAgent:
                 wire_to_native = (
                     strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
                 )
+
+            # The durable per-``toolUseId`` call metadata map recorded at
+            # emission (see the ``current_tool_use`` handler). On a RESUME
+            # run this is the ONLY source of ``{name, args, input,
+            # strands_tool_id}`` for the interrupted tool, since Strands does
+            # not re-emit ``current_tool_use`` events for it. Guarded because
+            # test doubles / stub agents may lack ``state`` entirely; a
+            # missing store just means "no persisted meta yet".
+            persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
+            _agent_state = getattr(strands_agent, "state", None)
+            if _agent_state is not None:
+                try:
+                    persisted_tool_call_meta = (
+                        _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+                    )
+                except Exception:
+                    persisted_tool_call_meta = {}
             # Scope to the TRAILING tool results (this continuation's just-
             # returned results). ``pending_tool_result_ids`` holds those ids;
             # without this, a multi-turn continuation re-sends already-reconciled
@@ -1536,6 +1563,35 @@ class StrandsAgent:
                                     if _data.get("strands_tool_id") == result_tool_id:
                                         call_info = _data
                                         break
+                            # RESUME-run fallback: the interrupted tool never
+                            # re-emits ``current_tool_use`` on resume, so
+                            # ``tool_calls_seen`` is empty for it. The
+                            # persisted meta map was populated when the call
+                            # was originally streamed (possibly in a prior
+                            # process). Direct native-id first, then scan by
+                            # ``strands_tool_id`` to match the frontend-tool
+                            # case.
+                            if not call_info:
+                                call_info = persisted_tool_call_meta.get(
+                                    result_tool_id, {}
+                                )
+                            if not call_info:
+                                for _pdata in persisted_tool_call_meta.values():
+                                    if (
+                                        isinstance(_pdata, dict)
+                                        and _pdata.get("strands_tool_id")
+                                        == result_tool_id
+                                    ):
+                                        call_info = _pdata
+                                        break
+                            # Record consumption once the lookup is complete
+                            # (even if it missed): the result was processed
+                            # this turn, so any persisted entry keyed on this
+                            # native id is safe to prune. Recording BEFORE the
+                            # frontend-skip / behavior branches ensures a
+                            # ``stop_streaming_after_result`` early break still
+                            # flags this id for prune.
+                            processed_result_native_ids.add(result_tool_id)
                             tool_name = call_info.get("name")
                             tool_args = call_info.get("args")
                             tool_input = call_info.get("input")
@@ -1666,6 +1722,33 @@ class StrandsAgent:
                                 )
                                 # Break inner loop — no further results should be emitted
                                 break
+
+                        # Prune the persisted tool-call meta map for entries
+                        # whose native id (or ``strands_tool_id`` for frontend
+                        # tools stored under a wire key) was just consumed.
+                        # The emission-time size cap (``_TOOL_CALL_MAP_MAX``) is
+                        # only a backstop for abandoned entries.
+                        if (
+                            persisted_tool_call_meta
+                            and processed_result_native_ids
+                        ):
+                            _remaining = {
+                                _k: _v
+                                for _k, _v in persisted_tool_call_meta.items()
+                                if _k not in processed_result_native_ids
+                                and (
+                                    not isinstance(_v, dict)
+                                    or _v.get("strands_tool_id")
+                                    not in processed_result_native_ids
+                                )
+                            }
+                            if len(_remaining) != len(persisted_tool_call_meta):
+                                if _get_strands_session_manager(strands_agent):
+                                    strands_agent.state.set(
+                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
+                                    )
+                                persisted_tool_call_meta = _remaining
+                        processed_result_native_ids.clear()
 
                         # Defer hand-off: now that this turn's backend
                         # TOOL_CALL_RESULT(s) have been emitted above, flush the
@@ -1811,6 +1894,42 @@ class StrandsAgent:
                                 "strands_tool_id": strands_tool_id,
                             }
 
+                            # Mirror the minimum-sufficient subset into durable
+                            # session state so a RESUME run — which does not
+                            # re-emit ``current_tool_use`` for the interrupted
+                            # tool — can still resolve ``tool_name``/behavior/
+                            # context at the ``toolResult`` site. Gate on
+                            # session_manager: only then does Strands durably flush state.
+                            if _get_strands_session_manager(strands_agent):
+                                _tc_meta = dict(
+                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                    or {}
+                                )
+                                # Key by the NATIVE ``toolUseId`` — that is what
+                                # arrives on ``toolResult``. For backend tools
+                                # this equals ``tool_use_id``; for frontend
+                                # tools ``tool_use_id`` is a fresh wire UUID
+                                # while ``strands_tool_id`` is native.
+                                _tc_key = strands_tool_id or tool_use_id
+                                _tc_meta[_tc_key] = {
+                                    "name": tool_name,
+                                    "args": args_str,
+                                    "input": tool_input,
+                                    "strands_tool_id": strands_tool_id,
+                                }
+                                if len(_tc_meta) > _TOOL_CALL_MAP_MAX:
+                                    for _stale in list(_tc_meta)[
+                                        : len(_tc_meta) - _TOOL_CALL_MAP_MAX
+                                    ]:
+                                        _tc_meta.pop(_stale, None)
+                                strands_agent.state.set(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
+                                )
+                                # Keep the in-run view aligned so downstream
+                                # result lookups see the same entry a fresh
+                                # process would restore from the store.
+                                persisted_tool_call_meta = _tc_meta
+
                             if use_streaming:
                                 # Close any open assistant text turn so the
                                 # snapshot order matches the wire-event order
@@ -1875,6 +1994,25 @@ class StrandsAgent:
                             tool_calls_seen[tool_use_id]["input"] = tool_input
                             tool_calls_seen[tool_use_id]["args"] = args_str
                             tool_calls_seen[tool_use_id]["raw"] = raw_str
+
+                            # Keep the persisted meta in sync with the final
+                            # streamed args. Without this refresh, resume runs
+                            # would see the first partial-JSON delta rather
+                            # than the complete args the model emitted.
+                            if _get_strands_session_manager(strands_agent):
+                                _tc_meta = dict(
+                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                    or {}
+                                )
+                                _tc_key = strands_tool_id or tool_use_id
+                                _existing = _tc_meta.get(_tc_key)
+                                if _existing is not None:
+                                    _existing["input"] = tool_input
+                                    _existing["args"] = args_str
+                                    strands_agent.state.set(
+                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
+                                    )
+                                    persisted_tool_call_meta = _tc_meta
 
                         # Stream incremental ToolCallArgs deltas as the LLM
                         # produces more characters of the JSON args. The FE
