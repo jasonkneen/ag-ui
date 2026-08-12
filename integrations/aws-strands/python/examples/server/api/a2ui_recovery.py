@@ -35,13 +35,28 @@ Use Row as the root with structural children to repeat a card per item.
 Repeat a card template via structural children:
   {"id":"root","component":"Row","children":{"componentId":"card","path":"/items"}}
 
-### HotelCard / ProductCard / TeamMemberCard
-Card components bound to per-item data (relative paths inside the template).
+### HotelCard
+Props: name, location, rating (number 0-5), pricePerNight, action
+Example:
+  {"id":"card","component":"HotelCard","name":{"path":"name"},"location":{"path":"location"},
+   "rating":{"path":"rating"},"pricePerNight":{"path":"pricePerNight"},
+   "action":{"event":{"name":"book","context":{"name":{"path":"name"}}}}}
+
+### ProductCard
+Props: name, price, rating (number 0-5), description (optional), action
+
+### TeamMemberCard
+Props: name, role, department (optional), email (optional), action
 
 ## RULES
+CRITICAL: Follow every rule below; violating any one produces an invalid or empty surface.
 - Root is ALWAYS a Row with structural children: {"componentId":"<card-id>","path":"/items"}
 - ALWAYS include the referenced card component in the components array.
 - Inside templates use RELATIVE paths (no leading slash): {"path":"name"}.
+- ALWAYS declare each card prop explicitly as a binding, e.g. "name":{"path":"name"}.
+  A card with no prop bindings renders empty.
+- Data keys must match the paths you bind, and `rating` MUST be a number 0-5
+  (e.g. 4.8), never a string like "4.8/5".
 - Always provide data in the "data" argument as {"items":[...]}.
 - Generate 3-4 realistic items with diverse data.
 """
