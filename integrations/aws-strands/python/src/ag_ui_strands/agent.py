@@ -1742,7 +1742,9 @@ class StrandsAgent:
                                     not in processed_result_native_ids
                                 )
                             }
-                            if len(_remaining) != len(persisted_tool_call_meta):
+                            if len(_remaining) != len(persisted_tool_call_meta) and _get_strands_session_manager(
+                                strands_agent
+                            ):
                                 strands_agent.state.set(
                                     AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
                                 )
