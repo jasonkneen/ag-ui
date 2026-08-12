@@ -72,6 +72,9 @@ def _make_base_agent() -> StrandsAgent:
     return StrandsAgent(agent=mock_core, name="test_agent", config=config)
 
 
+_UNSET = object()
+
+
 class _MockStrandsCore:
     """A minimal stand-in for ``StrandsAgentCore`` driving the stream loop.
 
@@ -80,13 +83,18 @@ class _MockStrandsCore:
     ``_interrupt_state`` to activated, mirroring a paused native run.
     """
 
-    def __init__(self, terminal_events=None, interrupts=None):
+    def __init__(self, terminal_events=None, interrupts=None, session_manager=_UNSET):
         self.tool_registry = MagicMock()
         self.tool_registry.registry = {}
         self.state = AgentState()
         self.model = MagicMock()
         self.messages = []
         self.stream_prompts = []
+        # Default to a mock session manager: the ``session_manager is None``
+        # guard now rejects interrupts/resume without one, and most tests
+        # here exercise the resume-translation logic, not that guard. Pass
+        # ``session_manager=None`` explicitly to exercise the guard itself.
+        self.session_manager = MagicMock() if session_manager is _UNSET else session_manager
         self._terminal_events = terminal_events or []
         self._interrupt_state = _InterruptState()
         if interrupts:
@@ -311,6 +319,52 @@ class TestResumeConsumption:
                 {"interruptResponse": {"interruptId": "b", "response": INTERRUPT_CANCELLED}},
             ]
         ]
+
+
+class TestRejectsInterruptsWithoutSessionManager:
+    """Interrupts/resume are not properly supported without a SessionManager:
+    reject explicitly with RUN_ERROR instead of silently mishandling
+    persistence-dependent state."""
+
+    @pytest.mark.asyncio
+    async def test_active_interrupt_without_session_manager_errors(self):
+        """A paused native run with no session_manager errors instead of
+        emitting an interrupt outcome."""
+        strands_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+            reason={"summary": "delete all"},
+        )
+        core = _MockStrandsCore(
+            terminal_events=[{"result": _agent_result_with_interrupt([strands_interrupt])}],
+            interrupts=[strands_interrupt],
+            session_manager=None,
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input())
+
+        assert not any(e.type == EventType.RUN_FINISHED for e in events)
+        error = next(e for e in events if e.type == EventType.RUN_ERROR)
+        assert "SessionManager" in error.message
+
+    @pytest.mark.asyncio
+    async def test_resume_entries_without_session_manager_errors(self):
+        """Resume entries submitted with no session_manager error instead of
+        being translated into a Strands resume prompt."""
+        core = _MockStrandsCore(terminal_events=[], session_manager=None)
+        agent = _make_base_agent()
+        resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload="yes")]
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input(resume=resume))
+
+        assert not any(e.type == EventType.RUN_FINISHED for e in events)
+        error = next(e for e in events if e.type == EventType.RUN_ERROR)
+        assert "SessionManager" in error.message
+        # The guard fires before the resume prompt is built and streamed.
+        assert core.stream_prompts == []
 
 
 # ---------------------------------------------------------------------------

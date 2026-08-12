@@ -1263,7 +1263,8 @@ class StrandsAgent:
             # precedence over) every branch above, since a resume batch may
             # still carry a fresh frontend tool result that needed reconciling.
             resume_entries = getattr(input_data, "resume", None)
-            if isinstance(resume_entries, list) and resume_entries:
+            has_resume_entries = isinstance(resume_entries, list) and resume_entries
+            if has_resume_entries:
                 resume_prompt = [
                     {
                         "interruptResponse": {
@@ -1273,6 +1274,12 @@ class StrandsAgent:
                     }
                     for entry in resume_entries
                 ]
+            if (has_resume_entries or has_active_interrupt) and session_manager is None:
+                # Interrupts and frontend-tools reconcicliation are not yet properly supported when
+                # used without a session manager, halt the conversation.
+                raise RuntimeError(
+                    "AG-UI currently supports interrupts only using a SessionManager"
+                )
 
             # Drop only the entries whose placeholder was actually corrected
             # this turn — they won't recur. Entries that were NOT corrected
