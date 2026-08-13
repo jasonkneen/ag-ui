@@ -11,6 +11,7 @@ AG-UI interrupt lifecycle:
 
 from __future__ import annotations
 
+import copy
 import json
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ from strands.session import FileSessionManager
 
 from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
+from ag_ui_strands.session_reconcile import AG_UI_TOOL_CALL_MAP_STATE_KEY
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -556,6 +558,72 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
         assert ctx.tool_use_id == "native-confirm"
         assert ctx.tool_input == {"key": "widget-1"}
         assert ctx.args_str == '{"key": "widget-1"}'
+
+
+@pytest.mark.asyncio
+async def test_mixed_interrupt_without_session_manager_errors_before_outcome():
+    agent, model = _make_e2e_agent(StrandsAgentConfig())
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+
+    events1 = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[
+                UserMessage(
+                    id="u1",
+                    role="user",
+                    content="please handle widget-1",
+                )
+            ],
+            tools=[approve_tool],
+        ),
+    )
+
+    errors1 = [event for event in events1 if event.type == EventType.RUN_ERROR]
+    assert len(errors1) == 1
+    assert errors1[0].code == "INTERRUPT_SESSION_REQUIRED"
+    assert not any(event.type == EventType.RUN_FINISHED for event in events1)
+
+    core = agent._agents_by_thread["thread-1"]
+    interrupt_state = core._interrupt_state
+    assert interrupt_state.activated
+    parked_results = copy.deepcopy(interrupt_state.context["tool_results"])
+    assert parked_results == [
+        {
+            "toolUseId": "native-approve",
+            "status": "success",
+            "content": [{"text": "Forwarded to client"}],
+        }
+    ]
+    interrupts = copy.deepcopy(interrupt_state.interrupts)
+    tool_metadata = copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY))
+    assert set(tool_metadata) == {"native-approve", "native-confirm"}
+
+    interrupt_id = next(iter(interrupts))
+    events2 = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[approve_tool],
+        ),
+    )
+
+    errors2 = [event for event in events2 if event.type == EventType.RUN_ERROR]
+    assert len(errors2) == 1
+    assert errors2[0].code == "INTERRUPT_SESSION_REQUIRED"
+    assert not any(event.type == EventType.RUN_FINISHED for event in events2)
+    assert model.turn == 1
+    assert interrupt_state.activated
+    assert interrupt_state.context["tool_results"] == parked_results
+    assert interrupt_state.interrupts == interrupts
+    assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
 
 
 @pytest.mark.parametrize("recreate_agent", [False, True])

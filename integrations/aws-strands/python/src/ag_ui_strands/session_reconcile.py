@@ -153,6 +153,26 @@ def has_placeholder_results(messages: Iterable[Any], only_ids: Any = None) -> bo
     return False
 
 
+def has_active_proxy_placeholder(agent: Any) -> bool:
+    """Return whether an active interrupt has a parked frontend proxy result."""
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return False
+
+    context = getattr(interrupt_state, "context", None)
+    if not isinstance(context, Mapping):
+        return False
+    tool_results = context.get("tool_results")
+    if not isinstance(tool_results, list):
+        return False
+
+    return any(
+        isinstance(tool_result, Mapping)
+        and _is_placeholder(tool_result.get("content"))
+        for tool_result in tool_results
+    )
+
+
 def _correct_single_tool(tool_result, pending_results: Mapping[str, str]) -> str | None:
     """Rewrite matching placeholder ToolResult dict. Return the corrected tool_use_id or None if no
     correction was done."""

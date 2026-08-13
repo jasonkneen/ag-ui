@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.session import SessionAgent, SessionMessage
 
+from ag_ui_strands import session_reconcile
 from ag_ui_strands.session_reconcile import (
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -46,6 +47,52 @@ def _tool_result_block(tool_use_id, text):
             "content": [{"text": text}],
         }
     }
+
+
+def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_result():
+    exact_result = {
+        "toolUseId": "native-frontend",
+        "status": "success",
+        "content": [{"text": PLACEHOLDER}],
+    }
+
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=False,
+                context={"tool_results": [exact_result]},
+            )
+        )
+    )
+    assert not session_reconcile.has_active_proxy_placeholder(SimpleNamespace())
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(activated=True, context={})
+        )
+    )
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=True,
+                context={
+                    "tool_results": [
+                        {
+                            **exact_result,
+                            "content": [{"text": f"{PLACEHOLDER}."}],
+                        }
+                    ]
+                },
+            )
+        )
+    )
+    assert session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=True,
+                context={"tool_results": [exact_result]},
+            )
+        )
+    )
 
 
 def test_reconcile_overwrites_persisted_placeholder_in_store(tmp_path):

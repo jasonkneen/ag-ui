@@ -167,6 +167,17 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
     return []
 
 
+def _interrupt_session_required_error() -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "A SessionManager is required to resume a native interrupt "
+            "that was created alongside a frontend tool call"
+        ),
+        code="INTERRUPT_SESSION_REQUIRED",
+    )
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
@@ -212,6 +223,7 @@ from .client_proxy_tool import sync_proxy_tools
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
+    has_active_proxy_placeholder,
     has_placeholder_results,
     reconcile_frontend_tool_results,
     resolve_native_ids,
@@ -1087,6 +1099,9 @@ class StrandsAgent:
             # payloads that omit the assistant message) when its wire id was
             # recorded in the wire->native map when the call was emitted.
             session_manager = _get_strands_session_manager(strands_agent)
+            if session_manager is None and has_active_proxy_placeholder(strands_agent):
+                yield _interrupt_session_required_error()
+                return
             # The durable wire->native map recorded at emission, read back from
             # session state (restored from the store on a fresh process).
             wire_to_native: Dict[str, str] = {}
@@ -2429,6 +2444,14 @@ class StrandsAgent:
                         type=EventType.MESSAGES_SNAPSHOT,
                         messages=list(snapshot_messages),
                     )
+
+            # A mixed frontend-proxy/native-interrupt batch parks the proxy's
+            # placeholder inside the live interrupt context. Without durable
+            # reconciliation, resuming that state would feed the placeholder
+            # back into Strands as if it were the client's real result.
+            if session_manager is None and has_active_proxy_placeholder(strands_agent):
+                yield _interrupt_session_required_error()
+                return
 
             # Final state snapshot before finishing
             yield StateSnapshotEvent(
