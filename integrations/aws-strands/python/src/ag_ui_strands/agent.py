@@ -896,10 +896,21 @@ def _strands_interrupt_to_agui(
     )
 
 
-def _active_proxy_hook_interrupt_ids(
+def _unanswered_interrupt_ids(interrupt_state: Any) -> frozenset[str]:
+    """Return ids whose Strands interrupt response is still falsy."""
+    return frozenset(
+        interrupt_id
+        for interrupt_id, interrupt in getattr(
+            interrupt_state, "interrupts", {}
+        ).items()
+        if not getattr(interrupt, "response", None)
+    )
+
+
+def _pending_proxy_hook_native_ids(
     agent: Any, tool_call_meta: dict[str, dict[str, Any]]
 ) -> set[str]:
-    """Return native ids for active before-tool-call interrupts on proxies."""
+    """Return native ids for unanswered before-tool-call proxy interrupts."""
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is None or not getattr(interrupt_state, "activated", False):
         return set()
@@ -908,7 +919,12 @@ def _active_proxy_hook_interrupt_ids(
     if present and (managed_ids is None or records is None):
         return set()
     native_ids: set[str] = set()
-    for interrupt in getattr(interrupt_state, "interrupts", {}).values():
+    unanswered_ids = _unanswered_interrupt_ids(interrupt_state)
+    for stored_interrupt_id, interrupt in getattr(
+        interrupt_state, "interrupts", {}
+    ).items():
+        if stored_interrupt_id not in unanswered_ids:
+            continue
         interrupt_id = getattr(interrupt, "id", "")
         if not isinstance(interrupt_id, str) or not interrupt_id.startswith(
             "v1:before_tool_call:"
@@ -946,7 +962,10 @@ def _validate_active_proxy_hook_provenance(
         # Do not claim genuine native/legacy checkpoints. A paused frontend
         # proxy, however, is adapter-owned and cannot be resumed safely after
         # its durable provenance marker has disappeared.
-        for interrupt in interrupt_state.interrupts.values():
+        unanswered_ids = _unanswered_interrupt_ids(interrupt_state)
+        for stored_interrupt_id, interrupt in interrupt_state.interrupts.items():
+            if stored_interrupt_id not in unanswered_ids:
+                continue
             interrupt_id = getattr(interrupt, "id", "")
             if not isinstance(interrupt_id, str) or not interrupt_id.startswith(
                 "v1:before_tool_call:"
@@ -960,7 +979,15 @@ def _validate_active_proxy_hook_provenance(
     active_interrupt_ids = set(interrupt_state.interrupts)
     if not (managed_ids or frozenset()).issubset(active_interrupt_ids):
         return _proxy_hook_error()
-    return _validate_proxy_hook_record_bindings(agent, tool_call_meta, records or {})
+    unanswered_ids = _unanswered_interrupt_ids(interrupt_state)
+    pending_records = {
+        interrupt_id: record
+        for interrupt_id, record in (records or {}).items()
+        if interrupt_id in unanswered_ids
+    }
+    return _validate_proxy_hook_record_bindings(
+        agent, tool_call_meta, pending_records
+    )
 
 
 def _validate_proxy_hook_record_bindings(
@@ -1006,7 +1033,11 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
         if getattr(terminal_result, "stop_reason", None) == "interrupt":
             interrupts = getattr(terminal_result, "interrupts", None) or []
             if interrupts:
-                return list(interrupts)
+                return [
+                    interrupt
+                    for interrupt in interrupts
+                    if not getattr(interrupt, "response", None)
+                ]
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is not None and getattr(interrupt_state, "activated", False):
         # Mirrors Strands' own gate (strands/types/interrupt.py: ``if interrupt_.response:``)
@@ -1653,18 +1684,21 @@ class StrandsAgent:
             )
             yield provenance_error
             return
-        active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
+        pending_proxy_hook_native_ids = _pending_proxy_hook_native_ids(
             strands_agent, persisted_tool_call_meta
         )
         selected_proxy_hook_native_ids: set[str] = set()
         retained_checkpoint_proxy_names: set[str] = set()
-        if has_resume_entries and active_proxy_hook_native_ids:
+        if has_resume_entries and pending_proxy_hook_native_ids:
             _present, _managed_ids, active_records = (
                 _proxy_hook_provenance_value(strands_agent)
             )
             selected_resume_interrupt_ids = {
                 entry.interrupt_id for entry in resume_entries
             }
+            selected_resume_interrupt_ids.intersection_update(
+                _unanswered_interrupt_ids(strands_agent._interrupt_state)
+            )
             selected_proxy_hook_native_ids = {
                 record["original_native_tool_call_id"]
                 for interrupt_id, record in (active_records or {}).items()
@@ -1685,7 +1719,7 @@ class StrandsAgent:
                 for tool in (input_data.tools or [])
             }
             unavailable_native_ids: set[str] = set()
-            for native_id in active_proxy_hook_native_ids:
+            for native_id in pending_proxy_hook_native_ids:
                 metadata = persisted_tool_call_meta.get(native_id)
                 tool_name = (
                     metadata.get("name") if isinstance(metadata, dict) else None
@@ -2219,7 +2253,7 @@ class StrandsAgent:
                 if not _supports_repository_reconciliation(session_manager):
                     yield _interrupt_session_capability_error()
                     return
-            if session_manager is None and active_proxy_hook_native_ids:
+            if session_manager is None and pending_proxy_hook_native_ids:
                 yield _interrupt_session_required_error()
                 return
 
@@ -2276,9 +2310,7 @@ class StrandsAgent:
                     self.config.replay_history_into_strands
                     or (has_resume_entries and active_proxy_native_ids)
                 )
-            ) or (
-                has_resume_entries and bool(active_proxy_hook_native_ids)
-            ):
+            ) or selected_proxy_hook_native_ids:
                 resolved_native_results = resolve_native_ids(
                     wire_to_native, frontend_results
                 )
@@ -2603,7 +2635,16 @@ class StrandsAgent:
                                     AG_UI_TOOL_CALL_MAP_STATE_KEY
                                 )
                                 or {},
-                                provenance or {},
+                                {
+                                    interrupt_id: record
+                                    for interrupt_id, record in (
+                                        provenance or {}
+                                    ).items()
+                                    if interrupt_id
+                                    in _unanswered_interrupt_ids(
+                                        strands_agent._interrupt_state
+                                    )
+                                },
                             )
                             if (
                                 owned_ids
@@ -3862,7 +3903,7 @@ class StrandsAgent:
                         messages=list(snapshot_messages),
                     )
 
-            active_hook_native_ids = _active_proxy_hook_interrupt_ids(
+            pending_hook_native_ids = _pending_proxy_hook_native_ids(
                 strands_agent, persisted_tool_call_meta
             )
             # A mixed frontend-proxy/native-interrupt batch parks the proxy's
@@ -3876,7 +3917,7 @@ class StrandsAgent:
                 if not _supports_repository_reconciliation(session_manager):
                     yield _interrupt_session_capability_error()
                     return
-            if session_manager is None and active_hook_native_ids:
+            if session_manager is None and pending_hook_native_ids:
                 yield _interrupt_session_required_error()
                 return
 
@@ -3900,7 +3941,7 @@ class StrandsAgent:
                 native_to_wire = {
                     native: wire
                     for wire, native in latest_wire_map.items()
-                    if native in active_hook_native_ids
+                    if native in pending_hook_native_ids
                 }
                 _present, _managed_ids, hook_provenance = (
                     _proxy_hook_provenance_value(
@@ -3910,6 +3951,8 @@ class StrandsAgent:
                 interrupt_to_wire = {
                     interrupt_id: record["wire_tool_call_id"]
                     for interrupt_id, record in (hook_provenance or {}).items()
+                    if interrupt_id
+                    in _unanswered_interrupt_ids(strands_agent._interrupt_state)
                 }
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
