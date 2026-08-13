@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ from strands.tools.registry import ToolRegistry
 from strands.tools.tools import PythonAgentTool
 
 from ag_ui_strands.client_proxy_tool import (
+    PROXY_RESUME_RESULT_BINDINGS_KEY,
     PROXY_RESUME_RESULTS_KEY,
     _PROXY_MARKER,
     _is_proxy,
@@ -72,10 +74,11 @@ class TestCreateProxyTool:
 
 
 class TestProxyToolResult:
-    def test_returns_success_with_placeholder(self):
+    @pytest.mark.asyncio
+    async def test_returns_success_with_placeholder(self):
         proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
         tool_use = {"toolUseId": "abc-123", "name": "bg", "input": {"color": "red"}}
-        result = proxy._tool_func(tool_use)
+        result = await proxy._tool_func(tool_use)
 
         assert result["toolUseId"] == "abc-123"
         assert result["status"] == "success"
@@ -96,7 +99,8 @@ class TestProxyToolResult:
             pytest.param("", "error", "boom", "boom", id="failure-diagnostic"),
         ],
     )
-    def test_returns_full_resumed_client_result(
+    @pytest.mark.asyncio
+    async def test_returns_full_resumed_client_result(
         self, content, status, error, expected_text
     ):
         proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
@@ -106,16 +110,20 @@ class TestProxyToolResult:
             "input": {"color": "red"},
         }
 
-        result = proxy._tool_func(
+        resumed_results = {
+            "abc-123": _FrontendToolResult(
+                content=content,
+                status=status,
+                error=error,
+            )
+        }
+        bindings = {"abc-123": "wire-123"}
+
+        result = await proxy._tool_func(
             tool_use,
             **{
-                PROXY_RESUME_RESULTS_KEY: {
-                    "abc-123": _FrontendToolResult(
-                        content=content,
-                        status=status,
-                        error=error,
-                    )
-                }
+                PROXY_RESUME_RESULTS_KEY: resumed_results,
+                PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
             },
         )
 
@@ -124,6 +132,45 @@ class TestProxyToolResult:
             "status": status,
             "content": [{"text": expected_text}],
         }
+        assert resumed_results == {}
+        # The proxy consumes only the typed result. The adapter's
+        # AfterToolCall cleanup owns the exact binding lifecycle.
+        assert bindings == {"abc-123": "wire-123"}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_resumed_calls_consume_only_their_own_result(self):
+        proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
+        results = {
+            "native-a": _FrontendToolResult("A", "success"),
+            "native-b": _FrontendToolResult("", "error", "boom"),
+        }
+        bindings = {"native-a": "wire-a", "native-b": "wire-b"}
+
+        result_a, result_b = await asyncio.gather(
+            proxy._tool_func(
+                {"toolUseId": "native-a", "name": "bg", "input": {}},
+                **{
+                    PROXY_RESUME_RESULTS_KEY: results,
+                    PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
+                },
+            ),
+            proxy._tool_func(
+                {"toolUseId": "native-b", "name": "bg", "input": {}},
+                **{
+                    PROXY_RESUME_RESULTS_KEY: results,
+                    PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
+                },
+            ),
+        )
+
+        assert result_a["content"] == [{"text": "A"}]
+        assert result_b == {
+            "toolUseId": "native-b",
+            "status": "error",
+            "content": [{"text": "boom"}],
+        }
+        assert results == {}
+        assert bindings == {"native-a": "wire-a", "native-b": "wire-b"}
 
 
 # ---------------------------------------------------------------------------

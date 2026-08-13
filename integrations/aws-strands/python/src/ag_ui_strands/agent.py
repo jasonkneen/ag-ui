@@ -17,6 +17,7 @@ from strands import Agent as StrandsAgentCore
 from strands.hooks import HookProvider
 from strands.hooks.events import (
     AfterInvocationEvent,
+    AfterToolCallEvent,
     BeforeToolCallEvent,
 )
 from strands.interrupt import InterruptException
@@ -366,8 +367,12 @@ class _ProxyHookBoundary:
         self.expected_records: dict[str, dict[str, Any]] = {}
         self.failure_fields: set[str] = set()
         self.authoritative_resume_results: dict[str, Any] = {}
+        self.authoritative_resume_bindings: dict[str, str] = {}
+        self.authoritative_pending_state: dict[str, Any] | None = None
         self.authoritative_records: dict[str, dict[str, Any]] = {}
         self.working_resume_results: dict[str, Any] | None = None
+        self.working_resume_bindings: dict[str, str] | None = None
+        self.consumed_resume_ids: set[str] = set()
         self.run_checkpoint: dict[str, Any] | None = None
         self.failed = False
 
@@ -375,6 +380,8 @@ class _ProxyHookBoundary:
         self,
         agent: Any,
         resume_results: dict[str, Any] | None,
+        resume_bindings: dict[str, str] | None = None,
+        pending_state: dict[str, Any] | None = None,
     ) -> None:
         self.captures.clear()
         self.claims.clear()
@@ -384,9 +391,13 @@ class _ProxyHookBoundary:
         self.candidate_collisions.clear()
         self.expected_records.clear()
         self.failure_fields.clear()
+        self.consumed_resume_ids.clear()
         self.failed = False
         self.authoritative_resume_results = copy.deepcopy(resume_results or {})
+        self.authoritative_resume_bindings = copy.deepcopy(resume_bindings or {})
+        self.authoritative_pending_state = copy.deepcopy(pending_state)
         self.working_resume_results = resume_results if resume_results else None
+        self.working_resume_bindings = resume_bindings if resume_bindings else None
         interrupt_state = agent._interrupt_state
         _present, managed_ids, records = _proxy_hook_provenance_value(agent)
         self.authoritative_records = copy.deepcopy(records or {})
@@ -441,6 +452,7 @@ class _ProxyHookBoundary:
                     AG_UI_WIRE_MAP_STATE_KEY,
                     AG_UI_TOOL_CALL_MAP_STATE_KEY,
                     AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
+                    AG_UI_PENDING_PROXY_RESULTS_STATE_KEY,
                 )
             },
         }
@@ -618,7 +630,10 @@ class _ProxyHookBoundary:
             and self.run_checkpoint["exact_resume"]
             and prior_records
         )
-        has_expected_resume = native_id in self.authoritative_resume_results
+        has_expected_resume = (
+            native_id in self.authoritative_resume_results
+            and native_id not in self.consumed_resume_ids
+        )
         expected_resume = self.authoritative_resume_results.get(native_id)
         working_results = event.invocation_state.get(PROXY_RESUME_RESULTS_KEY)
         if has_expected_resume and (
@@ -626,6 +641,42 @@ class _ProxyHookBoundary:
             or working_results.get(native_id) != expected_resume
         ):
             changed.add("proxy_resume_result")
+        working_bindings = event.invocation_state.get(
+            PROXY_RESUME_RESULT_BINDINGS_KEY
+        )
+        if has_expected_resume and (
+            not isinstance(working_bindings, dict)
+            or working_bindings.get(native_id)
+            != self.authoritative_resume_bindings.get(native_id)
+        ):
+            changed.add("proxy_resume_result_binding")
+
+        if has_expected_resume:
+            present_pending = _agent_state_key_present(
+                event.agent, AG_UI_PENDING_PROXY_RESULTS_STATE_KEY
+            )
+            current_pending = (
+                event.agent.state.get(AG_UI_PENDING_PROXY_RESULTS_STATE_KEY)
+                if present_pending
+                else None
+            )
+            expected_pending = self.authoritative_pending_state
+            if isinstance(expected_pending, dict) and isinstance(
+                working_bindings, dict
+            ):
+                expected_pending = copy.deepcopy(expected_pending)
+                expected_pending["records"] = {
+                    pending_native: record
+                    for pending_native, record in expected_pending[
+                        "records"
+                    ].items()
+                    if pending_native in working_bindings
+                    and pending_native not in self.consumed_resume_ids
+                }
+                if not expected_pending["records"]:
+                    expected_pending = None
+            if current_pending != expected_pending:
+                changed.add("pending_proxy_results")
 
         if not capture["interrupt_ids"] and not is_managed_resume:
             # No proxy checkpoint was established. Caller mutation remains
@@ -675,6 +726,13 @@ class _ProxyHookBoundary:
             **copy.deepcopy(self.authoritative_records),
             **copy.deepcopy(self.expected_records),
         }
+        if isinstance(current_wire_map, dict):
+            allowed_records = {
+                interrupt_id: record
+                for interrupt_id, record in allowed_records.items()
+                if current_wire_map.get(record["wire_tool_call_id"])
+                == record["original_native_tool_call_id"]
+            }
         if (bool(allowed_records) and not present_now) or (
             present_now
             and (
@@ -720,10 +778,26 @@ class _ProxyHookBoundary:
             # hook cannot retain and mutate our source of truth.
             self.working_resume_results.clear()
             self.working_resume_results.update(
-                copy.deepcopy(self.authoritative_resume_results)
+                {
+                    native_id: copy.deepcopy(result)
+                    for native_id, result in self.authoritative_resume_results.items()
+                    if native_id not in self.consumed_resume_ids
+                }
             )
             event.invocation_state[PROXY_RESUME_RESULTS_KEY] = (
                 self.working_resume_results
+            )
+        if self.working_resume_bindings is not None:
+            self.working_resume_bindings.clear()
+            self.working_resume_bindings.update(
+                {
+                    native_id: wire_id
+                    for native_id, wire_id in self.authoritative_resume_bindings.items()
+                    if native_id not in self.consumed_resume_ids
+                }
+            )
+            event.invocation_state[PROXY_RESUME_RESULT_BINDINGS_KEY] = (
+                self.working_resume_bindings
             )
         if changed:
             self.failure_fields.update(changed)
@@ -735,6 +809,11 @@ class _ProxyHookBoundary:
                 f"__ag_ui_integrity_failure_{uuid.uuid4()}__",
                 reason=_PROXY_HOOK_FAILURE_MESSAGE,
             )
+
+    def cleanup_executed_proxy_result(self, event: Any) -> None:
+        consumed_native_id = _cleanup_executed_proxy_result(event)
+        if consumed_native_id is not None:
+            self.consumed_resume_ids.add(consumed_native_id)
 
     def after_invocation(self, event: Any) -> None:
         for capture in self.captures.values():
@@ -790,6 +869,17 @@ class _ProxyHookBoundary:
                 agent.state.delete(key)
             else:
                 agent.state.set(key, value)
+        if self.working_resume_results is not None:
+            self.working_resume_results.clear()
+            self.working_resume_results.update(
+                copy.deepcopy(self.authoritative_resume_results)
+            )
+        if self.working_resume_bindings is not None:
+            self.working_resume_bindings.clear()
+            self.working_resume_bindings.update(
+                copy.deepcopy(self.authoritative_resume_bindings)
+            )
+        self.consumed_resume_ids.clear()
 
         session_manager = _get_strands_session_manager(agent)
         if checkpoint["messages"] is not None and (
@@ -852,6 +942,9 @@ class _ProxyHookFinalizerProvider(HookProvider):
 
     def register_hooks(self, registry: Any) -> None:
         registry.add_callback(BeforeToolCallEvent, self.boundary.finalize)
+        registry.add_callback(
+            AfterToolCallEvent, self.boundary.cleanup_executed_proxy_result
+        )
 
 
 def _strands_interrupt_to_agui(
@@ -944,6 +1037,113 @@ def _pending_proxy_hook_native_ids(
         if isinstance(metadata, dict) and metadata.get("is_frontend") is True:
             native_ids.add(native_id)
     return native_ids
+
+
+def _pending_proxy_hook_bindings(agent: Any) -> dict[str, str]:
+    """Return exact canonical->wire bindings from unanswered A1 records only."""
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return {}
+    present, managed_ids, records = _proxy_hook_provenance_value(agent)
+    if not present or managed_ids is None or records is None:
+        return {}
+    unanswered_ids = _unanswered_interrupt_ids(interrupt_state)
+    bindings: dict[str, str] = {}
+    for interrupt_id, record in records.items():
+        if interrupt_id not in unanswered_ids:
+            continue
+        native_id = record["original_native_tool_call_id"]
+        wire_id = record["wire_tool_call_id"]
+        existing = bindings.setdefault(native_id, wire_id)
+        if existing != wire_id:
+            raise ValueError("conflicting pending proxy result bindings")
+    return bindings
+
+
+def _cleanup_executed_proxy_result(event: Any) -> str | None:
+    """Remove one consumed canonical result before later reverse-order hooks."""
+    if getattr(event.selected_tool, "_ag_ui_proxy", False) is not True:
+        return
+    bindings = event.invocation_state.get(PROXY_RESUME_RESULT_BINDINGS_KEY)
+    native_id = event.tool_use.get("toolUseId")
+    if not isinstance(bindings, dict) or native_id not in bindings:
+        return
+    wire_id = bindings.get(native_id)
+    resumed_results = event.invocation_state.get(PROXY_RESUME_RESULTS_KEY)
+    if (
+        not isinstance(native_id, str)
+        or not isinstance(wire_id, str)
+        or not isinstance(resumed_results, dict)
+        or native_id in resumed_results
+    ):
+        raise RuntimeError("invalid consumed proxy result state")
+
+    pending = decode_pending_proxy_results(
+        event.agent.state.get(AG_UI_PENDING_PROXY_RESULTS_STATE_KEY)
+    )
+    pending_record = pending.get(native_id)
+    wire_map = event.agent.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    present, managed_ids, provenance = _proxy_hook_provenance_value(event.agent)
+    expected_content = (
+        [{"text": pending_record.frontend_result.provider_safe_content}]
+        if pending_record is not None
+        else None
+    )
+    if (
+        pending_record is None
+        or pending_record.wire_tool_call_id != wire_id
+        or not isinstance(event.result, dict)
+        or event.result.get("toolUseId") != native_id
+        or event.result.get("status") != pending_record.status
+        or event.result.get("content") != expected_content
+        or not isinstance(wire_map, dict)
+        or wire_map.get(wire_id) != native_id
+        or not present
+        or managed_ids is None
+        or provenance is None
+    ):
+        raise RuntimeError("invalid consumed proxy result binding")
+    consumed_interrupt_ids = {
+        interrupt_id
+        for interrupt_id, record in provenance.items()
+        if record["original_native_tool_call_id"] == native_id
+        and record["wire_tool_call_id"] == wire_id
+    }
+    if not consumed_interrupt_ids or any(
+        record["original_native_tool_call_id"] == native_id
+        and interrupt_id not in consumed_interrupt_ids
+        for interrupt_id, record in provenance.items()
+    ):
+        raise RuntimeError("invalid consumed proxy provenance")
+
+    remaining_pending = {
+        key: value for key, value in pending.items() if key != native_id
+    }
+    remaining_wire_map = dict(wire_map)
+    del remaining_wire_map[wire_id]
+    remaining_provenance = {
+        interrupt_id: record
+        for interrupt_id, record in provenance.items()
+        if interrupt_id not in consumed_interrupt_ids
+    }
+
+    if remaining_pending:
+        event.agent.state.set(
+            AG_UI_PENDING_PROXY_RESULTS_STATE_KEY,
+            encode_pending_proxy_results(remaining_pending),
+        )
+    else:
+        event.agent.state.delete(AG_UI_PENDING_PROXY_RESULTS_STATE_KEY)
+    event.agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining_wire_map)
+    if remaining_provenance:
+        event.agent.state.set(
+            AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
+            _proxy_hook_provenance_payload(remaining_provenance),
+        )
+    else:
+        event.agent.state.delete(AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY)
+    del bindings[native_id]
+    return native_id
 
 
 def _validate_active_proxy_hook_provenance(
@@ -1174,20 +1374,26 @@ from .a2ui_tool import (
     plan_a2ui_injection,
 )
 from .client_proxy_tool import (
+    PROXY_RESUME_RESULT_BINDINGS_KEY,
     PROXY_RESUME_RESULTS_KEY,
     create_proxy_tool,
     registered_proxy_tool_names,
     sync_proxy_tools,
 )
 from .session_reconcile import (
+    AG_UI_PENDING_PROXY_RESULTS_STATE_KEY,
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     ActiveInterruptReconciliationError,
+    PendingProxyResult,
     _FrontendToolResult,
     _supports_repository_reconciliation,
     active_proxy_placeholder_ids,
+    decode_pending_proxy_results,
+    encode_pending_proxy_results,
     has_active_proxy_placeholder,
     has_placeholder_results,
+    merge_pending_proxy_results,
     reconcile_frontend_tool_results,
     resolve_native_ids,
 )
@@ -1689,6 +1895,10 @@ class StrandsAgent:
         )
         selected_proxy_hook_native_ids: set[str] = set()
         retained_checkpoint_proxy_names: set[str] = set()
+        proxy_resume_results: Dict[str, _FrontendToolResult] = {}
+        proxy_resume_result_bindings: Dict[str, str] = {}
+        staged_pending_proxy_state: dict[str, Any] | None = None
+        proxy_boundary_prepared = False
         if has_resume_entries and pending_proxy_hook_native_ids:
             _present, _managed_ids, active_records = (
                 _proxy_hook_provenance_value(strands_agent)
@@ -1764,6 +1974,141 @@ class StrandsAgent:
                 )
                 yield _proxy_resume_tool_capability_error(
                     unavailable_native_ids
+                )
+                return
+
+        # Accept frontend results against exact unanswered A1 bindings before
+        # any registry/state mutation. A repeated identical ToolMessage is
+        # idempotent; any conflict fails closed while the retry checkpoint is
+        # still untouched.
+        try:
+            pending_bindings = (
+                _pending_proxy_hook_bindings(strands_agent)
+                if pending_proxy_hook_native_ids
+                else {}
+            )
+            prior_pending: dict[str, PendingProxyResult] = {}
+            state_store = getattr(
+                getattr(strands_agent, "state", None), "_state", None
+            )
+            pending_state_present = bool(
+                isinstance(state_store, dict)
+                and AG_UI_PENDING_PROXY_RESULTS_STATE_KEY in state_store
+            )
+            if pending_state_present:
+                prior_pending = decode_pending_proxy_results(
+                    strands_agent.state.get(
+                        AG_UI_PENDING_PROXY_RESULTS_STATE_KEY
+                    )
+                )
+            if any(
+                pending_bindings.get(native_id) != record.wire_tool_call_id
+                for native_id, record in prior_pending.items()
+            ):
+                raise ValueError("stored pending proxy result binding conflict")
+            retained_pending = dict(prior_pending)
+            native_by_wire = {
+                wire_id: native_id
+                for native_id, wire_id in pending_bindings.items()
+            }
+            incoming_pending: dict[str, PendingProxyResult] = {}
+            trailing_tool_messages: list[Any] = []
+            for message in reversed(input_data.messages or []):
+                if getattr(message, "role", None) != "tool":
+                    break
+                trailing_tool_messages.append(message)
+            for message in reversed(trailing_tool_messages):
+                wire_id = getattr(message, "tool_call_id", None)
+                native_id = native_by_wire.get(wire_id)
+                if native_id is None:
+                    continue
+                content = message.content
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else flatten_content_to_text(content)
+                )
+                result = _normalize_frontend_tool_result(
+                    text or "", getattr(message, "error", None)
+                )
+                incoming_pending = merge_pending_proxy_results(
+                    incoming_pending,
+                    {
+                        native_id: PendingProxyResult(
+                            wire_tool_call_id=wire_id,
+                            content=result.content,
+                            status=result.status,
+                            error=result.error,
+                        )
+                    },
+                )
+            merged_pending = merge_pending_proxy_results(
+                retained_pending, incoming_pending
+            )
+            missing_selected = (
+                selected_proxy_hook_native_ids - merged_pending.keys()
+            )
+            if missing_selected:
+                raise ValueError("missing selected pending proxy result")
+            proxy_resume_results = {
+                native_id: merged_pending[native_id].frontend_result
+                for native_id in selected_proxy_hook_native_ids
+            }
+            proxy_resume_result_bindings = {
+                native_id: pending_bindings[native_id]
+                for native_id in merged_pending
+            }
+            if merged_pending:
+                staged_pending_proxy_state = encode_pending_proxy_results(
+                    merged_pending
+                )
+        except (KeyError, TypeError, ValueError):
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message="Pending frontend proxy result reconciliation failed",
+                code="INTERRUPT_RECONCILIATION_ERROR",
+            )
+            return
+
+        if selected_proxy_hook_native_ids or pending_state_present:
+            proxy_hook_boundary = self._proxy_hook_boundaries_by_thread.get(
+                thread_id
+            )
+            if proxy_hook_boundary is not None:
+                proxy_hook_boundary.prepare_run(
+                    strands_agent,
+                    proxy_resume_results,
+                    proxy_resume_result_bindings,
+                    staged_pending_proxy_state,
+                )
+                proxy_boundary_prepared = True
+            try:
+                if staged_pending_proxy_state is None:
+                    strands_agent.state.delete(
+                        AG_UI_PENDING_PROXY_RESULTS_STATE_KEY
+                    )
+                else:
+                    strands_agent.state.set(
+                        AG_UI_PENDING_PROXY_RESULTS_STATE_KEY,
+                        staged_pending_proxy_state,
+                    )
+            except Exception:
+                if proxy_hook_boundary is not None:
+                    proxy_hook_boundary._restore_failed_attempt(strands_agent)
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message="Pending frontend proxy result reconciliation failed",
+                    code="INTERRUPT_RECONCILIATION_ERROR",
                 )
                 return
 
@@ -2315,35 +2660,6 @@ class StrandsAgent:
                     wire_to_native, frontend_results
                 )
 
-            # A before-tool hook pauses before the proxy can create a
-            # placeholder, so ordinary repository reconciliation has nothing
-            # to overwrite. Require the client's visible wire result before
-            # resuming; the proxy consumes this map when Strands invokes it.
-            proxy_resume_results: Dict[str, _FrontendToolResult] = {}
-            proxy_resume_native_ids: set[str] = set()
-            if selected_proxy_hook_native_ids:
-                missing_hook_results = (
-                    selected_proxy_hook_native_ids
-                    - resolved_native_results.keys()
-                )
-                if missing_hook_results:
-                    error = ActiveInterruptReconciliationError(missing_hook_results)
-                    logger.error(
-                        "Active proxy hook interrupt is missing mapped frontend "
-                        f"results for native ids {sorted(missing_hook_results)}"
-                    )
-                    yield RunErrorEvent(
-                        type=EventType.RUN_ERROR,
-                        message=str(error),
-                        code="INTERRUPT_RECONCILIATION_ERROR",
-                    )
-                    return
-                proxy_resume_results = {
-                    native_id: resolved_native_results[native_id]
-                    for native_id in selected_proxy_hook_native_ids
-                }
-                proxy_resume_native_ids = set(proxy_resume_results)
-
             # A native resume consumes and clears the active interrupt context.
             # Refuse to enter Strands unless every exact, provenance-backed
             # proxy placeholder parked there has a client result mapped back to
@@ -2564,7 +2880,7 @@ class StrandsAgent:
             proxy_hook_boundary = self._proxy_hook_boundaries_by_thread.get(
                 thread_id
             )
-            if proxy_hook_boundary is not None:
+            if proxy_hook_boundary is not None and not proxy_boundary_prepared:
                 proxy_hook_boundary.prepare_run(
                     strands_agent, proxy_resume_results
                 )
@@ -2574,6 +2890,9 @@ class StrandsAgent:
                     resume_prompt,
                     invocation_state={
                         PROXY_RESUME_RESULTS_KEY: proxy_resume_results,
+                        PROXY_RESUME_RESULT_BINDINGS_KEY: (
+                            proxy_resume_result_bindings
+                        ),
                     },
                 )
             else:
@@ -3824,51 +4143,6 @@ class StrandsAgent:
             if proxy_boundary_error is not None:
                 yield proxy_boundary_error
                 return
-
-            # ``create_proxy_tool`` pops only after the resumed hook allows the
-            # exact native proxy invocation to proceed. Remove the consumed
-            # wire mapping then; an unconsumed override remains retryable.
-            consumed_proxy_resume_ids = (
-                proxy_resume_native_ids - proxy_resume_results.keys()
-            )
-            if consumed_proxy_resume_ids and getattr(
-                strands_agent, "state", None
-            ) is not None:
-                current_wire_map = dict(
-                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-                )
-                remaining_wire_map = {
-                    wire: native
-                    for wire, native in current_wire_map.items()
-                    if native not in consumed_proxy_resume_ids
-                }
-                strands_agent.state.set(
-                    AG_UI_WIRE_MAP_STATE_KEY, remaining_wire_map
-                )
-                _present, managed_ids, current_provenance = (
-                    _proxy_hook_provenance_value(strands_agent)
-                )
-                if (
-                    managed_ids is not None
-                    and current_provenance is not None
-                ):
-                    remaining_provenance = {
-                        interrupt_id: record
-                        for interrupt_id, record in current_provenance.items()
-                        if record.get("original_native_tool_call_id")
-                        not in consumed_proxy_resume_ids
-                    }
-                    if remaining_provenance:
-                        strands_agent.state.set(
-                            AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
-                            _proxy_hook_provenance_payload(
-                                remaining_provenance
-                            ),
-                        )
-                    else:
-                        strands_agent.state.delete(
-                            AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY
-                        )
 
             # Close reasoning if still open
             if reasoning_started:

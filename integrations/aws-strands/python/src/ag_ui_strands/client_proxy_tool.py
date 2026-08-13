@@ -24,6 +24,7 @@ PROXY_RESULT_PLACEHOLDER = "Forwarded to client"
 # already executed the visible wire call, so the proxy consumes that real
 # result instead of manufacturing a placeholder after reconciliation ran.
 PROXY_RESUME_RESULTS_KEY = "__ag_ui_proxy_resume_results__"
+PROXY_RESUME_RESULT_BINDINGS_KEY = "__ag_ui_proxy_resume_result_bindings__"
 
 
 def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
@@ -58,7 +59,7 @@ def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
         "inputSchema": {"json": parameters or {}},
     }
 
-    def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
+    async def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
         resumed_results = _kwargs.get(PROXY_RESUME_RESULTS_KEY)
         if isinstance(resumed_results, dict) and tool_use["toolUseId"] in resumed_results:
             resumed_result = resumed_results.pop(tool_use["toolUseId"])

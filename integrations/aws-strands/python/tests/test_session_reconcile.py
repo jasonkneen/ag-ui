@@ -17,13 +17,164 @@ from strands.types.session import SessionAgent, SessionMessage
 
 from ag_ui_strands import session_reconcile
 from ag_ui_strands.session_reconcile import (
+    PendingProxyResult,
     _FrontendToolResult,
+    decode_pending_proxy_results,
+    encode_pending_proxy_results,
     has_placeholder_results,
+    merge_pending_proxy_results,
     reconcile_frontend_tool_results,
     resolve_native_ids,
 )
 
 PLACEHOLDER = "Forwarded to client"
+
+
+def _pending_result(
+    wire_id="wire-1", content="CLIENT", status="success", error=None
+):
+    return PendingProxyResult(
+        wire_tool_call_id=wire_id,
+        content=content,
+        status=status,
+        error=error,
+    )
+
+
+def test_pending_proxy_result_envelope_round_trips_raw_failed_result():
+    records = {
+        "native-1": _pending_result(
+            content="", status="error", error="boom"
+        )
+    }
+
+    encoded = encode_pending_proxy_results(records)
+
+    assert encoded == {
+        "version": 1,
+        "records": {
+            "native-1": {
+                "wire_tool_call_id": "wire-1",
+                "content": "",
+                "status": "error",
+                "error": "boom",
+            }
+        },
+    }
+    assert decode_pending_proxy_results(encoded) == records
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        None,
+        {},
+        {"version": True, "records": {}},
+        {"version": 1, "records": {}, "extra": True},
+        {"version": 1, "records": []},
+        {"version": 1, "records": {"": {}}},
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": None,
+                    "extra": True,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": 1,
+                    "status": "success",
+                    "error": None,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "cancelled",
+                    "error": None,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": 1,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": None,
+                },
+                "native-2": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "OTHER",
+                    "status": "success",
+                    "error": None,
+                },
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "bad\udcff",
+                    "status": "success",
+                    "error": None,
+                }
+            },
+        },
+    ],
+)
+def test_pending_proxy_result_decoder_rejects_malformed_state(malformed):
+    with pytest.raises(ValueError, match="pending proxy result"):
+        decode_pending_proxy_results(malformed)
+
+
+def test_pending_proxy_result_merge_is_idempotent_and_non_mutating():
+    accepted = {"native-1": _pending_result()}
+    before = dict(accepted)
+
+    merged = merge_pending_proxy_results(accepted, dict(accepted))
+
+    assert merged == accepted
+    assert merged is not accepted
+    assert accepted == before
+
+
+def test_pending_proxy_result_merge_rejects_any_conflict_without_mutation():
+    accepted = {"native-1": _pending_result()}
+    conflict = {"native-1": _pending_result(content="DIFFERENT")}
+    accepted_before = dict(accepted)
+    conflict_before = dict(conflict)
+
+    with pytest.raises(ValueError, match="pending proxy result conflict"):
+        merge_pending_proxy_results(accepted, conflict)
+
+    assert accepted == accepted_before
+    assert conflict == conflict_before
 
 
 def _client_result(content, status="success"):

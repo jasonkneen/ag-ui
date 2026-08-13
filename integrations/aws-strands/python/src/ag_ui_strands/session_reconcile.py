@@ -32,6 +32,10 @@ AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 # tool. Namespaced to avoid clashing with user-managed state keys.
 AG_UI_TOOL_CALL_MAP_STATE_KEY = "__ag_ui_tool_call_map__"
 
+# Strict adapter-owned persistence for accepted frontend results whose exact
+# proxy invocation is still parked behind a ``BeforeToolCallEvent`` interrupt.
+AG_UI_PENDING_PROXY_RESULTS_STATE_KEY = "__ag_ui_pending_proxy_results__"
+
 
 @dataclass(frozen=True)
 class _FrontendToolResult:
@@ -61,6 +65,111 @@ class _FrontendToolResult:
                 "utf-8", errors="backslashreplace"
             ).decode("utf-8")
         return diagnostic
+
+
+@dataclass(frozen=True)
+class PendingProxyResult:
+    """Raw client result durably bound to one exact emitted wire call."""
+
+    wire_tool_call_id: str
+    content: str
+    status: Literal["success", "error"]
+    error: str | None = None
+
+    @property
+    def frontend_result(self) -> _FrontendToolResult:
+        return _FrontendToolResult(
+            content=self.content,
+            status=self.status,
+            error=self.error,
+        )
+
+
+def _is_utf8_string(value: Any, *, nonempty: bool = False) -> bool:
+    if type(value) is not str or (nonempty and not value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def decode_pending_proxy_results(raw: Any) -> dict[str, PendingProxyResult]:
+    """Decode the strict version-1 pending-result envelope, failing closed."""
+    if (
+        type(raw) is not dict
+        or set(raw) != {"version", "records"}
+        or type(raw["version"]) is not int
+        or raw["version"] != 1
+        or type(raw["records"]) is not dict
+    ):
+        raise ValueError("malformed pending proxy result state")
+
+    decoded: dict[str, PendingProxyResult] = {}
+    wire_ids: set[str] = set()
+    for native_id, record in raw["records"].items():
+        if (
+            not _is_utf8_string(native_id, nonempty=True)
+            or type(record) is not dict
+            or set(record)
+            != {"wire_tool_call_id", "content", "status", "error"}
+            or not _is_utf8_string(record["wire_tool_call_id"], nonempty=True)
+            or not _is_utf8_string(record["content"])
+            or type(record["status"]) is not str
+            or record["status"] not in ("success", "error")
+            or (
+                record["error"] is not None
+                and not _is_utf8_string(record["error"])
+            )
+            or record["wire_tool_call_id"] in wire_ids
+        ):
+            raise ValueError("malformed pending proxy result state")
+        wire_ids.add(record["wire_tool_call_id"])
+        decoded[native_id] = PendingProxyResult(**record)
+    return decoded
+
+
+def encode_pending_proxy_results(
+    records: Mapping[str, PendingProxyResult],
+) -> dict[str, Any]:
+    """Encode pending records through the strict decoder's validation."""
+    raw = {
+        "version": 1,
+        "records": {
+            native_id: {
+                "wire_tool_call_id": record.wire_tool_call_id,
+                "content": record.content,
+                "status": record.status,
+                "error": record.error,
+            }
+            for native_id, record in records.items()
+        },
+    }
+    decode_pending_proxy_results(raw)
+    return raw
+
+
+def merge_pending_proxy_results(
+    accepted: Mapping[str, PendingProxyResult],
+    incoming: Mapping[str, PendingProxyResult],
+) -> dict[str, PendingProxyResult]:
+    """Return an idempotent merge, rejecting every native or wire conflict."""
+    merged = dict(accepted)
+    native_by_wire = {
+        record.wire_tool_call_id: native_id
+        for native_id, record in accepted.items()
+    }
+    for native_id, record in incoming.items():
+        existing = merged.get(native_id)
+        if existing is not None and existing != record:
+            raise ValueError("pending proxy result conflict")
+        wire_native = native_by_wire.get(record.wire_tool_call_id)
+        if wire_native is not None and wire_native != native_id:
+            raise ValueError("pending proxy result conflict")
+        merged[native_id] = record
+        native_by_wire[record.wire_tool_call_id] = native_id
+    return merged
 
 
 class _SessionRepository(Protocol):
