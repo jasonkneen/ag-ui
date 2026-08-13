@@ -235,8 +235,16 @@ def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
     assert in_memory["content"] == [{"text": '{"approved": true}'}]
 
 
-@pytest.mark.parametrize("status", ["success", "error"])
-def test_reconcile_updates_status_and_content_in_every_active_copy(tmp_path, status):
+@pytest.mark.parametrize(
+    ("status", "content"),
+    [
+        pytest.param("success", "real client result", id="success"),
+        pytest.param("error", "boom", id="failure-diagnostic"),
+    ],
+)
+def test_reconcile_updates_status_and_content_in_every_active_copy(
+    tmp_path, status, content
+):
     sm = _make_session(tmp_path)
     agent_id = "default"
     _seed(
@@ -258,7 +266,7 @@ def test_reconcile_updates_status_and_content_in_every_active_copy(tmp_path, sta
             context={"tool_results": [parked_result]},
         ),
     )
-    result = _client_result("real client result", status=status)
+    result = _client_result(content, status=status)
 
     corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": result})
 
@@ -266,7 +274,7 @@ def test_reconcile_updates_status_and_content_in_every_active_copy(tmp_path, sta
     expected = {
         "toolUseId": "tu-1",
         "status": status,
-        "content": [{"text": "real client result"}],
+        "content": [{"text": content}],
     }
     persisted = sm.session_repository.list_messages(sm.session_id, agent_id)
     assert persisted[0].message["content"][0]["toolResult"] == expected

@@ -1463,11 +1463,16 @@ class StrandsAgent:
                     if isinstance(content, str)
                     else flatten_content_to_text(content)
                 )
+                error = getattr(msg, "error", None)
+                if error is not None and not (text and text.strip()):
+                    error_text = _coerce_text(error).strip()
+                    if error_text:
+                        text = error_text
                 frontend_results[wire_id] = _FrontendToolResult(
                     content=text or "",
                     status=(
                         "error"
-                        if getattr(msg, "error", None) is not None
+                        if error is not None
                         else "success"
                     ),
                 )

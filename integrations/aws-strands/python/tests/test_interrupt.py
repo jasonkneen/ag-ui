@@ -2093,6 +2093,7 @@ async def test_mixed_active_resume_replays_failed_frontend_result_as_error(tmp_p
     assert frontend_result == {
         "toolUseId": "native-approve",
         "status": "error",
-        "content": [{"text": ""}],
+        "content": [{"text": "boom"}],
     }
+    assert "boom" in json.dumps(model.stream_calls_messages[-1])
     assert "executed successfully" not in json.dumps(model.stream_calls_messages[-1])

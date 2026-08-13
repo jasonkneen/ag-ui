@@ -638,15 +638,20 @@ class TestSessionFrontendToolReconciliation:
         }
 
     @pytest.mark.parametrize(
-        ("error", "content"),
+        ("error", "content", "expected_content"),
         [
-            pytest.param("boom", "client failure details", id="message"),
-            pytest.param("", "", id="empty-string"),
+            pytest.param(
+                "boom",
+                "client failure details",
+                "client failure details",
+                id="explicit-content-wins",
+            ),
+            pytest.param("boom", "", "boom", id="error-diagnostic-fallback"),
         ],
     )
     @pytest.mark.asyncio
     async def test_reconciles_failed_result_status_into_store_and_live_history(
-        self, tmp_path, error, content
+        self, tmp_path, error, content, expected_content
     ):
         from strands.session.file_session_manager import FileSessionManager
 
@@ -663,7 +668,7 @@ class TestSessionFrontendToolReconciliation:
         expected = {
             "toolUseId": "native-1",
             "status": "error",
-            "content": [{"text": content}],
+            "content": [{"text": expected_content}],
         }
         assert instance.stream_prompts == [None]
         assert _result_content(sm, "default", 1)[0]["toolResult"] == expected
