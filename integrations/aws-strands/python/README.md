@@ -112,7 +112,10 @@ interrupt round-trip:
   side effects that must not repeat:
 
   ```python
-  @tool
+  from strands import ToolContext, tool
+
+
+  @tool(context=True)
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Unsafe: re-runs (and re-charges) on every resume.
       charge(amount)
@@ -120,7 +123,7 @@ interrupt round-trip:
       return "cancelled" if envelope.get("cancelled") or not envelope.get("response") else "charged"
 
 
-  @tool
+  @tool(context=True)
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Safe: side effect happens only after the pause resolves.
       envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
