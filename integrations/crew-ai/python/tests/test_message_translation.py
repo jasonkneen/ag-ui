@@ -31,6 +31,19 @@ def test_litellm_conversion_generates_id_when_missing():
     assert len(out[0].id) == 36  # canonical uuid4 string length
 
 
+def test_litellm_conversion_generates_id_when_explicitly_none():
+    """A message with ``id`` present but ``None`` still gets a generated UUID.
+
+    Regression: the backfill guarded only on the key being absent, so an
+    explicit ``id=None`` survived to the None-strip, which then dropped the key
+    and left pydantic ``Message`` validation to fail on a missing id."""
+    out = litellm_messages_to_ag_ui_messages(
+        [{"role": "user", "content": "yo", "id": None}]
+    )
+    assert isinstance(out[0].id, str)
+    assert len(out[0].id) == 36  # canonical uuid4 string length
+
+
 def test_litellm_conversion_injects_tool_call_type():
     """Tool calls missing an explicit ``type`` are stamped ``function``."""
     out = litellm_messages_to_ag_ui_messages(
@@ -46,6 +59,23 @@ def test_litellm_conversion_injects_tool_call_type():
     assert tool_calls[0]["function"]["name"] == "f"
 
 
+def test_litellm_conversion_does_not_mutate_caller_tool_calls():
+    """Stamping ``type=function`` must not mutate the caller's (flow-state)
+    tool_call dicts in place: the whitelist comprehension is a shallow copy,
+    so a deep-enough copy is required before writing back."""
+    tool_call = {"id": "t1", "function": {"name": "f", "arguments": "{}"}}
+    message = {"role": "assistant", "id": "a3", "content": None,
+               "tool_calls": [tool_call]}
+
+    out = litellm_messages_to_ag_ui_messages([message])
+
+    # Output is stamped...
+    assert out[0].model_dump()["tool_calls"][0]["type"] == "function"
+    # ...but the caller's original dict is untouched.
+    assert "type" not in tool_call
+    assert message["tool_calls"][0] is tool_call
+
+
 def test_litellm_conversion_accepts_litellm_message_object():
     """A non-Mapping LiteLLM ``Message`` goes through the ``model_dump`` branch."""
     from litellm.types.utils import Message as LiteLLMMessage
@@ -56,6 +86,29 @@ def test_litellm_conversion_accepts_litellm_message_object():
     assert out[0].role == "assistant"
     assert out[0].content == "from-object"
     assert isinstance(out[0].id, str)
+
+
+def test_litellm_conversion_omits_client_owned_reasoning_from_snapshot():
+    """CrewAI does not own a complete canonical reasoning-message set.
+
+    Including prior reasoning in an authoritative ``MESSAGES_SNAPSHOT`` makes
+    the client replace all streamed reasoning, including the current turn, and
+    the whitelist also strips its encrypted continuation value. A snapshot with
+    no reasoning tells the client to preserve its complete local set instead.
+    """
+    out = litellm_messages_to_ag_ui_messages([
+        {"role": "user", "id": "u1", "content": "question"},
+        {
+            "role": "reasoning",
+            "id": "rs_1",
+            "content": "thinking",
+            "encrypted_value": "ENCRYPTED_STATE",
+        },
+        {"role": "assistant", "id": "a1", "content": "answer"},
+    ])
+
+    assert [message.id for message in out] == ["u1", "a1"]
+    assert all(message.role != "reasoning" for message in out)
 
 
 # --------------------------------------------------------------------------

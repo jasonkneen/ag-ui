@@ -13,6 +13,7 @@ stubbed (crewai's ``generate_*_with_ai`` helpers and ``acompletion`` /
 """
 
 import gc
+import json
 import weakref
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -29,7 +30,7 @@ try:
     import crewai.utilities.crew_chat as crew_chat_mod
 except ImportError:  # pragma: no cover - crewai 0.x fallback
     import crewai.cli.crew_chat as crew_chat_mod
-from crewai import Agent, Crew, LLM, Task
+from crewai import Agent, Crew, CrewOutput, LLM, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.flow.flow import Flow, start
 from crewai.types.crew_chat import ChatInputs
@@ -343,6 +344,132 @@ async def test_chat_crew_output_from_raw_attribute():
     assert state["outputs"] == "raw-output"
 
 
+async def _run_chat_with_crew_result(crew_result):
+    """Drive ``ChatWithCrewFlow.chat`` once where the crew tool returns
+    ``crew_result``; return the resulting ``state``.
+
+    Turn 1 of the stubbed stream names the crew tool; the defect-2 follow-up
+    turn returns plain assistant text, so ``state['messages']`` ends as
+    ``[assistant tool-call, tool result, follow-up text]``. Only the crew
+    tool factory and the LLM network boundary are stubbed — the real
+    ``chat`` crew-run branch under test runs unchanged.
+    """
+    async def _fake_acompletion(**_kwargs):
+        return object()
+
+    stream_calls = {"n": 0}
+
+    async def _fake_stream(_resp):
+        stream_calls["n"] += 1
+        if stream_calls["n"] == 1:
+            class _Resp:
+                choices = [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-crew",
+                            "function": {"name": "dummy", "arguments": "{}"},
+                        }],
+                    }
+                }]
+            return _Resp()
+
+        class _FollowUp:
+            choices = [{
+                "message": {"role": "assistant", "content": "done"}
+            }]
+        return _FollowUp()
+
+    def _fake_tool_factory(crew, messages):  # pylint: disable=unused-argument
+        return lambda **_kwargs: crew_result
+
+    flow = crews_mod.ChatWithCrewFlow.__new__(crews_mod.ChatWithCrewFlow)
+    flow.crew = type("C", (), {"chat_llm": "gpt-4o"})()
+    flow.crew_name = "dummy"
+    flow.crew_tool_schema = {
+        "type": "function",
+        "function": {"name": "dummy", "description": "", "parameters": {"type": "object"}},
+    }
+    flow.system_message = "sys"
+    state = {"messages": [], "inputs": {}, "copilotkit": {"actions": []}}
+
+    with _patch_instance_state(flow, state):
+        with patch.object(crews_mod, "acompletion", _fake_acompletion):
+            with patch.object(crews_mod, "copilotkit_stream", _fake_stream):
+                with patch.object(
+                    crews_mod, "crew_chat_create_tool_function", _fake_tool_factory
+                ):
+                    await flow.chat()
+    return state
+
+
+async def test_chat_crew_output_real_crewoutput_text_result_records_string():
+    """A text-producing ``CrewOutput`` (``.raw`` set, ``.json_dict`` None) records
+    its text as a string in ``state['outputs']`` and the tool message content,
+    not ``None`` and not the raw object. Fails against the pre-fix
+    ``hasattr``-gated code, which dropped the text to ``None``.
+    """
+    crew_output = CrewOutput(raw="the crew's final answer", json_dict=None)
+
+    state = await _run_chat_with_crew_result(crew_output)
+
+    assert state["outputs"] == "the crew's final answer"
+    tool_message = next(m for m in state["messages"] if m.get("role") == "tool")
+    assert tool_message["content"] == "the crew's final answer"
+    assert isinstance(tool_message["content"], str)
+
+
+async def test_chat_crew_output_real_crewoutput_structured_result_serializes_json():
+    """A structured ``CrewOutput`` (``.json_dict`` populated) records the
+    JSON-serialized string, not the raw object and not the non-JSON ``str()``
+    repr. ``.raw`` is non-empty to prove ``json_dict`` wins over it.
+    """
+    payload = {"topic": "ai", "score": 9}
+    crew_output = CrewOutput(raw="ignored raw text", json_dict=payload)
+    expected = json.dumps(payload)
+
+    state = await _run_chat_with_crew_result(crew_output)
+
+    assert state["outputs"] == expected
+    assert isinstance(state["outputs"], str)
+    tool_message = next(m for m in state["messages"] if m.get("role") == "tool")
+    assert tool_message["content"] == expected
+    assert isinstance(tool_message["content"], str)
+
+
+def test_crew_result_to_text_returns_string_across_branches():
+    """``_crew_result_to_text`` returns a string for every result shape:
+    plain str, ``json_dict``, ``pydantic``, string ``.raw``, and the
+    ``str(result)`` fallback. A non-string ``.raw`` is never returned as-is —
+    the helper's contract is to always yield a ``str``.
+    """
+    from pydantic import BaseModel
+
+    class _Model(BaseModel):
+        topic: str
+
+    to_text = crews_mod._crew_result_to_text
+
+    assert to_text("plain") == "plain"
+    assert to_text(CrewOutput(raw="", json_dict={"a": 1})) == json.dumps({"a": 1})
+
+    model = _Model(topic="ai")
+    assert to_text(CrewOutput(raw="", pydantic=model)) == model.model_dump_json()
+
+    assert to_text(CrewOutput(raw="hello", json_dict=None)) == "hello"
+
+    # Empty raw with no structured output falls back to str(result), a string.
+    assert isinstance(to_text(CrewOutput(raw="", json_dict=None)), str)
+
+    # A non-string raw must not leak through unchanged (always returns str).
+    class _NonStrRaw:
+        json_dict = None
+        pydantic = None
+        raw = 123
+
+    assert isinstance(to_text(_NonStrRaw()), str)
+
+
 # --------------------------------------------------------------------------
 # LLM connection fields forwarded to acompletion
 # --------------------------------------------------------------------------
@@ -634,6 +761,11 @@ async def test_crew_run_emits_state_snapshot():
                         lambda crew, messages: (lambda **_k: "OUT"),
                     ):
                         await flow.chat()
+        # The MethodExecutionFinished handler that emits the STATE_SNAPSHOT runs
+        # on crewai's off-thread pool; settle it before the synchronous drain so
+        # the snapshot has landed. Real HTTP streams drain in an awaiting loop,
+        # so they never need this.
+        await ep._flush_event_bus()
         items = _drain(queue)
     finally:
         flow_context.reset(token)

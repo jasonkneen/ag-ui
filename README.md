@@ -80,7 +80,7 @@ AG-UI is complementary to the other 2 top agentic protocols
 
 ## 🛠 Supported Integrations
 
-AG-UI was born from CopilotKit's initial **partnership** with LangGraph and CrewAI - and brings the incredibly popular agent-user-interactivity infrastructure to the wider agentic ecosystem.
+AG-UI was born from CopilotKit's initial **partnership** with LangChain and CrewAI - and brings the incredibly popular agent-user-interactivity infrastructure to the wider agentic ecosystem.
 
 **1st party** = the platforms that have AG‑UI built in and provide documentation for guidance.
 
@@ -107,6 +107,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 | [Agno](https://github.com/agno-agi/agno) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/agno/) 🎮 [Demos](https://dojo.ag-ui.com/agno/feature/tool_based_generative_ui) |
 | [LlamaIndex](https://github.com/run-llama/llama_index) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/llamaindex/) 🎮 [Demos](https://dojo.ag-ui.com/llamaindex/feature/shared_state) |
 | [AG2](https://ag2.ai/) | ✅ Supported | ➡️ [Docs](https://docs.copilotkit.ai/ag2/)  🎮 [Demos](https://dojo.ag-ui.com/ag2/feature/shared_state) |
+| [Claude Managed Agents](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-managed-agents) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/claude-managed-agents-typescript/feature/agentic_chat) |
 | [AWS Bedrock Agents](https://aws.amazon.com/bedrock/agents/) | 🛠️ In Progress | – |
 
 
@@ -115,7 +116,6 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 | Framework | Status | AG-UI Resources |
 | ---------- | ------- | ---------------- |
 | [Claude Agent SDK](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-agent-sdk) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/claude-agent-sdk-python/feature/shared_state) |
-| [Claude Managed Agents](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-managed-agents) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/claude-managed-agents-typescript/feature/agentic_chat) |
 | [Langroid](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/langroid) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/langroid/feature/shared_state) |
 | [OpenAI Agent SDK](https://openai.github.io/openai-agents-python/) | 🛠️ In Progress | – |
 | [Cloudflare Agents](https://developers.cloudflare.com/agents/) | 🛠️ In Progress | – |
@@ -167,15 +167,8 @@ AG-UI was born from CopilotKit's initial **partnership** with LangGraph and Crew
 | --- | ------- | ---------------- | ------------- |
 | [CopilotKit](https://github.com/CopilotKit/CopilotKit) | ✅ Supported | ➡️ [Getting Started](https://docs.copilotkit.ai/direct-to-llm/guides/quickstart) | 1st Party |
 | [Terminal + Agent]() | ✅ Supported | ➡️ [Getting Started](https://docs.ag-ui.com/quickstart/clients) | Community |
-| [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [GitHub Source](https://github.com/ag-ui-protocol/ag-ui/issues/510) | Community |
-| [Slack]() | ✅ Supported | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-slack) | Community |
-| [MS Teams Chat]() | ✅ Supported | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-teams) | Community |
-| [WhatsApp]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-whatsapp) | Community |
-| [Telegram]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-telegram) | Community |
-| [Discord]() | 🛠️ In Progress | ➡️ [GitHub Source](https://github.com/CopilotKit/CopilotKit/tree/main/packages/channels-discord) | Community |
-| [iMessage]() | 🛠️ In Progress | ➡️ [Coming soon]() | Community |
-| [SMS]() | 🛠️ In Progress | ➡️ [Coming soon]() | Community |
-
+| Chat platforms (Slack, Microsoft Teams) | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
+| [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [Example](https://github.com/CopilotKit/CopilotKit/tree/main/examples/v2/react-native/demo) | Community |
 
 [View all supported integrations →](https://docs.ag-ui.com/introduction#supported-integrations)
 
@@ -203,7 +196,7 @@ https://github.com/user-attachments/assets/c298eea8-3f39-4a94-b968-7712429b0c49
 
 Check out the [Contributing guide](https://github.com/ag-ui-protocol/ag-ui/blob/main/CONTRIBUTING.md)
 
-- **[Bi-Weekely AG-UI Webinar](https://lu.ma/CopilotKit?k=c)**
+- **[Biweekly AG-UI Working Group](https://lu.ma/CopilotKit?k=c)**
   📅 Follow the CopilotKit Luma Events Calendar
 
 ## Roadmap

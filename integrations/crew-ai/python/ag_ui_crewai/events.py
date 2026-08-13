@@ -9,9 +9,16 @@ This file is used to bridge the events from the crewai event bus to the ag-ui ev
 from ._capabilities import BaseEvent
 from ag_ui.core.events import (
   ToolCallChunkEvent,
+  ToolCallResultEvent,
   TextMessageChunkEvent,
   CustomEvent,
-  StateSnapshotEvent
+  StateSnapshotEvent,
+  ReasoningStartEvent,
+  ReasoningMessageStartEvent,
+  ReasoningMessageContentEvent,
+  ReasoningMessageEndEvent,
+  ReasoningEndEvent,
+  ReasoningEncryptedValueEvent,
 )
 
 # When ``crewai``'s events package doesn't resolve, ``BaseEvent`` is ``None``.
@@ -43,6 +50,9 @@ _BridgedBase = BaseEvent if BaseEvent is not None else _InertBridgedBase
 class BridgedToolCallChunkEvent(_BridgedBase, ToolCallChunkEvent):
     """Bridged tool call chunk event"""
 
+class BridgedToolCallResultEvent(_BridgedBase, ToolCallResultEvent):
+    """Bridged tool call result event"""
+
 class BridgedTextMessageChunkEvent(_BridgedBase, TextMessageChunkEvent):
     """Bridged text message chunk event"""
 
@@ -51,3 +61,39 @@ class BridgedCustomEvent(_BridgedBase, CustomEvent):
 
 class BridgedStateSnapshotEvent(_BridgedBase, StateSnapshotEvent):
     """Bridged state snapshot event"""
+
+# Reasoning lifecycle, emitted by ``sdk.copilotkit_stream`` off the litellm
+# streaming delta (provider-agnostic: deepseek, Anthropic thinking, ...). Both
+# transports translate them: the legacy bus listener and the frame translator.
+class BridgedReasoningStartEvent(_BridgedBase, ReasoningStartEvent):
+    """Bridged reasoning start event"""
+
+class BridgedReasoningMessageStartEvent(_BridgedBase, ReasoningMessageStartEvent):
+    """Bridged reasoning message start event"""
+
+class BridgedReasoningMessageContentEvent(_BridgedBase, ReasoningMessageContentEvent):
+    """Bridged reasoning message content event"""
+
+class BridgedReasoningMessageEndEvent(_BridgedBase, ReasoningMessageEndEvent):
+    """Bridged reasoning message end event"""
+
+class BridgedReasoningEndEvent(_BridgedBase, ReasoningEndEvent):
+    """Bridged reasoning end event"""
+
+class BridgedReasoningEncryptedValueEvent(_BridgedBase, ReasoningEncryptedValueEvent):
+    """Bridged reasoning encrypted-value event (signature / redacted thinking)"""
+
+
+__all__ = [
+    "BridgedToolCallChunkEvent",
+    "BridgedToolCallResultEvent",
+    "BridgedTextMessageChunkEvent",
+    "BridgedCustomEvent",
+    "BridgedStateSnapshotEvent",
+    "BridgedReasoningStartEvent",
+    "BridgedReasoningMessageStartEvent",
+    "BridgedReasoningMessageContentEvent",
+    "BridgedReasoningMessageEndEvent",
+    "BridgedReasoningEndEvent",
+    "BridgedReasoningEncryptedValueEvent",
+]
