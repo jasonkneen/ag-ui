@@ -340,6 +340,52 @@ def _interrupt_session_capability_error() -> "RunErrorEvent":
     )
 
 
+def _preflight_resume_entries(
+    agent: Any, resume_entries: list[Any]
+) -> "RunErrorEvent | None":
+    """Validate a complete resume batch without mutating native state.
+
+    Strands applies responses one at a time, so a later stale id can raise only
+    after an earlier valid interrupt was already answered. It also ignores a
+    resume prompt when its interrupt state is inactive. Validate the whole AG-UI
+    batch before any adapter or Strands mutation while preserving partial resume
+    semantics: a unique subset of the currently tracked interrupts is valid.
+    """
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return RunErrorEvent(
+            type=EventType.RUN_ERROR,
+            message="Cannot resume interrupts without an active interrupt state",
+            code="INTERRUPT_RESUME_ERROR",
+        )
+
+    current_interrupts = getattr(interrupt_state, "interrupts", {})
+    seen_ids: set[str] = set()
+    for entry in resume_entries:
+        interrupt_id = getattr(entry, "interrupt_id", None)
+        if not isinstance(interrupt_id, str) or not interrupt_id:
+            return RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message="Resume entries must contain a non-empty interrupt id",
+                code="INTERRUPT_RESUME_ERROR",
+            )
+        if interrupt_id in seen_ids:
+            return RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message=f"Resume contains duplicate interrupt id: {interrupt_id}",
+                code="INTERRUPT_RESUME_ERROR",
+            )
+        seen_ids.add(interrupt_id)
+        if interrupt_id not in current_interrupts:
+            return RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message=f"Resume references unknown interrupt id: {interrupt_id}",
+                code="INTERRUPT_RESUME_ERROR",
+            )
+
+    return None
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
@@ -827,6 +873,21 @@ class StrandsAgent:
                     )
         strands_agent = self._agents_by_thread[thread_id]
 
+        resume_entries = getattr(input_data, "resume", None)
+        has_resume_entries = bool(
+            isinstance(resume_entries, list) and resume_entries
+        )
+        if has_resume_entries:
+            resume_error = _preflight_resume_entries(strands_agent, resume_entries)
+            if resume_error is not None:
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield resume_error
+                return
+
         # Forward ``RunAgentInput.context`` to the per-thread Strands agent's
         # state so user tools can read it (e.g. catalog/component schemas
         # injected by the CopilotKit FE for A2UI rendering). Mirrors the
@@ -1309,8 +1370,6 @@ class StrandsAgent:
             active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
                 strands_agent, persisted_tool_call_meta
             )
-            resume_entries = getattr(input_data, "resume", None)
-            has_resume_entries = isinstance(resume_entries, list) and resume_entries
             if active_proxy_native_ids:
                 if session_manager is None:
                     yield _interrupt_session_required_error()

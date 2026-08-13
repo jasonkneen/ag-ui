@@ -436,7 +436,10 @@ class TestResumeConsumption:
         The raw payload is wrapped in ``{"response": ...}`` so Strands' truthiness
         gate always passes; the tool destructures via ``.get("response")``.
         """
-        core = _MockStrandsCore(terminal_events=[])
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[StrandsInterrupt(id="int-1", name="confirm")],
+        )
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload="yes")]
 
@@ -456,7 +459,10 @@ class TestResumeConsumption:
         ``""``/``0``/``[]``/``{}`` re-emit the same interrupt id on the resume
         run, re-running the tool body forever.
         """
-        core = _MockStrandsCore(terminal_events=[])
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[StrandsInterrupt(id="int-1", name="confirm")],
+        )
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload=falsy_payload)]
 
@@ -473,7 +479,10 @@ class TestResumeConsumption:
     @pytest.mark.asyncio
     async def test_cancelled_resume_uses_sentinel(self):
         """A cancelled ResumeEntry resumes with the denial sentinel as response."""
-        core = _MockStrandsCore(terminal_events=[])
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[StrandsInterrupt(id="int-1", name="confirm")],
+        )
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="cancelled", payload=None)]
 
@@ -487,7 +496,13 @@ class TestResumeConsumption:
     @pytest.mark.asyncio
     async def test_multiple_resume_entries(self):
         """Every ResumeEntry becomes one interruptResponse content block."""
-        core = _MockStrandsCore(terminal_events=[])
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[
+                StrandsInterrupt(id="a", name="confirm-a"),
+                StrandsInterrupt(id="b", name="confirm-b"),
+            ],
+        )
         agent = _make_base_agent()
         resume = [
             ResumeEntry(interrupt_id="a", status="resolved", payload={"k": 1}),
@@ -501,6 +516,42 @@ class TestResumeConsumption:
             [
                 {"interruptResponse": {"interruptId": "a", "response": {"response": {"k": 1}}}},
                 {"interruptResponse": {"interruptId": "b", "response": INTERRUPT_CANCELLED}},
+            ]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_partial_resume_subset_remains_allowed(self):
+        """A resume batch need not answer every currently open interrupt."""
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[
+                StrandsInterrupt(id="a", name="confirm-a"),
+                StrandsInterrupt(id="b", name="confirm-b"),
+            ],
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(
+                agent,
+                _make_run_input(
+                    resume=[
+                        ResumeEntry(
+                            interrupt_id="a", status="resolved", payload=True
+                        )
+                    ]
+                ),
+            )
+
+        assert not any(event.type == EventType.RUN_ERROR for event in events)
+        assert core.stream_prompts == [
+            [
+                {
+                    "interruptResponse": {
+                        "interruptId": "a",
+                        "response": {"response": True},
+                    }
+                }
             ]
         ]
 
@@ -535,7 +586,11 @@ class TestLiveInterruptsWithoutSessionManager:
     @pytest.mark.asyncio
     async def test_resume_entries_without_session_manager_are_streamed(self):
         """Resume entries are translated against the cached live core."""
-        core = _MockStrandsCore(terminal_events=[], session_manager=None)
+        core = _MockStrandsCore(
+            terminal_events=[],
+            interrupts=[StrandsInterrupt(id="int-1", name="confirm")],
+            session_manager=None,
+        )
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload="yes")]
 
@@ -764,6 +819,202 @@ def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _Interrup
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
     return StrandsAgent(core, name="e2e-interrupt", config=config), model
+
+
+def _snapshot_resume_state(core: StrandsAgentCore) -> dict:
+    """Capture every mutable surface an invalid resume must leave untouched."""
+    interrupt_state = core._interrupt_state
+    session_manager = getattr(core, "session_manager", None) or getattr(
+        core, "_session_manager", None
+    )
+    repository = getattr(session_manager, "session_repository", None)
+    repository_messages = None
+    if repository is not None:
+        repository_messages = copy.deepcopy(
+            repository.list_messages(session_manager.session_id, core.agent_id)
+        )
+
+    return {
+        "interrupt_responses": {
+            interrupt_id: copy.deepcopy(interrupt.response)
+            for interrupt_id, interrupt in interrupt_state.interrupts.items()
+        },
+        "interrupt_context": copy.deepcopy(interrupt_state.context),
+        "interrupts": copy.deepcopy(interrupt_state.interrupts),
+        "registry": {
+            name: copy.deepcopy(tool.tool_spec)
+            for name, tool in core.tool_registry.registry.items()
+        },
+        "messages": copy.deepcopy(core.messages),
+        "repository_messages": repository_messages,
+        "wire_map": copy.deepcopy(core.state.get(AG_UI_WIRE_MAP_STATE_KEY)),
+        "tool_map": copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)),
+        "agent_state": copy.deepcopy(core.state.get()),
+    }
+
+
+def _assert_atomic_resume_error(events: list) -> None:
+    errors = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "INTERRUPT_RESUME_ERROR"
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_resume_preflight_rejects_valid_then_stale_without_mutation():
+    """A later stale id cannot let Strands consume an earlier valid response."""
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="atomic-native-resume")
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="confirm widget-1")]
+        ),
+    )
+    interrupt_id = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0].id
+    live_core = agent._agents_by_thread["thread-1"]
+    before = _snapshot_resume_state(live_core)
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        invalid_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="resolved",
+                        payload=True,
+                    ),
+                    ResumeEntry(
+                        interrupt_id="stale-interrupt-id",
+                        status="resolved",
+                        payload=False,
+                    ),
+                ],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    _assert_atomic_resume_error(invalid_events)
+    assert _snapshot_resume_state(live_core) == before
+
+
+@pytest.mark.asyncio
+async def test_resume_preflight_rejects_duplicate_ids_before_mixed_session_mutation(
+    tmp_path,
+):
+    """Duplicate responses fail before proxy sync or repository reconciliation."""
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent, _ = _make_e2e_agent(config)
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="handle widget-1")],
+            tools=[approve_tool],
+        ),
+    )
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    interrupt_id = finished.outcome.interrupts[0].id
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    live_core = agent._agents_by_thread["thread-1"]
+    before = _snapshot_resume_state(live_core)
+    unexpected_tool = Tool(
+        name="unexpectedTool", description="must not be registered", parameters={}
+    )
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        invalid_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                messages=[
+                    ToolMessage(
+                        id="t-approve",
+                        role="tool",
+                        tool_call_id=wire_id,
+                        content='{"approved": true}',
+                    )
+                ],
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="resolved",
+                        payload=True,
+                    ),
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="cancelled",
+                        payload=None,
+                    ),
+                ],
+                tools=[approve_tool, unexpected_tool],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    _assert_atomic_resume_error(invalid_events)
+    assert _snapshot_resume_state(live_core) == before
+
+
+@pytest.mark.asyncio
+async def test_resume_preflight_rejects_nonempty_resume_after_interrupt_state_is_lost():
+    """Inactive Strands state cannot silently accept a stale resume batch."""
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="lost-native-resume")
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="confirm widget-1")]
+        ),
+    )
+    interrupt_id = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0].id
+    live_core = agent._agents_by_thread["thread-1"]
+    live_core._interrupt_state.deactivate()
+    before = _snapshot_resume_state(live_core)
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        invalid_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    _assert_atomic_resume_error(invalid_events)
+    assert _snapshot_resume_state(live_core) == before
 
 
 @pytest.mark.asyncio
