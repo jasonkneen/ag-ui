@@ -1464,10 +1464,6 @@ class StrandsAgent:
                     else flatten_content_to_text(content)
                 )
                 error = getattr(msg, "error", None)
-                if error is not None and not (text and text.strip()):
-                    error_text = _coerce_text(error).strip()
-                    if error_text:
-                        text = error_text
                 frontend_results[wire_id] = _FrontendToolResult(
                     content=text or "",
                     status=(
@@ -1475,6 +1471,7 @@ class StrandsAgent:
                         if error is not None
                         else "success"
                     ),
+                    error=error,
                 )
 
             # Translate the client's wire tool_call_id back to the native
@@ -1508,7 +1505,7 @@ class StrandsAgent:
             # placeholder, so ordinary repository reconciliation has nothing
             # to overwrite. Require the client's visible wire result before
             # resuming; the proxy consumes this map when Strands invokes it.
-            proxy_resume_results: Dict[str, str] = {}
+            proxy_resume_results: Dict[str, _FrontendToolResult] = {}
             proxy_resume_native_ids: set[str] = set()
             if has_resume_entries and active_proxy_hook_native_ids:
                 missing_hook_results = (
@@ -1527,7 +1524,7 @@ class StrandsAgent:
                     )
                     return
                 proxy_resume_results = {
-                    native_id: resolved_native_results[native_id].content
+                    native_id: resolved_native_results[native_id]
                     for native_id in active_proxy_hook_native_ids
                 }
                 proxy_resume_native_ids = set(proxy_resume_results)

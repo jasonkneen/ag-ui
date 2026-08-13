@@ -1150,6 +1150,79 @@ async def test_frontend_proxy_before_tool_hook_resume_retains_omitted_tool_once(
 
 
 @pytest.mark.asyncio
+async def test_frontend_proxy_hook_resume_preserves_failed_result(tmp_path):
+    """A failed client result reaches the model as an error, not proxy success."""
+    model = _ProxyHookInterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = StrandsAgent(
+        StrandsAgentCore(model=model, system_prompt="test"),
+        name="proxy-hook-failure",
+        config=config,
+        hooks=[_InterruptFrontendProxyHook()],
+    )
+    frontend_tool = Tool(name="approveTool", description="approve", parameters={})
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    interrupt_id = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0].id
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-approve",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content="",
+                    error="boom",
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    frontend_result = next(
+        block["toolResult"]
+        for message in model.stream_calls_messages[-1]
+        for block in message.get("content", [])
+        if block.get("toolResult", {}).get("toolUseId") == "native-approve"
+    )
+    assert frontend_result == {
+        "toolUseId": "native-approve",
+        "status": "error",
+        "content": [{"text": "boom"}],
+    }
+    assert "Forwarded to client" not in json.dumps(model.stream_calls_messages[-1])
+
+
+@pytest.mark.asyncio
 async def test_recreated_proxy_hook_resume_without_tool_spec_fails_capability(
     tmp_path,
 ):

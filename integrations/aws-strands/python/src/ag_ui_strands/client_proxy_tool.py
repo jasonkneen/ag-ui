@@ -61,12 +61,15 @@ def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
     def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
         resumed_results = _kwargs.get(PROXY_RESUME_RESULTS_KEY)
         if isinstance(resumed_results, dict) and tool_use["toolUseId"] in resumed_results:
-            result_text = resumed_results.pop(tool_use["toolUseId"])
+            resumed_result = resumed_results.pop(tool_use["toolUseId"])
+            result_text = resumed_result.provider_safe_content
+            result_status = resumed_result.status
         else:
             result_text = PROXY_RESULT_PLACEHOLDER
+            result_status = "success"
         return {
             "toolUseId": tool_use["toolUseId"],
-            "status": "success",
+            "status": result_status,
             "content": [{"text": result_text}],
         }
 

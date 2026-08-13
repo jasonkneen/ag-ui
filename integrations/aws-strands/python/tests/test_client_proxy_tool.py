@@ -10,12 +10,14 @@ from strands.tools.registry import ToolRegistry
 from strands.tools.tools import PythonAgentTool
 
 from ag_ui_strands.client_proxy_tool import (
+    PROXY_RESUME_RESULTS_KEY,
     _PROXY_MARKER,
     _is_proxy,
     create_proxy_tool,
     registered_proxy_tool_names,
     sync_proxy_tools,
 )
+from ag_ui_strands.session_reconcile import _FrontendToolResult
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,50 @@ class TestProxyToolResult:
         assert result["toolUseId"] == "abc-123"
         assert result["status"] == "success"
         assert result["content"] == [{"text": "Forwarded to client"}]
+
+    @pytest.mark.parametrize(
+        ("content", "status", "error", "expected_text"),
+        [
+            pytest.param("approved", "success", None, "approved", id="success"),
+            pytest.param("", "success", None, "", id="void-success"),
+            pytest.param(
+                "client failure details",
+                "error",
+                "boom",
+                "client failure details",
+                id="explicit-failure-content",
+            ),
+            pytest.param("", "error", "boom", "boom", id="failure-diagnostic"),
+        ],
+    )
+    def test_returns_full_resumed_client_result(
+        self, content, status, error, expected_text
+    ):
+        proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
+        tool_use = {
+            "toolUseId": "abc-123",
+            "name": "bg",
+            "input": {"color": "red"},
+        }
+
+        result = proxy._tool_func(
+            tool_use,
+            **{
+                PROXY_RESUME_RESULTS_KEY: {
+                    "abc-123": _FrontendToolResult(
+                        content=content,
+                        status=status,
+                        error=error,
+                    )
+                }
+            },
+        )
+
+        assert result == {
+            "toolUseId": "abc-123",
+            "status": status,
+            "content": [{"text": expected_text}],
+        }
 
 
 # ---------------------------------------------------------------------------

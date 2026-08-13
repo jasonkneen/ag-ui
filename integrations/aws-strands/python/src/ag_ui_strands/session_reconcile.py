@@ -39,11 +39,28 @@ class _FrontendToolResult:
 
     content: str
     status: Literal["success", "error"]
+    error: str | None = None
 
     @property
     def is_void(self) -> bool:
         """Return whether this is a successful result with no meaningful content."""
         return self.status == "success" and not self.content.strip()
+
+    @property
+    def provider_safe_content(self) -> str:
+        """Return model-visible text, retaining a failed result's diagnostic."""
+        if self.content.strip() or self.status != "error":
+            return self.content
+        diagnostic = (self.error or "").strip()
+        if not diagnostic:
+            return self.content
+        try:
+            diagnostic.encode("utf-8")
+        except UnicodeEncodeError:
+            return diagnostic.encode(
+                "utf-8", errors="backslashreplace"
+            ).decode("utf-8")
+        return diagnostic
 
 
 class _SessionRepository(Protocol):
@@ -253,7 +270,7 @@ def _correct_single_tool(
         result = pending_results[tool_use_id]
         tool_result.update(
             status=result.status,
-            content=[{"text": result.content}],
+            content=[{"text": result.provider_safe_content}],
         )
         return tool_use_id
 
