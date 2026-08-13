@@ -1623,7 +1623,18 @@ class StrandsAgent:
                                     f"state_context_builder failed: {e}", exc_info=True
                                 )
                             break
-                strands_agent.messages = native_history
+                # A live native interrupt already has the authoritative
+                # pre-interrupt conversation in this cached core. Resume-only
+                # clients commonly omit that history; replacing it with the
+                # shorter delta would leave Strands to append the resumed
+                # toolResult without its user/toolUse prefix. A full client
+                # history is still authoritative and keeps the replacement
+                # behavior used by ordinary in-memory replay.
+                preserve_live_interrupt_history = (
+                    has_resume_entries and has_active_interrupt and is_delta_payload
+                )
+                if not preserve_live_interrupt_history:
+                    strands_agent.messages = native_history
                 # ``None`` tells Strands to use existing ``self.messages`` as-is.
                 # The LLM sees real tool results (including ones produced by the
                 # frontend) and emits a proper follow-up turn instead of

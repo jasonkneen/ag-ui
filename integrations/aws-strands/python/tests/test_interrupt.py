@@ -17,11 +17,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from ag_ui.core import (
+    AssistantMessage,
     CustomEvent,
     EventType,
+    FunctionCall,
     ResumeEntry,
     RunAgentInput,
     Tool,
+    ToolCall,
     ToolMessage,
     UserMessage,
 )
@@ -706,6 +709,7 @@ class _NativeInterruptFlowModel(StrandsModel):
 
     def __init__(self):
         self.turn = 0
+        self.stream_calls_messages = []
 
     def get_config(self):
         return {}
@@ -719,6 +723,7 @@ class _NativeInterruptFlowModel(StrandsModel):
 
     async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
         self.turn += 1
+        self.stream_calls_messages.append(copy.deepcopy(messages))
         if self.turn == 1:
             yield {"messageStart": {"role": "assistant"}}
             yield {
@@ -1292,6 +1297,102 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
         assert ctx.tool_use_id == "native-confirm"
         assert ctx.tool_input == {"key": "widget-1"}
         assert ctx.args_str == '{"key": "widget-1"}'
+
+
+@pytest.mark.asyncio
+async def test_live_native_resume_without_client_history_retains_cached_history():
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="live-native-history")
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="confirm widget-1")]
+        ),
+    )
+    interrupt = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0]
+    live_core = agent._agents_by_thread["thread-1"]
+    cached_history = copy.deepcopy(live_core.messages)
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    resumed_history = model.stream_calls_messages[-1]
+    assert resumed_history[: len(cached_history)] == cached_history
+    assert resumed_history[-1]["content"][0]["toolResult"]["toolUseId"] == (
+        "native-confirm"
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_native_resume_with_full_client_history_replaces_cached_history():
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="live-native-authoritative-history")
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="cached prompt")]
+        ),
+    )
+    interrupt = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0]
+    authoritative_messages = [
+        UserMessage(id="u-client", role="user", content="authoritative client prompt"),
+        AssistantMessage(
+            id="a-client",
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="native-confirm",
+                    type="function",
+                    function=FunctionCall(
+                        name="confirm_action",
+                        arguments='{"key": "widget-1"}',
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=authoritative_messages,
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    resumed_history = model.stream_calls_messages[-1]
+    assert resumed_history[0]["content"] == [{"text": "authoritative client prompt"}]
+    assert "cached prompt" not in json.dumps(resumed_history)
 
 
 @pytest.mark.asyncio
