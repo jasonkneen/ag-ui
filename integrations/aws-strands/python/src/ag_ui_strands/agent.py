@@ -274,6 +274,7 @@ from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     ActiveInterruptReconciliationError,
+    _FrontendToolResult,
     _supports_repository_reconciliation,
     active_proxy_placeholder_ids,
     has_active_proxy_placeholder,
@@ -405,7 +406,11 @@ def _build_strands_history(input_messages: List[Any]) -> List[Dict[str, Any]]:
                         # Carry the AG-UI failure signal onto Bedrock's toolResult status,
                         # so a client-reported tool failure is not asserted to the model as
                         # a success.
-                        "status": "error" if getattr(msg, "error", None) else "success",
+                        "status": (
+                            "error"
+                            if getattr(msg, "error", None) is not None
+                            else "success"
+                        ),
                     }
                 }
             )
@@ -1058,6 +1063,12 @@ class StrandsAgent:
                             )
                             if result_text and result_text.strip():
                                 _result_parts.append(f"{tool_name} returned: {result_text}")
+                            elif getattr(msg, "error", None) is not None:
+                                error_text = getattr(msg, "error", "")
+                                _result_parts.append(
+                                    f"{tool_name} failed"
+                                    + (f": {error_text}" if error_text else ".")
+                                )
                             else:
                                 _result_parts.append(
                                     f"{tool_name} executed successfully with no return value."
@@ -1208,7 +1219,7 @@ class StrandsAgent:
             # without this, a multi-turn continuation re-sends already-reconciled
             # historical results, which can never be re-corrected and would force
             # the legacy fallback every turn.
-            frontend_results: List[Dict[str, Any]] = []
+            frontend_results: Dict[str, _FrontendToolResult] = {}
             for msg in (input_data.messages or []):
                 if getattr(msg, "role", None) != "tool":
                     continue
@@ -1224,7 +1235,14 @@ class StrandsAgent:
                     if isinstance(content, str)
                     else flatten_content_to_text(content)
                 )
-                frontend_results.append({"wire_id": wire_id, "text": text or ""})
+                frontend_results[wire_id] = _FrontendToolResult(
+                    content=text or "",
+                    status=(
+                        "error"
+                        if getattr(msg, "error", None) is not None
+                        else "success"
+                    ),
+                )
 
             # Translate the client's wire tool_call_id back to the native
             # toolUseId Strands persisted (they differ for frontend tools — see
@@ -1235,10 +1253,10 @@ class StrandsAgent:
             # empty toolResult. When reconciling, void placeholders in the same
             # turn are still cleared (to "") so the literal "Forwarded to client"
             # is never fed to the model.
-            resolved_native_results: Dict[str, str] = {}
+            resolved_native_results: Dict[str, _FrontendToolResult] = {}
             corrected_native_ids: set[str] = set()
             has_nonvoid_frontend_result = any(
-                (r["text"] or "").strip() for r in frontend_results
+                not result.is_void for result in frontend_results.values()
             )
             if (
                 session_manager is not None
@@ -1276,7 +1294,7 @@ class StrandsAgent:
                     )
                     return
                 proxy_resume_results = {
-                    native_id: resolved_native_results[native_id]
+                    native_id: resolved_native_results[native_id].content
                     for native_id in active_proxy_hook_native_ids
                 }
                 proxy_resume_native_ids = set(proxy_resume_results)
@@ -1436,12 +1454,14 @@ class StrandsAgent:
                 # forwarding the real result as a synthetic user message is
                 # safer than replaying a stub.
                 non_void_results = [
-                    r for r in frontend_results if (r["text"] or "").strip()
+                    result
+                    for result in frontend_results.values()
+                    if not result.is_void
                 ]
                 resolved_non_void = {
                     native
-                    for native, text in resolved_native_results.items()
-                    if (text or "").strip()
+                    for native, result in resolved_native_results.items()
+                    if not result.is_void
                 }
                 all_non_void_resolved = len(resolved_non_void) == len(non_void_results)
                 # Scan all of this turn's resolved native ids (void included, so a

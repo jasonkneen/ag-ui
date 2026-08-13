@@ -1507,3 +1507,69 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
     assert any(
         e.type == EventType.STATE_SNAPSHOT and e.snapshot.get("confirmed_key") for e in events2
     ), "state_from_result did not fire for confirm_action on the resume run"
+
+
+@pytest.mark.asyncio
+async def test_mixed_active_resume_replays_failed_frontend_result_as_error(tmp_path):
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent, model = _make_e2e_agent(config)
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="handle widget-1")],
+            tools=[approve_tool],
+        ),
+    )
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    interrupt_id = finished.outcome.interrupts[0].id
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-failed",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content="",
+                    error="boom",
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[approve_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    frontend_result = next(
+        block["toolResult"]
+        for message in model.stream_calls_messages[-1]
+        for block in message.get("content", [])
+        if block.get("toolResult", {}).get("toolUseId") == "native-approve"
+    )
+    assert frontend_result == {
+        "toolUseId": "native-approve",
+        "status": "error",
+        "content": [{"text": ""}],
+    }
+    assert "executed successfully" not in json.dumps(model.stream_calls_messages[-1])

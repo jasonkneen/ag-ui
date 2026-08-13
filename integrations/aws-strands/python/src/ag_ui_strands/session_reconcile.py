@@ -11,7 +11,8 @@ persisted placeholder by native id and overwrite it with the real result.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, Protocol
+from dataclasses import dataclass
+from typing import Any, Iterable, Literal, Mapping, Protocol
 
 from .client_proxy_tool import PROXY_RESULT_PLACEHOLDER
 
@@ -30,6 +31,19 @@ AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 # ``tool_behaviors`` gate + the frontend-placeholder skip) for the resumed
 # tool. Namespaced to avoid clashing with user-managed state keys.
 AG_UI_TOOL_CALL_MAP_STATE_KEY = "__ag_ui_tool_call_map__"
+
+
+@dataclass(frozen=True)
+class _FrontendToolResult:
+    """Client result data that must stay coupled during reconciliation."""
+
+    content: str
+    status: Literal["success", "error"]
+
+    @property
+    def is_void(self) -> bool:
+        """Return whether this is a successful result with no meaningful content."""
+        return self.status == "success" and not self.content.strip()
 
 
 class _SessionRepository(Protocol):
@@ -78,8 +92,8 @@ class ActiveInterruptReconciliationError(RuntimeError):
 
 def resolve_native_ids(
     wire_to_native: Mapping[str, str],
-    frontend_results: Iterable[Mapping[str, Any]],
-) -> dict[str, str]:
+    frontend_results: Mapping[str, _FrontendToolResult],
+) -> dict[str, _FrontendToolResult]:
     """Map client frontend results to Strands-native ``toolUseId``s.
 
     Frontend tools are emitted under a fresh wire ``tool_call_id`` that differs
@@ -92,23 +106,23 @@ def resolve_native_ids(
 
     Args:
         wire_to_native: Map of wire ``tool_call_id`` -> native ``toolUseId``.
-        frontend_results: Items with ``wire_id`` and ``text``.
+        frontend_results: Map of wire ``tool_call_id`` -> typed client result.
 
     Returns:
-        Map of native ``toolUseId`` -> real result text (unresolvable dropped).
+        Map of native ``toolUseId`` -> typed client result (unresolvable dropped).
     """
-    resolved: dict[str, str] = {}
-    for result in frontend_results:
-        native = wire_to_native.get(result.get("wire_id"))
+    resolved: dict[str, _FrontendToolResult] = {}
+    for wire_id, result in frontend_results.items():
+        native = wire_to_native.get(wire_id)
         if native is not None:
-            resolved[native] = result.get("text", "")
+            resolved[native] = result
     return resolved
 
 
 def reconcile_frontend_tool_results(
     session_manager: _RepositoryReconciliationSessionManager,
     agent: Any,
-    pending_results: Mapping[str, str],
+    pending_results: Mapping[str, _FrontendToolResult],
 ) -> set[str]:
     """Overwrite persisted placeholder ``toolResult`` blocks with real results.
 
@@ -119,7 +133,7 @@ def reconcile_frontend_tool_results(
         session_manager: A Strands ``RepositorySessionManager`` (exposes
             ``session_id`` and ``session_repository``).
         agent: The Strands agent (exposes ``agent_id``).
-        pending_results: Map of native ``toolUseId`` -> real result text.
+        pending_results: Map of native ``toolUseId`` -> typed client result.
 
     Returns:
         The set of ``toolUseId``s whose placeholder was corrected (in the store
@@ -226,7 +240,9 @@ def active_proxy_placeholder_ids(
     }
 
 
-def _correct_single_tool(tool_result, pending_results: Mapping[str, str]) -> str | None:
+def _correct_single_tool(
+    tool_result, pending_results: Mapping[str, _FrontendToolResult]
+) -> str | None:
     """Rewrite matching placeholder ToolResult dict. Return the corrected tool_use_id or None if no
     correction was done."""
     if not isinstance(tool_result, dict):
@@ -234,11 +250,17 @@ def _correct_single_tool(tool_result, pending_results: Mapping[str, str]) -> str
 
     tool_use_id = tool_result.get("toolUseId")
     if tool_use_id in pending_results and _is_placeholder(tool_result.get("content")):
-        tool_result["content"] = [{"text": pending_results[tool_use_id]}]
+        result = pending_results[tool_use_id]
+        tool_result.update(
+            status=result.status,
+            content=[{"text": result.content}],
+        )
         return tool_use_id
 
 
-def _correct_all_tools(tool_results, pending_results: Mapping[str, str]) -> set[str]:
+def _correct_all_tools(
+    tool_results, pending_results: Mapping[str, _FrontendToolResult]
+) -> set[str]:
     """Rewrite matching placeholder ToolResult dicts in *tool_results* in place."""
     changed: set[str] = set()
     for tool_result in tool_results:
@@ -248,7 +270,9 @@ def _correct_all_tools(tool_results, pending_results: Mapping[str, str]) -> set[
     return changed
 
 
-def _correct_message(message: Any, pending_results: Mapping[str, str]) -> set[str]:
+def _correct_message(
+    message: Any, pending_results: Mapping[str, _FrontendToolResult]
+) -> set[str]:
     """Rewrite matching placeholder ``toolResult`` blocks in *message* in place.
 
     Returns the set of ``toolUseId``s whose block was corrected.
