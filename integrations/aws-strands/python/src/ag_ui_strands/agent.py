@@ -1656,11 +1656,20 @@ class StrandsAgent:
         active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
             strands_agent, persisted_tool_call_meta
         )
+        selected_proxy_hook_native_ids: set[str] = set()
         retained_checkpoint_proxy_names: set[str] = set()
         if has_resume_entries and active_proxy_hook_native_ids:
             _present, _managed_ids, active_records = (
                 _proxy_hook_provenance_value(strands_agent)
             )
+            selected_resume_interrupt_ids = {
+                entry.interrupt_id for entry in resume_entries
+            }
+            selected_proxy_hook_native_ids = {
+                record["original_native_tool_call_id"]
+                for interrupt_id, record in (active_records or {}).items()
+                if interrupt_id in selected_resume_interrupt_ids
+            }
             marked_proxy_names = registered_proxy_tool_names(
                 strands_agent.tool_registry
             )
@@ -2280,9 +2289,10 @@ class StrandsAgent:
             # resuming; the proxy consumes this map when Strands invokes it.
             proxy_resume_results: Dict[str, _FrontendToolResult] = {}
             proxy_resume_native_ids: set[str] = set()
-            if has_resume_entries and active_proxy_hook_native_ids:
+            if selected_proxy_hook_native_ids:
                 missing_hook_results = (
-                    active_proxy_hook_native_ids - resolved_native_results.keys()
+                    selected_proxy_hook_native_ids
+                    - resolved_native_results.keys()
                 )
                 if missing_hook_results:
                     error = ActiveInterruptReconciliationError(missing_hook_results)
@@ -2298,7 +2308,7 @@ class StrandsAgent:
                     return
                 proxy_resume_results = {
                     native_id: resolved_native_results[native_id]
-                    for native_id in active_proxy_hook_native_ids
+                    for native_id in selected_proxy_hook_native_ids
                 }
                 proxy_resume_native_ids = set(proxy_resume_results)
 

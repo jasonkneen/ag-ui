@@ -42,6 +42,7 @@ from strands.interrupt import Interrupt as StrandsInterrupt
 from strands.interrupt import InterruptException, _InterruptState
 from strands.models.model import Model as StrandsModel
 from strands.session import FileSessionManager, SessionManager
+from strands.tools.executors import ConcurrentToolExecutor
 
 from ag_ui_strands.agent import (
     INTERRUPT_CANCELLED,
@@ -939,6 +940,57 @@ class _ProxyHookInterruptFlowModel(StrandsModel):
             yield {"messageStop": {"stopReason": "end_turn"}}
 
 
+class _ConcurrentProxyHookFlowModel(StrandsModel):
+    """Emit two identical frontend proxy calls in one concurrent tool batch."""
+
+    native_ids = ("native-proxy-a", "native-proxy-b")
+
+    def __init__(self):
+        self.turn = 0
+        self.stream_calls_messages = []
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(
+        self, output_model, prompt=None, system_prompt=None, **kwargs
+    ):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.turn += 1
+        self.stream_calls_messages.append(copy.deepcopy(messages))
+        if self.turn == 1:
+            yield {"messageStart": {"role": "assistant"}}
+            for native_id in self.native_ids:
+                yield {
+                    "contentBlockStart": {
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": native_id,
+                                "name": "approveTool",
+                            }
+                        }
+                    }
+                }
+                yield {
+                    "contentBlockDelta": {
+                        "delta": {"toolUse": {"input": "{}"}}
+                    }
+                }
+                yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+        else:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+
 class _InterruptFrontendProxyHook(HookProvider):
     """Pause a frontend proxy immediately before Strands invokes it."""
 
@@ -1013,6 +1065,26 @@ class _AsyncPerCallAliasHook(HookProvider):
         await asyncio.sleep(0)
         event.tool_use["toolUseId"] = f"hook-{native_id}"
         event.interrupt(f"approve_{native_id}", reason="Approve frontend action")
+
+
+class _ConcurrentProxySubsetHook(HookProvider):
+    """Interrupt equal proxy calls under aliases unrelated to native identity."""
+
+    aliases = {
+        "native-proxy-a": ("hook-alias-a", "proxy_a"),
+        "native-proxy-b": ("hook-alias-b", "proxy_b"),
+    }
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    async def _before_tool_call(self, event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        alias, interrupt_name = self.aliases[event.tool_use["toolUseId"]]
+        await asyncio.sleep(0)
+        event.tool_use["toolUseId"] = alias
+        event.interrupt(interrupt_name, reason="Approve frontend action")
 
 
 class _SameAliasHook(HookProvider):
@@ -1317,6 +1389,60 @@ def _snapshot_resume_state(core: StrandsAgentCore) -> dict:
         "tool_map": copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)),
         "agent_state": copy.deepcopy(core.state.get()),
     }
+
+
+async def _start_concurrent_proxy_hook_checkpoint(tmp_path):
+    """Create a durable two-proxy hook checkpoint through real Strands."""
+    model = _ConcurrentProxyHookFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_ConcurrentProxySubsetHook(),
+        config=config,
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="both")],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in initial_events)
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    assert finished.outcome is not None
+    assert len(finished.outcome.interrupts) == 2
+    live_core = agent._agents_by_thread["thread-1"]
+    assert isinstance(live_core.tool_executor, ConcurrentToolExecutor)
+    provenance = live_core.state.get("__ag_ui_proxy_hook_provenance__")
+    calls_by_native = {
+        provenance["records"][interrupt.id]["original_native_tool_call_id"]: {
+            "interrupt": interrupt,
+            "wire_id": provenance["records"][interrupt.id][
+                "wire_tool_call_id"
+            ],
+            "record": copy.deepcopy(provenance["records"][interrupt.id]),
+        }
+        for interrupt in finished.outcome.interrupts
+    }
+    assert set(calls_by_native) == set(model.native_ids)
+    return agent, model, live_core, calls_by_native
+
+
+def _assert_proxy_reconciliation_error(events: list) -> None:
+    errors = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "INTERRUPT_RECONCILIATION_ERROR"
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
 
 
 def _assert_atomic_resume_error(events: list) -> None:
@@ -3651,6 +3777,168 @@ async def test_async_parallel_proxy_hook_aliases_remain_call_exact(tmp_path):
         if block.get("toolResult", {}).get("toolUseId") in result_by_native
     }
     assert observed == result_by_native
+
+
+@pytest.mark.asyncio
+async def test_concurrent_proxy_hook_partial_resume_consumes_only_selected_call(
+    tmp_path,
+):
+    """Selecting A requires/injects only A while B remains fully parked."""
+    agent, model, live_core, calls = (
+        await _start_concurrent_proxy_hook_checkpoint(tmp_path)
+    )
+    call_a = calls["native-proxy-a"]
+    call_b = calls["native-proxy-b"]
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-a",
+                    role="tool",
+                    tool_call_id=call_a["wire_id"],
+                    content="CLIENT-A",
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=call_a["interrupt"].id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    finished = next(
+        event for event in resumed_events if event.type == EventType.RUN_FINISHED
+    )
+    assert finished.outcome is not None
+    assert [
+        interrupt.metadata["strands_name"]
+        for interrupt in finished.outcome.interrupts
+    ] == ["proxy_b"]
+    assert finished.outcome.interrupts[0].tool_call_id == call_b["wire_id"]
+
+    interrupt_state = live_core._interrupt_state
+    result_a = [
+        result
+        for result in interrupt_state.context["tool_results"]
+        if result["toolUseId"] == "native-proxy-a"
+    ]
+    assert result_a == [
+        {
+            "toolUseId": "native-proxy-a",
+            "status": "success",
+            "content": [{"text": "CLIENT-A"}],
+        }
+    ]
+    assert not any(
+        result["toolUseId"] == "native-proxy-b"
+        for result in interrupt_state.context["tool_results"]
+    )
+    assert interrupt_state.interrupts[call_b["interrupt"].id].response is None
+    assert model.turn == 1
+
+    provenance = live_core.state.get("__ag_ui_proxy_hook_provenance__")
+    assert provenance["records"][call_b["interrupt"].id] == call_b["record"]
+    assert live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)[call_b["wire_id"]] == (
+        "native-proxy-b"
+    )
+    assert live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)["native-proxy-b"][
+        "wire_tool_call_id"
+    ] == call_b["wire_id"]
+    assert getattr(
+        live_core.tool_registry.registry["approveTool"], "_ag_ui_proxy", False
+    )
+
+    encoded_events = "".join(
+        EventEncoder().encode(event) for event in resumed_events
+    )
+    assert "Forwarded to client" not in encoded_events
+    assert "native-proxy-a" not in encoded_events
+    assert "native-proxy-b" not in encoded_events
+
+
+@pytest.mark.asyncio
+async def test_concurrent_proxy_hook_subset_missing_selected_result_is_atomic(
+    tmp_path,
+):
+    """A selected proxy hook still requires its exact client result."""
+    agent, model, live_core, calls = (
+        await _start_concurrent_proxy_hook_checkpoint(tmp_path)
+    )
+    call_a = calls["native-proxy-a"]
+    before = _snapshot_resume_state(live_core)
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        failed_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=call_a["interrupt"].id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    _assert_proxy_reconciliation_error(failed_events)
+    assert model.turn == 1
+    assert _snapshot_resume_state(live_core) == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_proxy_hook_subset_sibling_result_cannot_authorize_selected(
+    tmp_path,
+):
+    """B's equal-name result cannot substitute for selected A's result."""
+    agent, model, live_core, calls = (
+        await _start_concurrent_proxy_hook_checkpoint(tmp_path)
+    )
+    call_a = calls["native-proxy-a"]
+    call_b = calls["native-proxy-b"]
+    before = _snapshot_resume_state(live_core)
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        failed_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                messages=[
+                    ToolMessage(
+                        id="t-b",
+                        role="tool",
+                        tool_call_id=call_b["wire_id"],
+                        content="CLIENT-B",
+                    )
+                ],
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=call_a["interrupt"].id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    _assert_proxy_reconciliation_error(failed_events)
+    assert model.turn == 1
+    assert _snapshot_resume_state(live_core) == before
+
 
 @pytest.mark.asyncio
 async def test_parallel_proxy_hook_same_alias_fails_closed(tmp_path):
