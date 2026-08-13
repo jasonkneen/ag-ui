@@ -90,13 +90,13 @@ interrupt round-trip:
 
 - When a run pauses, it finishes with `RUN_FINISHED` carrying a
   `RunFinishedInterruptOutcome` (`outcome.type == "interrupt"`) and one AG-UI
-  `Interrupt` per Strands interrupt. The Strands interrupt *name* becomes the
-  AG-UI `reason`; the original (free-form) reason object is preserved under
-  `metadata.strands_reason`.
+  `Interrupt` per Strands interrupt. Native interrupts use the AG-UI reason
+  `tool_call`; the Strands name and free-form reason are preserved under
+  `metadata.strands_name` and `metadata.strands_reason`.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
-  payload=...)]`. Strands' resume gate is truthiness-based (`if
-  interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
+payload=...)]`. Strands' resume gate is truthiness-based (`if
+interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
   `[]`, `{}`) would otherwise re-raise the same interrupt and re-run the tool
   body forever. To prevent that, `interrupt()` does **not** return `payload`
   directly — it returns a truthy envelope: `{"response": payload}` on
@@ -110,7 +110,7 @@ interrupt round-trip:
   side effects that must not repeat:
 
   ```python
-  @tool
+  @tool(context=True)
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Unsafe: re-runs (and re-charges) on every resume.
       charge(amount)
@@ -118,7 +118,7 @@ interrupt round-trip:
       return "cancelled" if envelope.get("cancelled") or not envelope.get("response") else "charged"
 
 
-  @tool
+  @tool(context=True)
   def charge_card(tool_context: ToolContext, amount: float) -> str:
       # Safe: side effect happens only after the pause resolves.
       envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
@@ -128,18 +128,29 @@ interrupt round-trip:
       return "charged"
   ```
 
-> **Persistence:** interrupt state lives on the per-thread agent instance. The
-> in-memory per-thread cache only preserves it within a single process, so
-> pause and resume must hit the same process. For stateless / multi-container
-> HTTP deployments, wire a durable `SessionManager` via
-> `StrandsAgentConfig.session_manager_provider` so interrupt state round-trips
-> across processes. Keep interrupt payloads and tool results JSON-safe (no raw
-> `bytes`) when doing so: Strands' `SessionAgent.to_dict()` — unlike
-> `SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
-> `bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
-> `ToolResult` in the same turn, raises `TypeError: Object of type bytes is
-> not JSON serializable` from `FileSessionManager`/`S3SessionManager` and
-> aborts the run.
+### Persistence and proxy-tool boundaries
+
+| Scenario                                                                        | Support boundary                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Native-only pause and resume on the same live wrapper, process, and `thread_id` | Supported without a `SessionManager`; the cached per-thread Strands agent is the checkpoint.                                                                                                                                                                                                     |
+| Wrapper recreation or cross-process resume                                      | Requires a compatible durable `SessionManager` that restores the same session and stable Strands `agent_id`.                                                                                                                                                                                     |
+| Frontend proxy and native interrupt in the same checkpoint                      | Requires `session_id` plus `session_repository.list_messages()` and `session_repository.update_message()`. Without a manager the run emits `INTERRUPT_SESSION_REQUIRED`; without those capabilities it emits `INTERRUPT_SESSION_CAPABILITY_ERROR`. The checkpoint is not advertised or consumed. |
+
+Submitted resume batches are validated atomically before streaming or
+reconciliation. They must contain at least one unique, non-blank, currently
+open interrupt id; a partial subset of the open native interrupts is allowed.
+Invalid batches emit `INTERRUPT_RESUME_ERROR` and leave the checkpoint
+retryable. If reconciliation fails while an interrupt checkpoint is active,
+the run emits `INTERRUPT_RECONCILIATION_ERROR` without finishing or consuming
+the checkpoint.
+
+When using a `SessionManager`, keep interrupt payloads and tool results
+JSON-safe (no raw `bytes`): Strands' `SessionAgent.to_dict()` — unlike
+`SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
+`bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
+`ToolResult` in the same turn, raises `TypeError: Object of type bytes is not
+JSON serializable` from `FileSessionManager`/`S3SessionManager` and aborts the
+run.
 
 ## Supported AG-UI Events
 

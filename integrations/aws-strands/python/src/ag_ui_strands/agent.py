@@ -167,6 +167,84 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
     return []
 
 
+def _interrupt_session_required_error() -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "A SessionManager is required for a mixed frontend-proxy/native "
+            "interrupt checkpoint"
+        ),
+        code="INTERRUPT_SESSION_REQUIRED",
+    )
+
+
+def _interrupt_session_capability_error() -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "Mixed frontend-proxy/native interrupt state requires session_id, "
+            "a stable agent_id, and a session_repository exposing "
+            "list_messages() and update_message()"
+        ),
+        code="INTERRUPT_SESSION_CAPABILITY_ERROR",
+    )
+
+
+def _interrupt_reconciliation_error() -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message="Active interrupt tool result reconciliation failed",
+        code="INTERRUPT_RECONCILIATION_ERROR",
+    )
+
+
+def _interrupt_resume_error(message: str) -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=message,
+        code="INTERRUPT_RESUME_ERROR",
+    )
+
+
+def _preflight_resume_entries(
+    agent: Any, resume_entries: Any
+) -> "RunErrorEvent | None":
+    """Validate the complete submitted resume batch without mutating state."""
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return _interrupt_resume_error(
+            "Cannot resume without an active native interrupt checkpoint"
+        )
+    if not isinstance(resume_entries, list) or not resume_entries:
+        return _interrupt_resume_error(
+            "A submitted resume must contain at least one entry"
+        )
+
+    current_interrupts = getattr(interrupt_state, "interrupts", {})
+    seen_ids: set[str] = set()
+    for entry in resume_entries:
+        interrupt_id = getattr(entry, "interrupt_id", None)
+        if not isinstance(interrupt_id, str) or not interrupt_id.strip():
+            return _interrupt_resume_error(
+                "Resume entries must contain a non-blank interrupt id"
+            )
+        if interrupt_id in seen_ids:
+            return _interrupt_resume_error(
+                f"Resume contains duplicate interrupt id: {interrupt_id}"
+            )
+        seen_ids.add(interrupt_id)
+        interrupt = (
+            current_interrupts.get(interrupt_id)
+            if isinstance(current_interrupts, dict)
+            else None
+        )
+        if interrupt is None or getattr(interrupt, "response", None):
+            return _interrupt_resume_error(
+                f"Resume references an interrupt that is not open: {interrupt_id}"
+            )
+    return None
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
@@ -212,6 +290,8 @@ from .client_proxy_tool import sync_proxy_tools
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
+    _supports_repository_reconciliation,
+    active_proxy_placeholder_ids,
     has_placeholder_results,
     reconcile_frontend_tool_results,
     resolve_native_ids,
@@ -640,6 +720,53 @@ class StrandsAgent:
                         **core_kwargs,
                     )
         strands_agent = self._agents_by_thread[thread_id]
+
+        # A submitted resume must be validated before any adapter mutation
+        # (context writes, proxy synchronization, history reconciliation, or
+        # metadata pruning). Strands otherwise applies entries one at a time,
+        # which lets a later invalid id partially consume the checkpoint.
+        resume_entries = getattr(input_data, "resume", None)
+        # ``RunAgentInput.resume`` is a list when the field was submitted.
+        # Some legacy callers pass mock-like inputs whose undeclared
+        # attributes auto-materialize; do not mistake those for a resume.
+        resume_submitted = isinstance(resume_entries, list)
+        if resume_submitted:
+            resume_error = _preflight_resume_entries(strands_agent, resume_entries)
+            if resume_error is not None:
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield resume_error
+                return
+
+        session_manager = _get_strands_session_manager(strands_agent)
+        has_active_interrupt = bool(
+            getattr(
+                getattr(strands_agent, "_interrupt_state", None),
+                "activated",
+                False,
+            )
+        )
+        active_proxy_native_ids = active_proxy_placeholder_ids(strands_agent)
+        if active_proxy_native_ids:
+            if session_manager is None:
+                session_error = _interrupt_session_required_error()
+            elif not _supports_repository_reconciliation(
+                session_manager, strands_agent
+            ):
+                session_error = _interrupt_session_capability_error()
+            else:
+                session_error = None
+            if session_error is not None:
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield session_error
+                return
 
         # Forward ``RunAgentInput.context`` to the per-thread Strands agent's
         # state so user tools can read it (e.g. catalog/component schemas
@@ -1086,14 +1213,17 @@ class StrandsAgent:
             # result when its tool name is client-declared, or (for delta-only
             # payloads that omit the assistant message) when its wire id was
             # recorded in the wire->native map when the call was emitted.
-            session_manager = _get_strands_session_manager(strands_agent)
             # The durable wire->native map recorded at emission, read back from
             # session state (restored from the store on a fresh process).
             wire_to_native: Dict[str, str] = {}
+            reconciliation_setup_error: Exception | None = None
             if session_manager is not None:
-                wire_to_native = (
-                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-                )
+                try:
+                    wire_to_native = (
+                        strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+                    )
+                except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
+                    reconciliation_setup_error = e
 
             # The durable per-``toolUseId`` call metadata map recorded at
             # emission (see the ``current_tool_use`` handler). On a RESUME
@@ -1109,8 +1239,18 @@ class StrandsAgent:
                     persisted_tool_call_meta = (
                         _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
                     )
-                except Exception:
-                    persisted_tool_call_meta = {}
+                except Exception as e:  # noqa: BLE001 - handled by checkpoint state
+                    if has_active_interrupt:
+                        if reconciliation_setup_error is None:
+                            reconciliation_setup_error = e
+                    else:
+                        logger.warning(
+                            "Persisted tool-call metadata is unavailable; "
+                            "continuing without historical callback metadata: %s",
+                            e,
+                            exc_info=True,
+                        )
+
             # Scope to the TRAILING tool results (this continuation's just-
             # returned results). ``pending_tool_result_ids`` holds those ids;
             # without this, a multi-turn continuation re-sends already-reconciled
@@ -1148,10 +1288,46 @@ class StrandsAgent:
             has_nonvoid_frontend_result = any(
                 (r["text"] or "").strip() for r in frontend_results
             )
-            if session_manager is not None and self.config.replay_history_into_strands:
-                resolved_native_results = resolve_native_ids(
-                    wire_to_native, frontend_results
+            if reconciliation_setup_error is None and session_manager is not None and (
+                self.config.replay_history_into_strands
+                or (resume_submitted and bool(active_proxy_native_ids))
+            ):
+                try:
+                    resolved_native_results = resolve_native_ids(
+                        wire_to_native, frontend_results
+                    )
+                except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
+                    reconciliation_setup_error = e
+
+            if reconciliation_setup_error is not None:
+                if has_active_interrupt:
+                    logger.error(
+                        "Active interrupt tool result reconciliation failed",
+                        exc_info=reconciliation_setup_error,
+                    )
+                    yield _interrupt_reconciliation_error()
+                    return
+                logger.warning(
+                    "Frontend tool result reconciliation failed; falling back to "
+                    f"the legacy continuation path: {reconciliation_setup_error}",
+                    exc_info=reconciliation_setup_error,
                 )
+
+            # Resuming clears the parked context. Every exact proxy placeholder
+            # in that context therefore needs a mapped client result before
+            # repository or live checkpoint mutation begins.
+            if resume_submitted and active_proxy_native_ids:
+                missing_active_results = (
+                    active_proxy_native_ids - resolved_native_results.keys()
+                )
+                if missing_active_results:
+                    logger.error(
+                        "Active interrupt is missing mapped frontend results for "
+                        "native ids %s",
+                        sorted(missing_active_results),
+                    )
+                    yield _interrupt_reconciliation_error()
+                    return
 
             # Reconcile Strands' internal conversation history with
             # ``RunAgentInput.messages``. Without this, frontend tool results
@@ -1168,17 +1344,21 @@ class StrandsAgent:
             replay_history = (
                 self.config.replay_history_into_strands and session_manager is None
             )
-            # An active interrupt means a sibling frontend tool's placeholder may
-            # be stashed in ``_interrupt_state.context["tool_results"]``; reconcile
-            # even when this turn's frontend result is void, since that stash has
-            # no other correction path and is destroyed once the interrupt resumes.
-            has_active_interrupt = bool(
-                getattr(getattr(strands_agent, "_interrupt_state", None), "activated", False)
-            )
+            # A native-only live checkpoint needs no repository access. Exact
+            # proxy placeholders do, including when the client result is void.
             reconcile_session_results = (
-                session_manager is not None
-                and self.config.replay_history_into_strands
-                and (has_nonvoid_frontend_result or has_active_interrupt)
+                reconciliation_setup_error is None
+                and _supports_repository_reconciliation(session_manager, strands_agent)
+                and (
+                    (
+                        self.config.replay_history_into_strands
+                        and (
+                            has_nonvoid_frontend_result
+                            or bool(active_proxy_native_ids)
+                        )
+                    )
+                    or (resume_submitted and bool(active_proxy_native_ids))
+                )
             )
 
             # Default prompt: the legacy path, passing only the latest user
@@ -1215,7 +1395,11 @@ class StrandsAgent:
                                     f"state_context_builder failed: {e}", exc_info=True
                                 )
                             break
-                strands_agent.messages = native_history
+                preserve_live_interrupt_history = (
+                    resume_submitted and has_active_interrupt and is_delta_payload
+                )
+                if not preserve_live_interrupt_history:
+                    strands_agent.messages = native_history
                 # ``None`` tells Strands to use existing ``self.messages`` as-is.
                 # The LLM sees real tool results (including ones produced by the
                 # frontend) and emits a proper follow-up turn instead of
@@ -1227,11 +1411,27 @@ class StrandsAgent:
                         session_manager, strands_agent, resolved_native_results
                     )
                 except Exception as e:  # noqa: BLE001 — degrade, don't crash the turn
+                    if has_active_interrupt:
+                        logger.error(
+                            "Active interrupt tool result reconciliation failed",
+                            exc_info=True,
+                        )
+                        yield _interrupt_reconciliation_error()
+                        return
                     logger.warning(
                         "Frontend tool result reconciliation failed; falling back to "
                         f"the legacy continuation path: {e}",
                         exc_info=True,
                     )
+                missing_corrections = active_proxy_native_ids - corrected_native_ids
+                if missing_corrections:
+                    logger.error(
+                        "Active interrupt frontend results were not corrected for "
+                        "native ids %s",
+                        sorted(missing_corrections),
+                    )
+                    yield _interrupt_reconciliation_error()
+                    return
                 # Continue from the corrected native history only when every
                 # NON-EMPTY frontend result this turn resolved to a native id
                 # (i.e. was present in the wire->native map) AND none of those
@@ -1265,9 +1465,7 @@ class StrandsAgent:
             # and drive the stream with it — this runs after (and takes
             # precedence over) every branch above, since a resume batch may
             # still carry a fresh frontend tool result that needed reconciling.
-            resume_entries = getattr(input_data, "resume", None)
-            has_resume_entries = isinstance(resume_entries, list) and resume_entries
-            if has_resume_entries:
+            if resume_submitted:
                 resume_prompt = [
                     {
                         "interruptResponse": {
@@ -1277,12 +1475,6 @@ class StrandsAgent:
                     }
                     for entry in resume_entries
                 ]
-            if (has_resume_entries or has_active_interrupt) and session_manager is None:
-                # Interrupts and frontend-tools reconcicliation are not yet properly supported when
-                # used without a session manager, halt the conversation.
-                raise RuntimeError(
-                    "AG-UI currently supports interrupts only using a SessionManager"
-                )
 
             # Drop only the entries whose placeholder was actually corrected
             # this turn — they won't recur. Entries that were NOT corrected
@@ -1753,10 +1945,9 @@ class StrandsAgent:
                                 )
                             }
                             if len(_remaining) != len(persisted_tool_call_meta):
-                                if _get_strands_session_manager(strands_agent):
-                                    strands_agent.state.set(
-                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
-                                    )
+                                strands_agent.state.set(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
+                                )
                                 persisted_tool_call_meta = _remaining
                         processed_result_native_ids.clear()
 
@@ -1904,41 +2095,35 @@ class StrandsAgent:
                                 "strands_tool_id": strands_tool_id,
                             }
 
-                            # Mirror the minimum-sufficient subset into durable
-                            # session state so a RESUME run — which does not
-                            # re-emit ``current_tool_use`` for the interrupted
-                            # tool — can still resolve ``tool_name``/behavior/
-                            # context at the ``toolResult`` site. Gate on
-                            # session_manager: only then does Strands durably flush state.
-                            if _get_strands_session_manager(strands_agent):
-                                _tc_meta = dict(
-                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
-                                    or {}
-                                )
-                                # Key by the NATIVE ``toolUseId`` — that is what
-                                # arrives on ``toolResult``. For backend tools
-                                # this equals ``tool_use_id``; for frontend
-                                # tools ``tool_use_id`` is a fresh wire UUID
-                                # while ``strands_tool_id`` is native.
-                                _tc_key = strands_tool_id or tool_use_id
-                                _tc_meta[_tc_key] = {
-                                    "name": tool_name,
-                                    "args": args_str,
-                                    "input": tool_input,
-                                    "strands_tool_id": strands_tool_id,
-                                }
-                                if len(_tc_meta) > _TOOL_CALL_MAP_MAX:
-                                    for _stale in list(_tc_meta)[
-                                        : len(_tc_meta) - _TOOL_CALL_MAP_MAX
-                                    ]:
-                                        _tc_meta.pop(_stale, None)
-                                strands_agent.state.set(
-                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
-                                )
-                                # Keep the in-run view aligned so downstream
-                                # result lookups see the same entry a fresh
-                                # process would restore from the store.
-                                persisted_tool_call_meta = _tc_meta
+                            # Mirror the minimum-sufficient subset into live
+                            # agent state. A SessionManager may persist it, but
+                            # the cached core itself is the same-process native
+                            # checkpoint and must restore callbacks without one.
+                            _tc_meta = dict(
+                                strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                or {}
+                            )
+                            # Key by the NATIVE ``toolUseId`` — that is what
+                            # arrives on ``toolResult``. For backend tools
+                            # this equals ``tool_use_id``; for frontend tools
+                            # ``tool_use_id`` is a fresh wire UUID while
+                            # ``strands_tool_id`` is native.
+                            _tc_key = strands_tool_id or tool_use_id
+                            _tc_meta[_tc_key] = {
+                                "name": tool_name,
+                                "args": args_str,
+                                "input": tool_input,
+                                "strands_tool_id": strands_tool_id,
+                            }
+                            if len(_tc_meta) > _TOOL_CALL_MAP_MAX:
+                                for _stale in list(_tc_meta)[
+                                    : len(_tc_meta) - _TOOL_CALL_MAP_MAX
+                                ]:
+                                    _tc_meta.pop(_stale, None)
+                            strands_agent.state.set(
+                                AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
+                            )
+                            persisted_tool_call_meta = _tc_meta
 
                             if use_streaming:
                                 # Close any open assistant text turn so the
@@ -2009,20 +2194,19 @@ class StrandsAgent:
                             # streamed args. Without this refresh, resume runs
                             # would see the first partial-JSON delta rather
                             # than the complete args the model emitted.
-                            if _get_strands_session_manager(strands_agent):
-                                _tc_meta = dict(
-                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
-                                    or {}
+                            _tc_meta = dict(
+                                strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                or {}
+                            )
+                            _tc_key = strands_tool_id or tool_use_id
+                            _existing = _tc_meta.get(_tc_key)
+                            if _existing is not None:
+                                _existing["input"] = tool_input
+                                _existing["args"] = args_str
+                                strands_agent.state.set(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
                                 )
-                                _tc_key = strands_tool_id or tool_use_id
-                                _existing = _tc_meta.get(_tc_key)
-                                if _existing is not None:
-                                    _existing["input"] = tool_input
-                                    _existing["args"] = args_str
-                                    strands_agent.state.set(
-                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
-                                    )
-                                    persisted_tool_call_meta = _tc_meta
+                                persisted_tool_call_meta = _tc_meta
 
                         # Stream incremental ToolCallArgs deltas as the LLM
                         # produces more characters of the JSON args. The FE
@@ -2436,6 +2620,19 @@ class StrandsAgent:
                         type=EventType.MESSAGES_SNAPSHOT,
                         messages=list(snapshot_messages),
                     )
+
+            # Streaming can create a mixed checkpoint that was not observable
+            # during preflight. Do not advertise or finish it unless the same
+            # repository boundary needed for a safe resume is available.
+            if active_proxy_placeholder_ids(strands_agent):
+                if session_manager is None:
+                    yield _interrupt_session_required_error()
+                    return
+                if not _supports_repository_reconciliation(
+                    session_manager, strands_agent
+                ):
+                    yield _interrupt_session_capability_error()
+                    return
 
             # Final state snapshot before finishing
             yield StateSnapshotEvent(
