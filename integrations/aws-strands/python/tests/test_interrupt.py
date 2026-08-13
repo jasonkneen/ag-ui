@@ -926,10 +926,16 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
     )
 
     assert not any(e.type == EventType.RUN_ERROR for e in events2)
-    assert any(
-        e.type == EventType.TOOL_CALL_RESULT and e.tool_call_id == "native-confirm"
-        for e in events2
+    finished2 = [e for e in events2 if e.type == EventType.RUN_FINISHED]
+    assert len(finished2) == 1
+    assert finished2[0].outcome is None
+    tool_result_index = next(
+        index
+        for index, event in enumerate(events2)
+        if event.type == EventType.TOOL_CALL_RESULT
+        and event.tool_call_id == "native-confirm"
     )
+    assert tool_result_index < events2.index(finished2[0])
     assert len(state_contexts) == 1
     assert len(custom_contexts) == 1
     for ctx in [state_contexts[0], custom_contexts[0]]:
