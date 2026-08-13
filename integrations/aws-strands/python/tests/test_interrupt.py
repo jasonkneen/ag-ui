@@ -786,9 +786,8 @@ async def test_mixed_interrupt_without_session_manager_errors_before_outcome():
     assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
 
 
-@pytest.mark.asyncio
-async def test_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
-    tmp_path,
+async def _assert_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+    tmp_path, failure_target
 ):
     config = StrandsAgentConfig(
         session_manager_provider=lambda input_data: FileSessionManager(
@@ -830,7 +829,7 @@ async def test_active_reconciliation_failure_emits_run_error_before_stream_and_k
     with (
         patch.object(core, "stream_async", wraps=core.stream_async) as stream_spy,
         patch(
-            "ag_ui_strands.session_reconcile._correct_all_tools",
+            failure_target,
             side_effect=RuntimeError("boom"),
         ),
     ):
@@ -867,6 +866,26 @@ async def test_active_reconciliation_failure_emits_run_error_before_stream_and_k
     assert interrupt_state.interrupts == parked_interrupts
     assert core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == wire_map
     assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
+
+
+@pytest.mark.asyncio
+async def test_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+    tmp_path,
+):
+    await _assert_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+        tmp_path,
+        "ag_ui_strands.session_reconcile._correct_all_tools",
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_repository_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+    tmp_path,
+):
+    await _assert_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+        tmp_path,
+        "ag_ui_strands.session_reconcile._correct_message",
+    )
 
 
 @pytest.mark.parametrize("recreate_agent", [False, True])

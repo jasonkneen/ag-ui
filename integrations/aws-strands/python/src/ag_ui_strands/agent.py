@@ -1266,6 +1266,17 @@ class StrandsAgent:
                     )
                     return
                 except Exception as e:  # noqa: BLE001 — degrade, don't crash the turn
+                    if has_active_interrupt:
+                        logger.error(
+                            "Active interrupt tool result reconciliation failed",
+                            exc_info=True,
+                        )
+                        yield RunErrorEvent(
+                            type=EventType.RUN_ERROR,
+                            message=str(e),
+                            code="INTERRUPT_RECONCILIATION_ERROR",
+                        )
+                        return
                     logger.warning(
                         "Frontend tool result reconciliation failed; falling back to "
                         f"the legacy continuation path: {e}",
