@@ -1136,6 +1136,7 @@ class StrandsAgent:
                 wire_to_native = (
                     strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
                 )
+            original_wire_native_ids = frozenset(wire_to_native.values())
             # Scope to the TRAILING tool results (this continuation's just-
             # returned results). ``pending_tool_result_ids`` holds those ids;
             # without this, a multi-turn continuation re-sends already-reconciled
@@ -1633,9 +1634,25 @@ class StrandsAgent:
                                 f"Processing tool result: tool_name={tool_name}, result_tool_id={result_tool_id}, pending_tool_result_ids={pending_tool_result_ids}, thread_id={input_data.thread_id}"
                             )
 
-                            # Skip emitting the placeholder result for forwarded/proxy tools
-                            # – the real execution happens on the client side.
-                            if tool_name and tool_name in frontend_tool_names:
+                            # Skip server-side proxy placeholders: explicit
+                            # per-call provenance is authoritative (including
+                            # False for a native tool whose name collides with a
+                            # client declaration). Older metadata lacks that
+                            # flag, so fall back only to the original durable
+                            # wire map or the immutable actual-registry snapshot.
+                            is_frontend_provenance = call_info.get("is_frontend")
+                            if isinstance(is_frontend_provenance, bool):
+                                is_frontend_result = is_frontend_provenance
+                            else:
+                                is_frontend_result = (
+                                    result_tool_id in original_wire_native_ids
+                                    or (
+                                        bool(tool_name)
+                                        and tool_name
+                                        in registered_frontend_tool_names
+                                    )
+                                )
+                            if is_frontend_result:
                                 continue
 
                             # Emit ToolCallResultEvent WITHOUT role field to complete the tool in UI

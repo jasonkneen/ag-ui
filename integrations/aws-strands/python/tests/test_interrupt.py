@@ -16,7 +16,15 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from ag_ui.core import EventType, ResumeEntry, RunAgentInput, Tool, ToolMessage, UserMessage
+from ag_ui.core import (
+    CustomEvent,
+    EventType,
+    ResumeEntry,
+    RunAgentInput,
+    Tool,
+    ToolMessage,
+    UserMessage,
+)
 from strands import Agent as StrandsAgentCore
 from strands import ToolContext, tool
 from strands.agent.state import AgentState
@@ -573,13 +581,44 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
 
 @pytest.mark.asyncio
 async def test_native_placeholder_text_with_interrupt_does_not_require_session_manager():
+    state_contexts = []
+    custom_contexts = []
+
+    def state_from_result(ctx):
+        state_contexts.append(ctx)
+        return {"native_placeholder_result": ctx.result_data}
+
+    async def custom_result_handler(ctx):
+        custom_contexts.append(ctx)
+        yield CustomEvent(
+            type=EventType.CUSTOM,
+            name="native-placeholder-result",
+            value={"content": ctx.result_data},
+        )
+
     model = _InterruptFlowModel(sibling_tool_name="native_placeholder")
     core = StrandsAgentCore(
         model=model,
         tools=[native_placeholder, confirm_action],
         system_prompt="test",
     )
-    agent = StrandsAgent(core, name="native-placeholder-interrupt")
+    agent = StrandsAgent(
+        core,
+        name="native-placeholder-interrupt",
+        config=StrandsAgentConfig(
+            tool_behaviors={
+                "native_placeholder": ToolBehavior(
+                    state_from_result=state_from_result,
+                    custom_result_handler=custom_result_handler,
+                )
+            }
+        ),
+    )
+    colliding_declaration = Tool(
+        name="native_placeholder",
+        description="frontend declaration colliding with a native tool",
+        parameters={},
+    )
 
     events = await _collect_events(
         agent,
@@ -591,13 +630,7 @@ async def test_native_placeholder_text_with_interrupt_does_not_require_session_m
                     content="run both native tools",
                 )
             ],
-            tools=[
-                Tool(
-                    name="native_placeholder",
-                    description="frontend declaration colliding with a native tool",
-                    parameters={},
-                )
-            ],
+            tools=[colliding_declaration],
         ),
     )
 
@@ -616,10 +649,70 @@ async def test_native_placeholder_text_with_interrupt_does_not_require_session_m
     assert finished.outcome is not None
     assert finished.outcome.type == "interrupt"
     assert finished.outcome.interrupts[0].tool_call_id == "native-confirm"
+    interrupt_id = finished.outcome.interrupts[0].id
 
     tool_metadata = live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
     assert tool_metadata["native-approve"]["is_frontend"] is False
     assert tool_metadata["native-confirm"]["is_frontend"] is False
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[colliding_declaration],
+        ),
+    )
+
+    native_results = [
+        event
+        for event in resumed_events
+        if event.type == EventType.TOOL_CALL_RESULT
+        and event.tool_call_id == "native-approve"
+    ]
+    assert len(native_results) == 1
+    assert native_results[0].content == '"Forwarded to client"'
+    custom_event_indices = [
+        index
+        for index, event in enumerate(resumed_events)
+        if event.type == EventType.CUSTOM
+        and event.name == "native-placeholder-result"
+    ]
+    assert len(custom_event_indices) == 1
+    custom_event_index = custom_event_indices[0]
+    assert [
+        event.snapshot
+        for event in resumed_events[:custom_event_index]
+        if event.type == EventType.STATE_SNAPSHOT
+        and event.snapshot.get("native_placeholder_result")
+        == "Forwarded to client"
+    ] == [{"native_placeholder_result": "Forwarded to client"}]
+    assert [
+        event.value
+        for event in resumed_events
+        if event.type == EventType.CUSTOM
+        and event.name == "native-placeholder-result"
+    ] == [{"content": "Forwarded to client"}]
+    assert len(state_contexts) == 1
+    assert len(custom_contexts) == 1
+    for ctx in [state_contexts[0], custom_contexts[0]]:
+        assert ctx.tool_name == "native_placeholder"
+        assert ctx.tool_use_id == "native-approve"
+        assert ctx.tool_input == {}
+        assert ctx.args_str == "{}"
+        assert ctx.result_data == "Forwarded to client"
+    assert not any(
+        event.type == EventType.RUN_ERROR for event in resumed_events
+    )
+    assert any(
+        event.type == EventType.RUN_FINISHED for event in resumed_events
+    )
 
 
 @pytest.mark.asyncio
@@ -783,6 +876,12 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
         tools=[approve_tool],
     )
     events2 = await _collect_events(agent, inp2)
+
+    assert not any(
+        event.type == EventType.TOOL_CALL_RESULT
+        and event.tool_call_id == "native-approve"
+        for event in events2
+    )
 
     # --- A falsy-but-explicit resume payload must resolve, not loop. ---
     finished2 = next(e for e in events2 if e.type == EventType.RUN_FINISHED)
