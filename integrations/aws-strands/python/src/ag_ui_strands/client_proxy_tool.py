@@ -101,6 +101,8 @@ def sync_proxy_tools(
     tool_registry: ToolRegistry,
     ag_ui_tools: list[AgUiTool],
     tracked_names: Set[str],
+    *,
+    retain_names: Set[str] | None = None,
 ) -> Set[str]:
     """Synchronise proxy tools in *tool_registry* with *ag_ui_tools*.
 
@@ -108,11 +110,17 @@ def sync_proxy_tools(
       registered (unless a native, non-proxy tool with the same name exists).
     * Stale proxy tools that are in *tracked_names* but absent from the
       incoming list are removed.
+    * Marked proxies named in *retain_names* survive this sync even when they
+      are absent from the incoming list. This is a one-call checkpoint escape
+      hatch; callers must pass the names again if another sync still needs
+      them.
 
     Args:
         tool_registry: The Strands ``ToolRegistry`` attached to the agent.
         ag_ui_tools: Tool definitions from the current ``RunAgentInput.tools``.
         tracked_names: Set of proxy tool names registered in previous calls.
+        retain_names: Existing marked proxy names required by an active
+            checkpoint during this sync only.
 
     Returns:
         Updated set of proxy tool names currently registered.
@@ -123,8 +131,10 @@ def sync_proxy_tools(
         if n:
             desired_names.add(n)
 
+    retained = set(retain_names or ())
+
     # --- Remove stale proxy tools ---
-    stale = tracked_names - desired_names
+    stale = tracked_names - desired_names - retained
     for name in stale:
         existing = tool_registry.registry.get(name)
         if existing is not None and _is_proxy(existing):
@@ -133,7 +143,12 @@ def sync_proxy_tools(
             logger.debug("Removed stale proxy tool: %s", name)
 
     # --- Add / update proxy tools ---
-    current_proxy_names: Set[str] = set()
+    current_proxy_names: Set[str] = {
+        name
+        for name in retained
+        if (existing := tool_registry.registry.get(name)) is not None
+        and _is_proxy(existing)
+    }
     for t in ag_ui_tools:
         n = t.name if isinstance(t, AgUiTool) else t.get("name", "")  # type: ignore[union-attr]
         if not n:

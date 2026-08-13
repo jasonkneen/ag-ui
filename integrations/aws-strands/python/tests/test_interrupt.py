@@ -1018,10 +1018,10 @@ async def test_resume_preflight_rejects_nonempty_resume_after_interrupt_state_is
 
 
 @pytest.mark.asyncio
-async def test_frontend_proxy_before_tool_hook_interrupt_uses_wire_id_and_real_result_once(
+async def test_frontend_proxy_before_tool_hook_resume_retains_omitted_tool_once(
     tmp_path,
 ):
-    """A proxy hook interrupt remains resumable through client-visible ids."""
+    """A hook checkpoint can finish after the client omits its proxy spec."""
     model = _ProxyHookInterruptFlowModel()
     core = StrandsAgentCore(model=model, system_prompt="test")
     config = StrandsAgentConfig(
@@ -1056,6 +1056,7 @@ async def test_frontend_proxy_before_tool_hook_interrupt_uses_wire_id_and_real_r
     )
     interrupt = finished.outcome.interrupts[0]
     live_core = agent._agents_by_thread["thread-1"]
+    assert "approveTool" in live_core.tool_registry.registry
     parked_context = copy.deepcopy(live_core._interrupt_state.context)
     parked_interrupts = copy.deepcopy(live_core._interrupt_state.interrupts)
 
@@ -1105,12 +1106,17 @@ async def test_frontend_proxy_before_tool_hook_interrupt_uses_wire_id_and_real_r
                     payload=True,
                 )
             ],
-            tools=[frontend_tool],
+            tools=[],
         ),
     )
 
     resumed_model_messages = json.dumps(model.stream_calls_messages[-1])
     assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    resumed_finished = [
+        event for event in resumed_events if event.type == EventType.RUN_FINISHED
+    ]
+    assert len(resumed_finished) == 1
+    assert resumed_finished[0].outcome is None
     assert not any(
         getattr(event, "tool_call_id", None) == "native-approve"
         for event in initial_events
@@ -1120,7 +1126,99 @@ async def test_frontend_proxy_before_tool_hook_interrupt_uses_wire_id_and_real_r
         resumed_model_messages.count("approved"),
         "Forwarded to client" in resumed_model_messages,
     ) == (wire_id, 1, False)
+    assert "Unknown tool" not in resumed_model_messages
     assert live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == {}
+    assert "approveTool" in live_core.tool_registry.registry
+    assert agent._proxy_tool_names_by_thread["thread-1"] == {"approveTool"}
+
+    cleanup_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-4",
+            messages=[UserMessage(id="u-cleanup", role="user", content="continue")],
+            tools=[],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in cleanup_events)
+    assert "approveTool" not in live_core.tool_registry.registry
+
+
+@pytest.mark.asyncio
+async def test_recreated_proxy_hook_resume_without_tool_spec_fails_capability(
+    tmp_path,
+):
+    """Persisted identity cannot safely recreate an omitted proxy schema."""
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    frontend_tool = Tool(name="approveTool", description="approve", parameters={})
+    initial_model = _ProxyHookInterruptFlowModel()
+    agent = StrandsAgent(
+        StrandsAgentCore(model=initial_model, system_prompt="test"),
+        name="proxy-hook-interrupt",
+        config=config,
+        hooks=[_InterruptFrontendProxyHook()],
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    interrupt_id = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    ).outcome.interrupts[0].id
+
+    resumed_model = _ProxyHookInterruptFlowModel()
+    resumed_model.turn = initial_model.turn
+    recreated_agent = StrandsAgent(
+        StrandsAgentCore(model=resumed_model, system_prompt="test"),
+        name="proxy-hook-interrupt",
+        config=config,
+        hooks=[_InterruptFrontendProxyHook()],
+    )
+    resumed_events = await _collect_events(
+        recreated_agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-approve",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content='{"approved": true}',
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[],
+        ),
+    )
+
+    errors = [event for event in resumed_events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "INTERRUPT_SESSION_CAPABILITY_ERROR"
+    assert "marked proxy tool specification is unavailable" in errors[0].message
+    assert not any(event.type == EventType.RUN_FINISHED for event in resumed_events)
+    assert resumed_model.turn == initial_model.turn
+    recreated_core = recreated_agent._agents_by_thread["thread-1"]
+    assert "approveTool" not in recreated_core.tool_registry.registry
+    assert recreated_core._interrupt_state.activated
 
 
 @pytest.mark.asyncio

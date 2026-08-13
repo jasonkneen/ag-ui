@@ -340,6 +340,18 @@ def _interrupt_session_capability_error() -> "RunErrorEvent":
     )
 
 
+def _proxy_resume_tool_capability_error(native_ids: set[str]) -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "Cannot resume frontend proxy hook checkpoint because its marked "
+            "proxy tool specification is unavailable for native tool ids: "
+            + ", ".join(sorted(native_ids))
+        ),
+        code="INTERRUPT_SESSION_CAPABILITY_ERROR",
+    )
+
+
 def _preflight_resume_entries(
     agent: Any, resume_entries: list[Any]
 ) -> "RunErrorEvent | None":
@@ -888,6 +900,60 @@ class StrandsAgent:
                 yield resume_error
                 return
 
+        # Read checkpoint provenance before proxy synchronization. A
+        # ``BeforeToolCallEvent`` pause parks the exact native proxy invocation
+        # for re-execution, so an omitted ``RunAgentInput.tools`` list must not
+        # delete that marked proxy before Strands consumes its resume override.
+        persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
+        _agent_state = getattr(strands_agent, "state", None)
+        if _agent_state is not None:
+            try:
+                persisted_tool_call_meta = (
+                    _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+                )
+            except Exception:
+                persisted_tool_call_meta = {}
+        active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
+            strands_agent, persisted_tool_call_meta
+        )
+        retained_checkpoint_proxy_names: set[str] = set()
+        if has_resume_entries and active_proxy_hook_native_ids:
+            marked_proxy_names = registered_proxy_tool_names(
+                strands_agent.tool_registry
+            )
+            incoming_proxy_names = {
+                getattr(tool, "name", None)
+                or (tool.get("name", "") if isinstance(tool, dict) else "")
+                for tool in (input_data.tools or [])
+            }
+            unavailable_native_ids: set[str] = set()
+            for native_id in active_proxy_hook_native_ids:
+                metadata = persisted_tool_call_meta.get(native_id)
+                tool_name = (
+                    metadata.get("name") if isinstance(metadata, dict) else None
+                )
+                if tool_name in marked_proxy_names:
+                    retained_checkpoint_proxy_names.add(tool_name)
+                    continue
+                if (
+                    tool_name in incoming_proxy_names
+                    and tool_name not in strands_agent.tool_registry.registry
+                ):
+                    # The current client declaration is a safe reconstruction
+                    # source and ordinary synchronization will register it.
+                    continue
+                unavailable_native_ids.add(native_id)
+            if unavailable_native_ids:
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield _proxy_resume_tool_capability_error(
+                    unavailable_native_ids
+                )
+                return
+
         # Forward ``RunAgentInput.context`` to the per-thread Strands agent's
         # state so user tools can read it (e.g. catalog/component schemas
         # injected by the CopilotKit FE for A2UI rendering). Mirrors the
@@ -915,22 +981,21 @@ class StrandsAgent:
         except Exception as e:
             logger.warning(f"Failed to set agui_context on strands_agent.state: {e}")
 
-        # Sync proxy tools from client-defined tools
-        if input_data.tools:
+        # Sync proxy tools from client-defined tools. Only exact marked proxies
+        # required by the active hook checkpoint survive an omitted tools list;
+        # the returned bookkeeping makes the next ordinary sync stale-delete
+        # them once the checkpoint is consumed.
+        tracked_proxy_names = self._proxy_tool_names_by_thread.get(
+            thread_id, set()
+        )
+        if input_data.tools or tracked_proxy_names or retained_checkpoint_proxy_names:
             proxy_names = sync_proxy_tools(
                 strands_agent.tool_registry,
-                input_data.tools,
-                self._proxy_tool_names_by_thread.get(thread_id, set()),
+                input_data.tools or [],
+                tracked_proxy_names,
+                retain_names=retained_checkpoint_proxy_names,
             )
             self._proxy_tool_names_by_thread[thread_id] = proxy_names
-        elif self._proxy_tool_names_by_thread.get(thread_id):
-            # Remove all stale proxy tools when no tools are sent
-            sync_proxy_tools(
-                strands_agent.tool_registry,
-                [],
-                self._proxy_tool_names_by_thread[thread_id],
-            )
-            self._proxy_tool_names_by_thread[thread_id] = set()
 
         # A2UI auto-injection. When the runtime forwards
         # ``injectA2UITool`` (or the host opts in via ``config.a2ui``), register
@@ -1352,22 +1417,10 @@ class StrandsAgent:
             # emission (see the ``current_tool_use`` handler). On a RESUME
             # run this is the ONLY source of ``{name, args, input,
             # strands_tool_id}`` for the interrupted tool, since Strands does
-            # not re-emit ``current_tool_use`` events for it. Guarded because
-            # test doubles / stub agents may lack ``state`` entirely; a
-            # missing store just means "no persisted meta yet".
-            persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
-            _agent_state = getattr(strands_agent, "state", None)
-            if _agent_state is not None:
-                try:
-                    persisted_tool_call_meta = (
-                        _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
-                    )
-                except Exception:
-                    persisted_tool_call_meta = {}
+            # not re-emit ``current_tool_use`` events for it. It was loaded
+            # before proxy sync so the same provenance can also protect the
+            # exact checkpoint-required marked proxy from stale deletion.
             active_proxy_native_ids = active_proxy_placeholder_ids(
-                strands_agent, persisted_tool_call_meta
-            )
-            active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
                 strands_agent, persisted_tool_call_meta
             )
             if active_proxy_native_ids:

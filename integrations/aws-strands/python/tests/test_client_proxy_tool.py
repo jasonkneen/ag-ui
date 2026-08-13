@@ -138,6 +138,27 @@ class TestSyncProxyTools:
         assert result == set()
         assert "tool_x" not in registry.registry
 
+    def test_retains_only_checkpoint_required_stale_proxy_for_one_sync(self):
+        registry = self._fresh_registry()
+        registry.register_tool(create_proxy_tool(_make_ag_ui_tool("resume_tool")))
+        registry.register_tool(create_proxy_tool(_make_ag_ui_tool("unrelated_tool")))
+
+        retained = sync_proxy_tools(
+            registry,
+            [],
+            {"resume_tool", "unrelated_tool"},
+            retain_names={"resume_tool"},
+        )
+
+        assert retained == {"resume_tool"}
+        assert "resume_tool" in registry.registry
+        assert "unrelated_tool" not in registry.registry
+
+        removed = sync_proxy_tools(registry, [], retained)
+
+        assert removed == set()
+        assert "resume_tool" not in registry.registry
+
     def test_idempotent_re_registration(self):
         """Re-syncing the same tools should work (hot reload)."""
         registry = self._fresh_registry()
