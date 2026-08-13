@@ -1277,13 +1277,6 @@ class StrandsAgent:
                     }
                     for entry in resume_entries
                 ]
-            if (has_resume_entries or has_active_interrupt) and session_manager is None:
-                # Interrupts and frontend-tools reconcicliation are not yet properly supported when
-                # used without a session manager, halt the conversation.
-                raise RuntimeError(
-                    "AG-UI currently supports interrupts only using a SessionManager"
-                )
-
             # Drop only the entries whose placeholder was actually corrected
             # this turn — they won't recur. Entries that were NOT corrected
             # (unresolved, or a reconcile that raised) are kept so a later turn
@@ -1753,10 +1746,9 @@ class StrandsAgent:
                                 )
                             }
                             if len(_remaining) != len(persisted_tool_call_meta):
-                                if _get_strands_session_manager(strands_agent):
-                                    strands_agent.state.set(
-                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
-                                    )
+                                strands_agent.state.set(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
+                                )
                                 persisted_tool_call_meta = _remaining
                         processed_result_native_ids.clear()
 
@@ -1904,13 +1896,14 @@ class StrandsAgent:
                                 "strands_tool_id": strands_tool_id,
                             }
 
-                            # Mirror the minimum-sufficient subset into durable
-                            # session state so a RESUME run — which does not
+                            # Mirror the minimum-sufficient subset into agent
+                            # state so a RESUME run — which does not
                             # re-emit ``current_tool_use`` for the interrupted
                             # tool — can still resolve ``tool_name``/behavior/
-                            # context at the ``toolResult`` site. Gate on
-                            # session_manager: only then does Strands durably flush state.
-                            if _get_strands_session_manager(strands_agent):
+                            # context at the ``toolResult`` site. The cached
+                            # per-thread agent provides the live checkpoint;
+                            # a SessionManager additionally makes it durable.
+                            if getattr(strands_agent, "state", None) is not None:
                                 _tc_meta = dict(
                                     strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
                                     or {}
@@ -2009,7 +2002,7 @@ class StrandsAgent:
                             # streamed args. Without this refresh, resume runs
                             # would see the first partial-JSON delta rather
                             # than the complete args the model emitted.
-                            if _get_strands_session_manager(strands_agent):
+                            if getattr(strands_agent, "state", None) is not None:
                                 _tc_meta = dict(
                                     strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
                                     or {}

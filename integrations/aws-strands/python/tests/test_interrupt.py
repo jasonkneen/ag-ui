@@ -321,15 +321,12 @@ class TestResumeConsumption:
         ]
 
 
-class TestRejectsInterruptsWithoutSessionManager:
-    """Interrupts/resume are not properly supported without a SessionManager:
-    reject explicitly with RUN_ERROR instead of silently mishandling
-    persistence-dependent state."""
+class TestLiveInterruptsWithoutSessionManager:
+    """The cached per-thread core is a live interrupt checkpoint."""
 
     @pytest.mark.asyncio
-    async def test_active_interrupt_without_session_manager_errors(self):
-        """A paused native run with no session_manager errors instead of
-        emitting an interrupt outcome."""
+    async def test_active_interrupt_without_session_manager_emits_outcome(self):
+        """A paused native run does not require durable session storage."""
         strands_interrupt = StrandsInterrupt(
             id="v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000",
             name="confirm",
@@ -345,14 +342,15 @@ class TestRejectsInterruptsWithoutSessionManager:
         with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
             events = await _collect_events(agent, _make_run_input())
 
-        assert not any(e.type == EventType.RUN_FINISHED for e in events)
-        error = next(e for e in events if e.type == EventType.RUN_ERROR)
-        assert "SessionManager" in error.message
+        assert not any(e.type == EventType.RUN_ERROR for e in events)
+        finished = next(e for e in events if e.type == EventType.RUN_FINISHED)
+        assert finished.outcome is not None
+        assert finished.outcome.type == "interrupt"
+        assert finished.outcome.interrupts[0].id == strands_interrupt.id
 
     @pytest.mark.asyncio
-    async def test_resume_entries_without_session_manager_errors(self):
-        """Resume entries submitted with no session_manager error instead of
-        being translated into a Strands resume prompt."""
+    async def test_resume_entries_without_session_manager_are_streamed(self):
+        """Resume entries are translated against the cached live core."""
         core = _MockStrandsCore(terminal_events=[], session_manager=None)
         agent = _make_base_agent()
         resume = [ResumeEntry(interrupt_id="int-1", status="resolved", payload="yes")]
@@ -360,11 +358,18 @@ class TestRejectsInterruptsWithoutSessionManager:
         with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
             events = await _collect_events(agent, _make_run_input(resume=resume))
 
-        assert not any(e.type == EventType.RUN_FINISHED for e in events)
-        error = next(e for e in events if e.type == EventType.RUN_ERROR)
-        assert "SessionManager" in error.message
-        # The guard fires before the resume prompt is built and streamed.
-        assert core.stream_prompts == []
+        assert not any(e.type == EventType.RUN_ERROR for e in events)
+        assert any(e.type == EventType.RUN_FINISHED for e in events)
+        assert core.stream_prompts == [
+            [
+                {
+                    "interruptResponse": {
+                        "interruptId": "int-1",
+                        "response": {"response": "yes"},
+                    }
+                }
+            ]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -436,10 +441,121 @@ class _InterruptFlowModel(StrandsModel):
             yield {"messageStop": {"stopReason": "end_turn"}}
 
 
+class _NativeInterruptFlowModel(StrandsModel):
+    """Turn 1 interrupts in a native tool; turn 2 narrates completion."""
+
+    def __init__(self):
+        self.turn = 0
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(self, output_model, prompt=None, system_prompt=None, **kwargs):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.turn += 1
+        if self.turn == 1:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {
+                "contentBlockStart": {
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "native-confirm",
+                            "name": "confirm_action",
+                        }
+                    }
+                }
+            }
+            yield {
+                "contentBlockDelta": {
+                    "delta": {"toolUse": {"input": '{"key": "widget-1"}'}}
+                }
+            }
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+        else:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+
 def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _InterruptFlowModel]:
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
     return StrandsAgent(core, name="e2e-interrupt", config=config), model
+
+
+@pytest.mark.asyncio
+async def test_native_interrupt_resumes_without_session_manager_and_restores_behaviors():
+    state_contexts = []
+    custom_contexts = []
+
+    def state_from_result(ctx):
+        state_contexts.append(ctx)
+        return {"confirmed_key": ctx.tool_input["key"]}
+
+    async def custom_result_handler(ctx):
+        custom_contexts.append(ctx)
+        if False:
+            yield  # pragma: no cover — async-generator contract
+
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    config = StrandsAgentConfig(
+        tool_behaviors={
+            "confirm_action": ToolBehavior(
+                state_from_result=state_from_result,
+                custom_result_handler=custom_result_handler,
+            )
+        }
+    )
+    agent = StrandsAgent(core, name="live-native-interrupt", config=config)
+
+    events1 = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="confirm widget-1")]
+        ),
+    )
+
+    finished1 = next(e for e in events1 if e.type == EventType.RUN_FINISHED)
+    assert finished1.outcome is not None
+    assert finished1.outcome.type == "interrupt"
+    interrupt = finished1.outcome.interrupts[0]
+    assert interrupt.tool_call_id == "native-confirm"
+
+    events2 = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        ),
+    )
+
+    assert not any(e.type == EventType.RUN_ERROR for e in events2)
+    assert any(
+        e.type == EventType.TOOL_CALL_RESULT and e.tool_call_id == "native-confirm"
+        for e in events2
+    )
+    assert len(state_contexts) == 1
+    assert len(custom_contexts) == 1
+    for ctx in [state_contexts[0], custom_contexts[0]]:
+        assert ctx.tool_name == "confirm_action"
+        assert ctx.tool_use_id == "native-confirm"
+        assert ctx.tool_input == {"key": "widget-1"}
+        assert ctx.args_str == '{"key": "widget-1"}'
 
 
 @pytest.mark.parametrize("recreate_agent", [False, True])
