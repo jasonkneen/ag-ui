@@ -103,7 +103,21 @@ def _get_strands_session_manager(agent: Any) -> Any:
     )
 
 
-def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
+def _interrupt_tool_call_id(strands_interrupt: Any) -> str | None:
+    """Extract the native ``toolUseId`` embedded in a Strands interrupt id."""
+    s_id = getattr(strands_interrupt, "id", "")
+    s_id_parts = s_id.split(":") if isinstance(s_id, str) else []
+    if len(s_id_parts) >= 4:
+        # toolUseId is freeform and can itself contain ":" — slice the parts
+        # list to drop only the "v1"/"<kind>" prefix and the trailing uuid.
+        return ":".join(s_id_parts[2:-1])
+    return None
+
+
+def _strands_interrupt_to_agui(
+    strands_interrupt: Any,
+    native_to_wire: dict[str, str] | None = None,
+) -> "Interrupt":
     """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
 
     Every Strands interrupt originates from ``tool_context.interrupt()`` or a
@@ -121,12 +135,10 @@ def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
     name = getattr(strands_interrupt, "name", None) or "interrupt"
     raw_reason = getattr(strands_interrupt, "reason", None)
 
-    tool_call_id = None
-    s_id_parts = s_id.split(":") if isinstance(s_id, str) else []
-    if len(s_id_parts) >= 4:
-        # toolUseId is freeform and can itself contain ":" — slice the parts
-        # list to drop only the "v1"/"<kind>" prefix and the trailing uuid.
-        tool_call_id = ":".join(s_id_parts[2:-1])
+    native_tool_call_id = _interrupt_tool_call_id(strands_interrupt)
+    tool_call_id = (native_to_wire or {}).get(
+        native_tool_call_id, native_tool_call_id
+    )
 
     metadata = {"strands_name": name}
     if raw_reason is not None:
@@ -139,6 +151,28 @@ def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
         message=raw_reason if isinstance(raw_reason, str) else None,
         metadata=metadata,
     )
+
+
+def _active_proxy_hook_interrupt_ids(
+    agent: Any, tool_call_meta: dict[str, dict[str, Any]]
+) -> set[str]:
+    """Return native ids for active before-tool-call interrupts on proxies."""
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return set()
+
+    native_ids: set[str] = set()
+    for interrupt in getattr(interrupt_state, "interrupts", {}).values():
+        interrupt_id = getattr(interrupt, "id", "")
+        if not isinstance(interrupt_id, str) or not interrupt_id.startswith(
+            "v1:before_tool_call:"
+        ):
+            continue
+        native_id = _interrupt_tool_call_id(interrupt)
+        metadata = tool_call_meta.get(native_id) if native_id else None
+        if isinstance(metadata, dict) and metadata.get("is_frontend") is True:
+            native_ids.add(native_id)
+    return native_ids
 
 
 def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
@@ -231,7 +265,11 @@ from .a2ui_tool import (
     is_auto_injected_a2ui_tool,
     plan_a2ui_injection,
 )
-from .client_proxy_tool import registered_proxy_tool_names, sync_proxy_tools
+from .client_proxy_tool import (
+    PROXY_RESUME_RESULTS_KEY,
+    registered_proxy_tool_names,
+    sync_proxy_tools,
+)
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
@@ -1141,6 +1179,9 @@ class StrandsAgent:
             active_proxy_native_ids = active_proxy_placeholder_ids(
                 strands_agent, persisted_tool_call_meta
             )
+            active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
+                strands_agent, persisted_tool_call_meta
+            )
             resume_entries = getattr(input_data, "resume", None)
             has_resume_entries = isinstance(resume_entries, list) and resume_entries
             if active_proxy_native_ids:
@@ -1150,6 +1191,9 @@ class StrandsAgent:
                 if not _supports_repository_reconciliation(session_manager):
                     yield _interrupt_session_capability_error()
                     return
+            if session_manager is None and active_proxy_hook_native_ids:
+                yield _interrupt_session_required_error()
+                return
 
             # The durable wire->native map recorded at emission, read back from
             # session state (restored from the store on a fresh process).
@@ -1196,13 +1240,46 @@ class StrandsAgent:
             has_nonvoid_frontend_result = any(
                 (r["text"] or "").strip() for r in frontend_results
             )
-            if session_manager is not None and (
-                self.config.replay_history_into_strands
-                or (has_resume_entries and active_proxy_native_ids)
+            if (
+                session_manager is not None
+                and (
+                    self.config.replay_history_into_strands
+                    or (has_resume_entries and active_proxy_native_ids)
+                )
+            ) or (
+                has_resume_entries and bool(active_proxy_hook_native_ids)
             ):
                 resolved_native_results = resolve_native_ids(
                     wire_to_native, frontend_results
                 )
+
+            # A before-tool hook pauses before the proxy can create a
+            # placeholder, so ordinary repository reconciliation has nothing
+            # to overwrite. Require the client's visible wire result before
+            # resuming; the proxy consumes this map when Strands invokes it.
+            proxy_resume_results: Dict[str, str] = {}
+            proxy_resume_native_ids: set[str] = set()
+            if has_resume_entries and active_proxy_hook_native_ids:
+                missing_hook_results = (
+                    active_proxy_hook_native_ids - resolved_native_results.keys()
+                )
+                if missing_hook_results:
+                    error = ActiveInterruptReconciliationError(missing_hook_results)
+                    logger.error(
+                        "Active proxy hook interrupt is missing mapped frontend "
+                        f"results for native ids {sorted(missing_hook_results)}"
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        message=str(error),
+                        code="INTERRUPT_RECONCILIATION_ERROR",
+                    )
+                    return
+                proxy_resume_results = {
+                    native_id: resolved_native_results[native_id]
+                    for native_id in active_proxy_hook_native_ids
+                }
+                proxy_resume_native_ids = set(proxy_resume_results)
 
             # A native resume consumes and clears the active interrupt context.
             # Refuse to enter Strands unless every exact, provenance-backed
@@ -1408,7 +1485,15 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
-            agent_stream = strands_agent.stream_async(resume_prompt)
+            if proxy_resume_results:
+                agent_stream = strands_agent.stream_async(
+                    resume_prompt,
+                    invocation_state={
+                        PROXY_RESUME_RESULTS_KEY: proxy_resume_results,
+                    },
+                )
+            else:
+                agent_stream = strands_agent.stream_async(resume_prompt)
             try:
                 async for event in agent_stream:
                     # Capture the terminal ``AgentResult`` (always emitted last
@@ -2530,6 +2615,27 @@ class StrandsAgent:
                     # Log other errors but don't fail
                     logger.warning(f"Error closing agent stream: {e}")
 
+            # ``create_proxy_tool`` pops only after the resumed hook allows the
+            # exact native proxy invocation to proceed. Remove the consumed
+            # wire mapping then; an unconsumed override remains retryable.
+            consumed_proxy_resume_ids = (
+                proxy_resume_native_ids - proxy_resume_results.keys()
+            )
+            if consumed_proxy_resume_ids and getattr(
+                strands_agent, "state", None
+            ) is not None:
+                current_wire_map = dict(
+                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+                )
+                remaining_wire_map = {
+                    wire: native
+                    for wire, native in current_wire_map.items()
+                    if native not in consumed_proxy_resume_ids
+                }
+                strands_agent.state.set(
+                    AG_UI_WIRE_MAP_STATE_KEY, remaining_wire_map
+                )
+
             # Close reasoning if still open
             if reasoning_started:
                 yield ReasoningMessageEndEvent(
@@ -2563,10 +2669,13 @@ class StrandsAgent:
                         messages=list(snapshot_messages),
                     )
 
+            active_hook_native_ids = _active_proxy_hook_interrupt_ids(
+                strands_agent, persisted_tool_call_meta
+            )
             # A mixed frontend-proxy/native-interrupt batch parks the proxy's
-            # placeholder inside the live interrupt context. Without durable
-            # reconciliation, resuming that state would feed the placeholder
-            # back into Strands as if it were the client's real result.
+            # placeholder inside the live interrupt context. A proxy hook
+            # pause likewise needs durable wire/native identity before it can
+            # advertise a resumable interrupt.
             if has_active_proxy_placeholder(strands_agent, persisted_tool_call_meta):
                 if session_manager is None:
                     yield _interrupt_session_required_error()
@@ -2574,6 +2683,9 @@ class StrandsAgent:
                 if not _supports_repository_reconciliation(session_manager):
                     yield _interrupt_session_capability_error()
                     return
+            if session_manager is None and active_hook_native_ids:
+                yield _interrupt_session_required_error()
+                return
 
             # Final state snapshot before finishing
             yield StateSnapshotEvent(
@@ -2587,6 +2699,16 @@ class StrandsAgent:
             # bare, exactly as before (no behavior change for normal runs).
             native_interrupts = _extract_interrupts(strands_agent, terminal_result)
             if native_interrupts:
+                latest_wire_map = (
+                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+                    if getattr(strands_agent, "state", None) is not None
+                    else {}
+                )
+                native_to_wire = {
+                    native: wire
+                    for wire, native in latest_wire_map.items()
+                    if native in active_hook_native_ids
+                }
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
                     thread_id=input_data.thread_id,
@@ -2594,7 +2716,8 @@ class StrandsAgent:
                     outcome=RunFinishedInterruptOutcome(
                         type="interrupt",
                         interrupts=[
-                            _strands_interrupt_to_agui(i) for i in native_interrupts
+                            _strands_interrupt_to_agui(i, native_to_wire)
+                            for i in native_interrupts
                         ],
                     ),
                 )

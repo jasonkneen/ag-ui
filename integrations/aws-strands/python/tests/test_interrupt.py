@@ -28,6 +28,8 @@ from ag_ui.core import (
 from strands import Agent as StrandsAgentCore
 from strands import ToolContext, tool
 from strands.agent.state import AgentState
+from strands.hooks import HookProvider
+from strands.hooks.events import BeforeToolCallEvent
 from strands.interrupt import Interrupt as StrandsInterrupt
 from strands.interrupt import _InterruptState
 from strands.models.model import Model as StrandsModel
@@ -535,10 +537,170 @@ class _NonRepositorySessionManager(SessionManager):
         pass
 
 
+class _ProxyHookInterruptFlowModel(StrandsModel):
+    """Turn 1 calls a frontend proxy; turn 2 records the resumed result."""
+
+    def __init__(self):
+        self.turn = 0
+        self.stream_calls_messages = []
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(self, output_model, prompt=None, system_prompt=None, **kwargs):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.turn += 1
+        self.stream_calls_messages.append(copy.deepcopy(messages))
+        if self.turn == 1:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {
+                "contentBlockStart": {
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "native-approve",
+                            "name": "approveTool",
+                        }
+                    }
+                }
+            }
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+        else:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+class _InterruptFrontendProxyHook(HookProvider):
+    """Pause a frontend proxy immediately before Strands invokes it."""
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    @staticmethod
+    def _before_tool_call(event):
+        if event.tool_use["name"] == "approveTool":
+            event.interrupt("approve_proxy", reason="Approve frontend action")
+
+
 def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _InterruptFlowModel]:
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
     return StrandsAgent(core, name="e2e-interrupt", config=config), model
+
+
+@pytest.mark.asyncio
+async def test_frontend_proxy_before_tool_hook_interrupt_uses_wire_id_and_real_result_once(
+    tmp_path,
+):
+    """A proxy hook interrupt remains resumable through client-visible ids."""
+    model = _ProxyHookInterruptFlowModel()
+    core = StrandsAgentCore(model=model, system_prompt="test")
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = StrandsAgent(
+        core,
+        name="proxy-hook-interrupt",
+        config=config,
+        hooks=[_InterruptFrontendProxyHook()],
+    )
+    frontend_tool = Tool(name="approveTool", description="approve", parameters={})
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    interrupt = finished.outcome.interrupts[0]
+    live_core = agent._agents_by_thread["thread-1"]
+    parked_context = copy.deepcopy(live_core._interrupt_state.context)
+    parked_interrupts = copy.deepcopy(live_core._interrupt_state.interrupts)
+
+    with patch.object(
+        live_core, "stream_async", wraps=live_core.stream_async
+    ) as stream_spy:
+        incomplete_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt.id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+                tools=[frontend_tool],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    assert [
+        event.code
+        for event in incomplete_events
+        if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_RECONCILIATION_ERROR"]
+    assert live_core._interrupt_state.context == parked_context
+    assert live_core._interrupt_state.interrupts == parked_interrupts
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            messages=[
+                ToolMessage(
+                    id="t-approve",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content='{"approved": true}',
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    resumed_model_messages = json.dumps(model.stream_calls_messages[-1])
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    assert not any(
+        getattr(event, "tool_call_id", None) == "native-approve"
+        for event in initial_events
+    )
+    assert (
+        interrupt.tool_call_id,
+        resumed_model_messages.count("approved"),
+        "Forwarded to client" in resumed_model_messages,
+    ) == (wire_id, 1, False)
+    assert live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == {}
 
 
 @pytest.mark.asyncio

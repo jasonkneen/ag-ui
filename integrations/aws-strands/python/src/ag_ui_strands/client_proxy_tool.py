@@ -19,6 +19,12 @@ _PROXY_MARKER = "_ag_ui_proxy"
 # on the client and reconciled back in on the following run.
 PROXY_RESULT_PLACEHOLDER = "Forwarded to client"
 
+# Invocation-state key used only when a ``BeforeToolCallEvent`` interrupted a
+# proxy before it could return its placeholder. On resume the client has
+# already executed the visible wire call, so the proxy consumes that real
+# result instead of manufacturing a placeholder after reconciliation ran.
+PROXY_RESUME_RESULTS_KEY = "__ag_ui_proxy_resume_results__"
+
 
 def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
     """Convert an AG-UI ``Tool`` into a Strands ``PythonAgentTool``.
@@ -53,10 +59,15 @@ def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
     }
 
     def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
+        resumed_results = _kwargs.get(PROXY_RESUME_RESULTS_KEY)
+        if isinstance(resumed_results, dict) and tool_use["toolUseId"] in resumed_results:
+            result_text = resumed_results.pop(tool_use["toolUseId"])
+        else:
+            result_text = PROXY_RESULT_PLACEHOLDER
         return {
             "toolUseId": tool_use["toolUseId"],
             "status": "success",
-            "content": [{"text": PROXY_RESULT_PLACEHOLDER}],
+            "content": [{"text": result_text}],
         }
 
     # ToolFunc protocol requires __name__
