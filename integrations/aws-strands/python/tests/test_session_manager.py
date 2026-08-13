@@ -559,10 +559,13 @@ class TestWireToNativeMapCapture:
         )
         with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
             MockCore.return_value = instance
-            await _collect_events(agent, input_data)
+            events = await _collect_events(agent, input_data)
 
+        tool_call_start = next(
+            event for event in events if event.type == EventType.TOOL_CALL_START
+        )
         wire_map = instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-        assert list(wire_map.values()) == ["native-1"]
+        assert wire_map == {tool_call_start.tool_call_id: "native-1"}
 
     @pytest.mark.asyncio
     async def test_wire_map_is_size_capped(self, monkeypatch):
