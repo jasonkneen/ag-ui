@@ -31,7 +31,7 @@ from strands.agent.state import AgentState
 from strands.interrupt import Interrupt as StrandsInterrupt
 from strands.interrupt import _InterruptState
 from strands.models.model import Model as StrandsModel
-from strands.session import FileSessionManager
+from strands.session import FileSessionManager, SessionManager
 
 from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
@@ -519,6 +519,22 @@ class _NativeInterruptFlowModel(StrandsModel):
             yield {"messageStop": {"stopReason": "end_turn"}}
 
 
+class _NonRepositorySessionManager(SessionManager):
+    """Valid Strands session manager without repository-specific attributes."""
+
+    def initialize(self, agent, **kwargs):
+        pass
+
+    def append_message(self, message, agent, **kwargs):
+        pass
+
+    def sync_agent(self, agent, **kwargs):
+        pass
+
+    def redact_latest_message(self, redact_message, agent, **kwargs):
+        pass
+
+
 def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _InterruptFlowModel]:
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
@@ -590,6 +606,151 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
         assert ctx.tool_use_id == "native-confirm"
         assert ctx.tool_input == {"key": "widget-1"}
         assert ctx.args_str == '{"key": "widget-1"}'
+
+
+@pytest.mark.asyncio
+async def test_native_interrupt_resumes_with_non_repository_session_manager():
+    """Native-only resume accepts the public SessionManager ABC contract."""
+    session_manager = _NonRepositorySessionManager()
+    model = _NativeInterruptFlowModel()
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(
+        core,
+        name="native-abc-session-manager",
+        config=StrandsAgentConfig(
+            session_manager_provider=lambda input_data: session_manager
+        ),
+    )
+
+    with patch(
+        "ag_ui_strands.agent.reconcile_frontend_tool_results",
+        side_effect=AssertionError(
+            "native-only resume must not reconcile a repository"
+        ),
+    ) as reconcile_spy:
+        initial_events = await _collect_events(
+            agent,
+            _make_run_input(
+                messages=[UserMessage(id="u1", role="user", content="confirm widget-1")]
+            ),
+        )
+        initial_finished = next(
+            event for event in initial_events if event.type == EventType.RUN_FINISHED
+        )
+        interrupt = initial_finished.outcome.interrupts[0]
+
+        resumed_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt.id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+            ),
+        )
+
+    reconcile_spy.assert_not_called()
+    assert not any(
+        event.type == EventType.RUN_ERROR for event in initial_events + resumed_events
+    )
+    assert any(event.type == EventType.RUN_FINISHED for event in resumed_events)
+    assert model.turn == 2
+
+
+@pytest.mark.asyncio
+async def test_mixed_interrupt_requires_repository_capability_before_outcome_or_resume():
+    """Mixed proxy/native state fails closed for a non-repository manager."""
+    session_manager = _NonRepositorySessionManager()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: session_manager
+    )
+    agent, model = _make_e2e_agent(config)
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+
+    with patch(
+        "ag_ui_strands.agent.reconcile_frontend_tool_results",
+        side_effect=AssertionError("unsafe repository reconciliation was attempted"),
+    ) as reconcile_spy:
+        initial_events = await _collect_events(
+            agent,
+            _make_run_input(
+                messages=[
+                    UserMessage(
+                        id="u1",
+                        role="user",
+                        content="please handle widget-1",
+                    )
+                ],
+                tools=[approve_tool],
+            ),
+        )
+
+        initial_errors = [
+            event for event in initial_events if event.type == EventType.RUN_ERROR
+        ]
+        assert len(initial_errors) == 1
+        assert initial_errors[0].code == "INTERRUPT_SESSION_CAPABILITY_ERROR"
+        assert "repository reconciliation" in initial_errors[0].message
+        assert not any(event.type == EventType.RUN_FINISHED for event in initial_events)
+
+        core = agent._agents_by_thread["thread-1"]
+        interrupt_state = core._interrupt_state
+        parked_context = copy.deepcopy(interrupt_state.context)
+        parked_interrupts = copy.deepcopy(interrupt_state.interrupts)
+        parked_messages = copy.deepcopy(core.messages)
+        wire_map = copy.deepcopy(core.state.get(AG_UI_WIRE_MAP_STATE_KEY))
+        tool_metadata = copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY))
+        frontend_wire_id = next(
+            event.tool_call_id
+            for event in initial_events
+            if event.type == EventType.TOOL_CALL_START
+            and event.tool_call_name == "approveTool"
+        )
+        interrupt_id = next(iter(parked_interrupts))
+
+        with patch.object(core, "stream_async", wraps=core.stream_async) as stream_spy:
+            resumed_events = await _collect_events(
+                agent,
+                _make_run_input(
+                    run_id="run-2",
+                    messages=[
+                        ToolMessage(
+                            id="t-fe",
+                            role="tool",
+                            tool_call_id=frontend_wire_id,
+                            content='{"approved": true}',
+                        )
+                    ],
+                    resume=[
+                        ResumeEntry(
+                            interrupt_id=interrupt_id,
+                            status="resolved",
+                            payload=True,
+                        )
+                    ],
+                    tools=[approve_tool],
+                ),
+            )
+
+    reconcile_spy.assert_not_called()
+    stream_spy.assert_not_called()
+    resumed_errors = [
+        event for event in resumed_events if event.type == EventType.RUN_ERROR
+    ]
+    assert len(resumed_errors) == 1
+    assert resumed_errors[0].code == "INTERRUPT_SESSION_CAPABILITY_ERROR"
+    assert not any(event.type == EventType.RUN_FINISHED for event in resumed_events)
+    assert model.turn == 1
+    assert interrupt_state.activated
+    assert interrupt_state.context == parked_context
+    assert interrupt_state.interrupts == parked_interrupts
+    assert core.messages == parked_messages
+    assert core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == wire_map
+    assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
 
 
 @pytest.mark.asyncio

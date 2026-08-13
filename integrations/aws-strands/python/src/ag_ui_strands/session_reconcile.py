@@ -11,7 +11,7 @@ persisted placeholder by native id and overwrite it with the real result.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Protocol
 
 from .client_proxy_tool import PROXY_RESULT_PLACEHOLDER
 
@@ -30,6 +30,42 @@ AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 # ``tool_behaviors`` gate + the frontend-placeholder skip) for the resumed
 # tool. Namespaced to avoid clashing with user-managed state keys.
 AG_UI_TOOL_CALL_MAP_STATE_KEY = "__ag_ui_tool_call_map__"
+
+
+class _SessionRepository(Protocol):
+    def list_messages(self, session_id: str, agent_id: str) -> Iterable[Any]: ...
+
+    def update_message(
+        self, session_id: str, agent_id: str, session_message: Any
+    ) -> None: ...
+
+
+class _RepositoryReconciliationSessionManager(Protocol):
+    """Structural capability required to rewrite persisted tool results."""
+
+    @property
+    def session_id(self) -> str: ...
+
+    @property
+    def session_repository(self) -> _SessionRepository: ...
+
+
+def _supports_repository_reconciliation(session_manager: Any) -> bool:
+    """Return whether a session manager exposes the repository rewrite API."""
+    if session_manager is None:
+        return False
+    try:
+        session_id = session_manager.session_id
+        repository = session_manager.session_repository
+    except (AttributeError, TypeError):
+        # Capability absence is expected for the public SessionManager ABC;
+        # mixed-state callers convert False into a structured RUN_ERROR.
+        return False
+    return (
+        isinstance(session_id, str)
+        and callable(getattr(repository, "list_messages", None))
+        and callable(getattr(repository, "update_message", None))
+    )
 
 
 class ActiveInterruptReconciliationError(RuntimeError):
@@ -70,7 +106,7 @@ def resolve_native_ids(
 
 
 def reconcile_frontend_tool_results(
-    session_manager: Any,
+    session_manager: _RepositoryReconciliationSessionManager,
     agent: Any,
     pending_results: Mapping[str, str],
 ) -> set[str]:

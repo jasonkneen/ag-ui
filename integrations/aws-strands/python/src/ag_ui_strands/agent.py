@@ -178,6 +178,18 @@ def _interrupt_session_required_error() -> "RunErrorEvent":
     )
 
 
+def _interrupt_session_capability_error() -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "Mixed frontend/native interrupt state requires repository reconciliation; "
+            "the configured SessionManager must expose session_id and a "
+            "session_repository with list_messages() and update_message()"
+        ),
+        code="INTERRUPT_SESSION_CAPABILITY_ERROR",
+    )
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
@@ -224,6 +236,7 @@ from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     ActiveInterruptReconciliationError,
+    _supports_repository_reconciliation,
     active_proxy_placeholder_ids,
     has_active_proxy_placeholder,
     has_placeholder_results,
@@ -1130,9 +1143,13 @@ class StrandsAgent:
             )
             resume_entries = getattr(input_data, "resume", None)
             has_resume_entries = isinstance(resume_entries, list) and resume_entries
-            if session_manager is None and active_proxy_native_ids:
-                yield _interrupt_session_required_error()
-                return
+            if active_proxy_native_ids:
+                if session_manager is None:
+                    yield _interrupt_session_required_error()
+                    return
+                if not _supports_repository_reconciliation(session_manager):
+                    yield _interrupt_session_capability_error()
+                    return
 
             # The durable wire->native map recorded at emission, read back from
             # session state (restored from the store on a fresh process).
@@ -1226,22 +1243,22 @@ class StrandsAgent:
             replay_history = (
                 self.config.replay_history_into_strands and session_manager is None
             )
-            # An active interrupt means a sibling frontend tool's placeholder may
-            # be stashed in ``_interrupt_state.context["tool_results"]``; reconcile
-            # even when this turn's frontend result is void, since that stash has
-            # no other correction path and is destroyed once the interrupt resumes.
+            # An exact active proxy placeholder may be stashed in
+            # ``_interrupt_state.context["tool_results"]``; reconcile even when
+            # this turn's frontend result is void, since that stash has no other
+            # correction path and is destroyed once the interrupt resumes. A
+            # native-only active interrupt needs no repository access.
             has_active_interrupt = bool(
                 getattr(getattr(strands_agent, "_interrupt_state", None), "activated", False)
             )
-            reconcile_session_results = (
-                session_manager is not None
-                and (
-                    (
-                        self.config.replay_history_into_strands
-                        and (has_nonvoid_frontend_result or has_active_interrupt)
-                    )
-                    or (has_resume_entries and bool(active_proxy_native_ids))
+            reconcile_session_results = _supports_repository_reconciliation(
+                session_manager
+            ) and (
+                (
+                    self.config.replay_history_into_strands
+                    and (has_nonvoid_frontend_result or bool(active_proxy_native_ids))
                 )
+                or (has_resume_entries and bool(active_proxy_native_ids))
             )
 
             # Default prompt: the legacy path, passing only the latest user
@@ -2550,11 +2567,13 @@ class StrandsAgent:
             # placeholder inside the live interrupt context. Without durable
             # reconciliation, resuming that state would feed the placeholder
             # back into Strands as if it were the client's real result.
-            if session_manager is None and has_active_proxy_placeholder(
-                strands_agent, persisted_tool_call_meta
-            ):
-                yield _interrupt_session_required_error()
-                return
+            if has_active_proxy_placeholder(strands_agent, persisted_tool_call_meta):
+                if session_manager is None:
+                    yield _interrupt_session_required_error()
+                    return
+                if not _supports_repository_reconciliation(session_manager):
+                    yield _interrupt_session_capability_error()
+                    return
 
             # Final state snapshot before finishing
             yield StateSnapshotEvent(
