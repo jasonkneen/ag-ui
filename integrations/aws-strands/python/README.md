@@ -93,8 +93,11 @@ interrupt round-trip:
   `Interrupt` per reported Strands interrupt. Native interrupts use the AG-UI
   reason `tool_call`; the Strands name and free-form reason are preserved in
   JSON-safe form as `metadata.strands_name` and `metadata.strands_reason`.
-  JSON-native values remain unchanged, while `bytes` use Strands' deterministic
-  base64 marker (`{"__bytes_encoded__": true, "data": "..."}`).
+  Ordinary JSON-native values remain unchanged. String mapping keys in the
+  adapter-reserved `__ag_ui_key_v1__:` namespace, along with non-UTF-8-safe
+  string keys, are escaped injectively using that scheme, while `bytes` use
+  Strands' deterministic base64 marker
+  (`{"__bytes_encoded__": true, "data": "..."}`).
 - To resume, the client sends the next `RunAgentInput` on the same `thread_id`
   with `resume=[ResumeEntry(interrupt_id=..., status="resolved", payload=...)]`.
   Strands' resume gate is truthiness-based (`if interrupt_.response:`), so a
