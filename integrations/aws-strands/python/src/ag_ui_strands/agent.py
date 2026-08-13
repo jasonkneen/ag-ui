@@ -8,6 +8,7 @@ import base64
 import inspect
 import json
 import logging
+import math
 import uuid
 from typing import Any, AsyncIterator, Dict, List
 
@@ -114,6 +115,121 @@ def _interrupt_tool_call_id(strands_interrupt: Any) -> str | None:
     return None
 
 
+_INTERRUPT_METADATA_MAX_DEPTH = 20
+
+
+def _wire_safe_text(value: str) -> str:
+    """Return UTF-8-safe text, escaping lone surrogate code points."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return value
+
+
+def _stable_json_sort_key(value: Any) -> str:
+    """Return a canonical key for values already normalized for JSON."""
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _interrupt_metadata_to_json_safe(
+    value: Any,
+    *,
+    _ancestors: frozenset[int] = frozenset(),
+    _depth: int = 0,
+) -> Any:
+    """Normalize free-form Strands interrupt details for the AG-UI wire.
+
+    JSON-native values are retained. Bytes use Strands' session serialization
+    marker, unordered containers are canonically sorted, and opaque objects
+    retain only their qualified type (never their address-bearing ``repr``).
+    Container recursion is cycle-safe and depth-bounded.
+    """
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is float:
+        if math.isfinite(value):
+            return value
+        if math.isnan(value):
+            label = "nan"
+        elif value > 0:
+            label = "infinity"
+        else:
+            label = "-infinity"
+        return {"__ag_ui_type__": "non_finite_float", "value": label}
+    if type(value) is str:
+        return _wire_safe_text(value)
+    if type(value) is bytes:
+        return {
+            "__bytes_encoded__": True,
+            "data": base64.b64encode(value).decode("ascii"),
+        }
+
+    if _depth >= _INTERRUPT_METADATA_MAX_DEPTH:
+        return {"__ag_ui_type__": "max_depth_exceeded"}
+
+    if type(value) in (dict, list, tuple, set, frozenset):
+        identity = id(value)
+        if identity in _ancestors:
+            return {"__ag_ui_type__": "circular_reference"}
+        descendants = _ancestors | {identity}
+
+        if type(value) is dict:
+            if all(type(key) is str for key in value):
+                return {
+                    _wire_safe_text(key): _interrupt_metadata_to_json_safe(
+                        item,
+                        _ancestors=descendants,
+                        _depth=_depth + 1,
+                    )
+                    for key, item in value.items()
+                }
+            entries = [
+                [
+                    _interrupt_metadata_to_json_safe(
+                        key,
+                        _ancestors=descendants,
+                        _depth=_depth + 1,
+                    ),
+                    _interrupt_metadata_to_json_safe(
+                        item,
+                        _ancestors=descendants,
+                        _depth=_depth + 1,
+                    ),
+                ]
+                for key, item in value.items()
+            ]
+            entries.sort(key=_stable_json_sort_key)
+            return {"__ag_ui_type__": "mapping", "items": entries}
+
+        normalized_items = [
+            _interrupt_metadata_to_json_safe(
+                item,
+                _ancestors=descendants,
+                _depth=_depth + 1,
+            )
+            for item in value
+        ]
+        if type(value) in (set, frozenset):
+            normalized_items.sort(key=_stable_json_sort_key)
+            return {
+                "__ag_ui_type__": "set" if type(value) is set else "frozenset",
+                "items": normalized_items,
+            }
+        return normalized_items
+
+    value_type = type(value)
+    return {
+        "__ag_ui_type__": "python_object",
+        "type": _wire_safe_text(f"{value_type.__module__}.{value_type.__qualname__}"),
+    }
+
+
 def _strands_interrupt_to_agui(
     strands_interrupt: Any,
     native_to_wire: dict[str, str] | None = None,
@@ -126,10 +242,10 @@ def _strands_interrupt_to_agui(
     tool-call-bound. This maps onto AG-UI's reserved ``reason="tool_call"``
     core value, with ``tool_call_id`` extracted from the id.
 
-    Strands' free-form ``name`` and ``reason`` are preserved verbatim under
-    ``metadata`` (``strands_name`` / ``strands_reason``) so no information is
-    lost on the wire; ``message`` additionally carries ``reason`` when it is a
-    plain string, since AG-UI clients render ``message`` directly.
+    Strands' free-form ``name`` and ``reason`` are preserved under ``metadata``
+    (``strands_name`` / ``strands_reason``), normalized into deterministic,
+    JSON-safe values. ``message`` additionally carries a UTF-8-safe ``reason``
+    when it is a plain string, since AG-UI clients render ``message`` directly.
     """
     s_id = getattr(strands_interrupt, "id", "")
     name = getattr(strands_interrupt, "name", None) or "interrupt"
@@ -140,15 +256,15 @@ def _strands_interrupt_to_agui(
         native_tool_call_id, native_tool_call_id
     )
 
-    metadata = {"strands_name": name}
+    metadata = {"strands_name": _interrupt_metadata_to_json_safe(name)}
     if raw_reason is not None:
-        metadata["strands_reason"] = raw_reason
+        metadata["strands_reason"] = _interrupt_metadata_to_json_safe(raw_reason)
 
     return Interrupt(
         id=s_id,
         tool_call_id=tool_call_id,
         reason="tool_call",
-        message=raw_reason if isinstance(raw_reason, str) else None,
+        message=_wire_safe_text(raw_reason) if type(raw_reason) is str else None,
         metadata=metadata,
     )
 

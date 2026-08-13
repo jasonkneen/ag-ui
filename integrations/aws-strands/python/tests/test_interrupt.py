@@ -25,6 +25,7 @@ from ag_ui.core import (
     ToolMessage,
     UserMessage,
 )
+from ag_ui.encoder import EventEncoder
 from strands import Agent as StrandsAgentCore
 from strands import ToolContext, tool
 from strands.agent.state import AgentState
@@ -88,6 +89,14 @@ def _make_base_agent() -> StrandsAgent:
 
 
 _UNSET = object()
+
+
+class _OpaqueInterruptDetail:
+    """Non-serializable detail with the default address-bearing repr."""
+
+
+_CYCLIC_INTERRUPT_DETAIL = {}
+_CYCLIC_INTERRUPT_DETAIL["self"] = _CYCLIC_INTERRUPT_DETAIL
 
 
 class _MockStrandsCore:
@@ -168,6 +177,166 @@ class TestInterruptOutcome:
             "strands_name": "confirm",
             "strands_reason": {"summary": "delete all"},
         }
+
+    @pytest.mark.parametrize("session_backed", [False, True])
+    @pytest.mark.parametrize(
+        ("reason", "expected_reason", "expected_message"),
+        [
+            pytest.param(
+                b"\xff\xfe",
+                {"__bytes_encoded__": True, "data": "//4="},
+                None,
+                id="invalid-utf8-bytes",
+            ),
+            pytest.param(
+                {"choices": {"beta", "alpha"}},
+                {
+                    "choices": {
+                        "__ag_ui_type__": "set",
+                        "items": ["alpha", "beta"],
+                    }
+                },
+                None,
+                id="set",
+            ),
+            pytest.param(
+                _OpaqueInterruptDetail(),
+                {
+                    "__ag_ui_type__": "python_object",
+                    "type": (
+                        f"{_OpaqueInterruptDetail.__module__}."
+                        f"{_OpaqueInterruptDetail.__qualname__}"
+                    ),
+                },
+                None,
+                id="custom-object",
+            ),
+            pytest.param(
+                {
+                    "details": [
+                        b"\x00\xff",
+                        {3, 1, 2},
+                        _OpaqueInterruptDetail(),
+                    ]
+                },
+                {
+                    "details": [
+                        {"__bytes_encoded__": True, "data": "AP8="},
+                        {"__ag_ui_type__": "set", "items": [1, 2, 3]},
+                        {
+                            "__ag_ui_type__": "python_object",
+                            "type": (
+                                f"{_OpaqueInterruptDetail.__module__}."
+                                f"{_OpaqueInterruptDetail.__qualname__}"
+                            ),
+                        },
+                    ]
+                },
+                None,
+                id="nested-non-json-values",
+            ),
+            pytest.param(
+                {"summary": "delete all", "attempt": 2, "approved": False},
+                {"summary": "delete all", "attempt": 2, "approved": False},
+                None,
+                id="ordinary-dict",
+            ),
+            pytest.param(
+                "Approve deletion",
+                "Approve deletion",
+                "Approve deletion",
+                id="ordinary-string",
+            ),
+            pytest.param(
+                "invalid\udcffunicode",
+                "invalid\\udcffunicode",
+                "invalid\\udcffunicode",
+                id="invalid-unicode-string",
+            ),
+            pytest.param(
+                _CYCLIC_INTERRUPT_DETAIL,
+                {"self": {"__ag_ui_type__": "circular_reference"}},
+                None,
+                id="circular-container",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_interrupt_metadata_is_wire_safe(
+        self,
+        tmp_path,
+        session_backed,
+        reason,
+        expected_reason,
+        expected_message,
+    ):
+        """Native terminal outcomes remain serializable through the SSE boundary."""
+        strands_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+            reason=reason,
+        )
+        session_manager = (
+            FileSessionManager(session_id="thread-1", storage_dir=str(tmp_path))
+            if session_backed
+            else None
+        )
+        core = _MockStrandsCore(
+            terminal_events=[
+                {"result": _agent_result_with_interrupt([strands_interrupt])}
+            ],
+            interrupts=[strands_interrupt],
+            session_manager=session_manager,
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input())
+
+        finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
+        model_payload = json.loads(
+            finished.model_dump_json(by_alias=True, exclude_none=True)
+        )
+        encoded = EventEncoder().encode(finished)
+        assert encoded.startswith("data: ") and encoded.endswith("\n\n")
+        sse_payload = json.loads(encoded.removeprefix("data: ").removesuffix("\n\n"))
+        assert sse_payload == model_payload
+
+        [wire_interrupt] = sse_payload["outcome"]["interrupts"]
+        assert wire_interrupt["reason"] == "tool_call"
+        assert wire_interrupt.get("message") == expected_message
+        assert wire_interrupt["metadata"] == {
+            "strands_name": "confirm",
+            "strands_reason": expected_reason,
+        }
+        assert "0x" not in json.dumps(wire_interrupt["metadata"])
+
+    @pytest.mark.asyncio
+    async def test_interrupt_metadata_normalization_is_depth_bounded(self):
+        reason = {"leaf": "diagnostic"}
+        for _ in range(30):
+            reason = {"nested": reason}
+        strands_interrupt = StrandsInterrupt(
+            id="v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000",
+            name="confirm",
+            reason=reason,
+        )
+        core = _MockStrandsCore(
+            terminal_events=[
+                {"result": _agent_result_with_interrupt([strands_interrupt])}
+            ],
+            interrupts=[strands_interrupt],
+            session_manager=None,
+        )
+        agent = _make_base_agent()
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect_events(agent, _make_run_input())
+
+        finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
+        encoded = EventEncoder().encode(finished)
+        assert '"__ag_ui_type__":"max_depth_exceeded"' in encoded
+        assert "diagnostic" not in encoded
 
     @pytest.mark.asyncio
     async def test_terminal_result_captured_despite_halt_in_same_cycle(self):
