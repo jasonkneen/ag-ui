@@ -39,7 +39,11 @@ from strands.interrupt import _InterruptState
 from strands.models.model import Model as StrandsModel
 from strands.session import FileSessionManager, SessionManager
 
-from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
+from ag_ui_strands.agent import (
+    INTERRUPT_CANCELLED,
+    StrandsAgent,
+    _interrupt_metadata_to_json_safe,
+)
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 from ag_ui_strands.session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
@@ -148,6 +152,78 @@ def _agent_result_with_interrupt(interrupts):
 
 
 class TestInterruptOutcome:
+    def test_interrupt_metadata_mapping_keys_are_injective(self):
+        normalized = _interrupt_metadata_to_json_safe(
+            {
+                "bad\udcffkey": "surrogate-value",
+                "bad\\udcffkey": "literal-value",
+            }
+        )
+
+        assert normalized == {
+            "__ag_ui_key_v1__:s:YmFk7bO_a2V5": "surrogate-value",
+            "bad\\udcffkey": "literal-value",
+        }
+
+    def test_interrupt_metadata_mapping_key_namespace_cannot_be_spoofed(self):
+        normalized = _interrupt_metadata_to_json_safe(
+            {
+                "bad\udcffkey": "surrogate-value",
+                "__ag_ui_key_v1__:s:YmFk7bO_a2V5": "spoof-value",
+                "__ag_ui_key_v1__:literal": "reserved-value",
+            }
+        )
+
+        assert normalized == {
+            "__ag_ui_key_v1__:s:YmFk7bO_a2V5": "surrogate-value",
+            (
+                "__ag_ui_key_v1__:v:"
+                "X19hZ191aV9rZXlfdjFfXzpzOlltRms3Yk9fYTJWNQ"
+            ): "spoof-value",
+            (
+                "__ag_ui_key_v1__:v:"
+                "X19hZ191aV9rZXlfdjFfXzpsaXRlcmFs"
+            ): "reserved-value",
+        }
+
+    def test_interrupt_metadata_preserves_normal_string_mapping_shape(self):
+        reason = {
+            "plain": "value",
+            "café": {"東京": "値"},
+        }
+
+        assert _interrupt_metadata_to_json_safe(reason) == reason
+
+    def test_interrupt_metadata_encodes_string_keys_in_mixed_mappings(self):
+        normalized = _interrupt_metadata_to_json_safe(
+            {
+                "ordinary": "plain-value",
+                "bad\udcffkey": "surrogate-key-value",
+                7: "integer-key-value",
+            }
+        )
+
+        assert normalized["__ag_ui_type__"] == "mapping"
+        assert ["ordinary", "plain-value"] in normalized["items"]
+        assert [
+            "__ag_ui_key_v1__:s:YmFk7bO_a2V5",
+            "surrogate-key-value",
+        ] in normalized["items"]
+        assert [7, "integer-key-value"] in normalized["items"]
+
+    def test_interrupt_metadata_scalar_strings_keep_existing_normalization(self):
+        normalized = _interrupt_metadata_to_json_safe(
+            {
+                "surrogate": "bad\udcffvalue",
+                "reserved": "__ag_ui_key_v1__:literal",
+            }
+        )
+
+        assert normalized == {
+            "surrogate": "bad\\udcffvalue",
+            "reserved": "__ag_ui_key_v1__:literal",
+        }
+
     @pytest.mark.asyncio
     async def test_pause_emits_interrupt_outcome(self):
         """A native interrupt produces RUN_FINISHED with an interrupt outcome."""
@@ -644,6 +720,19 @@ def native_placeholder() -> str:
     return "Forwarded to client"
 
 
+@tool(context=True)
+def interrupt_with_colliding_metadata(tool_context: ToolContext) -> str:
+    tool_context.interrupt(
+        "collision",
+        reason={
+            "bad\udcffkey": "surrogate-value",
+            "bad\\udcffkey": "literal-value",
+            "__ag_ui_key_v1__:literal": "reserved-value",
+        },
+    )
+    return "resumed"
+
+
 class _InterruptFlowModel(StrandsModel):
     """Turn 1 calls a sibling tool and an interrupting native tool together."""
 
@@ -748,6 +837,38 @@ class _NativeInterruptFlowModel(StrandsModel):
             yield {"contentBlockDelta": {"delta": {"text": "Done."}}}
             yield {"contentBlockStop": {}}
             yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+class _MetadataInterruptFlowModel(StrandsModel):
+    """Call the real metadata interrupt tool once."""
+
+    def get_config(self):
+        return {}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(
+        self, output_model, prompt=None, system_prompt=None, **kwargs
+    ):
+        raise NotImplementedError
+        yield  # pragma: no cover — make this an async generator
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        yield {"messageStart": {"role": "assistant"}}
+        yield {
+            "contentBlockStart": {
+                "start": {
+                    "toolUse": {
+                        "toolUseId": "native-metadata",
+                        "name": "interrupt_with_colliding_metadata",
+                    }
+                }
+            }
+        }
+        yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+        yield {"contentBlockStop": {}}
+        yield {"messageStop": {"stopReason": "tool_use"}}
 
 
 class _NonRepositorySessionManager(SessionManager):
@@ -938,6 +1059,36 @@ def _assert_atomic_resume_error(events: list) -> None:
     assert len(errors) == 1
     assert errors[0].code == "INTERRUPT_RESUME_ERROR"
     assert not any(event.type == EventType.RUN_FINISHED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_real_interrupt_metadata_mapping_keys_survive_event_encoding():
+    core = StrandsAgentCore(
+        model=_MetadataInterruptFlowModel(),
+        tools=[interrupt_with_colliding_metadata],
+        system_prompt="test",
+    )
+    agent = StrandsAgent(core, name="metadata-collision")
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="interrupt")]
+        ),
+    )
+
+    finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
+    encoded = EventEncoder().encode(finished)
+    payload = json.loads(encoded.removeprefix("data: ").removesuffix("\n\n"))
+    [wire_interrupt] = payload["outcome"]["interrupts"]
+    assert wire_interrupt["metadata"]["strands_reason"] == {
+        "__ag_ui_key_v1__:s:YmFk7bO_a2V5": "surrogate-value",
+        "bad\\udcffkey": "literal-value",
+        (
+            "__ag_ui_key_v1__:v:"
+            "X19hZ191aV9rZXlfdjFfXzpsaXRlcmFs"
+        ): "reserved-value",
+    }
 
 
 @pytest.mark.asyncio

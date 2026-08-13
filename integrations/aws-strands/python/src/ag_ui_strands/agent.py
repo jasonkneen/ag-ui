@@ -116,6 +116,7 @@ def _interrupt_tool_call_id(strands_interrupt: Any) -> str | None:
 
 
 _INTERRUPT_METADATA_MAX_DEPTH = 20
+_INTERRUPT_METADATA_KEY_PREFIX = "__ag_ui_key_v1__:"
 
 
 def _wire_safe_text(value: str) -> str:
@@ -125,6 +126,22 @@ def _wire_safe_text(value: str) -> str:
     except UnicodeEncodeError:
         return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
     return value
+
+
+def _wire_safe_mapping_key(value: str) -> str:
+    """Encode mapping keys injectively while retaining ordinary UTF-8 keys."""
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        tag = "s:"
+    else:
+        if not value.startswith(_INTERRUPT_METADATA_KEY_PREFIX):
+            return value
+        tag = "v:"
+
+    payload = base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+    return f"{_INTERRUPT_METADATA_KEY_PREFIX}{tag}{payload}"
 
 
 def _stable_json_sort_key(value: Any) -> str:
@@ -182,7 +199,7 @@ def _interrupt_metadata_to_json_safe(
         if type(value) is dict:
             if all(type(key) is str for key in value):
                 return {
-                    _wire_safe_text(key): _interrupt_metadata_to_json_safe(
+                    _wire_safe_mapping_key(key): _interrupt_metadata_to_json_safe(
                         item,
                         _ancestors=descendants,
                         _depth=_depth + 1,
@@ -191,10 +208,14 @@ def _interrupt_metadata_to_json_safe(
                 }
             entries = [
                 [
-                    _interrupt_metadata_to_json_safe(
-                        key,
-                        _ancestors=descendants,
-                        _depth=_depth + 1,
+                    (
+                        _wire_safe_mapping_key(key)
+                        if type(key) is str
+                        else _interrupt_metadata_to_json_safe(
+                            key,
+                            _ancestors=descendants,
+                            _depth=_depth + 1,
+                        )
                     ),
                     _interrupt_metadata_to_json_safe(
                         item,
