@@ -2075,7 +2075,7 @@ class StrandsAgent:
             )
             return
 
-        if selected_proxy_hook_native_ids or pending_state_present:
+        if staged_pending_proxy_state is not None or pending_state_present:
             proxy_hook_boundary = self._proxy_hook_boundaries_by_thread.get(
                 thread_id
             )

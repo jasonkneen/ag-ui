@@ -4014,6 +4014,169 @@ async def test_proxy_hook_and_native_sibling_interrupts_are_both_advertised(
     assert by_name["approve_proxy"].tool_call_id == wire_id
     assert by_name["confirm_action"].tool_call_id == "native-confirm"
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recreate_wrapper", [False, True])
+@pytest.mark.parametrize(
+    ("client_content", "client_error", "expected_status", "expected_text"),
+    [
+        pytest.param(
+            "CLIENT-PROXY-RESULT",
+            None,
+            "success",
+            "CLIENT-PROXY-RESULT",
+            id="success",
+        ),
+        pytest.param("", "boom", "error", "boom", id="blank-failure"),
+    ],
+)
+async def test_native_only_resume_persists_unselected_proxy_result_for_later_resume(
+    tmp_path,
+    recreate_wrapper,
+    client_content,
+    client_error,
+    expected_status,
+    expected_text,
+):
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+
+    def make_agent(model):
+        return StrandsAgent(
+            StrandsAgentCore(
+                model=model,
+                tools=[confirm_action],
+                system_prompt="test",
+                agent_id="proxy-hook-agent",
+            ),
+            name="mixed-proxy-native-persistence",
+            config=config,
+            hooks=[_MutatingFrontendProxyHook("none")],
+        )
+
+    model = _InterruptFlowModel()
+    agent = make_agent(model)
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="run both")],
+            tools=[frontend_tool],
+        ),
+    )
+    initial_finished = next(
+        event for event in initial if event.type == EventType.RUN_FINISHED
+    )
+    interrupts = {
+        interrupt.metadata["strands_name"]: interrupt
+        for interrupt in initial_finished.outcome.interrupts
+    }
+    wire_id = next(
+        event.tool_call_id
+        for event in initial
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+
+    native_resumed = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-proxy-result",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content=client_content,
+                    error=client_error,
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupts["confirm_action"].id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in native_resumed)
+    native_finished = next(
+        event
+        for event in native_resumed
+        if event.type == EventType.RUN_FINISHED
+    )
+    assert [
+        interrupt.metadata["strands_name"]
+        for interrupt in native_finished.outcome.interrupts
+    ] == ["approve_proxy"]
+    live_core = agent._agents_by_thread["thread-1"]
+    assert live_core.state.get(AG_UI_PENDING_PROXY_RESULTS_STATE_KEY) == {
+        "version": 1,
+        "records": {
+            "native-approve": {
+                "wire_tool_call_id": wire_id,
+                "content": client_content,
+                "status": expected_status,
+                "error": client_error,
+            }
+        },
+    }
+    assert model.turn == 1
+
+    if recreate_wrapper:
+        model = _InterruptFlowModel()
+        model.turn = 1
+        agent = make_agent(model)
+
+    proxy_resumed = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupts["approve_proxy"].id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in proxy_resumed)
+    proxy_finished = next(
+        event
+        for event in proxy_resumed
+        if event.type == EventType.RUN_FINISHED
+    )
+    assert proxy_finished.outcome is None
+    live_core = agent._agents_by_thread["thread-1"]
+    observed = [
+        block["toolResult"]
+        for message in model.stream_calls_messages[-1]
+        for block in message.get("content", [])
+        if block.get("toolResult", {}).get("toolUseId") == "native-approve"
+    ]
+    assert observed == [
+        {
+            "toolUseId": "native-approve",
+            "status": expected_status,
+            "content": [{"text": expected_text}],
+        }
+    ]
+    assert model.turn == 2
+    assert AG_UI_PENDING_PROXY_RESULTS_STATE_KEY not in live_core.state.get()
+    assert wire_id not in live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+
 @pytest.mark.asyncio
 async def test_async_parallel_proxy_hook_aliases_remain_call_exact(tmp_path):
     """Concurrent finalizers accept sibling records and never cross results."""
