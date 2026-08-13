@@ -692,7 +692,7 @@ class TestSessionFrontendToolReconciliation:
                 _store_placeholder("native-2"),
             ],
         )
-        assert instance.stream_prompts != [None]
+        assert instance.stream_prompts == ["setColor returned: ok"]
         assert _result_content(sm, "default", 1)[0]["toolResult"]["content"] == [
             {"text": "Forwarded to client"}
         ]
@@ -952,7 +952,9 @@ class TestSessionFrontendToolReconciliation:
                 ],
             )
 
-        assert instance.stream_prompts != [None]  # legacy fallback on error
+        assert instance.stream_prompts == [
+            'approve returned: {"approved": true}'
+        ]  # legacy fallback on error
         remaining = instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
         assert remaining == {"wire-1": "native-1"}  # entry kept for retry
 
@@ -993,7 +995,9 @@ class TestSessionFrontendToolReconciliation:
             wire_map={},  # nothing recorded -> unresolvable
             store=store,
         )
-        assert instance.stream_prompts != [None]  # unresolvable -> legacy
+        assert instance.stream_prompts == [
+            "approve returned: R1\napprove returned: R2"
+        ]  # unresolvable -> legacy
         results = sm.session_repository.list_messages(sm.session_id, "default")[1].message[
             "content"
         ]
