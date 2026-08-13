@@ -317,6 +317,14 @@ def _proxy_hook_provenance_value(
     if set(records) != managed_ids or not all(
         isinstance(interrupt_id, str)
         and isinstance(record, dict)
+        and set(record)
+        == {
+            "original_native_tool_call_id",
+            "wire_tool_call_id",
+            "name",
+            "input",
+            "tool_spec",
+        }
         and isinstance(record.get("original_native_tool_call_id"), str)
         and isinstance(record.get("wire_tool_call_id"), str)
         and isinstance(record.get("name"), str)
@@ -1155,6 +1163,8 @@ def _validate_active_proxy_hook_provenance(
         or getattr(interrupt_state, "activated", False) is not True
     ):
         return None
+    if not isinstance(tool_call_meta, dict):
+        return _proxy_hook_error({"tool_call_metadata"})
     present, managed_ids, records = _proxy_hook_provenance_value(agent)
     if present and (managed_ids is None or records is None):
         return _proxy_hook_error()
@@ -1873,11 +1883,13 @@ class StrandsAgent:
         # ``BeforeToolCallEvent`` pause parks the exact native proxy invocation
         # for re-execution, so an omitted ``RunAgentInput.tools`` list must not
         # delete that marked proxy before Strands consumes its resume override.
-        persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
+        persisted_tool_call_meta: Any = {}
         _agent_state = getattr(strands_agent, "state", None)
-        if _agent_state is not None:
-            persisted_tool_call_meta = (
-                _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+        if _agent_state is not None and _agent_state_key_present(
+            strands_agent, AG_UI_TOOL_CALL_MAP_STATE_KEY
+        ):
+            persisted_tool_call_meta = _agent_state.get(
+                AG_UI_TOOL_CALL_MAP_STATE_KEY
             )
         provenance_error = _validate_active_proxy_hook_provenance(
             strands_agent, persisted_tool_call_meta
@@ -1893,6 +1905,26 @@ class StrandsAgent:
         pending_proxy_hook_native_ids = _pending_proxy_hook_native_ids(
             strands_agent, persisted_tool_call_meta
         )
+        session_manager = _get_strands_session_manager(strands_agent)
+        active_proxy_native_ids = active_proxy_placeholder_ids(
+            strands_agent, persisted_tool_call_meta
+        )
+        session_capability_error = None
+        if active_proxy_native_ids:
+            if session_manager is None:
+                session_capability_error = _interrupt_session_required_error()
+            elif not _supports_repository_reconciliation(session_manager):
+                session_capability_error = _interrupt_session_capability_error()
+        if session_manager is None and pending_proxy_hook_native_ids:
+            session_capability_error = _interrupt_session_required_error()
+        if session_capability_error is not None:
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+            yield session_capability_error
+            return
         selected_proxy_hook_native_ids: set[str] = set()
         retained_checkpoint_proxy_names: set[str] = set()
         proxy_resume_results: Dict[str, _FrontendToolResult] = {}
@@ -1988,12 +2020,11 @@ class StrandsAgent:
                 else {}
             )
             prior_pending: dict[str, PendingProxyResult] = {}
-            state_store = getattr(
-                getattr(strands_agent, "state", None), "_state", None
-            )
             pending_state_present = bool(
-                isinstance(state_store, dict)
-                and AG_UI_PENDING_PROXY_RESULTS_STATE_KEY in state_store
+                pending_proxy_hook_native_ids
+                and _agent_state_key_present(
+                    strands_agent, AG_UI_PENDING_PROXY_RESULTS_STATE_KEY
+                )
             )
             if pending_state_present:
                 prior_pending = decode_pending_proxy_results(
@@ -2580,7 +2611,6 @@ class StrandsAgent:
             # result when its tool name is client-declared, or (for delta-only
             # payloads that omit the assistant message) when its wire id was
             # recorded in the wire->native map when the call was emitted.
-            session_manager = _get_strands_session_manager(strands_agent)
             # The durable per-``toolUseId`` call metadata map recorded at
             # emission (see the ``current_tool_use`` handler). On a RESUME
             # run this is the ONLY source of ``{name, args, input,
@@ -2588,20 +2618,6 @@ class StrandsAgent:
             # not re-emit ``current_tool_use`` events for it. It was loaded
             # before proxy sync so the same provenance can also protect the
             # exact checkpoint-required marked proxy from stale deletion.
-            active_proxy_native_ids = active_proxy_placeholder_ids(
-                strands_agent, persisted_tool_call_meta
-            )
-            if active_proxy_native_ids:
-                if session_manager is None:
-                    yield _interrupt_session_required_error()
-                    return
-                if not _supports_repository_reconciliation(session_manager):
-                    yield _interrupt_session_capability_error()
-                    return
-            if session_manager is None and pending_proxy_hook_native_ids:
-                yield _interrupt_session_required_error()
-                return
-
             # The durable wire->native map recorded at emission, read back from
             # session state (restored from the store on a fresh process).
             wire_to_native: Dict[str, str] = {}
@@ -2793,7 +2809,9 @@ class StrandsAgent:
                         )
                         yield RunErrorEvent(
                             type=EventType.RUN_ERROR,
-                            message=str(e),
+                            message=(
+                                "Active interrupt tool result reconciliation failed"
+                            ),
                             code="INTERRUPT_RECONCILIATION_ERROR",
                         )
                         return

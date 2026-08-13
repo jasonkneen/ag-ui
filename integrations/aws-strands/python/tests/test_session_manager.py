@@ -79,6 +79,8 @@ def _make_base_agent(session_manager_provider=None) -> StrandsAgent:
 
 def _make_mock_instance():
     instance = MagicMock()
+    instance._interrupt_state = None
+    instance.state = AgentState()
     instance.tool_registry = MagicMock()
     instance.tool_registry.registry = {}
     instance.stream_async = MagicMock(side_effect=lambda _: _empty_async_gen())
