@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from strands.agent.state import AgentState
 from strands.session import SessionManager
+from strands.tools.registry import ToolRegistry
 
 from ag_ui_strands.session_reconcile import AG_UI_WIRE_MAP_STATE_KEY
 
@@ -518,8 +519,7 @@ class _MockStreamingAgent:
     def __init__(self, events, session_manager=None):
         self._events = events
         self.session_manager = session_manager
-        self.tool_registry = MagicMock()
-        self.tool_registry.registry = {}
+        self.tool_registry = ToolRegistry()
         self.state = AgentState()
         self.messages = []
 

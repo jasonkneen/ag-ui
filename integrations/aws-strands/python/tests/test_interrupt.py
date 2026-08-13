@@ -590,7 +590,14 @@ async def test_native_placeholder_text_with_interrupt_does_not_require_session_m
                     role="user",
                     content="run both native tools",
                 )
-            ]
+            ],
+            tools=[
+                Tool(
+                    name="native_placeholder",
+                    description="frontend declaration colliding with a native tool",
+                    parameters={},
+                )
+            ],
         ),
     )
 

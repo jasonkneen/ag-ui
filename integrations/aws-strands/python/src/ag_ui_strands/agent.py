@@ -219,7 +219,7 @@ from .a2ui_tool import (
     is_auto_injected_a2ui_tool,
     plan_a2ui_injection,
 )
-from .client_proxy_tool import sync_proxy_tools
+from .client_proxy_tool import registered_proxy_tool_names, sync_proxy_tools
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
@@ -763,6 +763,14 @@ class StrandsAgent:
                 e,
                 exc_info=True,
             )
+
+        # Snapshot provenance only after proxy sync and A2UI registry edits.
+        # The stream uses this immutable view rather than client declarations:
+        # a declaration can collide with a native tool that sync correctly
+        # preserves, and callbacks must not observe mid-stream registry changes.
+        registered_frontend_tool_names = frozenset(
+            registered_proxy_tool_names(strands_agent.tool_registry)
+        )
 
         # Start run
         yield RunStartedEvent(
@@ -1801,7 +1809,7 @@ class StrandsAgent:
 
                         # Generate unique ID for frontend tools (to avoid ID conflicts across requests)
                         # Use Strands' ID for backend tools (so result lookup works)
-                        is_frontend_tool = tool_name in frontend_tool_names
+                        is_frontend_tool = tool_name in registered_frontend_tool_names
 
                         # Check if we've already seen this tool (by Strands' internal ID)
                         existing_entry = None

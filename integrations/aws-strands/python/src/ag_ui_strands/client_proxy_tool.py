@@ -77,6 +77,15 @@ def _is_proxy(tool: Any) -> bool:
     return getattr(tool, _PROXY_MARKER, False) is True
 
 
+def registered_proxy_tool_names(tool_registry: ToolRegistry) -> set[str]:
+    """Return names whose current registry entry is an AG-UI proxy tool."""
+    return {
+        name
+        for name, registered_tool in tool_registry.registry.items()
+        if _is_proxy(registered_tool)
+    }
+
+
 def sync_proxy_tools(
     tool_registry: ToolRegistry,
     ag_ui_tools: list[AgUiTool],

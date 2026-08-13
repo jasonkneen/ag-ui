@@ -13,6 +13,7 @@ from ag_ui_strands.client_proxy_tool import (
     _PROXY_MARKER,
     _is_proxy,
     create_proxy_tool,
+    registered_proxy_tool_names,
     sync_proxy_tools,
 )
 
@@ -147,3 +148,11 @@ class TestSyncProxyTools:
 
         assert r1 == r2 == {"t1"}
         assert "t1" in registry.registry
+
+
+def test_registered_proxy_tool_names_reads_actual_marked_registry_entries():
+    registry = ToolRegistry()
+    registry.register_tool(_make_native_tool("native_tool"))
+    registry.register_tool(create_proxy_tool(_make_ag_ui_tool("proxy_tool")))
+
+    assert registered_proxy_tool_names(registry) == {"proxy_tool"}
