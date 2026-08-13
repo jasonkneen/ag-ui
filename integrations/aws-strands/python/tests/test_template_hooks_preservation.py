@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from ag_ui.core import RunErrorEvent
 from strands import Agent
-from strands.hooks import HookProvider, HookRegistry
+from strands.hooks import HookProvider
 from strands.hooks.events import BeforeToolCallEvent
 from strands.models.model import Model
 from strands.tools.registry import ToolRegistry
@@ -63,9 +63,6 @@ class _CapturingCore:
     def __init__(self, **kwargs):
         self.init_kwargs = kwargs
         self.tool_registry = ToolRegistry()
-        self.hooks = HookRegistry()
-        for provider in kwargs.get("hooks", []):
-            self.hooks.add_hook(provider)
 
     async def stream_async(self, _msg: str, **_kwargs):
         # ``**_kwargs`` intentionally swallows future additions (e.g.

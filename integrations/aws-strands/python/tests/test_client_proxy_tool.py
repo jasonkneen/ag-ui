@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,15 +10,11 @@ from strands.tools.registry import ToolRegistry
 from strands.tools.tools import PythonAgentTool
 
 from ag_ui_strands.client_proxy_tool import (
-    PROXY_RESUME_RESULT_BINDINGS_KEY,
-    PROXY_RESUME_RESULTS_KEY,
     _PROXY_MARKER,
     _is_proxy,
     create_proxy_tool,
-    registered_proxy_tool_names,
     sync_proxy_tools,
 )
-from ag_ui_strands.session_reconcile import _FrontendToolResult
 
 
 # ---------------------------------------------------------------------------
@@ -74,103 +69,14 @@ class TestCreateProxyTool:
 
 
 class TestProxyToolResult:
-    @pytest.mark.asyncio
-    async def test_returns_success_with_placeholder(self):
+    def test_returns_success_with_placeholder(self):
         proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
         tool_use = {"toolUseId": "abc-123", "name": "bg", "input": {"color": "red"}}
-        result = await proxy._tool_func(tool_use)
+        result = proxy._tool_func(tool_use)
 
         assert result["toolUseId"] == "abc-123"
         assert result["status"] == "success"
         assert result["content"] == [{"text": "Forwarded to client"}]
-
-    @pytest.mark.parametrize(
-        ("content", "status", "error", "expected_text"),
-        [
-            pytest.param("approved", "success", None, "approved", id="success"),
-            pytest.param("", "success", None, "", id="void-success"),
-            pytest.param(
-                "client failure details",
-                "error",
-                "boom",
-                "client failure details",
-                id="explicit-failure-content",
-            ),
-            pytest.param("", "error", "boom", "boom", id="failure-diagnostic"),
-        ],
-    )
-    @pytest.mark.asyncio
-    async def test_returns_full_resumed_client_result(
-        self, content, status, error, expected_text
-    ):
-        proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
-        tool_use = {
-            "toolUseId": "abc-123",
-            "name": "bg",
-            "input": {"color": "red"},
-        }
-
-        resumed_results = {
-            "abc-123": _FrontendToolResult(
-                content=content,
-                status=status,
-                error=error,
-            )
-        }
-        bindings = {"abc-123": "wire-123"}
-
-        result = await proxy._tool_func(
-            tool_use,
-            **{
-                PROXY_RESUME_RESULTS_KEY: resumed_results,
-                PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
-            },
-        )
-
-        assert result == {
-            "toolUseId": "abc-123",
-            "status": status,
-            "content": [{"text": expected_text}],
-        }
-        assert resumed_results == {}
-        # The proxy consumes only the typed result. The adapter's
-        # AfterToolCall cleanup owns the exact binding lifecycle.
-        assert bindings == {"abc-123": "wire-123"}
-
-    @pytest.mark.asyncio
-    async def test_concurrent_resumed_calls_consume_only_their_own_result(self):
-        proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
-        results = {
-            "native-a": _FrontendToolResult("A", "success"),
-            "native-b": _FrontendToolResult("", "error", "boom"),
-        }
-        bindings = {"native-a": "wire-a", "native-b": "wire-b"}
-
-        result_a, result_b = await asyncio.gather(
-            proxy._tool_func(
-                {"toolUseId": "native-a", "name": "bg", "input": {}},
-                **{
-                    PROXY_RESUME_RESULTS_KEY: results,
-                    PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
-                },
-            ),
-            proxy._tool_func(
-                {"toolUseId": "native-b", "name": "bg", "input": {}},
-                **{
-                    PROXY_RESUME_RESULTS_KEY: results,
-                    PROXY_RESUME_RESULT_BINDINGS_KEY: bindings,
-                },
-            ),
-        )
-
-        assert result_a["content"] == [{"text": "A"}]
-        assert result_b == {
-            "toolUseId": "native-b",
-            "status": "error",
-            "content": [{"text": "boom"}],
-        }
-        assert results == {}
-        assert bindings == {"native-a": "wire-a", "native-b": "wire-b"}
 
 
 # ---------------------------------------------------------------------------
@@ -231,27 +137,6 @@ class TestSyncProxyTools:
         assert result == set()
         assert "tool_x" not in registry.registry
 
-    def test_retains_only_checkpoint_required_stale_proxy_for_one_sync(self):
-        registry = self._fresh_registry()
-        registry.register_tool(create_proxy_tool(_make_ag_ui_tool("resume_tool")))
-        registry.register_tool(create_proxy_tool(_make_ag_ui_tool("unrelated_tool")))
-
-        retained = sync_proxy_tools(
-            registry,
-            [],
-            {"resume_tool", "unrelated_tool"},
-            retain_names={"resume_tool"},
-        )
-
-        assert retained == {"resume_tool"}
-        assert "resume_tool" in registry.registry
-        assert "unrelated_tool" not in registry.registry
-
-        removed = sync_proxy_tools(registry, [], retained)
-
-        assert removed == set()
-        assert "resume_tool" not in registry.registry
-
     def test_idempotent_re_registration(self):
         """Re-syncing the same tools should work (hot reload)."""
         registry = self._fresh_registry()
@@ -262,11 +147,3 @@ class TestSyncProxyTools:
 
         assert r1 == r2 == {"t1"}
         assert "t1" in registry.registry
-
-
-def test_registered_proxy_tool_names_reads_actual_marked_registry_entries():
-    registry = ToolRegistry()
-    registry.register_tool(_make_native_tool("native_tool"))
-    registry.register_tool(create_proxy_tool(_make_ag_ui_tool("proxy_tool")))
-
-    assert registered_proxy_tool_names(registry) == {"proxy_tool"}
