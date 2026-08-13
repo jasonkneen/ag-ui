@@ -398,13 +398,19 @@ def confirm_action(key: str, tool_context: ToolContext) -> dict:
     return {"status": "success", "content": [{"text": f"denied {key}"}]}
 
 
-class _InterruptFlowModel(StrandsModel):
-    """Turn 1: calls the frontend proxy tool and the interrupting native tool
-    in the same batch. Turn 2+: narrates a final answer."""
+@tool
+def native_placeholder() -> str:
+    """Return text that happens to equal the frontend proxy's reserved result."""
+    return "Forwarded to client"
 
-    def __init__(self):
+
+class _InterruptFlowModel(StrandsModel):
+    """Turn 1 calls a sibling tool and an interrupting native tool together."""
+
+    def __init__(self, sibling_tool_name: str = "approveTool"):
         self.turn = 0
         self.stream_calls_messages = []
+        self.sibling_tool_name = sibling_tool_name
 
     def get_config(self):
         return {}
@@ -423,7 +429,12 @@ class _InterruptFlowModel(StrandsModel):
             yield {"messageStart": {"role": "assistant"}}
             yield {
                 "contentBlockStart": {
-                    "start": {"toolUse": {"toolUseId": "native-approve", "name": "approveTool"}}
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "native-approve",
+                            "name": self.sibling_tool_name,
+                        }
+                    }
                 }
             }
             yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
@@ -561,6 +572,50 @@ async def test_native_interrupt_resumes_without_session_manager_and_restores_beh
 
 
 @pytest.mark.asyncio
+async def test_native_placeholder_text_with_interrupt_does_not_require_session_manager():
+    model = _InterruptFlowModel(sibling_tool_name="native_placeholder")
+    core = StrandsAgentCore(
+        model=model,
+        tools=[native_placeholder, confirm_action],
+        system_prompt="test",
+    )
+    agent = StrandsAgent(core, name="native-placeholder-interrupt")
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[
+                UserMessage(
+                    id="u1",
+                    role="user",
+                    content="run both native tools",
+                )
+            ]
+        ),
+    )
+
+    live_core = agent._agents_by_thread["thread-1"]
+    assert live_core._interrupt_state.context["tool_results"] == [
+        {
+            "toolUseId": "native-approve",
+            "status": "success",
+            "content": [{"text": "Forwarded to client"}],
+        }
+    ]
+    assert [
+        event.code for event in events if event.type == EventType.RUN_ERROR
+    ] == []
+    finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
+    assert finished.outcome is not None
+    assert finished.outcome.type == "interrupt"
+    assert finished.outcome.interrupts[0].tool_call_id == "native-confirm"
+
+    tool_metadata = live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+    assert tool_metadata["native-approve"]["is_frontend"] is False
+    assert tool_metadata["native-confirm"]["is_frontend"] is False
+
+
+@pytest.mark.asyncio
 async def test_mixed_interrupt_without_session_manager_errors_before_outcome():
     agent, model = _make_e2e_agent(StrandsAgentConfig())
     approve_tool = Tool(name="approveTool", description="approve", parameters={})
@@ -598,6 +653,8 @@ async def test_mixed_interrupt_without_session_manager_errors_before_outcome():
     interrupts = copy.deepcopy(interrupt_state.interrupts)
     tool_metadata = copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY))
     assert set(tool_metadata) == {"native-approve", "native-confirm"}
+    assert tool_metadata["native-approve"]["is_frontend"] is True
+    assert tool_metadata["native-confirm"]["is_frontend"] is False
 
     interrupt_id = next(iter(interrupts))
     events2 = await _collect_events(

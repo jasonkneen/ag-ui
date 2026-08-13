@@ -55,6 +55,7 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
         "status": "success",
         "content": [{"text": PLACEHOLDER}],
     }
+    frontend_meta = {"native-frontend": {"is_frontend": True}}
 
     assert not session_reconcile.has_active_proxy_placeholder(
         SimpleNamespace(
@@ -62,13 +63,17 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
                 activated=False,
                 context={"tool_results": [exact_result]},
             )
-        )
+        ),
+        frontend_meta,
     )
-    assert not session_reconcile.has_active_proxy_placeholder(SimpleNamespace())
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(), frontend_meta
+    )
     assert not session_reconcile.has_active_proxy_placeholder(
         SimpleNamespace(
             _interrupt_state=SimpleNamespace(activated=True, context={})
-        )
+        ),
+        frontend_meta,
     )
     assert not session_reconcile.has_active_proxy_placeholder(
         SimpleNamespace(
@@ -83,7 +88,8 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
                     ]
                 },
             )
-        )
+        ),
+        frontend_meta,
     )
     structurally_non_exact_results = [
         {**exact_result, "status": "error"},
@@ -110,7 +116,25 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
                     activated=True,
                     context={"tool_results": [parked_result]},
                 )
-            )
+            ),
+            frontend_meta,
+        )
+    non_frontend_meta = [
+        {"native-frontend": {"is_frontend": False}},
+        {"native-frontend": {}},
+        {},
+        {"native-frontend": {"is_frontend": "true"}},
+        {"native-frontend": None},
+    ]
+    for tool_call_meta in non_frontend_meta:
+        assert not session_reconcile.has_active_proxy_placeholder(
+            SimpleNamespace(
+                _interrupt_state=SimpleNamespace(
+                    activated=True,
+                    context={"tool_results": [exact_result]},
+                )
+            ),
+            tool_call_meta,
         )
     assert session_reconcile.has_active_proxy_placeholder(
         SimpleNamespace(
@@ -118,7 +142,8 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
                 activated=True,
                 context={"tool_results": [exact_result]},
             )
-        )
+        ),
+        frontend_meta,
     )
 
 

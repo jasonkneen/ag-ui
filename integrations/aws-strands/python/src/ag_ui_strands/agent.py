@@ -1099,17 +1099,6 @@ class StrandsAgent:
             # payloads that omit the assistant message) when its wire id was
             # recorded in the wire->native map when the call was emitted.
             session_manager = _get_strands_session_manager(strands_agent)
-            if session_manager is None and has_active_proxy_placeholder(strands_agent):
-                yield _interrupt_session_required_error()
-                return
-            # The durable wire->native map recorded at emission, read back from
-            # session state (restored from the store on a fresh process).
-            wire_to_native: Dict[str, str] = {}
-            if session_manager is not None:
-                wire_to_native = (
-                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-                )
-
             # The durable per-``toolUseId`` call metadata map recorded at
             # emission (see the ``current_tool_use`` handler). On a RESUME
             # run this is the ONLY source of ``{name, args, input,
@@ -1126,6 +1115,19 @@ class StrandsAgent:
                     )
                 except Exception:
                     persisted_tool_call_meta = {}
+            if session_manager is None and has_active_proxy_placeholder(
+                strands_agent, persisted_tool_call_meta
+            ):
+                yield _interrupt_session_required_error()
+                return
+
+            # The durable wire->native map recorded at emission, read back from
+            # session state (restored from the store on a fresh process).
+            wire_to_native: Dict[str, str] = {}
+            if session_manager is not None:
+                wire_to_native = (
+                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+                )
             # Scope to the TRAILING tool results (this continuation's just-
             # returned results). ``pending_tool_result_ids`` holds those ids;
             # without this, a multi-turn continuation re-sends already-reconciled
@@ -1934,6 +1936,7 @@ class StrandsAgent:
                                     "args": args_str,
                                     "input": tool_input,
                                     "strands_tool_id": strands_tool_id,
+                                    "is_frontend": is_frontend_tool,
                                 }
                                 if len(_tc_meta) > _TOOL_CALL_MAP_MAX:
                                     for _stale in list(_tc_meta)[
@@ -2449,7 +2452,9 @@ class StrandsAgent:
             # placeholder inside the live interrupt context. Without durable
             # reconciliation, resuming that state would feed the placeholder
             # back into Strands as if it were the client's real result.
-            if session_manager is None and has_active_proxy_placeholder(strands_agent):
+            if session_manager is None and has_active_proxy_placeholder(
+                strands_agent, persisted_tool_call_meta
+            ):
                 yield _interrupt_session_required_error()
                 return
 

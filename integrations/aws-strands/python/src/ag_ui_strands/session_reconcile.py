@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 
 # Key under which the adapter stores every ``toolUseId`` tool call metadata
-# (name, args, input, strands_tool_id) on the Strands agent's session state.
+# (name, args, input, strands_tool_id, is_frontend) on the Strands agent's
+# session state.
 # On a native-interrupt RESUME run Strands does not re-invoke the model for the
 # interrupted tool, so no ``current_tool_use`` events fire and the in-run
 # ``tool_calls_seen`` dict is empty when the ``toolResult`` arrives. Reading
@@ -153,12 +154,16 @@ def has_placeholder_results(messages: Iterable[Any], only_ids: Any = None) -> bo
     return False
 
 
-def has_active_proxy_placeholder(agent: Any) -> bool:
-    """Return whether an active interrupt has a parked frontend proxy result."""
+def has_active_proxy_placeholder(
+    agent: Any, tool_call_meta: Mapping[str, Any]
+) -> bool:
+    """Return whether an active interrupt parks an exact, proven proxy result."""
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is None or not getattr(interrupt_state, "activated", False):
         return False
 
+    if not isinstance(tool_call_meta, Mapping):
+        return False
     context = getattr(interrupt_state, "context", None)
     if not isinstance(context, Mapping):
         return False
@@ -173,6 +178,8 @@ def has_active_proxy_placeholder(agent: Any) -> bool:
         and bool(tool_result["toolUseId"])
         and tool_result["status"] == "success"
         and tool_result["content"] == [{"text": PROXY_RESULT_PLACEHOLDER}]
+        and isinstance(tool_call_meta.get(tool_result["toolUseId"]), Mapping)
+        and tool_call_meta[tool_result["toolUseId"]].get("is_frontend") is True
         for tool_result in tool_results
     )
 
