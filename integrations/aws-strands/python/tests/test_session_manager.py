@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from strands.agent.state import AgentState
 from strands.session import SessionManager
+from strands.tools.registry import ToolRegistry
 
 from ag_ui_strands.session_reconcile import AG_UI_WIRE_MAP_STATE_KEY
 
@@ -78,6 +79,8 @@ def _make_base_agent(session_manager_provider=None) -> StrandsAgent:
 
 def _make_mock_instance():
     instance = MagicMock()
+    instance._interrupt_state = None
+    instance.state = AgentState()
     instance.tool_registry = MagicMock()
     instance.tool_registry.registry = {}
     instance.stream_async = MagicMock(side_effect=lambda _: _empty_async_gen())
@@ -475,8 +478,14 @@ def _payload_assistant(wire_id, name, args="{}"):
     )
 
 
-def _payload_tool(wire_id, content):
-    return ToolMessage(id="t-" + wire_id, role="tool", content=content, tool_call_id=wire_id)
+def _payload_tool(wire_id, content, *, error=None):
+    return ToolMessage(
+        id="t-" + wire_id,
+        role="tool",
+        content=content,
+        tool_call_id=wire_id,
+        error=error,
+    )
 
 
 def _result_content(sm, agent_id, index):
@@ -518,8 +527,7 @@ class _MockStreamingAgent:
     def __init__(self, events, session_manager=None):
         self._events = events
         self.session_manager = session_manager
-        self.tool_registry = MagicMock()
-        self.tool_registry.registry = {}
+        self.tool_registry = ToolRegistry()
         self.state = AgentState()
         self.messages = []
 
@@ -553,10 +561,13 @@ class TestWireToNativeMapCapture:
         )
         with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
             MockCore.return_value = instance
-            await _collect_events(agent, input_data)
+            events = await _collect_events(agent, input_data)
 
+        tool_call_start = next(
+            event for event in events if event.type == EventType.TOOL_CALL_START
+        )
         wire_map = instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-        assert list(wire_map.values()) == ["native-1"]
+        assert wire_map == {tool_call_start.tool_call_id: "native-1"}
 
     @pytest.mark.asyncio
     async def test_wire_map_is_size_capped(self, monkeypatch):
@@ -621,6 +632,49 @@ class TestSessionFrontendToolReconciliation:
         assert _result_content(sm, "default", 1)[0]["toolResult"]["content"] == [
             {"text": '{"approved": false}'}
         ]
+        assert _result_content(sm, "default", 1)[0]["toolResult"]["status"] == "success"
+        assert instance.messages[1]["content"][0]["toolResult"] == {
+            "toolUseId": "native-1",
+            "status": "success",
+            "content": [{"text": '{"approved": false}'}],
+        }
+
+    @pytest.mark.parametrize(
+        ("error", "content", "expected_content"),
+        [
+            pytest.param(
+                "boom",
+                "client failure details",
+                "client failure details",
+                id="explicit-content-wins",
+            ),
+            pytest.param("boom", "", "boom", id="error-diagnostic-fallback"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_reconciles_failed_result_status_into_store_and_live_history(
+        self, tmp_path, error, content, expected_content
+    ):
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(session_id=f"thread-error-{error!r}", storage_dir=str(tmp_path))
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[_payload_tool("wire-1", content, error=error)],
+            tools=[_frontend_tool("approve")],
+            wire_map={"wire-1": "native-1"},
+            store=[_store_tool_use("native-1", "approve"), _store_placeholder("native-1")],
+        )
+
+        expected = {
+            "toolUseId": "native-1",
+            "status": "error",
+            "content": [{"text": expected_content}],
+        }
+        assert instance.stream_prompts == [None]
+        assert _result_content(sm, "default", 1)[0]["toolResult"] == expected
+        assert instance.messages[1]["content"][0]["toolResult"] == expected
 
     @pytest.mark.asyncio
     async def test_no_wire_map_degrades_to_legacy(self, tmp_path):
@@ -645,10 +699,62 @@ class TestSessionFrontendToolReconciliation:
                 _store_placeholder("native-2"),
             ],
         )
-        assert instance.stream_prompts != [None]
+        assert instance.stream_prompts == ["setColor returned: ok"]
         assert _result_content(sm, "default", 1)[0]["toolResult"]["content"] == [
             {"text": "Forwarded to client"}
         ]
+
+    @pytest.mark.asyncio
+    async def test_unmapped_failed_empty_result_uses_failure_legacy_prompt(self, tmp_path):
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(session_id="thread-error-legacy", storage_dir=str(tmp_path))
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[
+                _payload_assistant("wire-1", "approve"),
+                _payload_tool("wire-1", "", error="boom"),
+            ],
+            tools=[_frontend_tool("approve")],
+            wire_map={},
+            store=[_store_tool_use("native-1", "approve"), _store_placeholder("native-1")],
+        )
+
+        assert instance.stream_prompts == ["approve failed: boom"]
+        assert "executed successfully" not in instance.stream_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_unmapped_failed_explicit_result_uses_failure_legacy_prompt(
+        self, tmp_path
+    ):
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(
+            session_id="thread-explicit-error-legacy", storage_dir=str(tmp_path)
+        )
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[
+                _payload_assistant("wire-1", "approve"),
+                _payload_tool(
+                    "wire-1", "client failure details", error="boom"
+                ),
+            ],
+            tools=[_frontend_tool("approve")],
+            wire_map={},
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1"),
+            ],
+        )
+
+        assert instance.stream_prompts == [
+            "approve failed: client failure details"
+        ]
+        assert "returned:" not in instance.stream_prompts[0]
+        assert "executed successfully" not in instance.stream_prompts[0]
 
     @pytest.mark.asyncio
     async def test_mixed_void_and_real_clears_both_placeholders(self, tmp_path):
@@ -885,7 +991,9 @@ class TestSessionFrontendToolReconciliation:
                 ],
             )
 
-        assert instance.stream_prompts != [None]  # legacy fallback on error
+        assert instance.stream_prompts == [
+            'approve returned: {"approved": true}'
+        ]  # legacy fallback on error
         remaining = instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
         assert remaining == {"wire-1": "native-1"}  # entry kept for retry
 
@@ -926,7 +1034,9 @@ class TestSessionFrontendToolReconciliation:
             wire_map={},  # nothing recorded -> unresolvable
             store=store,
         )
-        assert instance.stream_prompts != [None]  # unresolvable -> legacy
+        assert instance.stream_prompts == [
+            "approve returned: R1\napprove returned: R2"
+        ]  # unresolvable -> legacy
         results = sm.session_repository.list_messages(sm.session_id, "default")[1].message[
             "content"
         ]

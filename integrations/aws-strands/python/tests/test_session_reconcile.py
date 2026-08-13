@@ -11,16 +11,174 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.session import SessionAgent, SessionMessage
 
+from ag_ui_strands import session_reconcile
 from ag_ui_strands.session_reconcile import (
+    PendingProxyResult,
+    _FrontendToolResult,
+    decode_pending_proxy_results,
+    encode_pending_proxy_results,
     has_placeholder_results,
+    merge_pending_proxy_results,
     reconcile_frontend_tool_results,
     resolve_native_ids,
 )
 
 PLACEHOLDER = "Forwarded to client"
+
+
+def _pending_result(
+    wire_id="wire-1", content="CLIENT", status="success", error=None
+):
+    return PendingProxyResult(
+        wire_tool_call_id=wire_id,
+        content=content,
+        status=status,
+        error=error,
+    )
+
+
+def test_pending_proxy_result_envelope_round_trips_raw_failed_result():
+    records = {
+        "native-1": _pending_result(
+            content="", status="error", error="boom"
+        )
+    }
+
+    encoded = encode_pending_proxy_results(records)
+
+    assert encoded == {
+        "version": 1,
+        "records": {
+            "native-1": {
+                "wire_tool_call_id": "wire-1",
+                "content": "",
+                "status": "error",
+                "error": "boom",
+            }
+        },
+    }
+    assert decode_pending_proxy_results(encoded) == records
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        None,
+        {},
+        {"version": True, "records": {}},
+        {"version": 1, "records": {}, "extra": True},
+        {"version": 1, "records": []},
+        {"version": 1, "records": {"": {}}},
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": None,
+                    "extra": True,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": 1,
+                    "status": "success",
+                    "error": None,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "cancelled",
+                    "error": None,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": 1,
+                }
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "CLIENT",
+                    "status": "success",
+                    "error": None,
+                },
+                "native-2": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "OTHER",
+                    "status": "success",
+                    "error": None,
+                },
+            },
+        },
+        {
+            "version": 1,
+            "records": {
+                "native-1": {
+                    "wire_tool_call_id": "wire-1",
+                    "content": "bad\udcff",
+                    "status": "success",
+                    "error": None,
+                }
+            },
+        },
+    ],
+)
+def test_pending_proxy_result_decoder_rejects_malformed_state(malformed):
+    with pytest.raises(ValueError, match="pending proxy result"):
+        decode_pending_proxy_results(malformed)
+
+
+def test_pending_proxy_result_merge_is_idempotent_and_non_mutating():
+    accepted = {"native-1": _pending_result()}
+    before = dict(accepted)
+
+    merged = merge_pending_proxy_results(accepted, dict(accepted))
+
+    assert merged == accepted
+    assert merged is not accepted
+    assert accepted == before
+
+
+def test_pending_proxy_result_merge_rejects_any_conflict_without_mutation():
+    accepted = {"native-1": _pending_result()}
+    conflict = {"native-1": _pending_result(content="DIFFERENT")}
+    accepted_before = dict(accepted)
+    conflict_before = dict(conflict)
+
+    with pytest.raises(ValueError, match="pending proxy result conflict"):
+        merge_pending_proxy_results(accepted, conflict)
+
+    assert accepted == accepted_before
+    assert conflict == conflict_before
+
+
+def _client_result(content, status="success"):
+    return _FrontendToolResult(content=content, status=status)
 
 
 def _make_session(tmp_path, session_id="s1", agent_id="default"):
@@ -48,6 +206,104 @@ def _tool_result_block(tool_use_id, text):
     }
 
 
+def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_result():
+    exact_result = {
+        "toolUseId": "native-frontend",
+        "status": "success",
+        "content": [{"text": PLACEHOLDER}],
+    }
+    frontend_meta = {"native-frontend": {"is_frontend": True}}
+
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=False,
+                context={"tool_results": [exact_result]},
+            )
+        ),
+        frontend_meta,
+    )
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(), frontend_meta
+    )
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(activated=True, context={})
+        ),
+        frontend_meta,
+    )
+    assert not session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=True,
+                context={
+                    "tool_results": [
+                        {
+                            **exact_result,
+                            "content": [{"text": f"{PLACEHOLDER}."}],
+                        }
+                    ]
+                },
+            )
+        ),
+        frontend_meta,
+    )
+    structurally_non_exact_results = [
+        {**exact_result, "status": "error"},
+        {key: value for key, value in exact_result.items() if key != "toolUseId"},
+        {key: value for key, value in exact_result.items() if key != "status"},
+        {**exact_result, "toolUseId": ""},
+        {
+            **exact_result,
+            "content": [
+                {"text": PLACEHOLDER},
+                {"text": "additional content"},
+            ],
+        },
+        {
+            **exact_result,
+            "content": [{"text": PLACEHOLDER, "unexpected": True}],
+        },
+        {**exact_result, "unexpected": True},
+    ]
+    for parked_result in structurally_non_exact_results:
+        assert not session_reconcile.has_active_proxy_placeholder(
+            SimpleNamespace(
+                _interrupt_state=SimpleNamespace(
+                    activated=True,
+                    context={"tool_results": [parked_result]},
+                )
+            ),
+            frontend_meta,
+        )
+    non_frontend_meta = [
+        {"native-frontend": {"is_frontend": False}},
+        {"native-frontend": {}},
+        {},
+        {"native-frontend": {"is_frontend": "true"}},
+        {"native-frontend": None},
+    ]
+    for tool_call_meta in non_frontend_meta:
+        assert not session_reconcile.has_active_proxy_placeholder(
+            SimpleNamespace(
+                _interrupt_state=SimpleNamespace(
+                    activated=True,
+                    context={"tool_results": [exact_result]},
+                )
+            ),
+            tool_call_meta,
+        )
+    assert session_reconcile.has_active_proxy_placeholder(
+        SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=True,
+                context={"tool_results": [exact_result]},
+            )
+        ),
+        frontend_meta,
+    )
+
+
 def test_reconcile_overwrites_persisted_placeholder_in_store(tmp_path):
     sm = _make_session(tmp_path)
     agent_id = "default"
@@ -70,7 +326,7 @@ def test_reconcile_overwrites_persisted_placeholder_in_store(tmp_path):
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
     corrected = reconcile_frontend_tool_results(
-        sm, agent, {"tu-1": '{"approved": false}'}
+        sm, agent, {"tu-1": _client_result('{"approved": false}')}
     )
 
     assert corrected == {"tu-1"}
@@ -93,7 +349,11 @@ def test_reconcile_returns_set_of_corrected_tool_use_ids(tmp_path):
         messages=[{"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]}],
     )
 
-    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": "R", "tu-absent": "X"})
+    corrected = reconcile_frontend_tool_results(
+        sm,
+        agent,
+        {"tu-1": _client_result("R"), "tu-absent": _client_result("X")},
+    )
 
     assert corrected == {"tu-1"}
 
@@ -118,10 +378,113 @@ def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
         ],
     )
 
-    reconcile_frontend_tool_results(sm, agent, {"tu-1": '{"approved": true}'})
+    reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": _client_result('{"approved": true}')}
+    )
 
     in_memory = agent.messages[1]["content"][0]["toolResult"]
     assert in_memory["content"] == [{"text": '{"approved": true}'}]
+
+
+@pytest.mark.parametrize(
+    ("status", "content"),
+    [
+        pytest.param("success", "real client result", id="success"),
+        pytest.param("error", "boom", id="failure-diagnostic"),
+    ],
+)
+def test_reconcile_updates_status_and_content_in_every_active_copy(
+    tmp_path, status, content
+):
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+    live_message = {
+        "role": "user",
+        "content": [_tool_result_block("tu-1", PLACEHOLDER)],
+    }
+    parked_result = _tool_result_block("tu-1", PLACEHOLDER)["toolResult"]
+    agent = SimpleNamespace(
+        agent_id=agent_id,
+        messages=[live_message],
+        _interrupt_state=SimpleNamespace(
+            activated=True,
+            context={"tool_results": [parked_result]},
+        ),
+    )
+    result = _client_result(content, status=status)
+
+    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": result})
+
+    assert corrected == {"tu-1"}
+    expected = {
+        "toolUseId": "tu-1",
+        "status": status,
+        "content": [{"text": content}],
+    }
+    persisted = sm.session_repository.list_messages(sm.session_id, agent_id)
+    assert persisted[0].message["content"][0]["toolResult"] == expected
+    assert live_message["content"][0]["toolResult"] == expected
+    assert parked_result == expected
+
+
+def test_active_interrupt_context_reconcile_raises_typed_error(tmp_path):
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+
+    class ExplodingToolResults(list):
+        def __iter__(self):
+            raise RuntimeError("boom")
+
+    parked_results = ExplodingToolResults(
+        [
+            {
+                "toolUseId": "tu-1",
+                "status": "success",
+                "content": [{"text": PLACEHOLDER}],
+            }
+        ]
+    )
+    interrupt_state = SimpleNamespace(
+        activated=True,
+        context={"tool_results": parked_results},
+    )
+    agent = SimpleNamespace(
+        agent_id=agent_id,
+        messages=[],
+        _interrupt_state=interrupt_state,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        reconcile_frontend_tool_results(
+            sm,
+            agent,
+            {"tu-1": _client_result("real"), "tu-2": _client_result("other")},
+        )
+
+    assert isinstance(
+        exc_info.value, session_reconcile.ActiveInterruptReconciliationError
+    )
+    assert exc_info.value.affected_native_ids == frozenset({"tu-1", "tu-2"})
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "boom"
+    persisted = sm.session_repository.list_messages(sm.session_id, agent_id)
+    assert persisted[0].message["content"][0]["toolResult"]["content"] == [
+        {"text": "real"}
+    ]
+    assert interrupt_state.activated
+    assert interrupt_state.context["tool_results"] is parked_results
 
 
 def test_reconcile_handles_parallel_tool_calls_in_one_message(tmp_path):
@@ -154,7 +517,9 @@ def test_reconcile_handles_parallel_tool_calls_in_one_message(tmp_path):
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
     corrected = reconcile_frontend_tool_results(
-        sm, agent, {"tu-1": "R1", "tu-2": "R2"}
+        sm,
+        agent,
+        {"tu-1": _client_result("R1"), "tu-2": _client_result("R2")},
     )
 
     assert corrected == {"tu-1", "tu-2"}
@@ -170,12 +535,15 @@ def test_resolve_maps_wire_id_to_native_id():
     # wire->native map (from session state) bridges them.
     resolved = resolve_native_ids(
         wire_to_native={"wire-1": "native-1", "wire-2": "native-2"},
-        frontend_results=[
-            {"wire_id": "wire-1", "text": "R1"},
-            {"wire_id": "wire-2", "text": "R2"},
-        ],
+        frontend_results={
+            "wire-1": _client_result("R1"),
+            "wire-2": _client_result("R2", status="error"),
+        },
     )
-    assert resolved == {"native-1": "R1", "native-2": "R2"}
+    assert resolved == {
+        "native-1": _client_result("R1"),
+        "native-2": _client_result("R2", status="error"),
+    }
 
 
 def test_resolve_skips_results_absent_from_map():
@@ -183,12 +551,12 @@ def test_resolve_skips_results_absent_from_map():
     # pruned entry) is dropped — the caller then degrades to the legacy path.
     resolved = resolve_native_ids(
         wire_to_native={"wire-1": "native-1"},
-        frontend_results=[
-            {"wire_id": "wire-1", "text": "R1"},
-            {"wire_id": "wire-unknown", "text": "R2"},
-        ],
+        frontend_results={
+            "wire-1": _client_result("R1"),
+            "wire-unknown": _client_result("R2"),
+        },
     )
-    assert resolved == {"native-1": "R1"}
+    assert resolved == {"native-1": _client_result("R1")}
 
 
 def test_has_placeholder_results_detects_remaining_stub():
@@ -222,7 +590,9 @@ def test_reconcile_leaves_non_placeholder_results_untouched(tmp_path):
     )
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
-    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": "SHOULD NOT APPLY"})
+    corrected = reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": _client_result("SHOULD NOT APPLY")}
+    )
 
     assert corrected == set()
     block = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
