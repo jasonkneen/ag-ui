@@ -224,6 +224,7 @@ from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     ActiveInterruptReconciliationError,
+    active_proxy_placeholder_ids,
     has_active_proxy_placeholder,
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -1124,9 +1125,12 @@ class StrandsAgent:
                     )
                 except Exception:
                     persisted_tool_call_meta = {}
-            if session_manager is None and has_active_proxy_placeholder(
+            active_proxy_native_ids = active_proxy_placeholder_ids(
                 strands_agent, persisted_tool_call_meta
-            ):
+            )
+            resume_entries = getattr(input_data, "resume", None)
+            has_resume_entries = isinstance(resume_entries, list) and resume_entries
+            if session_manager is None and active_proxy_native_ids:
                 yield _interrupt_session_required_error()
                 return
 
@@ -1175,10 +1179,37 @@ class StrandsAgent:
             has_nonvoid_frontend_result = any(
                 (r["text"] or "").strip() for r in frontend_results
             )
-            if session_manager is not None and self.config.replay_history_into_strands:
+            if session_manager is not None and (
+                self.config.replay_history_into_strands
+                or (has_resume_entries and active_proxy_native_ids)
+            ):
                 resolved_native_results = resolve_native_ids(
                     wire_to_native, frontend_results
                 )
+
+            # A native resume consumes and clears the active interrupt context.
+            # Refuse to enter Strands unless every exact, provenance-backed
+            # proxy placeholder parked there has a client result mapped back to
+            # its native id. This validation must precede reconciliation so an
+            # incomplete batch cannot partially mutate the retry checkpoint.
+            if has_resume_entries and active_proxy_native_ids:
+                missing_active_results = (
+                    active_proxy_native_ids - resolved_native_results.keys()
+                )
+                if missing_active_results:
+                    error = ActiveInterruptReconciliationError(
+                        missing_active_results
+                    )
+                    logger.error(
+                        "Active interrupt is missing mapped frontend results for "
+                        f"native ids {sorted(missing_active_results)}"
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        message=str(error),
+                        code="INTERRUPT_RECONCILIATION_ERROR",
+                    )
+                    return
 
             # Reconcile Strands' internal conversation history with
             # ``RunAgentInput.messages``. Without this, frontend tool results
@@ -1204,8 +1235,13 @@ class StrandsAgent:
             )
             reconcile_session_results = (
                 session_manager is not None
-                and self.config.replay_history_into_strands
-                and (has_nonvoid_frontend_result or has_active_interrupt)
+                and (
+                    (
+                        self.config.replay_history_into_strands
+                        and (has_nonvoid_frontend_result or has_active_interrupt)
+                    )
+                    or (has_resume_entries and bool(active_proxy_native_ids))
+                )
             )
 
             # Default prompt: the legacy path, passing only the latest user
@@ -1281,7 +1317,22 @@ class StrandsAgent:
                         "Frontend tool result reconciliation failed; falling back to "
                         f"the legacy continuation path: {e}",
                         exc_info=True,
+                )
+                if active_proxy_native_ids - corrected_native_ids:
+                    missing_corrections = (
+                        active_proxy_native_ids - corrected_native_ids
                     )
+                    error = ActiveInterruptReconciliationError(missing_corrections)
+                    logger.error(
+                        "Active interrupt frontend results were not corrected for "
+                        f"native ids {sorted(missing_corrections)}"
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        message=str(error),
+                        code="INTERRUPT_RECONCILIATION_ERROR",
+                    )
+                    return
                 # Continue from the corrected native history only when every
                 # NON-EMPTY frontend result this turn resolved to a native id
                 # (i.e. was present in the wire->native map) AND none of those
@@ -1315,8 +1366,6 @@ class StrandsAgent:
             # and drive the stream with it — this runs after (and takes
             # precedence over) every branch above, since a resume batch may
             # still carry a fresh frontend tool result that needed reconciling.
-            resume_entries = getattr(input_data, "resume", None)
-            has_resume_entries = isinstance(resume_entries, list) and resume_entries
             if has_resume_entries:
                 resume_prompt = [
                     {

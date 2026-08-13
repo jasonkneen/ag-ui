@@ -156,21 +156,30 @@ def has_active_proxy_placeholder(
     agent: Any, tool_call_meta: Mapping[str, Any]
 ) -> bool:
     """Return whether an active interrupt parks an exact, proven proxy result."""
+    return bool(active_proxy_placeholder_ids(agent, tool_call_meta))
+
+
+def active_proxy_placeholder_ids(
+    agent: Any, tool_call_meta: Mapping[str, Any]
+) -> set[str]:
+    """Return native ids for exact, provenance-backed active proxy stubs."""
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is None or not getattr(interrupt_state, "activated", False):
-        return False
+        return set()
 
     if not isinstance(tool_call_meta, Mapping):
-        return False
+        return set()
     context = getattr(interrupt_state, "context", None)
     if not isinstance(context, Mapping):
-        return False
+        return set()
     tool_results = context.get("tool_results")
     if not isinstance(tool_results, list):
-        return False
+        return set()
 
-    return any(
-        isinstance(tool_result, dict)
+    return {
+        tool_result["toolUseId"]
+        for tool_result in tool_results
+        if isinstance(tool_result, dict)
         and set(tool_result) == {"toolUseId", "status", "content"}
         and isinstance(tool_result["toolUseId"], str)
         and bool(tool_result["toolUseId"])
@@ -178,8 +187,7 @@ def has_active_proxy_placeholder(
         and tool_result["content"] == [{"text": PROXY_RESULT_PLACEHOLDER}]
         and isinstance(tool_call_meta.get(tool_result["toolUseId"]), Mapping)
         and tool_call_meta[tool_result["toolUseId"]].get("is_frontend") is True
-        for tool_result in tool_results
-    )
+    }
 
 
 def _correct_single_tool(tool_result, pending_results: Mapping[str, str]) -> str | None:

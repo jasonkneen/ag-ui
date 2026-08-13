@@ -418,10 +418,14 @@ def native_placeholder() -> str:
 class _InterruptFlowModel(StrandsModel):
     """Turn 1 calls a sibling tool and an interrupting native tool together."""
 
-    def __init__(self, sibling_tool_name: str = "approveTool"):
+    def __init__(
+        self,
+        sibling_tool_name: str = "approveTool",
+        sibling_tool_names: tuple[str, ...] | None = None,
+    ):
         self.turn = 0
         self.stream_calls_messages = []
-        self.sibling_tool_name = sibling_tool_name
+        self.sibling_tool_names = sibling_tool_names or (sibling_tool_name,)
 
     def get_config(self):
         return {}
@@ -438,18 +442,24 @@ class _InterruptFlowModel(StrandsModel):
         self.stream_calls_messages.append(messages)
         if self.turn == 1:
             yield {"messageStart": {"role": "assistant"}}
-            yield {
-                "contentBlockStart": {
-                    "start": {
-                        "toolUse": {
-                            "toolUseId": "native-approve",
-                            "name": self.sibling_tool_name,
+            for index, sibling_tool_name in enumerate(self.sibling_tool_names):
+                native_id = (
+                    "native-approve"
+                    if index == 0
+                    else f"native-approve-{index + 1}"
+                )
+                yield {
+                    "contentBlockStart": {
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": native_id,
+                                "name": sibling_tool_name,
+                            }
                         }
                     }
                 }
-            }
-            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
-            yield {"contentBlockStop": {}}
+                yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+                yield {"contentBlockStop": {}}
             yield {
                 "contentBlockStart": {
                     "start": {"toolUse": {"toolUseId": "native-confirm", "name": "confirm_action"}}
@@ -886,6 +896,173 @@ async def test_active_repository_reconciliation_failure_emits_run_error_before_s
         tmp_path,
         "ag_ui_strands.session_reconcile._correct_message",
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "frontend_names", "replay_history"),
+    [
+        pytest.param("missing", ("approveTool",), True, id="missing-proxy-result"),
+        pytest.param("unmapped", ("approveTool",), True, id="unmapped-wire-id"),
+        pytest.param(
+            "partial",
+            ("approveTool", "reviewTool"),
+            True,
+            id="partial-proxy-result-batch",
+        ),
+        pytest.param(
+            "missing",
+            ("approveTool",),
+            False,
+            id="history-replay-disabled",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_active_mixed_resume_rejects_unresolved_proxy_placeholders_before_stream(
+    tmp_path, case, frontend_names, replay_history
+):
+    """A native response cannot consume an active sibling proxy placeholder."""
+    config = StrandsAgentConfig(
+        replay_history_into_strands=replay_history,
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    model = _InterruptFlowModel(sibling_tool_names=frontend_names)
+    core_template = StrandsAgentCore(
+        model=model,
+        tools=[confirm_action],
+        system_prompt="test",
+    )
+    agent = StrandsAgent(core_template, name="unresolved-mixed", config=config)
+    frontend_tools = [
+        Tool(name=name, description=f"run {name}", parameters={})
+        for name in frontend_names
+    ]
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="handle widget-1")],
+            tools=frontend_tools,
+        ),
+    )
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    interrupt_id = finished.outcome.interrupts[0].id
+    wire_ids = {
+        event.tool_call_name: event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name in frontend_names
+    }
+    assert set(wire_ids) == set(frontend_names)
+
+    core = agent._agents_by_thread["thread-1"]
+    interrupt_state = core._interrupt_state
+    parked_context = copy.deepcopy(interrupt_state.context)
+    parked_interrupts = copy.deepcopy(interrupt_state.interrupts)
+    parked_messages = copy.deepcopy(core.messages)
+    session_manager = core._session_manager
+    parked_repository_messages = copy.deepcopy(
+        session_manager.session_repository.list_messages(
+            session_manager.session_id, core.agent_id
+        )
+    )
+    wire_map = copy.deepcopy(core.state.get(AG_UI_WIRE_MAP_STATE_KEY))
+    tool_metadata = copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY))
+
+    if case == "missing":
+        unsafe_messages = []
+    elif case == "unmapped":
+        unsafe_messages = [
+            ToolMessage(
+                id="t-wrong",
+                role="tool",
+                tool_call_id="wrong-wire-id",
+                content='{"approved": true}',
+            )
+        ]
+    elif case == "partial":
+        unsafe_messages = [
+            ToolMessage(
+                id="t-partial",
+                role="tool",
+                tool_call_id=wire_ids[frontend_names[0]],
+                content='{"approved": true}',
+            )
+        ]
+    else:
+        unsafe_messages = [
+            ToolMessage(
+                id="t-complete",
+                role="tool",
+                tool_call_id=wire_ids[frontend_names[0]],
+                content='{"approved": true}',
+            )
+        ]
+
+    with patch.object(core, "stream_async", wraps=core.stream_async) as stream_spy:
+        unsafe_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                messages=unsafe_messages,
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+                tools=frontend_tools,
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    errors = [event for event in unsafe_events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "INTERRUPT_RECONCILIATION_ERROR"
+    assert not any(event.type == EventType.RUN_FINISHED for event in unsafe_events)
+    assert interrupt_state.activated
+    assert interrupt_state.context == parked_context
+    assert interrupt_state.interrupts == parked_interrupts
+    assert core.messages == parked_messages
+    assert session_manager.session_repository.list_messages(
+        session_manager.session_id, core.agent_id
+    ) == parked_repository_messages
+    assert core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == wire_map
+    assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
+
+    complete_messages = [
+        ToolMessage(
+            id=f"t-retry-{index}",
+            role="tool",
+            tool_call_id=wire_ids[name],
+            content=f'{{"{name}": true}}',
+        )
+        for index, name in enumerate(frontend_names)
+    ]
+    retry_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            messages=complete_messages,
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=frontend_tools,
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in retry_events)
+    assert any(event.type == EventType.RUN_FINISHED for event in retry_events)
+    assert "Forwarded to client" not in json.dumps(model.stream_calls_messages[-1])
 
 
 @pytest.mark.parametrize("recreate_agent", [False, True])
