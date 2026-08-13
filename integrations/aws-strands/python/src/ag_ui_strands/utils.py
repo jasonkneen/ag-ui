@@ -81,8 +81,11 @@ def _fetch_url_bytes(url: str) -> Optional[bytes]:
         # through unescaped — the re.sub below fixes those up into valid %25 escapes.
         encoded_path = quote(parts.path, safe="/:@!$&'()*+,;=-._~%")
         encoded_path = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", encoded_path)
-        # Apply the same encoding to the query string for non-ASCII values
-        encoded_query = quote(parts.query, safe="=&+%") if parts.query else ""
+        # Apply the same encoding to the query string for non-ASCII values.
+        # RFC 3986 allows these characters unencoded in a query component, so they
+        # must stay in safe= to avoid rewriting presigned URLs (S3/Azure/GCS) or
+        # breaking servers that distinguish encoded vs literal separators.
+        encoded_query = quote(parts.query, safe="/:@!$&'()*+,;=-._~?%") if parts.query else ""
         encoded_query = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", encoded_query) if encoded_query else ""
         safe_url = urlunsplit((
             parts.scheme, parts.netloc, encoded_path,

@@ -69,6 +69,30 @@ class TestFetchUrlBytesEncoding:
         assert "name=%E5%A4%A7%E6%A8%A1%E5%9E%8B" in called_url
 
     @pytest.mark.parametrize(
+        "query",
+        [
+            "next=/home/page&t=2021-01-01T00:00:00Z",
+            "sig=ab/cd+ef=",
+            "X-Amz-Credential=AKIA/20260807/us-east-1/s3/aws4_request",
+            "redirect=http://x.com/?a=b",
+        ],
+    )
+    @patch("ag_ui_strands.utils.urllib.request.urlopen")
+    def test_ascii_query_string_unchanged(self, mock_urlopen, query):
+        """ASCII query strings with RFC 3986 allowed chars must not be rewritten."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"ok"
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        url = f"https://example.com/file.txt?{query}"
+        _fetch_url_bytes(url)
+
+        called_url = mock_urlopen.call_args[0][0]
+        assert called_url == url
+
+    @pytest.mark.parametrize(
         ("path", "expected_path"),
         [
             ("my%20file.txt", "my%20file.txt"),
