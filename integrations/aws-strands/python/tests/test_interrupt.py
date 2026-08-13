@@ -1663,14 +1663,13 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
         for event in events2
     )
 
-    # --- A falsy-but-explicit resume payload must resolve, not loop. ---
-    finished2 = next(e for e in events2 if e.type == EventType.RUN_FINISHED)
-    still_stuck = (
-        finished2.outcome is not None
-        and finished2.outcome.type == "interrupt"
-        and finished2.outcome.interrupts[0].id == interrupt_id
-    )
-    assert not still_stuck, "falsy resume payload re-emitted the same interrupt"
+    # --- A falsy-but-explicit resume payload must resolve completely. ---
+    assert not any(event.type == EventType.RUN_ERROR for event in events2)
+    finished_events = [
+        event for event in events2 if event.type == EventType.RUN_FINISHED
+    ]
+    assert len(finished_events) == 1
+    assert finished_events[0].outcome is None
 
     # --- The frontend tool's REAL result must reach the model. ---
     assert model.turn >= 2, "resume never advanced the event loop past the interrupt"
