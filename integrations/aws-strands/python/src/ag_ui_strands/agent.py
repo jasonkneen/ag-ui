@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List
 
 from strands import Agent as StrandsAgentCore
 from strands.session import SessionManager
+from strands.types.interrupt import InterruptResponseContent
 
 # Params handled explicitly by StrandsAgent — excluded from auto-forwarding.
 # "messages" is excluded: per-thread agents start with no history;
@@ -66,6 +67,30 @@ def _extract_agent_kwargs(agent: StrandsAgentCore) -> dict:
 # outstanding frontend calls at once.
 _WIRE_MAP_MAX = 512
 
+# Upper bound on the per-agent tool-call metadata map held in session state.
+# It bounds abandoned entries (tool calls whose result never returns)
+# so state cannot grow without bound.
+_TOOL_CALL_MAP_MAX = 512
+
+# Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
+# cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
+# tool receives this in place of a real answer and can treat it as a denial.
+INTERRUPT_CANCELLED = {"cancelled": True}
+
+
+def _wrap_resume_response(status: str, payload: Any) -> dict:
+    """Package a ``ResumeEntry`` for Strands' ``interruptResponse`` shape.
+
+    Strands' resume gate is truthiness-based (i.e. ``if interrupt_.response:``),
+    so a raw falsy payload (``None``, ``False``, ``""``, ``0``, ``[]``, ``{}``)
+    re-raises the same interrupt and re-runs the tool body — an infinite approve loop.
+    Always hand Strands a truthy envelope; up to the tool implementation to properly
+    destructures it (e.g. via ``.get("cancelled")`` / ``.get("response")``).
+    """
+    if status == "cancelled":
+        return dict(INTERRUPT_CANCELLED)
+    return {"response": payload}
+
 
 def _get_strands_session_manager(agent: Any) -> Any:
     """Return the agent's Strands ``SessionManager``, or ``None``.
@@ -78,12 +103,77 @@ def _get_strands_session_manager(agent: Any) -> Any:
     )
 
 
+def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
+    """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
+
+    Every Strands interrupt originates from ``tool_context.interrupt()`` or a
+    ``BeforeToolCallEvent`` hook, so its id always embeds the triggering
+    ``toolUseId`` (``v1:<kind>:<toolUseId>:<uuid>``) and is inherently
+    tool-call-bound. This maps onto AG-UI's reserved ``reason="tool_call"``
+    core value, with ``tool_call_id`` extracted from the id.
+
+    Strands' free-form ``name`` and ``reason`` are preserved verbatim under
+    ``metadata`` (``strands_name`` / ``strands_reason``) so no information is
+    lost on the wire; ``message`` additionally carries ``reason`` when it is a
+    plain string, since AG-UI clients render ``message`` directly.
+    """
+    s_id = getattr(strands_interrupt, "id", "")
+    name = getattr(strands_interrupt, "name", None) or "interrupt"
+    raw_reason = getattr(strands_interrupt, "reason", None)
+
+    tool_call_id = None
+    s_id_parts = s_id.split(":") if isinstance(s_id, str) else []
+    if len(s_id_parts) >= 4:
+        # toolUseId is freeform and can itself contain ":" — slice the parts
+        # list to drop only the "v1"/"<kind>" prefix and the trailing uuid.
+        tool_call_id = ":".join(s_id_parts[2:-1])
+
+    metadata = {"strands_name": name}
+    if raw_reason is not None:
+        metadata["strands_reason"] = raw_reason
+
+    return Interrupt(
+        id=s_id,
+        tool_call_id=tool_call_id,
+        reason="tool_call",
+        message=raw_reason if isinstance(raw_reason, str) else None,
+        metadata=metadata,
+    )
+
+
+def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
+    """Return the native Strands interrupts for a paused run, or ``[]``.
+
+    Prefers the terminal ``AgentResult`` (``stop_reason == "interrupt"`` with a
+    populated ``interrupts``); falls back to the live agent's
+    ``_interrupt_state`` so a pause is still detected if the result event was
+    consumed by the stream's early-break path.
+    """
+    if terminal_result is not None:
+        if getattr(terminal_result, "stop_reason", None) == "interrupt":
+            interrupts = getattr(terminal_result, "interrupts", None) or []
+            if interrupts:
+                return list(interrupts)
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is not None and getattr(interrupt_state, "activated", False):
+        # Mirrors Strands' own gate (strands/types/interrupt.py: ``if interrupt_.response:``)
+        # — an interrupt with a truthy response was already answered by a prior partial
+        # resume and must not be re-reported as still pending.
+        return [
+            interrupt
+            for interrupt in getattr(interrupt_state, "interrupts", {}).values()
+            if not getattr(interrupt, "response", None)
+        ]
+    return []
+
+
 logger = logging.getLogger(__name__)
 from ag_ui.core import (
     AssistantMessage,
     CustomEvent,
     EventType,
     FunctionCall,
+    Interrupt,
     MessagesSnapshotEvent,
     ReasoningEncryptedValueEvent,
     ReasoningEndEvent,
@@ -94,6 +184,7 @@ from ag_ui.core import (
     RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
+    RunFinishedInterruptOutcome,
     RunStartedEvent,
     StateSnapshotEvent,
     StepFinishedEvent,
@@ -119,6 +210,7 @@ from .a2ui_tool import (
 )
 from .client_proxy_tool import sync_proxy_tools
 from .session_reconcile import (
+    AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -970,6 +1062,14 @@ class StrandsAgent:
             # client dispatching its follow-up run before the backend results
             # reach it, narrowing the ConcurrencyException race window.
             deferred_frontend_tool_ends = []
+            # Native ``toolUseId``s whose ``toolResult`` was processed this
+            # run. Drained after each result batch to prune the persisted
+            # tool-call meta map.
+            processed_result_native_ids: set[str] = set()
+            # Terminal ``AgentResult`` from Strands (carried on the final
+            # ``{"result": ...}`` stream event). Used after the loop to detect a
+            # native interrupt pause (``stop_reason == "interrupt"``).
+            terminal_result = None
 
             # Reasoning/thinking state tracking
             reasoning_started = False
@@ -994,6 +1094,23 @@ class StrandsAgent:
                 wire_to_native = (
                     strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
                 )
+
+            # The durable per-``toolUseId`` call metadata map recorded at
+            # emission (see the ``current_tool_use`` handler). On a RESUME
+            # run this is the ONLY source of ``{name, args, input,
+            # strands_tool_id}`` for the interrupted tool, since Strands does
+            # not re-emit ``current_tool_use`` events for it. Guarded because
+            # test doubles / stub agents may lack ``state`` entirely; a
+            # missing store just means "no persisted meta yet".
+            persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
+            _agent_state = getattr(strands_agent, "state", None)
+            if _agent_state is not None:
+                try:
+                    persisted_tool_call_meta = (
+                        _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+                    )
+                except Exception:
+                    persisted_tool_call_meta = {}
             # Scope to the TRAILING tool results (this continuation's just-
             # returned results). ``pending_tool_result_ids`` holds those ids;
             # without this, a multi-turn continuation re-sends already-reconciled
@@ -1051,11 +1168,27 @@ class StrandsAgent:
             replay_history = (
                 self.config.replay_history_into_strands and session_manager is None
             )
+            # An active interrupt means a sibling frontend tool's placeholder may
+            # be stashed in ``_interrupt_state.context["tool_results"]``; reconcile
+            # even when this turn's frontend result is void, since that stash has
+            # no other correction path and is destroyed once the interrupt resumes.
+            has_active_interrupt = bool(
+                getattr(getattr(strands_agent, "_interrupt_state", None), "activated", False)
+            )
             reconcile_session_results = (
                 session_manager is not None
                 and self.config.replay_history_into_strands
-                and has_nonvoid_frontend_result
+                and (has_nonvoid_frontend_result or has_active_interrupt)
             )
+
+            # Default prompt: the legacy path, passing only the latest user
+            # message and trusting Strands (via session_manager) to track
+            # history. Each branch below may narrow this further; a resume run
+            # can carry BOTH a fresh frontend tool result and an interrupt
+            # response in the same batch, so the resume-entries translation
+            # below runs unconditionally after the other branches and layers
+            # on top, rather than short-circuiting them.
+            resume_prompt: str | List[Dict[str, Any]] | list[InterruptResponseContent] | None = user_message
             if replay_history:
                 native_history = _build_strands_history(input_data.messages)
                 # Apply ``state_context_builder`` to the last user-text
@@ -1083,11 +1216,11 @@ class StrandsAgent:
                                 )
                             break
                 strands_agent.messages = native_history
-                # ``stream_async(None)`` tells Strands to use existing
-                # ``self.messages`` as-is. The LLM sees real tool results
-                # (including ones produced by the frontend) and emits a
-                # proper follow-up turn instead of re-calling the tool.
-                agent_stream = strands_agent.stream_async(None)
+                # ``None`` tells Strands to use existing ``self.messages`` as-is.
+                # The LLM sees real tool results (including ones produced by the
+                # frontend) and emits a proper follow-up turn instead of
+                # re-calling the tool.
+                resume_prompt = None
             elif reconcile_session_results:
                 try:
                     corrected_native_ids = reconcile_frontend_tool_results(
@@ -1123,13 +1256,33 @@ class StrandsAgent:
                     getattr(strands_agent, "messages", None) or [],
                     only_ids=set(resolved_native_results),
                 )
-                agent_stream = strands_agent.stream_async(
-                    None if reconciled else user_message
+                resume_prompt = None if reconciled else user_message
+
+            # A client answering to an interrupt sends its responses
+            # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
+            # not as a new user message. Translate those into the Strands resume
+            # prompt shape ``[{"interruptResponse": {"interruptId", "response"}}]``
+            # and drive the stream with it — this runs after (and takes
+            # precedence over) every branch above, since a resume batch may
+            # still carry a fresh frontend tool result that needed reconciling.
+            resume_entries = getattr(input_data, "resume", None)
+            has_resume_entries = isinstance(resume_entries, list) and resume_entries
+            if has_resume_entries:
+                resume_prompt = [
+                    {
+                        "interruptResponse": {
+                            "interruptId": entry.interrupt_id,
+                            "response": _wrap_resume_response(entry.status, entry.payload),
+                        }
+                    }
+                    for entry in resume_entries
+                ]
+            if (has_resume_entries or has_active_interrupt) and session_manager is None:
+                # Interrupts and frontend-tools reconcicliation are not yet properly supported when
+                # used without a session manager, halt the conversation.
+                raise RuntimeError(
+                    "AG-UI currently supports interrupts only using a SessionManager"
                 )
-            else:
-                # Legacy path: pass only the latest user message and trust
-                # Strands (via session_manager) to track history.
-                agent_stream = strands_agent.stream_async(user_message)
 
             # Drop only the entries whose placeholder was actually corrected
             # this turn — they won't recur. Entries that were NOT corrected
@@ -1146,8 +1299,16 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
+            agent_stream = strands_agent.stream_async(resume_prompt)
             try:
                 async for event in agent_stream:
+                    # Capture the terminal ``AgentResult`` (always emitted last
+                    # by ``stream_async``) so a native interrupt pause can be
+                    # detected after the loop. Recorded first so it is never
+                    # dropped, even on the halt-event-stream break below.
+                    if "result" in event and event["result"] is not None:
+                        terminal_result = event["result"]
+
                     # Frontend-tool halt: STOP the loop rather than muting the
                     # wire and draining it. The proxy tool returns a SUCCESSFUL
                     # "Forwarded to client" placeholder, so Strands has every
@@ -1412,6 +1573,35 @@ class StrandsAgent:
                                     if _data.get("strands_tool_id") == result_tool_id:
                                         call_info = _data
                                         break
+                            # RESUME-run fallback: the interrupted tool never
+                            # re-emits ``current_tool_use`` on resume, so
+                            # ``tool_calls_seen`` is empty for it. The
+                            # persisted meta map was populated when the call
+                            # was originally streamed (possibly in a prior
+                            # process). Direct native-id first, then scan by
+                            # ``strands_tool_id`` to match the frontend-tool
+                            # case.
+                            if not call_info:
+                                call_info = persisted_tool_call_meta.get(
+                                    result_tool_id, {}
+                                )
+                            if not call_info:
+                                for _pdata in persisted_tool_call_meta.values():
+                                    if (
+                                        isinstance(_pdata, dict)
+                                        and _pdata.get("strands_tool_id")
+                                        == result_tool_id
+                                    ):
+                                        call_info = _pdata
+                                        break
+                            # Record consumption once the lookup is complete
+                            # (even if it missed): the result was processed
+                            # this turn, so any persisted entry keyed on this
+                            # native id is safe to prune. Recording BEFORE the
+                            # frontend-skip / behavior branches ensures a
+                            # ``stop_streaming_after_result`` early break still
+                            # flags this id for prune.
+                            processed_result_native_ids.add(result_tool_id)
                             tool_name = call_info.get("name")
                             tool_args = call_info.get("args")
                             tool_input = call_info.get("input")
@@ -1542,6 +1732,33 @@ class StrandsAgent:
                                 )
                                 # Break inner loop — no further results should be emitted
                                 break
+
+                        # Prune the persisted tool-call meta map for entries
+                        # whose native id (or ``strands_tool_id`` for frontend
+                        # tools stored under a wire key) was just consumed.
+                        # The emission-time size cap (``_TOOL_CALL_MAP_MAX``) is
+                        # only a backstop for abandoned entries.
+                        if (
+                            persisted_tool_call_meta
+                            and processed_result_native_ids
+                        ):
+                            _remaining = {
+                                _k: _v
+                                for _k, _v in persisted_tool_call_meta.items()
+                                if _k not in processed_result_native_ids
+                                and (
+                                    not isinstance(_v, dict)
+                                    or _v.get("strands_tool_id")
+                                    not in processed_result_native_ids
+                                )
+                            }
+                            if len(_remaining) != len(persisted_tool_call_meta):
+                                if _get_strands_session_manager(strands_agent):
+                                    strands_agent.state.set(
+                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _remaining
+                                    )
+                                persisted_tool_call_meta = _remaining
+                        processed_result_native_ids.clear()
 
                         # Defer hand-off: now that this turn's backend
                         # TOOL_CALL_RESULT(s) have been emitted above, flush the
@@ -1687,6 +1904,42 @@ class StrandsAgent:
                                 "strands_tool_id": strands_tool_id,
                             }
 
+                            # Mirror the minimum-sufficient subset into durable
+                            # session state so a RESUME run — which does not
+                            # re-emit ``current_tool_use`` for the interrupted
+                            # tool — can still resolve ``tool_name``/behavior/
+                            # context at the ``toolResult`` site. Gate on
+                            # session_manager: only then does Strands durably flush state.
+                            if _get_strands_session_manager(strands_agent):
+                                _tc_meta = dict(
+                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                    or {}
+                                )
+                                # Key by the NATIVE ``toolUseId`` — that is what
+                                # arrives on ``toolResult``. For backend tools
+                                # this equals ``tool_use_id``; for frontend
+                                # tools ``tool_use_id`` is a fresh wire UUID
+                                # while ``strands_tool_id`` is native.
+                                _tc_key = strands_tool_id or tool_use_id
+                                _tc_meta[_tc_key] = {
+                                    "name": tool_name,
+                                    "args": args_str,
+                                    "input": tool_input,
+                                    "strands_tool_id": strands_tool_id,
+                                }
+                                if len(_tc_meta) > _TOOL_CALL_MAP_MAX:
+                                    for _stale in list(_tc_meta)[
+                                        : len(_tc_meta) - _TOOL_CALL_MAP_MAX
+                                    ]:
+                                        _tc_meta.pop(_stale, None)
+                                strands_agent.state.set(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
+                                )
+                                # Keep the in-run view aligned so downstream
+                                # result lookups see the same entry a fresh
+                                # process would restore from the store.
+                                persisted_tool_call_meta = _tc_meta
+
                             if use_streaming:
                                 # Close any open assistant text turn so the
                                 # snapshot order matches the wire-event order
@@ -1751,6 +2004,25 @@ class StrandsAgent:
                             tool_calls_seen[tool_use_id]["input"] = tool_input
                             tool_calls_seen[tool_use_id]["args"] = args_str
                             tool_calls_seen[tool_use_id]["raw"] = raw_str
+
+                            # Keep the persisted meta in sync with the final
+                            # streamed args. Without this refresh, resume runs
+                            # would see the first partial-JSON delta rather
+                            # than the complete args the model emitted.
+                            if _get_strands_session_manager(strands_agent):
+                                _tc_meta = dict(
+                                    strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+                                    or {}
+                                )
+                                _tc_key = strands_tool_id or tool_use_id
+                                _existing = _tc_meta.get(_tc_key)
+                                if _existing is not None:
+                                    _existing["input"] = tool_input
+                                    _existing["args"] = args_str
+                                    strands_agent.state.set(
+                                        AG_UI_TOOL_CALL_MAP_STATE_KEY, _tc_meta
+                                    )
+                                    persisted_tool_call_meta = _tc_meta
 
                         # Stream incremental ToolCallArgs deltas as the LLM
                         # produces more characters of the JSON args. The FE
@@ -2171,12 +2443,30 @@ class StrandsAgent:
                 snapshot=current_state,
             )
 
-            # Always finish the run - frontend handles keeping action executing
-            yield RunFinishedEvent(
-                type=EventType.RUN_FINISHED,
-                thread_id=input_data.thread_id,
-                run_id=input_data.run_id,
-            )
+            # If the run paused on a native Strands interrupt, surface it as an
+            # AG-UI interrupt outcome so the client can collect a response and
+            # resume via ``RunAgentInput.resume`` next turn. Otherwise finish
+            # bare, exactly as before (no behavior change for normal runs).
+            native_interrupts = _extract_interrupts(strands_agent, terminal_result)
+            if native_interrupts:
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                    outcome=RunFinishedInterruptOutcome(
+                        type="interrupt",
+                        interrupts=[
+                            _strands_interrupt_to_agui(i) for i in native_interrupts
+                        ],
+                    ),
+                )
+            else:
+                # Always finish the run - frontend handles keeping action executing
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
 
         except Exception as e:
             import traceback

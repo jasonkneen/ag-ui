@@ -83,6 +83,64 @@ agentcore deploy
 
 For the complete deployment walkthrough, see [Deploy AG-UI servers in AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-agui.html).
 
+## Human-in-the-loop (native Strands interrupts)
+
+Tools that pause with `tool_context.interrupt(...)` are bridged to the AG-UI
+interrupt round-trip:
+
+- When a run pauses, it finishes with `RUN_FINISHED` carrying a
+  `RunFinishedInterruptOutcome` (`outcome.type == "interrupt"`) and one AG-UI
+  `Interrupt` per Strands interrupt. The Strands interrupt *name* becomes the
+  AG-UI `reason`; the original (free-form) reason object is preserved under
+  `metadata.strands_reason`.
+- To resume, the client sends the next `RunAgentInput` on the **same
+  `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
+  payload=...)]`. Strands' resume gate is truthiness-based (`if
+  interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
+  `[]`, `{}`) would otherwise re-raise the same interrupt and re-run the tool
+  body forever. To prevent that, `interrupt()` does **not** return `payload`
+  directly — it returns a truthy envelope: `{"response": payload}` on
+  resolve, `{"cancelled": True}` on cancel. Destructure it with
+  `.get("response")` / `.get("cancelled")`.
+- `status="cancelled"` resumes the tool with the sentinel
+  `{"cancelled": True}` (`ag_ui_strands.INTERRUPT_CANCELLED`) so it can
+  treat the pause as a denial.
+- **Re-execution on resume:** resuming a paused tool re-runs its body from
+  the top — any code before the `interrupt()` call executes again. Guard
+  side effects that must not repeat:
+
+  ```python
+  @tool
+  def charge_card(tool_context: ToolContext, amount: float) -> str:
+      # Unsafe: re-runs (and re-charges) on every resume.
+      charge(amount)
+      envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      return "cancelled" if envelope.get("cancelled") or not envelope.get("response") else "charged"
+
+
+  @tool
+  def charge_card(tool_context: ToolContext, amount: float) -> str:
+      # Safe: side effect happens only after the pause resolves.
+      envelope = tool_context.interrupt("confirm_charge", reason={"amount": amount})
+      if envelope.get("cancelled") or not envelope.get("response"):
+          return "cancelled"
+      charge(amount)
+      return "charged"
+  ```
+
+> **Persistence:** interrupt state lives on the per-thread agent instance. The
+> in-memory per-thread cache only preserves it within a single process, so
+> pause and resume must hit the same process. For stateless / multi-container
+> HTTP deployments, wire a durable `SessionManager` via
+> `StrandsAgentConfig.session_manager_provider` so interrupt state round-trips
+> across processes. Keep interrupt payloads and tool results JSON-safe (no raw
+> `bytes`) when doing so: Strands' `SessionAgent.to_dict()` — unlike
+> `SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
+> `bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
+> `ToolResult` in the same turn, raises `TypeError: Object of type bytes is
+> not JSON serializable` from `FileSessionManager`/`S3SessionManager` and
+> aborts the run.
+
 ## Supported AG-UI Events
 
 The integration supports the following AG-UI event families:
