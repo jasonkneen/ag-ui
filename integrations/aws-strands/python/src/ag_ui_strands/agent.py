@@ -475,6 +475,17 @@ def _coerce_text(content: Any) -> str:
     return str(content)
 
 
+def _normalize_frontend_tool_result(
+    content: str, error: str | None
+) -> _FrontendToolResult:
+    """Couple frontend result text with its provider-visible status."""
+    return _FrontendToolResult(
+        content=content,
+        status="error" if error is not None else "success",
+        error=error,
+    )
+
+
 def _coerce_id(value: Any) -> str:
     """Return ``value`` if it is a non-empty string, else a fresh UUID."""
     return value if isinstance(value, str) and value else str(uuid.uuid4())
@@ -572,19 +583,18 @@ def _build_strands_history(input_messages: List[Any]) -> List[Dict[str, Any]]:
     for msg in input_messages or []:
         role = getattr(msg, "role", None)
         if role == "tool":
+            result = _normalize_frontend_tool_result(
+                _coerce_text(msg.content), getattr(msg, "error", None)
+            )
             pending_tool_results.append(
                 {
                     "toolResult": {
                         "toolUseId": getattr(msg, "tool_call_id", "") or "",
-                        "content": [{"text": _coerce_text(msg.content)}],
+                        "content": [{"text": result.provider_safe_content}],
                         # Carry the AG-UI failure signal onto Bedrock's toolResult status,
                         # so a client-reported tool failure is not asserted to the model as
                         # a success.
-                        "status": (
-                            "error"
-                            if getattr(msg, "error", None) is not None
-                            else "success"
-                        ),
+                        "status": result.status,
                     }
                 }
             )
@@ -1303,13 +1313,22 @@ class StrandsAgent:
                                 if isinstance(msg.content, str)
                                 else flatten_content_to_text(msg.content)
                             )
-                            if result_text and result_text.strip():
-                                _result_parts.append(f"{tool_name} returned: {result_text}")
-                            elif getattr(msg, "error", None) is not None:
-                                error_text = getattr(msg, "error", "")
+                            result = _normalize_frontend_tool_result(
+                                result_text or "", getattr(msg, "error", None)
+                            )
+                            provider_text = result.provider_safe_content
+                            if result.status == "error":
                                 _result_parts.append(
                                     f"{tool_name} failed"
-                                    + (f": {error_text}" if error_text else ".")
+                                    + (
+                                        f": {provider_text}"
+                                        if provider_text.strip()
+                                        else "."
+                                    )
+                                )
+                            elif provider_text.strip():
+                                _result_parts.append(
+                                    f"{tool_name} returned: {provider_text}"
                                 )
                             else:
                                 _result_parts.append(
@@ -1463,15 +1482,8 @@ class StrandsAgent:
                     if isinstance(content, str)
                     else flatten_content_to_text(content)
                 )
-                error = getattr(msg, "error", None)
-                frontend_results[wire_id] = _FrontendToolResult(
-                    content=text or "",
-                    status=(
-                        "error"
-                        if error is not None
-                        else "success"
-                    ),
-                    error=error,
+                frontend_results[wire_id] = _normalize_frontend_tool_result(
+                    text or "", getattr(msg, "error", None)
                 )
 
             # Translate the client's wire tool_call_id back to the native

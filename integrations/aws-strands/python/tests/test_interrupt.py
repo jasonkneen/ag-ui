@@ -820,6 +820,81 @@ class _InterruptFrontendProxyHook(HookProvider):
             event.interrupt("approve_proxy", reason="Approve frontend action")
 
 
+@pytest.mark.asyncio
+async def test_no_session_frontend_failure_replay_preserves_blank_diagnostic():
+    """Default history replay must retain why a frontend action failed."""
+    model = _ProxyHookInterruptFlowModel()
+    core = StrandsAgentCore(model=model, system_prompt="test")
+    agent = StrandsAgent(core, name="no-session-frontend-failure")
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id = next(
+        event.tool_call_id
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                UserMessage(id="u1", role="user", content="approve"),
+                AssistantMessage(
+                    id="a1",
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id=wire_id,
+                            type="function",
+                            function=FunctionCall(
+                                name="approveTool", arguments="{}"
+                            ),
+                        )
+                    ],
+                ),
+                ToolMessage(
+                    id="t-failed",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content="",
+                    error="boom",
+                ),
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(
+        event.type == EventType.RUN_ERROR for event in resumed_events
+    )
+    frontend_result = next(
+        block["toolResult"]
+        for message in model.stream_calls_messages[-1]
+        for block in message.get("content", [])
+        if block.get("toolResult", {}).get("toolUseId") == wire_id
+    )
+    assert frontend_result == {
+        "toolUseId": wire_id,
+        "content": [{"text": "boom"}],
+        "status": "error",
+    }
+    assert "Forwarded to client" not in json.dumps(
+        model.stream_calls_messages[-1]
+    )
+
+
 def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _InterruptFlowModel]:
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")

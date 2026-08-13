@@ -723,6 +723,38 @@ class TestSessionFrontendToolReconciliation:
         assert "executed successfully" not in instance.stream_prompts[0]
 
     @pytest.mark.asyncio
+    async def test_unmapped_failed_explicit_result_uses_failure_legacy_prompt(
+        self, tmp_path
+    ):
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(
+            session_id="thread-explicit-error-legacy", storage_dir=str(tmp_path)
+        )
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[
+                _payload_assistant("wire-1", "approve"),
+                _payload_tool(
+                    "wire-1", "client failure details", error="boom"
+                ),
+            ],
+            tools=[_frontend_tool("approve")],
+            wire_map={},
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1"),
+            ],
+        )
+
+        assert instance.stream_prompts == [
+            "approve failed: client failure details"
+        ]
+        assert "returned:" not in instance.stream_prompts[0]
+        assert "executed successfully" not in instance.stream_prompts[0]
+
+    @pytest.mark.asyncio
     async def test_mixed_void_and_real_clears_both_placeholders(self, tmp_path):
         # A void call in the same turn as a real one: the void placeholder must
         # be cleared (to "") rather than left as the literal "Forwarded to
