@@ -167,8 +167,12 @@ def has_active_proxy_placeholder(agent: Any) -> bool:
         return False
 
     return any(
-        isinstance(tool_result, Mapping)
-        and _is_placeholder(tool_result.get("content"))
+        isinstance(tool_result, dict)
+        and set(tool_result) == {"toolUseId", "status", "content"}
+        and isinstance(tool_result["toolUseId"], str)
+        and bool(tool_result["toolUseId"])
+        and tool_result["status"] == "success"
+        and tool_result["content"] == [{"text": PROXY_RESULT_PLACEHOLDER}]
         for tool_result in tool_results
     )
 

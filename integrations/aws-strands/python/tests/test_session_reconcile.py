@@ -85,6 +85,33 @@ def test_has_active_proxy_placeholder_requires_active_state_and_exact_reserved_r
             )
         )
     )
+    structurally_non_exact_results = [
+        {**exact_result, "status": "error"},
+        {key: value for key, value in exact_result.items() if key != "toolUseId"},
+        {key: value for key, value in exact_result.items() if key != "status"},
+        {**exact_result, "toolUseId": ""},
+        {
+            **exact_result,
+            "content": [
+                {"text": PLACEHOLDER},
+                {"text": "additional content"},
+            ],
+        },
+        {
+            **exact_result,
+            "content": [{"text": PLACEHOLDER, "unexpected": True}],
+        },
+        {**exact_result, "unexpected": True},
+    ]
+    for parked_result in structurally_non_exact_results:
+        assert not session_reconcile.has_active_proxy_placeholder(
+            SimpleNamespace(
+                _interrupt_state=SimpleNamespace(
+                    activated=True,
+                    context={"tool_results": [parked_result]},
+                )
+            )
+        )
     assert session_reconcile.has_active_proxy_placeholder(
         SimpleNamespace(
             _interrupt_state=SimpleNamespace(
