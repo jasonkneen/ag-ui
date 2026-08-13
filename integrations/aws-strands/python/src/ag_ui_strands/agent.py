@@ -5,6 +5,7 @@ Translates Strands streaming events into the AG-UI event protocol.
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
@@ -13,7 +14,14 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List
 
 from strands import Agent as StrandsAgentCore
+from strands.hooks import HookProvider
+from strands.hooks.events import (
+    AfterInvocationEvent,
+    BeforeToolCallEvent,
+)
+from strands.interrupt import InterruptException
 from strands.session import SessionManager
+from strands.tools import normalize_tool_spec
 from strands.types.interrupt import InterruptResponseContent
 
 # Params handled explicitly by StrandsAgent — excluded from auto-forwarding.
@@ -251,9 +259,605 @@ def _interrupt_metadata_to_json_safe(
     }
 
 
+AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY = "__ag_ui_proxy_hook_provenance__"
+_PROXY_HOOK_FAILURE_MESSAGE = (
+    "Frontend tool call was not executed because a BeforeToolCall hook "
+    "changed its semantics."
+)
+
+
+def _json_native_copy(value: Any) -> Any:
+    """Copy internal identity without applying wire metadata encoding."""
+    return json.loads(json.dumps(value, ensure_ascii=True, sort_keys=True))
+
+
+def _agent_state_key_present(agent: Any, key: str) -> bool:
+    """Check one adapter key without copying the complete AgentState.
+
+    Strands 1.18 AgentState has no public membership API, while ``get`` cannot
+    distinguish a missing key from a present ``None`` value. Its backing
+    mapping is therefore the only efficient presence check and is used only
+    for adapter-owned keys; values still come from the public keyed ``get``.
+    """
+    state_store = getattr(agent.state, "_state", None)
+    if isinstance(state_store, dict):
+        return key in state_store
+    return agent.state.get(key) is not None
+
+
+def _proxy_hook_provenance_value(
+    agent: Any,
+) -> tuple[
+    bool,
+    frozenset[str] | None,
+    dict[str, dict[str, Any]] | None,
+]:
+    """Decode durable proxy-hook provenance, distinguishing absence/malformed."""
+    present = _agent_state_key_present(agent, AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY)
+    if not present:
+        return False, frozenset(), {}
+    raw = agent.state.get(AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY)
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != 1
+        or set(raw) != {"version", "managed_interrupt_ids", "records"}
+        or not isinstance(raw.get("managed_interrupt_ids"), list)
+        or not all(
+            isinstance(interrupt_id, str)
+            and interrupt_id.startswith("v1:before_tool_call:")
+            for interrupt_id in raw["managed_interrupt_ids"]
+        )
+        or len(set(raw["managed_interrupt_ids"])) != len(raw["managed_interrupt_ids"])
+        or not isinstance(raw.get("records"), dict)
+    ):
+        return True, None, None
+    managed_ids = frozenset(raw["managed_interrupt_ids"])
+    records = raw["records"]
+    if set(records) != managed_ids or not all(
+        isinstance(interrupt_id, str)
+        and isinstance(record, dict)
+        and isinstance(record.get("original_native_tool_call_id"), str)
+        and isinstance(record.get("wire_tool_call_id"), str)
+        and isinstance(record.get("name"), str)
+        and isinstance(record.get("input"), dict)
+        and isinstance(record.get("tool_spec"), dict)
+        for interrupt_id, record in records.items()
+    ):
+        return True, None, None
+    return True, managed_ids, records
+
+
+def _proxy_hook_provenance_payload(
+    records: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the strict on-session proxy provenance envelope."""
+    return {
+        "version": 1,
+        "managed_interrupt_ids": sorted(records),
+        "records": records,
+    }
+
+
+def _proxy_hook_error(changed_fields: set[str] | None = None) -> "RunErrorEvent":
+    from ag_ui.core import EventType, RunErrorEvent
+
+    changed = sorted(changed_fields or ())
+    suffix = f" ({', '.join(changed)})" if changed else ""
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "A BeforeToolCall hook changed frontend proxy semantics after "
+            f"the call was emitted{suffix}"
+        ),
+        code="INTERRUPT_PROXY_PROVENANCE_ERROR",
+    )
+
+
+class _ProxyHookBoundary:
+    """Per-core authoritative state inaccessible to caller invocation state."""
+
+    def __init__(self) -> None:
+        self.captures: dict[int, dict[str, Any]] = {}
+        self.claims: dict[str, str] = {}
+        self.candidate_records: dict[str, dict[str, Any]] = {}
+        self.candidate_failures: dict[str, set[str]] = {}
+        self.candidate_captures: dict[str, dict[str, Any]] = {}
+        self.candidate_collisions: set[str] = set()
+        self.expected_records: dict[str, dict[str, Any]] = {}
+        self.failure_fields: set[str] = set()
+        self.authoritative_resume_results: dict[str, Any] = {}
+        self.authoritative_records: dict[str, dict[str, Any]] = {}
+        self.working_resume_results: dict[str, Any] | None = None
+        self.run_checkpoint: dict[str, Any] | None = None
+        self.failed = False
+
+    def prepare_run(
+        self,
+        agent: Any,
+        resume_results: dict[str, Any] | None,
+    ) -> None:
+        self.captures.clear()
+        self.claims.clear()
+        self.candidate_records.clear()
+        self.candidate_failures.clear()
+        self.candidate_captures.clear()
+        self.candidate_collisions.clear()
+        self.expected_records.clear()
+        self.failure_fields.clear()
+        self.failed = False
+        self.authoritative_resume_results = copy.deepcopy(resume_results or {})
+        self.working_resume_results = resume_results if resume_results else None
+        interrupt_state = agent._interrupt_state
+        _present, managed_ids, records = _proxy_hook_provenance_value(agent)
+        self.authoritative_records = copy.deepcopy(records or {})
+        exact_resume = bool(
+            interrupt_state.activated
+            and managed_ids
+            and managed_ids.intersection(interrupt_state.interrupts)
+        )
+        session_manager = _get_strands_session_manager(agent)
+        no_session_proxy_turn = bool(
+            session_manager is None and registered_proxy_tool_names(agent.tool_registry)
+        )
+        message_snapshot: list | None = None
+        message_snapshot_is_deep = False
+        conversation_manager_state: dict[str, Any] | None = None
+        if exact_resume:
+            message_snapshot = copy.deepcopy(agent.messages)
+            message_snapshot_is_deep = True
+            conversation_manager_state = copy.deepcopy(
+                agent.conversation_manager.get_state()
+            )
+        elif no_session_proxy_turn:
+            # Initial no-session failures are restored to the exact live
+            # checkpoint without copying arbitrary existing message payloads.
+            message_snapshot = list(agent.messages)
+            conversation_manager_state = _json_native_copy(
+                agent.conversation_manager.get_state()
+            )
+        self.run_checkpoint = {
+            "interrupts": dict(interrupt_state.interrupts),
+            "responses": {
+                interrupt_id: interrupt.response
+                for interrupt_id, interrupt in interrupt_state.interrupts.items()
+            },
+            "context": (
+                copy.deepcopy(interrupt_state.context)
+                if exact_resume
+                else interrupt_state.context
+            ),
+            "activated": interrupt_state.activated,
+            "exact_resume": exact_resume,
+            "messages_object": agent.messages,
+            "messages": message_snapshot,
+            "messages_deep": message_snapshot_is_deep,
+            "conversation_manager_state": conversation_manager_state,
+            "state": {
+                key: (
+                    _agent_state_key_present(agent, key),
+                    agent.state.get(key),
+                )
+                for key in (
+                    AG_UI_WIRE_MAP_STATE_KEY,
+                    AG_UI_TOOL_CALL_MAP_STATE_KEY,
+                    AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
+                )
+            },
+        }
+
+    def capture(self, event: Any) -> None:
+        if getattr(event.selected_tool, "_ag_ui_proxy", False) is not True:
+            return
+        original_tool_use = copy.deepcopy(event.tool_use)
+        native_id = original_tool_use.get("toolUseId")
+        tool_meta = event.agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+        metadata = tool_meta.get(native_id) if isinstance(tool_meta, dict) else None
+        wire_id = (
+            metadata.get("wire_tool_call_id") if isinstance(metadata, dict) else None
+        )
+        wire_map = event.agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+        if not isinstance(wire_id, str) and isinstance(wire_map, dict):
+            wire_id = next(
+                (
+                    wire
+                    for wire, mapped_native in wire_map.items()
+                    if mapped_native == native_id
+                ),
+                None,
+            )
+        if not isinstance(wire_id, str):
+            wire_id = next(
+                (
+                    data.get("wire_tool_call_id")
+                    for data in self.captures.values()
+                    if data["original_tool_use"]["toolUseId"] == native_id
+                    and isinstance(data.get("wire_tool_call_id"), str)
+                ),
+                None,
+            )
+        capture = {
+            "original_tool_use": original_tool_use,
+            "original_tool_use_object": event.tool_use,
+            "selected_tool": event.selected_tool,
+            "tool_spec": _json_native_copy(event.selected_tool.tool_spec),
+            "cancel_tool": event.cancel_tool,
+            "wire_tool_call_id": wire_id,
+            "interrupt_ids": [],
+            "wire_map_entry": (
+                (
+                    wire_id in wire_map
+                    if isinstance(wire_map, dict) and isinstance(wire_id, str)
+                    else False
+                ),
+                (
+                    copy.deepcopy(wire_map.get(wire_id))
+                    if isinstance(wire_map, dict) and isinstance(wire_id, str)
+                    else None
+                ),
+            ),
+            "tool_meta_entry": (
+                native_id in tool_meta if isinstance(tool_meta, dict) else False,
+                (
+                    copy.deepcopy(tool_meta.get(native_id))
+                    if isinstance(tool_meta, dict)
+                    else None
+                ),
+            ),
+            "original_interrupt": event.interrupt,
+            "event": event,
+        }
+        self.captures[id(event)] = capture
+
+        original_interrupt = event.interrupt
+
+        def observed_interrupt(
+            name: str, reason: Any = None, response: Any = None
+        ) -> Any:
+            try:
+                return original_interrupt(name, reason=reason, response=response)
+            except InterruptException as exception:
+                self._record_claim(capture, exception.interrupt.id)
+                raise
+
+        # BeforeToolCallEvent intentionally allows only its documented fields
+        # through __setattr__. Strands exposes no public interrupt-observation
+        # hook, so object.__setattr__ installs the smallest call-exact seam on
+        # this event only; the finalizer removes it before the event escapes.
+        object.__setattr__(event, "interrupt", observed_interrupt)
+
+    @staticmethod
+    def _restore_interrupt_method(capture: dict[str, Any]) -> None:
+        event = capture["event"]
+        if "interrupt" in vars(event):
+            object.__delattr__(event, "interrupt")
+
+    def _record_claim(self, capture: dict[str, Any], interrupt_id: str) -> None:
+        native_id = capture["original_tool_use"]["toolUseId"]
+        prior_native = self.claims.setdefault(interrupt_id, native_id)
+        if prior_native != native_id:
+            self.candidate_collisions.add(interrupt_id)
+        if interrupt_id not in capture["interrupt_ids"]:
+            capture["interrupt_ids"].append(interrupt_id)
+
+    def promote_interrupts(self, agent: Any, interrupt_ids: set[str]) -> None:
+        """Persist only candidates Strands actually advertised as pending."""
+        if not interrupt_ids:
+            return
+        present, managed_ids, records = _proxy_hook_provenance_value(agent)
+        if present and (managed_ids is None or records is None):
+            self.failure_fields.add("provenance_state")
+            self.failed = True
+            return
+        promoted = copy.deepcopy(records or {})
+        restored_captures: set[int] = set()
+        for interrupt_id in interrupt_ids:
+            if interrupt_id in self.candidate_collisions:
+                self.failure_fields.add("interrupt_id_collision")
+                self.failed = True
+            record = self.candidate_records.get(interrupt_id)
+            if record is None:
+                self.failure_fields.add("provenance_state")
+                self.failed = True
+                continue
+            capture = self.candidate_captures[interrupt_id]
+            if id(capture) not in restored_captures:
+                # HookRegistry has now proven the candidate escaped as a real
+                # pause. Restore the native tool-use object before Strands
+                # resumes and parks it in interrupt context. Non-pausing calls
+                # never pass this seam, so their ordinary hook mutations stay
+                # untouched.
+                original_object = capture["original_tool_use_object"]
+                original_object.clear()
+                original_object.update(copy.deepcopy(capture["original_tool_use"]))
+                live_spec = getattr(capture["selected_tool"], "tool_spec", None)
+                if isinstance(live_spec, dict):
+                    live_spec.clear()
+                    live_spec.update(_json_native_copy(capture["tool_spec"]))
+                restored_captures.add(id(capture))
+            candidate_failures = self.candidate_failures.get(interrupt_id, set())
+            if candidate_failures:
+                self.failure_fields.update(candidate_failures)
+                self.failed = True
+            promoted[interrupt_id] = copy.deepcopy(record)
+            self.expected_records[interrupt_id] = copy.deepcopy(record)
+        if promoted:
+            agent.state.set(
+                AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
+                _proxy_hook_provenance_payload(promoted),
+            )
+
+    def finalize(self, event: Any) -> None:
+        capture = self.captures.pop(id(event), None)
+        if capture is None:
+            return
+        self._restore_interrupt_method(capture)
+        original = capture["original_tool_use"]
+        current = event.tool_use
+        changed: set[str] = set()
+        if not isinstance(current, dict) or current.get("name") != original["name"]:
+            changed.add("name")
+        if not isinstance(current, dict) or current.get("input") != original.get(
+            "input", {}
+        ):
+            changed.add("input")
+        if event.selected_tool is not capture["selected_tool"]:
+            changed.add("selected_tool")
+        if getattr(event.selected_tool, "tool_spec", None) != capture["tool_spec"]:
+            changed.add("tool_spec")
+        if event.cancel_tool != capture["cancel_tool"]:
+            changed.add("cancel_tool")
+
+        native_id = original["toolUseId"]
+        prior_records = [
+            record
+            for record in self.authoritative_records.values()
+            if record["original_native_tool_call_id"] == native_id
+        ]
+        is_managed_resume = bool(
+            self.run_checkpoint
+            and self.run_checkpoint["exact_resume"]
+            and prior_records
+        )
+        has_expected_resume = native_id in self.authoritative_resume_results
+        expected_resume = self.authoritative_resume_results.get(native_id)
+        working_results = event.invocation_state.get(PROXY_RESUME_RESULTS_KEY)
+        if has_expected_resume and (
+            not isinstance(working_results, dict)
+            or working_results.get(native_id) != expected_resume
+        ):
+            changed.add("proxy_resume_result")
+
+        if not capture["interrupt_ids"] and not is_managed_resume:
+            # No proxy checkpoint was established. Caller mutation remains
+            # ordinary legal Strands behavior and must not be constrained.
+            return
+
+        if is_managed_resume:
+            for prior_record in prior_records:
+                if prior_record["wire_tool_call_id"] != capture["wire_tool_call_id"]:
+                    changed.add("wire_tool_call_id")
+                if prior_record["name"] != original["name"]:
+                    changed.add("name")
+                if prior_record["input"] != original.get("input", {}):
+                    changed.add("input")
+                if prior_record["tool_spec"] != capture["tool_spec"]:
+                    changed.add("tool_spec")
+
+        current_wire_map = event.agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+        wire_present, wire_value = capture["wire_map_entry"]
+        if (
+            not isinstance(current_wire_map, dict)
+            or (
+                capture["wire_tool_call_id"] in current_wire_map
+                if isinstance(capture["wire_tool_call_id"], str)
+                else False
+            )
+            != wire_present
+            or (
+                isinstance(capture["wire_tool_call_id"], str)
+                and current_wire_map.get(capture["wire_tool_call_id"]) != wire_value
+            )
+        ):
+            changed.add("wire_map")
+        current_tool_meta = event.agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+        meta_present, meta_value = capture["tool_meta_entry"]
+        if (
+            not isinstance(current_tool_meta, dict)
+            or (native_id in current_tool_meta) != meta_present
+            or current_tool_meta.get(native_id) != meta_value
+        ):
+            changed.add("tool_call_metadata")
+
+        present_now, managed_now, records_now = _proxy_hook_provenance_value(
+            event.agent
+        )
+        allowed_records = {
+            **copy.deepcopy(self.authoritative_records),
+            **copy.deepcopy(self.expected_records),
+        }
+        if (bool(allowed_records) and not present_now) or (
+            present_now
+            and (
+                managed_now is None
+                or records_now is None
+                or records_now != allowed_records
+            )
+        ):
+            changed.add("provenance_state")
+
+        if not isinstance(capture["wire_tool_call_id"], str):
+            changed.add("wire_tool_call_id")
+        for interrupt_id in capture["interrupt_ids"]:
+            record = {
+                "original_native_tool_call_id": native_id,
+                "wire_tool_call_id": capture["wire_tool_call_id"],
+                "name": original["name"],
+                "input": _json_native_copy(original.get("input", {})),
+                "tool_spec": _json_native_copy(capture["tool_spec"]),
+            }
+            self.candidate_records[interrupt_id] = record
+            self.candidate_failures[interrupt_id] = set(changed)
+            self.candidate_captures[interrupt_id] = capture
+        if not is_managed_resume:
+            # A call to event.interrupt() is only a candidate until Strands
+            # emits ToolInterruptEvent. Preemptively answered or caller-caught
+            # interrupts are ordinary non-pausing hooks and remain unrestricted.
+            return
+
+        original_object = capture["original_tool_use_object"]
+        original_object.clear()
+        original_object.update(copy.deepcopy(original))
+        event.tool_use = original_object
+        event.selected_tool = capture["selected_tool"]
+        event.cancel_tool = capture["cancel_tool"]
+        live_spec = getattr(event.selected_tool, "tool_spec", None)
+        if isinstance(live_spec, dict):
+            live_spec.clear()
+            live_spec.update(_json_native_copy(capture["tool_spec"]))
+        if self.working_resume_results is not None:
+            # Re-pin the caller-visible working map from the private copy. The
+            # authoritative dict itself never enters invocation_state, so a
+            # hook cannot retain and mutate our source of truth.
+            self.working_resume_results.clear()
+            self.working_resume_results.update(
+                copy.deepcopy(self.authoritative_resume_results)
+            )
+            event.invocation_state[PROXY_RESUME_RESULTS_KEY] = (
+                self.working_resume_results
+            )
+        if changed:
+            self.failure_fields.update(changed)
+            self.failed = True
+            # HookRegistry's supported control path is an interrupt. A fresh
+            # name guarantees this checkpoint cannot already have a response;
+            # rollback removes it before any retry is exposed to the caller.
+            capture["original_interrupt"](
+                f"__ag_ui_integrity_failure_{uuid.uuid4()}__",
+                reason=_PROXY_HOOK_FAILURE_MESSAGE,
+            )
+
+    def after_invocation(self, event: Any) -> None:
+        for capture in self.captures.values():
+            self._restore_interrupt_method(capture)
+        if (
+            self.run_checkpoint
+            and self.run_checkpoint["exact_resume"]
+            and self.captures
+        ):
+            managed_native_ids = {
+                record["original_native_tool_call_id"]
+                for record in self.authoritative_records.values()
+            }
+            if any(
+                capture["original_tool_use"].get("toolUseId") in managed_native_ids
+                for capture in self.captures.values()
+            ):
+                self.failure_fields.add("hook_completion")
+                self.failed = True
+        if not self.expected_records and not self.failed:
+            return
+        _present, managed_ids, records = _proxy_hook_provenance_value(event.agent)
+        if (
+            records is None
+            or managed_ids is None
+            or any(
+                interrupt_id not in managed_ids or records.get(interrupt_id) != expected
+                for interrupt_id, expected in self.expected_records.items()
+            )
+        ):
+            self.failure_fields.add("provenance_state")
+            self.failed = True
+        if not self.failed:
+            return
+        self._restore_failed_attempt(event.agent)
+
+    def _restore_failed_attempt(self, agent: Any) -> None:
+        checkpoint = self.run_checkpoint
+        if checkpoint is None:
+            return
+        interrupt_state = agent._interrupt_state
+        interrupt_state.interrupts = dict(checkpoint["interrupts"])
+        for interrupt_id, response in checkpoint["responses"].items():
+            interrupt_state.interrupts[interrupt_id].response = response
+        interrupt_state.context = (
+            copy.deepcopy(checkpoint["context"])
+            if checkpoint["exact_resume"]
+            else checkpoint["context"]
+        )
+        interrupt_state.activated = checkpoint["activated"]
+        for key, (present, value) in checkpoint["state"].items():
+            if not present:
+                agent.state.delete(key)
+            else:
+                agent.state.set(key, value)
+
+        session_manager = _get_strands_session_manager(agent)
+        if checkpoint["messages"] is not None and (
+            checkpoint["exact_resume"] or session_manager is None
+        ):
+            original_messages = checkpoint["messages_object"]
+            restored_messages = (
+                copy.deepcopy(checkpoint["messages"])
+                if checkpoint["messages_deep"]
+                else list(checkpoint["messages"])
+            )
+            original_messages[:] = restored_messages
+            agent.messages = original_messages
+            conversation_manager_state = checkpoint["conversation_manager_state"]
+            if conversation_manager_state is not None:
+                agent.conversation_manager.restore_from_session(
+                    copy.deepcopy(conversation_manager_state)
+                )
+        elif not checkpoint["activated"] and session_manager is not None:
+            # Initial session-backed failures cannot delete the durable batch
+            # through the public API. Find the exact assistant toolUse batch,
+            # replace it live, and publicly redact the persisted latest copy.
+            managed_native_ids = set(self.claims.values()) | {
+                record["original_native_tool_call_id"]
+                for record in self.expected_records.values()
+            }
+            target_index = next(
+                (
+                    index
+                    for index in range(len(agent.messages) - 1, -1, -1)
+                    if any(
+                        block.get("toolUse", {}).get("toolUseId") in managed_native_ids
+                        for block in agent.messages[index].get("content", [])
+                    )
+                ),
+                None,
+            )
+            replacement = {
+                "role": "assistant",
+                "content": [{"text": _PROXY_HOOK_FAILURE_MESSAGE}],
+            }
+            if target_index is not None:
+                agent.messages[target_index] = replacement
+            if managed_native_ids:
+                session_manager.redact_latest_message(replacement, agent)
+
+
+class _ProxyHookCaptureProvider(HookProvider):
+    def __init__(self, boundary: _ProxyHookBoundary) -> None:
+        self.boundary = boundary
+
+    def register_hooks(self, registry: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self.boundary.capture)
+        registry.add_callback(AfterInvocationEvent, self.boundary.after_invocation)
+
+
+class _ProxyHookFinalizerProvider(HookProvider):
+    def __init__(self, boundary: _ProxyHookBoundary) -> None:
+        self.boundary = boundary
+
+    def register_hooks(self, registry: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self.boundary.finalize)
+
+
 def _strands_interrupt_to_agui(
     strands_interrupt: Any,
     native_to_wire: dict[str, str] | None = None,
+    interrupt_to_wire: dict[str, str] | None = None,
 ) -> "Interrupt":
     """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
 
@@ -273,9 +877,11 @@ def _strands_interrupt_to_agui(
     raw_reason = getattr(strands_interrupt, "reason", None)
 
     native_tool_call_id = _interrupt_tool_call_id(strands_interrupt)
-    tool_call_id = (native_to_wire or {}).get(
-        native_tool_call_id, native_tool_call_id
-    )
+    tool_call_id = (interrupt_to_wire or {}).get(s_id)
+    if tool_call_id is None:
+        tool_call_id = (native_to_wire or {}).get(
+            native_tool_call_id, native_tool_call_id
+        )
 
     metadata = {"strands_name": _interrupt_metadata_to_json_safe(name)}
     if raw_reason is not None:
@@ -298,6 +904,9 @@ def _active_proxy_hook_interrupt_ids(
     if interrupt_state is None or not getattr(interrupt_state, "activated", False):
         return set()
 
+    present, managed_ids, records = _proxy_hook_provenance_value(agent)
+    if present and (managed_ids is None or records is None):
+        return set()
     native_ids: set[str] = set()
     for interrupt in getattr(interrupt_state, "interrupts", {}).values():
         interrupt_id = getattr(interrupt, "id", "")
@@ -305,11 +914,84 @@ def _active_proxy_hook_interrupt_ids(
             "v1:before_tool_call:"
         ):
             continue
-        native_id = _interrupt_tool_call_id(interrupt)
+        if present and interrupt_id not in (managed_ids or frozenset()):
+            # A native BeforeToolCall interrupt may be a sibling of a managed
+            # proxy interrupt. Presence of our manifest does not claim it.
+            continue
+        record = (records or {}).get(interrupt_id)
+        native_id = (
+            record.get("original_native_tool_call_id")
+            if isinstance(record, dict)
+            else _interrupt_tool_call_id(interrupt)
+        )
         metadata = tool_call_meta.get(native_id) if native_id else None
         if isinstance(metadata, dict) and metadata.get("is_frontend") is True:
             native_ids.add(native_id)
     return native_ids
+
+
+def _validate_active_proxy_hook_provenance(
+    agent: Any, tool_call_meta: dict[str, dict[str, Any]]
+) -> "RunErrorEvent | None":
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if (
+        interrupt_state is None
+        or getattr(interrupt_state, "activated", False) is not True
+    ):
+        return None
+    present, managed_ids, records = _proxy_hook_provenance_value(agent)
+    if present and (managed_ids is None or records is None):
+        return _proxy_hook_error()
+    if not present:
+        # Do not claim genuine native/legacy checkpoints. A paused frontend
+        # proxy, however, is adapter-owned and cannot be resumed safely after
+        # its durable provenance marker has disappeared.
+        for interrupt in interrupt_state.interrupts.values():
+            interrupt_id = getattr(interrupt, "id", "")
+            if not isinstance(interrupt_id, str) or not interrupt_id.startswith(
+                "v1:before_tool_call:"
+            ):
+                continue
+            native_id = _interrupt_tool_call_id(interrupt)
+            metadata = tool_call_meta.get(native_id) if native_id else None
+            if isinstance(metadata, dict) and metadata.get("is_frontend") is True:
+                return _proxy_hook_error()
+        return None
+    active_interrupt_ids = set(interrupt_state.interrupts)
+    if not (managed_ids or frozenset()).issubset(active_interrupt_ids):
+        return _proxy_hook_error()
+    return _validate_proxy_hook_record_bindings(agent, tool_call_meta, records or {})
+
+
+def _validate_proxy_hook_record_bindings(
+    agent: Any,
+    tool_call_meta: dict[str, dict[str, Any]],
+    records: dict[str, dict[str, Any]],
+) -> "RunErrorEvent | None":
+    """Validate every managed record against adapter-owned routing state."""
+    wire_map = agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+    if not isinstance(tool_call_meta, dict) or not isinstance(wire_map, dict):
+        return _proxy_hook_error()
+    for record in records.values():
+        native_id = record["original_native_tool_call_id"]
+        wire_id = record["wire_tool_call_id"]
+        metadata = tool_call_meta.get(native_id)
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("is_frontend") is not True
+            or metadata.get("name") != record["name"]
+            or metadata.get("input") != record["input"]
+            or wire_map.get(wire_id) != native_id
+        ):
+            return _proxy_hook_error()
+    return None
+
+
+def _proxy_tool_spec_from_agui(tool: Any) -> dict[str, Any]:
+    """Build the normalized Strands ToolSpec for a client declaration."""
+    return _json_native_copy(
+        normalize_tool_spec(copy.deepcopy(create_proxy_tool(tool).tool_spec))
+    )
 
 
 def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
@@ -462,6 +1144,7 @@ from .a2ui_tool import (
 )
 from .client_proxy_tool import (
     PROXY_RESUME_RESULTS_KEY,
+    create_proxy_tool,
     registered_proxy_tool_names,
     sync_proxy_tools,
 )
@@ -811,6 +1494,9 @@ class StrandsAgent:
 
         # Dictionary to store agent instances per thread
         self._agents_by_thread: Dict[str, StrandsAgentCore] = {}
+        self._proxy_hook_boundaries_by_thread: Dict[
+            str, _ProxyHookBoundary
+        ] = {}
         # Track proxy tool names registered per thread
         self._proxy_tool_names_by_thread: Dict[str, set] = {}
         # Guards first-time thread initialization. The session_manager_provider
@@ -906,14 +1592,29 @@ class StrandsAgent:
                     # there's nothing to forward.
                     core_kwargs = dict(self._agent_kwargs)
                     if self._hooks:
-                        core_kwargs["hooks"] = list(self._hooks)
-                    self._agents_by_thread[thread_id] = StrandsAgentCore(
+                        proxy_hook_boundary = _ProxyHookBoundary()
+                        core_kwargs["hooks"] = [
+                            _ProxyHookCaptureProvider(proxy_hook_boundary),
+                            *self._hooks,
+                        ]
+                    core_agent = StrandsAgentCore(
                         model=self._model,
                         system_prompt=self._system_prompt,
                         tools=self._tools,
                         session_manager=session_manager,
                         **core_kwargs,
                     )
+                    if self._hooks:
+                        # Constructor-time AgentInitialized callbacks may add
+                        # more BeforeToolCall callbacks. Append the finalizer
+                        # only after construction so it remains last.
+                        core_agent.hooks.add_hook(
+                            _ProxyHookFinalizerProvider(proxy_hook_boundary)
+                        )
+                        self._proxy_hook_boundaries_by_thread[
+                            thread_id
+                        ] = proxy_hook_boundary
+                    self._agents_by_thread[thread_id] = core_agent
         strands_agent = self._agents_by_thread[thread_id]
 
         resume_entries = getattr(input_data, "resume", None)
@@ -938,17 +1639,28 @@ class StrandsAgent:
         persisted_tool_call_meta: Dict[str, Dict[str, Any]] = {}
         _agent_state = getattr(strands_agent, "state", None)
         if _agent_state is not None:
-            try:
-                persisted_tool_call_meta = (
-                    _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
-                )
-            except Exception:
-                persisted_tool_call_meta = {}
+            persisted_tool_call_meta = (
+                _agent_state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) or {}
+            )
+        provenance_error = _validate_active_proxy_hook_provenance(
+            strands_agent, persisted_tool_call_meta
+        )
+        if provenance_error is not None:
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+            yield provenance_error
+            return
         active_proxy_hook_native_ids = _active_proxy_hook_interrupt_ids(
             strands_agent, persisted_tool_call_meta
         )
         retained_checkpoint_proxy_names: set[str] = set()
         if has_resume_entries and active_proxy_hook_native_ids:
+            _present, _managed_ids, active_records = (
+                _proxy_hook_provenance_value(strands_agent)
+            )
             marked_proxy_names = registered_proxy_tool_names(
                 strands_agent.tool_registry
             )
@@ -957,12 +1669,39 @@ class StrandsAgent:
                 or (tool.get("name", "") if isinstance(tool, dict) else "")
                 for tool in (input_data.tools or [])
             }
+            incoming_proxy_tools = {
+                getattr(tool, "name", None)
+                or (tool.get("name", "") if isinstance(tool, dict) else ""):
+                tool
+                for tool in (input_data.tools or [])
+            }
             unavailable_native_ids: set[str] = set()
             for native_id in active_proxy_hook_native_ids:
                 metadata = persisted_tool_call_meta.get(native_id)
                 tool_name = (
                     metadata.get("name") if isinstance(metadata, dict) else None
                 )
+                prior_specs = {
+                    json.dumps(record["tool_spec"], sort_keys=True)
+                    for record in (active_records or {}).values()
+                    if record["original_native_tool_call_id"] == native_id
+                }
+                incoming_tool = incoming_proxy_tools.get(tool_name)
+                if incoming_tool is not None and (
+                    len(prior_specs) != 1
+                    or json.dumps(
+                        _proxy_tool_spec_from_agui(incoming_tool),
+                        sort_keys=True,
+                    )
+                    not in prior_specs
+                ):
+                    yield RunStartedEvent(
+                        type=EventType.RUN_STARTED,
+                        thread_id=input_data.thread_id,
+                        run_id=input_data.run_id,
+                    )
+                    yield _proxy_hook_error({"tool_spec"})
+                    return
                 if tool_name in marked_proxy_names:
                     retained_checkpoint_proxy_names.add(tool_name)
                     continue
@@ -1436,6 +2175,7 @@ class StrandsAgent:
             # ``{"result": ...}`` stream event). Used after the loop to detect a
             # native interrupt pause (``stop_reason == "interrupt"``).
             terminal_result = None
+            proxy_boundary_error: RunErrorEvent | None = None
 
             # Reasoning/thinking state tracking
             reasoning_started = False
@@ -1779,6 +2519,14 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
+            proxy_hook_boundary = self._proxy_hook_boundaries_by_thread.get(
+                thread_id
+            )
+            if proxy_hook_boundary is not None:
+                proxy_hook_boundary.prepare_run(
+                    strands_agent, proxy_resume_results
+                )
+
             if proxy_resume_results:
                 agent_stream = strands_agent.stream_async(
                     resume_prompt,
@@ -1796,6 +2544,107 @@ class StrandsAgent:
                     # dropped, even on the halt-event-stream break below.
                     if "result" in event and event["result"] is not None:
                         terminal_result = event["result"]
+
+                    if event.get("tool_interrupt_event"):
+                        proxy_hook_boundary = (
+                            self._proxy_hook_boundaries_by_thread.get(thread_id)
+                        )
+                        payload = event["tool_interrupt_event"]
+                        raw_interrupts = payload.get("interrupts") or []
+                        boundary_ids = {
+                            getattr(interrupt, "id", None)
+                            for interrupt in raw_interrupts
+                            if isinstance(getattr(interrupt, "id", None), str)
+                        }
+                        owned_ids = (
+                            boundary_ids.intersection(
+                                proxy_hook_boundary.claims
+                            )
+                            if proxy_hook_boundary is not None
+                            else set()
+                        )
+                        if proxy_hook_boundary is not None:
+                            proxy_hook_boundary.promote_interrupts(
+                                strands_agent, owned_ids
+                            )
+                        present, managed_ids, provenance = (
+                            _proxy_hook_provenance_value(strands_agent)
+                        )
+                        malformed = bool(
+                            owned_ids
+                            and present
+                            and (
+                                managed_ids is None or provenance is None
+                            )
+                        )
+                        missing = bool(
+                            owned_ids
+                            and any(
+                                interrupt_id
+                                not in (managed_ids or frozenset())
+                                or interrupt_id not in (provenance or {})
+                                for interrupt_id in owned_ids
+                            )
+                        )
+                        binding_error = (
+                            _validate_proxy_hook_record_bindings(
+                                strands_agent,
+                                strands_agent.state.get(
+                                    AG_UI_TOOL_CALL_MAP_STATE_KEY
+                                )
+                                or {},
+                                provenance or {},
+                            )
+                            if (
+                                owned_ids
+                                and provenance is not None
+                                and session_manager is not None
+                            )
+                            else None
+                        )
+                        if (
+                            malformed
+                            or missing
+                            or binding_error is not None
+                            or (
+                                proxy_hook_boundary is not None
+                                and proxy_hook_boundary.failed
+                            )
+                        ):
+                            changed = (
+                                proxy_hook_boundary.failure_fields
+                                if proxy_hook_boundary is not None
+                                else set()
+                            )
+                            proxy_boundary_error = _proxy_hook_error(changed)
+                            deferred_frontend_tool_ends = []
+                            if (
+                                proxy_hook_boundary is not None
+                                and (
+                                    malformed
+                                    or missing
+                                    or binding_error is not None
+                                )
+                            ):
+                                proxy_hook_boundary.failure_fields.add(
+                                    "provenance_state"
+                                )
+                                proxy_hook_boundary.failed = True
+                        elif (
+                            session_manager is None
+                            and bool(
+                                owned_ids.intersection(
+                                    managed_ids or frozenset()
+                                )
+                            )
+                        ):
+                            proxy_boundary_error = (
+                                _interrupt_session_required_error()
+                            )
+                            deferred_frontend_tool_ends = []
+                            if proxy_hook_boundary is not None:
+                                proxy_hook_boundary.failed = True
+                        continue
 
                     # Frontend-tool halt: STOP the loop rather than muting the
                     # wire and draining it. The proxy tool returns a SUCCESSFUL
@@ -2429,6 +3278,7 @@ class StrandsAgent:
                                     "name": tool_name,
                                     "args": args_str,
                                     "input": tool_input,
+                                    "wire_tool_call_id": tool_use_id,
                                     "strands_tool_id": strands_tool_id,
                                     "is_frontend": is_frontend_tool,
                                 }
@@ -2856,7 +3706,7 @@ class StrandsAgent:
                 # calls), the per-batch flush above never ran and the buffered
                 # frontend ToolCallEnd(s) would be lost — leaving TOOL_CALL_START
                 # events with no matching END. Flush any remainder here.
-                if deferred_frontend_tool_ends:
+                if deferred_frontend_tool_ends and proxy_boundary_error is None:
                     for _fe_tool_use_id in deferred_frontend_tool_ends:
                         yield ToolCallEndEvent(
                             type=EventType.TOOL_CALL_END,
@@ -2909,6 +3759,21 @@ class StrandsAgent:
                     # Log other errors but don't fail
                     logger.warning(f"Error closing agent stream: {e}")
 
+            proxy_hook_boundary = self._proxy_hook_boundaries_by_thread.get(
+                thread_id
+            )
+            if (
+                proxy_boundary_error is None
+                and proxy_hook_boundary is not None
+                and proxy_hook_boundary.failed
+            ):
+                proxy_boundary_error = _proxy_hook_error(
+                    proxy_hook_boundary.failure_fields
+                )
+            if proxy_boundary_error is not None:
+                yield proxy_boundary_error
+                return
+
             # ``create_proxy_tool`` pops only after the resumed hook allows the
             # exact native proxy invocation to proceed. Remove the consumed
             # wire mapping then; an unconsumed override remains retryable.
@@ -2929,6 +3794,30 @@ class StrandsAgent:
                 strands_agent.state.set(
                     AG_UI_WIRE_MAP_STATE_KEY, remaining_wire_map
                 )
+                _present, managed_ids, current_provenance = (
+                    _proxy_hook_provenance_value(strands_agent)
+                )
+                if (
+                    managed_ids is not None
+                    and current_provenance is not None
+                ):
+                    remaining_provenance = {
+                        interrupt_id: record
+                        for interrupt_id, record in current_provenance.items()
+                        if record.get("original_native_tool_call_id")
+                        not in consumed_proxy_resume_ids
+                    }
+                    if remaining_provenance:
+                        strands_agent.state.set(
+                            AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY,
+                            _proxy_hook_provenance_payload(
+                                remaining_provenance
+                            ),
+                        )
+                    else:
+                        strands_agent.state.delete(
+                            AG_UI_PROXY_HOOK_PROVENANCE_STATE_KEY
+                        )
 
             # Close reasoning if still open
             if reasoning_started:
@@ -3003,6 +3892,15 @@ class StrandsAgent:
                     for wire, native in latest_wire_map.items()
                     if native in active_hook_native_ids
                 }
+                _present, _managed_ids, hook_provenance = (
+                    _proxy_hook_provenance_value(
+                    strands_agent
+                    )
+                )
+                interrupt_to_wire = {
+                    interrupt_id: record["wire_tool_call_id"]
+                    for interrupt_id, record in (hook_provenance or {}).items()
+                }
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
                     thread_id=input_data.thread_id,
@@ -3010,7 +3908,9 @@ class StrandsAgent:
                     outcome=RunFinishedInterruptOutcome(
                         type="interrupt",
                         interrupts=[
-                            _strands_interrupt_to_agui(i, native_to_wire)
+                            _strands_interrupt_to_agui(
+                                i, native_to_wire, interrupt_to_wire
+                            )
                             for i in native_interrupts
                         ],
                     ),

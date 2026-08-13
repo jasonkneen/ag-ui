@@ -11,6 +11,7 @@ AG-UI interrupt lifecycle:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from unittest.mock import MagicMock, patch
@@ -33,9 +34,12 @@ from strands import Agent as StrandsAgentCore
 from strands import ToolContext, tool
 from strands.agent.state import AgentState
 from strands.hooks import HookProvider
-from strands.hooks.events import BeforeToolCallEvent
+from strands.hooks.events import (
+    AgentInitializedEvent,
+    BeforeToolCallEvent,
+)
 from strands.interrupt import Interrupt as StrandsInterrupt
-from strands.interrupt import _InterruptState
+from strands.interrupt import InterruptException, _InterruptState
 from strands.models.model import Model as StrandsModel
 from strands.session import FileSessionManager, SessionManager
 
@@ -890,9 +894,10 @@ class _NonRepositorySessionManager(SessionManager):
 class _ProxyHookInterruptFlowModel(StrandsModel):
     """Turn 1 calls a frontend proxy; turn 2 records the resumed result."""
 
-    def __init__(self):
+    def __init__(self, *, tool_turns: set[int] | None = None):
         self.turn = 0
         self.stream_calls_messages = []
+        self.tool_turns = tool_turns or {1}
 
     def get_config(self):
         return {}
@@ -907,13 +912,18 @@ class _ProxyHookInterruptFlowModel(StrandsModel):
     async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
         self.turn += 1
         self.stream_calls_messages.append(copy.deepcopy(messages))
-        if self.turn == 1:
+        if self.turn in self.tool_turns:
+            native_id = (
+                "native-approve"
+                if self.turn == 1
+                else f"native-approve-{self.turn}"
+            )
             yield {"messageStart": {"role": "assistant"}}
             yield {
                 "contentBlockStart": {
                     "start": {
                         "toolUse": {
-                            "toolUseId": "native-approve",
+                            "toolUseId": native_id,
                             "name": "approveTool",
                         }
                     }
@@ -939,6 +949,261 @@ class _InterruptFrontendProxyHook(HookProvider):
     def _before_tool_call(event):
         if event.tool_use["name"] == "approveTool":
             event.interrupt("approve_proxy", reason="Approve frontend action")
+
+
+class _MutatingFrontendProxyHook(HookProvider):
+    """Exercise writable proxy-hook surfaces against the real executor."""
+
+    def __init__(self, mutation: str, *, should_interrupt: bool = True):
+        self.mutation = mutation
+        self.should_interrupt = should_interrupt
+        self.enabled = True
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if not self.enabled or event.tool_use["name"] != "approveTool":
+            return
+        if self.mutation == "id-in-place":
+            event.tool_use["toolUseId"] = "hook-mutated-id"
+        elif self.mutation == "id-replacement":
+            event.tool_use = {
+                **event.tool_use,
+                "toolUseId": "hook-replacement-id",
+            }
+        elif self.mutation == "input":
+            event.tool_use["input"] = {"changed": True}
+        elif self.mutation == "name":
+            event.tool_use["name"] = "replacementTool"
+        elif self.mutation == "selected-tool":
+            event.selected_tool = event.agent.tool_registry.registry["replacementTool"]
+        elif self.mutation == "tool-spec":
+            event.selected_tool.tool_spec["description"] = "hook changed"
+        elif self.mutation == "wire-map-delete":
+            event.agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, {})
+        elif self.mutation == "tool-meta-delete":
+            event.agent.state.set(AG_UI_TOOL_CALL_MAP_STATE_KEY, {})
+        if not self.should_interrupt:
+            return
+        event.interrupt("approve_proxy", reason="Approve frontend action")
+        if self.mutation == "input-after-resume":
+            event.tool_use["input"] = {"changed_after_resume": True}
+        elif self.mutation == "cancel-after-resume":
+            event.cancel_tool = "hook cancelled"
+        elif self.mutation == "provenance-delete":
+            event.agent.state.delete("__ag_ui_proxy_hook_provenance__")
+        elif self.mutation == "resume-value-in-place":
+            working = event.invocation_state["__ag_ui_proxy_resume_results__"]
+            result = working[event.tool_use["toolUseId"]]
+            object.__setattr__(result, "content", "HOOK-TAMPERED")
+
+
+class _AsyncPerCallAliasHook(HookProvider):
+    """Give concurrent equal proxies distinct aliases after an async yield."""
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    @staticmethod
+    async def _before_tool_call(event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        native_id = event.tool_use["toolUseId"]
+        await asyncio.sleep(0)
+        event.tool_use["toolUseId"] = f"hook-{native_id}"
+        event.interrupt(f"approve_{native_id}", reason="Approve frontend action")
+
+
+class _SameAliasHook(HookProvider):
+    """Force two different proxy calls onto the same caller-selected alias."""
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    @staticmethod
+    def _before_tool_call(event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        event.tool_use["toolUseId"] = "shared-hook-alias"
+        event.interrupt("approve_shared", reason="Approve frontend action")
+
+
+class _PreemptiveThenPendingInterruptHook(HookProvider):
+    """Pre-answer one proxy call, then pause the next proxy call normally."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        self.calls += 1
+        if self.calls == 1:
+            assert (
+                event.interrupt(
+                    "approve_proxy",
+                    reason="Approve frontend action",
+                    response=True,
+                )
+                is True
+            )
+            event.tool_use["input"] = {"preemptive": True}
+            return
+        event.interrupt("approve_proxy", reason="Approve frontend action")
+
+
+class _CaughtInterruptThenMutateHook(HookProvider):
+    """Catch a candidate interrupt and continue with a legal mutation."""
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    @staticmethod
+    def _before_tool_call(event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        try:
+            event.interrupt("caught_proxy", reason="caught")
+        except InterruptException:
+            pass
+        event.tool_use["input"] = {"caught": True}
+
+
+class _RetainingNonInterruptingProxyHook(HookProvider):
+    """Retain the event so the temporary observer can be inspected."""
+
+    def __init__(self):
+        self.event = None
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if event.tool_use["name"] == "approveTool":
+            self.event = event
+
+
+class _InterruptThenReplaceWithoutRecheckingHook(HookProvider):
+    """Pause initially, then try to bypass the checkpoint on resume."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        self.calls += 1
+        if self.calls == 1:
+            event.interrupt("approve_proxy", reason="Approve frontend action")
+        else:
+            event.selected_tool = event.agent.tool_registry.registry["replacementTool"]
+
+
+class _RaiseOnSecondProxyHook(HookProvider):
+    """Raise after the managed hook returns its resume response."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("later static hook failed")
+
+
+class _LateRegisteredInterruptHook(HookProvider):
+    """Register a proxy callback during Strands agent initialization."""
+
+    def register_hooks(self, registry):
+        registry.add_callback(AgentInitializedEvent, self._initialized)
+
+    @staticmethod
+    def _initialized(event):
+        def initialized_interrupt(tool_event):
+            if tool_event.tool_use["name"] == "approveTool":
+                tool_event.interrupt("initialized_proxy", reason="initialized")
+
+        event.agent.hooks.add_callback(BeforeToolCallEvent, initialized_interrupt)
+
+
+class _CrossSiblingMapTamperHook(HookProvider):
+    """Corrupt the first finalized sibling while handling the second."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def register_hooks(self, registry):
+        registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
+
+    def _before_tool_call(self, event):
+        if event.tool_use["name"] != "approveTool":
+            return
+        self.calls += 1
+        native_id = event.tool_use["toolUseId"]
+        if self.calls == 2:
+            wire_map = event.agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+            first_wire = next(
+                wire
+                for wire, mapped_native in wire_map.items()
+                if mapped_native != native_id
+            )
+            wire_map[first_wire] = "corrupted-native"
+            event.agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, wire_map)
+        event.interrupt(f"approve_{native_id}", reason="approve")
+
+
+_replacement_tool_calls: list[dict] = []
+
+
+@tool
+def replacementTool(**kwargs) -> str:
+    """Record replacement execution; provenance failures must never call it."""
+    _replacement_tool_calls.append(kwargs)
+    return "SERVER-REPLACEMENT"
+
+
+def _proxy_hook_agent(
+    model,
+    *,
+    hook,
+    config: StrandsAgentConfig,
+    include_replacement: bool = False,
+) -> StrandsAgent:
+    core = StrandsAgentCore(
+        model=model,
+        tools=[replacementTool] if include_replacement else None,
+        system_prompt="test",
+        agent_id="proxy-hook-agent",
+    )
+    return StrandsAgent(
+        core,
+        name="proxy-hook-provenance",
+        config=config,
+        hooks=[hook],
+    )
+
+
+def _proxy_wire_and_interrupt(events):
+    wire_id = next(
+        event.tool_call_id
+        for event in events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    finished = next(event for event in events if event.type == EventType.RUN_FINISHED)
+    return wire_id, finished.outcome.interrupts[0]
 
 
 @pytest.mark.asyncio
@@ -2497,3 +2762,990 @@ async def test_mixed_active_resume_replays_failed_frontend_result_as_error(tmp_p
     }
     assert "boom" in json.dumps(model.stream_calls_messages[-1])
     assert "executed successfully" not in json.dumps(model.stream_calls_messages[-1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation,mutated_id",
+    [
+        ("id-in-place", "hook-mutated-id"),
+        ("id-replacement", "hook-replacement-id"),
+    ],
+)
+async def test_proxy_hook_id_mutation_round_trips_on_original_identity(
+    tmp_path,
+    mutation,
+    mutated_id,
+):
+    """A caller-selected hook alias cannot replace native/wire identity."""
+    model = _ProxyHookInterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_MutatingFrontendProxyHook(mutation),
+        config=config,
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+
+    assert interrupt.tool_call_id == wire_id
+    assert not any(
+        getattr(event, "tool_call_id", None) == mutated_id
+        for event in initial_events
+    )
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-approve",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content="CLIENT-REAL",
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    model_input = json.dumps(model.stream_calls_messages[-1])
+    assert model_input.count("CLIENT-REAL") == 1
+    assert "Forwarded to client" not in model_input
+    assert mutated_id not in json.dumps(model.stream_calls_messages)
+    live_core = agent._agents_by_thread["thread-1"]
+    assistant_ids = [
+        block["toolUse"]["toolUseId"]
+        for message in live_core.messages
+        for block in message.get("content", [])
+        if "toolUse" in block and block["toolUse"]["name"] == "approveTool"
+    ]
+    result_ids = [
+        block["toolResult"]["toolUseId"]
+        for message in live_core.messages
+        for block in message.get("content", [])
+        if "toolResult" in block
+        and block["toolResult"].get("content") == [{"text": "CLIENT-REAL"}]
+    ]
+    assert assistant_ids == result_ids == ["native-approve"]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["id-in-place", "id-replacement"])
+async def test_proxy_hook_id_alias_survives_recreated_wrapper(
+    tmp_path,
+    mutation,
+):
+    """Durable alias provenance never relies on same-process inference."""
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_model = _ProxyHookInterruptFlowModel()
+    initial_agent = _proxy_hook_agent(
+        initial_model,
+        hook=_MutatingFrontendProxyHook(mutation),
+        config=config,
+    )
+    initial_events = await _collect_events(
+        initial_agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+
+    resumed_model = _ProxyHookInterruptFlowModel()
+    resumed_model.turn = initial_model.turn
+    recreated_agent = _proxy_hook_agent(
+        resumed_model,
+        hook=_MutatingFrontendProxyHook(mutation),
+        config=config,
+    )
+    resumed_events = await _collect_events(
+        recreated_agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-approve",
+                    role="tool",
+                    tool_call_id=wire_id,
+                    content="DURABLE-REAL",
+                )
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    assert "DURABLE-REAL" in json.dumps(
+        resumed_model.stream_calls_messages[-1]
+    )
+    assert "Forwarded to client" not in json.dumps(
+        resumed_model.stream_calls_messages[-1]
+    )
+    assert "hook-mutated-id" not in json.dumps(
+        resumed_model.stream_calls_messages
+    )
+    assert "hook-replacement-id" not in json.dumps(
+        resumed_model.stream_calls_messages
+    )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "input",
+        "name",
+        "selected-tool",
+        "tool-spec",
+        "wire-map-delete",
+        "tool-meta-delete",
+    ],
+)
+async def test_proxy_hook_semantic_mutation_fails_before_authorization(
+    tmp_path,
+    mutation,
+):
+    """Already-emitted proxy semantics cannot be rewritten by caller hooks."""
+    _replacement_tool_calls.clear()
+    model = _ProxyHookInterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_MutatingFrontendProxyHook(mutation),
+        config=config,
+        include_replacement=mutation == "selected-tool",
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert [
+        event.code for event in events if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert not any(event.type == EventType.TOOL_CALL_END for event in events)
+    assert not any(event.type == EventType.TOOL_CALL_RESULT for event in events)
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+    assert _replacement_tool_calls == []
+    live_core = agent._agents_by_thread["thread-1"]
+    assert not live_core._interrupt_state.activated
+    assert live_core._interrupt_state.interrupts == {}
+    assert not live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    assert not live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+    assert live_core.messages[-1]["role"] == "assistant"
+    [redacted_block] = live_core.messages[-1]["content"]
+    assert isinstance(redacted_block.get("text"), str)
+    assert redacted_block["text"].strip()
+    assert "toolUse" not in redacted_block
+    assert "native-approve" not in json.dumps(live_core.messages[-1])
+    assert "Forwarded to client" not in json.dumps(live_core.messages[-1])
+    persisted = FileSessionManager(
+        session_id="thread-1", storage_dir=str(tmp_path)
+    ).session_repository.list_messages("thread-1", "proxy-hook-agent")
+    assert persisted[-1].to_message() == live_core.messages[-1]
+    assert persisted[-1].redact_message == live_core.messages[-1]
+
+    safe_model = model
+    safe_model.turn = 1
+    safe_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[UserMessage(id="u2", role="user", content="continue")],
+            tools=[],
+        ),
+    )
+    assert not any(event.type == EventType.RUN_ERROR for event in safe_events)
+    assert any(event.type == EventType.RUN_FINISHED for event in safe_events)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "input-after-resume",
+        "cancel-after-resume",
+        "provenance-delete",
+        "resume-value-in-place",
+    ],
+)
+async def test_proxy_hook_resume_semantic_mutation_restores_retry_checkpoint(
+    tmp_path,
+    mutation,
+):
+    """A mutation after interrupt returns cannot execute or consume the result."""
+    model = _ProxyHookInterruptFlowModel()
+    hook = _MutatingFrontendProxyHook(mutation)
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(model, hook=hook, config=config)
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+    live_core = agent._agents_by_thread["thread-1"]
+    before = _snapshot_resume_state(live_core)
+    resume_input = _make_run_input(
+        run_id="run-2",
+        messages=[
+            ToolMessage(
+                id="t-approve",
+                role="tool",
+                tool_call_id=wire_id,
+                content="CLIENT-REAL",
+            )
+        ],
+        resume=[
+            ResumeEntry(
+                interrupt_id=interrupt.id,
+                status="resolved",
+                payload=True,
+            )
+        ],
+        tools=[frontend_tool],
+    )
+
+    failed_events = await _collect_events(agent, resume_input)
+
+    assert [
+        event.code
+        for event in failed_events
+        if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert not any(
+        event.type == EventType.RUN_FINISHED for event in failed_events
+    )
+    assert model.turn == 1
+    assert _snapshot_resume_state(live_core) == before
+
+    hook.mutation = "none"
+    retry_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            messages=resume_input.messages,
+            resume=resume_input.resume,
+            tools=[frontend_tool],
+        ),
+    )
+    assert not any(event.type == EventType.RUN_ERROR for event in retry_events)
+    assert "CLIENT-REAL" in json.dumps(model.stream_calls_messages[-1])
+
+@pytest.mark.asyncio
+async def test_proxy_hook_resume_remains_armed_without_second_interrupt_call(
+    tmp_path,
+):
+    """Durable provenance prevents a stateful hook bypass on resume."""
+    _replacement_tool_calls.clear()
+    model = _ProxyHookInterruptFlowModel()
+    hook = _InterruptThenReplaceWithoutRecheckingHook()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=hook,
+        config=config,
+        include_replacement=True,
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+    live_core = agent._agents_by_thread["thread-1"]
+    checkpoint = _snapshot_resume_state(live_core)
+
+    resume_input = _make_run_input(
+        run_id="run-2",
+        messages=[
+            ToolMessage(
+                id="t-approve",
+                role="tool",
+                tool_call_id=wire_id,
+                content="CLIENT-REAL",
+            )
+        ],
+        resume=[
+            ResumeEntry(
+                interrupt_id=interrupt.id,
+                status="resolved",
+                payload=True,
+            )
+        ],
+        tools=[frontend_tool],
+    )
+    failed_events = await _collect_events(agent, resume_input)
+
+    assert [
+        event.code
+        for event in failed_events
+        if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert not any(
+        event.type == EventType.RUN_FINISHED for event in failed_events
+    )
+    assert _replacement_tool_calls == []
+    assert model.turn == 1
+    assert _snapshot_resume_state(live_core) == checkpoint
+
+@pytest.mark.asyncio
+async def test_proxy_hook_resume_contains_later_static_hook_failure(
+    tmp_path,
+):
+    """A callback failure preserves the live checkpoint for an exact retry."""
+    model = _ProxyHookInterruptFlowModel()
+    raising_hook = _RaiseOnSecondProxyHook()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    core = StrandsAgentCore(
+        model=model,
+        system_prompt="test",
+        agent_id="proxy-hook-agent",
+    )
+    agent = StrandsAgent(
+        core,
+        name="proxy-hook-provenance",
+        config=config,
+        hooks=[_InterruptFrontendProxyHook(), raising_hook],
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+    live_core = agent._agents_by_thread["thread-1"]
+    checkpoint = _snapshot_resume_state(live_core)
+
+    resume_input = _make_run_input(
+        run_id="run-2",
+        messages=[
+            ToolMessage(
+                id="t-approve",
+                role="tool",
+                tool_call_id=wire_id,
+                content="CLIENT-REAL",
+            )
+        ],
+        resume=[
+            ResumeEntry(
+                interrupt_id=interrupt.id,
+                status="resolved",
+                payload=True,
+            )
+        ],
+        tools=[frontend_tool],
+    )
+    failed_events = await _collect_events(agent, resume_input)
+
+    assert [
+        event.code
+        for event in failed_events
+        if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert not any(
+        event.type == EventType.RUN_FINISHED for event in failed_events
+    )
+    assert "CLIENT-REAL" not in json.dumps(model.stream_calls_messages[-1])
+    after_failure = _snapshot_resume_state(live_core)
+    for key, value in checkpoint.items():
+        if key != "repository_messages":
+            assert after_failure[key] == value
+
+    retry_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            messages=resume_input.messages,
+            resume=resume_input.resume,
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in retry_events)
+    assert any(event.type == EventType.RUN_FINISHED for event in retry_events)
+    assert sum(
+        json.dumps(messages).count("CLIENT-REAL")
+        for messages in model.stream_calls_messages
+    ) == 1
+
+@pytest.mark.asyncio
+async def test_proxy_hook_resume_rejects_changed_client_tool_spec_pre_stream(
+    tmp_path,
+):
+    """A recreated client declaration cannot change a parked proxy contract."""
+    model = _ProxyHookInterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_MutatingFrontendProxyHook("none"),
+        config=config,
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[frontend_tool],
+        ),
+    )
+    wire_id, interrupt = _proxy_wire_and_interrupt(initial_events)
+    live_core = agent._agents_by_thread["thread-1"]
+    checkpoint = _snapshot_resume_state(live_core)
+    resume_messages = [
+        ToolMessage(
+            id="t-approve",
+            role="tool",
+            tool_call_id=wire_id,
+            content="CLIENT-REAL",
+        )
+    ]
+    resume = [
+        ResumeEntry(
+            interrupt_id=interrupt.id,
+            status="resolved",
+            payload=True,
+        )
+    ]
+
+    failed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=resume_messages,
+            resume=resume,
+            tools=[
+                Tool(
+                    name="approveTool",
+                    description="approve",
+                    parameters={"changed": {"type": "string"}},
+                )
+            ],
+        ),
+    )
+
+    assert [
+        event.code
+        for event in failed_events
+        if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert model.turn == 1
+    assert _snapshot_resume_state(live_core) == checkpoint
+
+    retry_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-3",
+            messages=resume_messages,
+            resume=resume,
+            tools=[frontend_tool],
+        ),
+    )
+    assert not any(event.type == EventType.RUN_ERROR for event in retry_events)
+    assert "CLIENT-REAL" in json.dumps(model.stream_calls_messages[-1])
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["none", "id-in-place"])
+async def test_proxy_hook_without_session_restores_exact_live_checkpoint(
+    mutation,
+):
+    """An unresumable proxy checkpoint is never authorized on the client."""
+    model = _ProxyHookInterruptFlowModel()
+    hook = _MutatingFrontendProxyHook(mutation)
+    agent = _proxy_hook_agent(
+        model,
+        hook=hook,
+        config=StrandsAgentConfig(),
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert [
+        event.code for event in events if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_SESSION_REQUIRED"]
+    assert not any(event.type == EventType.TOOL_CALL_END for event in events)
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+    live_core = agent._agents_by_thread["thread-1"]
+    assert live_core.messages == [
+        {"role": "user", "content": [{"text": "approve"}]}
+    ]
+    assert "toolUse" not in json.dumps(live_core.messages)
+    assert live_core._interrupt_state == _InterruptState()
+    assert not live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    assert not live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+
+    hook.enabled = False
+    retry_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[UserMessage(id="u2", role="user", content="continue")],
+            tools=[],
+        ),
+    )
+    assert not any(event.type == EventType.RUN_ERROR for event in retry_events)
+    assert any(event.type == EventType.RUN_FINISHED for event in retry_events)
+
+@pytest.mark.asyncio
+async def test_non_interrupting_proxy_hook_preserves_legal_strands_mutation():
+    """The integrity boundary applies to checkpoints, not ordinary hooks."""
+    model = _ProxyHookInterruptFlowModel()
+    agent = _proxy_hook_agent(
+        model,
+        hook=_MutatingFrontendProxyHook("input", should_interrupt=False),
+        config=StrandsAgentConfig(),
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    live_core = agent._agents_by_thread["thread-1"]
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+    assert any(
+        block["toolUse"]["input"] == {"changed": True}
+        for message in live_core.messages
+        for block in message.get("content", [])
+        if "toolUse" in block
+    )
+
+@pytest.mark.asyncio
+async def test_preemptive_proxy_hook_response_does_not_leave_provenance(
+    tmp_path,
+):
+    """Only an unresolved hook interrupt establishes a durable checkpoint."""
+    model = _ProxyHookInterruptFlowModel(tool_turns={1, 2})
+    hook = _PreemptiveThenPendingInterruptHook()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(model, hook=hook, config=config)
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+
+    preempted_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="first")],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(
+        event.type == EventType.RUN_ERROR for event in preempted_events
+    )
+    first_finished = next(
+        event
+        for event in preempted_events
+        if event.type == EventType.RUN_FINISHED
+    )
+    assert first_finished.outcome is None
+    live_core = agent._agents_by_thread["thread-1"]
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+    assert any(
+        block["toolUse"]["input"] == {"preemptive": True}
+        for message in live_core.messages
+        for block in message.get("content", [])
+        if "toolUse" in block
+    )
+    first_wire_id = next(
+        event.tool_call_id
+        for event in preempted_events
+        if event.type == EventType.TOOL_CALL_START
+    )
+
+    pending_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="t-first",
+                    role="tool",
+                    tool_call_id=first_wire_id,
+                    content="FIRST-REAL",
+                )
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in pending_events)
+    wire_id, interrupt = _proxy_wire_and_interrupt(pending_events)
+    assert interrupt.tool_call_id == wire_id
+    assert model.turn == 2
+
+@pytest.mark.asyncio
+async def test_caught_proxy_hook_interrupt_preserves_legal_mutation():
+    """A candidate caught inside its callback never arms the boundary."""
+    model = _ProxyHookInterruptFlowModel()
+    agent = _proxy_hook_agent(
+        model,
+        hook=_CaughtInterruptThenMutateHook(),
+        config=StrandsAgentConfig(),
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    live_core = agent._agents_by_thread["thread-1"]
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+    assert any(
+        block["toolUse"]["input"] == {"caught": True}
+        for message in live_core.messages
+        for block in message.get("content", [])
+        if "toolUse" in block
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_hook_event_interrupt_method_is_restored_after_finalizer():
+    """The call-exact observer never remains installed on a retained event."""
+    model = _ProxyHookInterruptFlowModel()
+    hook = _RetainingNonInterruptingProxyHook()
+    agent = _proxy_hook_agent(
+        model,
+        hook=hook,
+        config=StrandsAgentConfig(),
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    assert hook.event is not None
+    assert "interrupt" not in vars(hook.event)
+    assert hook.event.interrupt.__self__ is hook.event
+
+
+@pytest.mark.asyncio
+async def test_proxy_hook_and_native_sibling_interrupts_are_both_advertised(
+    tmp_path,
+):
+    """Managed provenance never claims a concurrent native checkpoint."""
+    model = _InterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = StrandsAgent(
+        StrandsAgentCore(
+            model=model,
+            tools=[confirm_action],
+            system_prompt="test",
+            agent_id="proxy-hook-agent",
+        ),
+        name="proxy-hook-provenance",
+        config=config,
+        hooks=[_MutatingFrontendProxyHook("none")],
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="run both")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    finished = next(
+        event for event in events if event.type == EventType.RUN_FINISHED
+    )
+    assert finished.outcome is not None
+    by_name = {
+        interrupt.metadata["strands_name"]: interrupt
+        for interrupt in finished.outcome.interrupts
+    }
+    assert set(by_name) == {"approve_proxy", "confirm_action"}
+    wire_id = next(
+        event.tool_call_id
+        for event in events
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+    assert by_name["approve_proxy"].tool_call_id == wire_id
+    assert by_name["confirm_action"].tool_call_id == "native-confirm"
+
+@pytest.mark.asyncio
+async def test_async_parallel_proxy_hook_aliases_remain_call_exact(tmp_path):
+    """Concurrent finalizers accept sibling records and never cross results."""
+    model = _InterruptFlowModel(
+        sibling_tool_names=("approveTool", "approveTool")
+    )
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_AsyncPerCallAliasHook(),
+        config=config,
+    )
+    frontend_tool = Tool(
+        name="approveTool", description="approve", parameters={}
+    )
+    initial_events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="both")],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in initial_events)
+    finished = next(
+        event for event in initial_events if event.type == EventType.RUN_FINISHED
+    )
+    assert finished.outcome is not None
+    assert len(finished.outcome.interrupts) == 2
+    live_core = agent._agents_by_thread["thread-1"]
+    provenance = live_core.state.get("__ag_ui_proxy_hook_provenance__")
+    records = provenance["records"]
+    result_by_native = {
+        "native-approve": "FIRST-REAL",
+        "native-approve-2": "SECOND-REAL",
+    }
+    wire_by_native = {
+        record["original_native_tool_call_id"]: record["wire_tool_call_id"]
+        for record in records.values()
+    }
+    assert set(wire_by_native) == set(result_by_native)
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id=f"t-{native_id}",
+                    role="tool",
+                    tool_call_id=wire_by_native[native_id],
+                    content=result,
+                )
+                for native_id, result in result_by_native.items()
+            ],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt.id,
+                    status="resolved",
+                    payload=True,
+                )
+                for interrupt in finished.outcome.interrupts
+            ],
+            tools=[frontend_tool],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+    observed = {
+        block["toolResult"]["toolUseId"]: block["toolResult"]["content"][0][
+            "text"
+        ]
+        for message in model.stream_calls_messages[-1]
+        for block in message.get("content", [])
+        if block.get("toolResult", {}).get("toolUseId") in result_by_native
+    }
+    assert observed == result_by_native
+
+@pytest.mark.asyncio
+async def test_parallel_proxy_hook_same_alias_fails_closed(tmp_path):
+    """One caller alias cannot ambiguously claim two native proxy calls."""
+    model = _InterruptFlowModel(
+        sibling_tool_names=("approveTool", "approveTool")
+    )
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_SameAliasHook(),
+        config=config,
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="both")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert [
+        event.code for event in events if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert model.turn == 1
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+    live_core = agent._agents_by_thread["thread-1"]
+    assert live_core._interrupt_state == _InterruptState()
+    assert not live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    assert not live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+    assert "__ag_ui_proxy_hook_provenance__" not in live_core.state.get()
+
+@pytest.mark.asyncio
+async def test_parallel_proxy_sibling_binding_tamper_fails_closed(tmp_path):
+    """A later sibling cannot make an earlier advertised call unresumable."""
+    model = _InterruptFlowModel(
+        sibling_tool_names=("approveTool", "approveTool")
+    )
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_CrossSiblingMapTamperHook(),
+        config=config,
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="both")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert [
+        event.code for event in events if event.type == EventType.RUN_ERROR
+    ] == ["INTERRUPT_PROXY_PROVENANCE_ERROR"]
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+    live_core = agent._agents_by_thread["thread-1"]
+    assert live_core._interrupt_state == _InterruptState()
+    assert not live_core.state.get(AG_UI_WIRE_MAP_STATE_KEY)
+    assert not live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
+
+@pytest.mark.asyncio
+async def test_agent_initialized_proxy_interrupt_runs_before_finalizer(tmp_path):
+    """Constructor-time callback registration remains inside the boundary."""
+    model = _ProxyHookInterruptFlowModel()
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent = _proxy_hook_agent(
+        model,
+        hook=_LateRegisteredInterruptHook(),
+        config=config,
+    )
+
+    events = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[UserMessage(id="u1", role="user", content="approve")],
+            tools=[Tool(name="approveTool", description="approve", parameters={})],
+        ),
+    )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    wire_id, interrupt = _proxy_wire_and_interrupt(events)
+    assert interrupt.tool_call_id == wire_id
+    assert interrupt.metadata["strands_name"] == "initialized_proxy"
