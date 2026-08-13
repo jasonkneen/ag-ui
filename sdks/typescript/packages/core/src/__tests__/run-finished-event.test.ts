@@ -68,39 +68,13 @@ describe("RunFinishedEventSchema — outcome is optional and back-compat", () =>
       expect(parsed.outcome.interrupts).toHaveLength(1);
     }
   });
-
-  it("preserves encoded Python interrupt metadata mapping keys", () => {
-    const strandsReason = {
-      "__ag_ui_key_v1__:s:YmFk7bO_a2V5": "surrogate-value",
-      "bad\\udcffkey": "literal-value",
-      "__ag_ui_key_v1__:v:X19hZ191aV9rZXlfdjFfXzpsaXRlcmFs": "reserved-value",
-    };
-    const parsed = RunFinishedEventSchema.parse({
-      type: EventType.RUN_FINISHED,
-      threadId: "t-1",
-      runId: "r-1",
-      outcome: {
-        type: "interrupt",
-        interrupts: [
-          {
-            id: "int-1",
-            reason: "tool_call",
-            metadata: { strands_reason: strandsReason },
-          },
-        ],
-      },
-    });
-
-    expect(parsed.outcome?.type).toBe("interrupt");
-    if (parsed.outcome?.type === "interrupt") {
-      expect(parsed.outcome.interrupts[0].metadata?.strands_reason).toEqual(strandsReason);
-    }
-  });
 });
 
 describe("RunFinishedOutcomeSchema — discriminated union", () => {
   it("rejects outcome with empty interrupts", () => {
-    expect(() => RunFinishedOutcomeSchema.parse({ type: "interrupt", interrupts: [] })).toThrow();
+    expect(() =>
+      RunFinishedOutcomeSchema.parse({ type: "interrupt", interrupts: [] }),
+    ).toThrow();
   });
 
   it("rejects outcome with unknown type", () => {

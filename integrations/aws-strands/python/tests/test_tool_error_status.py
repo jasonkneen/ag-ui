@@ -27,59 +27,6 @@ class TestBedrockToolResultStatus:
         tool_result = history[0]["content"][0]["toolResult"]
         assert tool_result["status"] == "success"
 
-    def test_blank_failed_result_uses_error_diagnostic_as_content(self):
-        history = _build_strands_history(
-            [_tool_message(content="", error="boom")]
-        )
-
-        assert history[0]["content"][0]["toolResult"] == {
-            "toolUseId": "tc1",
-            "content": [{"text": "boom"}],
-            "status": "error",
-        }
-
-    def test_explicit_failed_result_content_wins_over_error_diagnostic(self):
-        history = _build_strands_history(
-            [_tool_message(content="client failure details", error="boom")]
-        )
-
-        assert history[0]["content"][0]["toolResult"] == {
-            "toolUseId": "tc1",
-            "content": [{"text": "client failure details"}],
-            "status": "error",
-        }
-
-    def test_empty_error_value_still_maps_to_failure(self):
-        history = _build_strands_history(
-            [_tool_message(content="", error="")]
-        )
-
-        assert history[0]["content"][0]["toolResult"] == {
-            "toolUseId": "tc1",
-            "content": [{"text": ""}],
-            "status": "error",
-        }
-
-    def test_invalid_utf8_failure_diagnostic_is_provider_safe(self):
-        history = _build_strands_history(
-            [_tool_message(content="", error="boom\udcff")]
-        )
-
-        assert history[0]["content"][0]["toolResult"] == {
-            "toolUseId": "tc1",
-            "content": [{"text": "boom\\udcff"}],
-            "status": "error",
-        }
-
-    def test_successful_empty_result_remains_empty(self):
-        history = _build_strands_history([_tool_message(content="")])
-
-        assert history[0]["content"][0]["toolResult"] == {
-            "toolUseId": "tc1",
-            "content": [{"text": ""}],
-            "status": "success",
-        }
-
 
 class TestSnapshotPreservesClientFields:
     def test_preserves_error_and_encrypted_value(self):

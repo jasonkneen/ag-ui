@@ -19,13 +19,6 @@ _PROXY_MARKER = "_ag_ui_proxy"
 # on the client and reconciled back in on the following run.
 PROXY_RESULT_PLACEHOLDER = "Forwarded to client"
 
-# Invocation-state key used only when a ``BeforeToolCallEvent`` interrupted a
-# proxy before it could return its placeholder. On resume the client has
-# already executed the visible wire call, so the proxy consumes that real
-# result instead of manufacturing a placeholder after reconciliation ran.
-PROXY_RESUME_RESULTS_KEY = "__ag_ui_proxy_resume_results__"
-PROXY_RESUME_RESULT_BINDINGS_KEY = "__ag_ui_proxy_resume_result_bindings__"
-
 
 def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
     """Convert an AG-UI ``Tool`` into a Strands ``PythonAgentTool``.
@@ -59,19 +52,11 @@ def create_proxy_tool(ag_ui_tool: AgUiTool) -> PythonAgentTool:
         "inputSchema": {"json": parameters or {}},
     }
 
-    async def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
-        resumed_results = _kwargs.get(PROXY_RESUME_RESULTS_KEY)
-        if isinstance(resumed_results, dict) and tool_use["toolUseId"] in resumed_results:
-            resumed_result = resumed_results.pop(tool_use["toolUseId"])
-            result_text = resumed_result.provider_safe_content
-            result_status = resumed_result.status
-        else:
-            result_text = PROXY_RESULT_PLACEHOLDER
-            result_status = "success"
+    def _proxy_func(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
         return {
             "toolUseId": tool_use["toolUseId"],
-            "status": result_status,
-            "content": [{"text": result_text}],
+            "status": "success",
+            "content": [{"text": PROXY_RESULT_PLACEHOLDER}],
         }
 
     # ToolFunc protocol requires __name__
@@ -92,21 +77,10 @@ def _is_proxy(tool: Any) -> bool:
     return getattr(tool, _PROXY_MARKER, False) is True
 
 
-def registered_proxy_tool_names(tool_registry: ToolRegistry) -> set[str]:
-    """Return names whose current registry entry is an AG-UI proxy tool."""
-    return {
-        name
-        for name, registered_tool in tool_registry.registry.items()
-        if _is_proxy(registered_tool)
-    }
-
-
 def sync_proxy_tools(
     tool_registry: ToolRegistry,
     ag_ui_tools: list[AgUiTool],
     tracked_names: Set[str],
-    *,
-    retain_names: Set[str] | None = None,
 ) -> Set[str]:
     """Synchronise proxy tools in *tool_registry* with *ag_ui_tools*.
 
@@ -114,17 +88,11 @@ def sync_proxy_tools(
       registered (unless a native, non-proxy tool with the same name exists).
     * Stale proxy tools that are in *tracked_names* but absent from the
       incoming list are removed.
-    * Marked proxies named in *retain_names* survive this sync even when they
-      are absent from the incoming list. This is a one-call checkpoint escape
-      hatch; callers must pass the names again if another sync still needs
-      them.
 
     Args:
         tool_registry: The Strands ``ToolRegistry`` attached to the agent.
         ag_ui_tools: Tool definitions from the current ``RunAgentInput.tools``.
         tracked_names: Set of proxy tool names registered in previous calls.
-        retain_names: Existing marked proxy names required by an active
-            checkpoint during this sync only.
 
     Returns:
         Updated set of proxy tool names currently registered.
@@ -135,10 +103,8 @@ def sync_proxy_tools(
         if n:
             desired_names.add(n)
 
-    retained = set(retain_names or ())
-
     # --- Remove stale proxy tools ---
-    stale = tracked_names - desired_names - retained
+    stale = tracked_names - desired_names
     for name in stale:
         existing = tool_registry.registry.get(name)
         if existing is not None and _is_proxy(existing):
@@ -147,12 +113,7 @@ def sync_proxy_tools(
             logger.debug("Removed stale proxy tool: %s", name)
 
     # --- Add / update proxy tools ---
-    current_proxy_names: Set[str] = {
-        name
-        for name in retained
-        if (existing := tool_registry.registry.get(name)) is not None
-        and _is_proxy(existing)
-    }
+    current_proxy_names: Set[str] = set()
     for t in ag_ui_tools:
         n = t.name if isinstance(t, AgUiTool) else t.get("name", "")  # type: ignore[union-attr]
         if not n:
