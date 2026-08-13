@@ -11,12 +11,9 @@ persisted placeholder by native id and overwrite it with the real result.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Iterable, Mapping
 
 from .client_proxy_tool import PROXY_RESULT_PLACEHOLDER
-
-logger = logging.getLogger(__name__)
 
 # Key under which the adapter stores the ``{wire_tool_call_id: native_toolUseId}``
 # map on the Strands agent's session state. Namespaced to avoid clashing with
@@ -33,6 +30,14 @@ AG_UI_WIRE_MAP_STATE_KEY = "__ag_ui_wire_to_native__"
 # ``tool_behaviors`` gate + the frontend-placeholder skip) for the resumed
 # tool. Namespaced to avoid clashing with user-managed state keys.
 AG_UI_TOOL_CALL_MAP_STATE_KEY = "__ag_ui_tool_call_map__"
+
+
+class ActiveInterruptReconciliationError(RuntimeError):
+    """An activated interrupt's parked tool results could not be reconciled."""
+
+    def __init__(self, affected_native_ids: Iterable[str]) -> None:
+        self.affected_native_ids: frozenset[str] = frozenset(affected_native_ids)
+        super().__init__("Active interrupt tool result reconciliation failed")
 
 
 def resolve_native_ids(
@@ -101,26 +106,19 @@ def reconcile_frontend_tool_results(
     for message in getattr(agent, "messages", None) or []:
         corrected |= _correct_message(message, pending_results)
 
-    # Correct the agent's live interrupt state too. Isolated in its own
-    # try/except: a failure here must not discard the ``corrected`` ids
-    # already fixed above (agent.messages / session), and — unlike those,
-    # which stay retryable via ``wire_to_native`` on a later turn — this
-    # correction has no retry path. Strands clears
-    # ``_interrupt_state.context`` once the resume succeeds (see
-    # ``event_loop.py``), so a placeholder missed here (e.g. due to a
-    # transient error) is unrecoverable after this turn.
-    try:
-        interrupt_state = getattr(agent, "_interrupt_state", None)
-        if interrupt_state is not None and getattr(interrupt_state, "activated", False):
+    # Correct the agent's live interrupt state too. Once activation is known,
+    # a failure to access or correct its parked tool results must stop the
+    # resume before Strands clears the context. Repository and live-message
+    # failures remain outside this typed boundary and retain their caller's
+    # generic fallback behavior.
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is not None and getattr(interrupt_state, "activated", False):
+        try:
             tool_results = interrupt_state.context.get("tool_results")
             if tool_results:
                 corrected |= _correct_all_tools(tool_results, pending_results)
-    except Exception as e:  # noqa: BLE001 — degrade, don't lose already-corrected ids
-        logger.warning(
-            "Interrupt-context tool result reconciliation failed; the "
-            f"stashed placeholder may reach the model unresolved: {e}",
-            exc_info=True,
-        )
+        except Exception as e:
+            raise ActiveInterruptReconciliationError(pending_results) from e
 
     return corrected
 

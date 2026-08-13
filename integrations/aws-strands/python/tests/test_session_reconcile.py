@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.session import SessionAgent, SessionMessage
 
@@ -221,6 +222,56 @@ def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
 
     in_memory = agent.messages[1]["content"][0]["toolResult"]
     assert in_memory["content"] == [{"text": '{"approved": true}'}]
+
+
+def test_active_interrupt_context_reconcile_raises_typed_error(tmp_path):
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+
+    class ExplodingToolResults(list):
+        def __iter__(self):
+            raise RuntimeError("boom")
+
+    parked_results = ExplodingToolResults(
+        [
+            {
+                "toolUseId": "tu-1",
+                "status": "success",
+                "content": [{"text": PLACEHOLDER}],
+            }
+        ]
+    )
+    interrupt_state = SimpleNamespace(
+        activated=True,
+        context={"tool_results": parked_results},
+    )
+    agent = SimpleNamespace(
+        agent_id=agent_id,
+        messages=[],
+        _interrupt_state=interrupt_state,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        reconcile_frontend_tool_results(sm, agent, {"tu-1": "real", "tu-2": "other"})
+
+    assert isinstance(
+        exc_info.value, session_reconcile.ActiveInterruptReconciliationError
+    )
+    assert exc_info.value.affected_native_ids == frozenset({"tu-1", "tu-2"})
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "boom"
+    persisted = sm.session_repository.list_messages(sm.session_id, agent_id)
+    assert persisted[0].message["content"][0]["toolResult"]["content"] == [
+        {"text": "real"}
+    ]
+    assert interrupt_state.activated
+    assert interrupt_state.context["tool_results"] is parked_results
 
 
 def test_reconcile_handles_parallel_tool_calls_in_one_message(tmp_path):

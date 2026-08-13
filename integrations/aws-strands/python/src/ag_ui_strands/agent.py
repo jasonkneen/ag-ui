@@ -223,6 +223,7 @@ from .client_proxy_tool import registered_proxy_tool_names, sync_proxy_tools
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
+    ActiveInterruptReconciliationError,
     has_active_proxy_placeholder,
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -1252,6 +1253,18 @@ class StrandsAgent:
                     corrected_native_ids = reconcile_frontend_tool_results(
                         session_manager, strands_agent, resolved_native_results
                     )
+                except ActiveInterruptReconciliationError as e:
+                    logger.error(
+                        "Active interrupt tool result reconciliation failed for "
+                        f"native ids {sorted(e.affected_native_ids)}",
+                        exc_info=True,
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        message=str(e),
+                        code="INTERRUPT_RECONCILIATION_ERROR",
+                    )
+                    return
                 except Exception as e:  # noqa: BLE001 — degrade, don't crash the turn
                     logger.warning(
                         "Frontend tool result reconciliation failed; falling back to "

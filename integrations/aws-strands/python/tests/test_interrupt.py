@@ -35,7 +35,10 @@ from strands.session import FileSessionManager
 
 from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
-from ag_ui_strands.session_reconcile import AG_UI_TOOL_CALL_MAP_STATE_KEY
+from ag_ui_strands.session_reconcile import (
+    AG_UI_TOOL_CALL_MAP_STATE_KEY,
+    AG_UI_WIRE_MAP_STATE_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -780,6 +783,89 @@ async def test_mixed_interrupt_without_session_manager_errors_before_outcome():
     assert interrupt_state.activated
     assert interrupt_state.context["tool_results"] == parked_results
     assert interrupt_state.interrupts == interrupts
+    assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
+
+
+@pytest.mark.asyncio
+async def test_active_reconciliation_failure_emits_run_error_before_stream_and_keeps_metadata(
+    tmp_path,
+):
+    config = StrandsAgentConfig(
+        session_manager_provider=lambda input_data: FileSessionManager(
+            session_id=input_data.thread_id, storage_dir=str(tmp_path)
+        ),
+    )
+    agent, _ = _make_e2e_agent(config)
+    approve_tool = Tool(name="approveTool", description="approve", parameters={})
+
+    events1 = await _collect_events(
+        agent,
+        _make_run_input(
+            messages=[
+                UserMessage(
+                    id="u1",
+                    role="user",
+                    content="please handle widget-1",
+                )
+            ],
+            tools=[approve_tool],
+        ),
+    )
+    finished1 = next(event for event in events1 if event.type == EventType.RUN_FINISHED)
+    interrupt_id = finished1.outcome.interrupts[0].id
+    fe_wire_id = next(
+        event.tool_call_id
+        for event in events1
+        if event.type == EventType.TOOL_CALL_START
+        and event.tool_call_name == "approveTool"
+    )
+
+    core = agent._agents_by_thread["thread-1"]
+    interrupt_state = core._interrupt_state
+    parked_context = copy.deepcopy(interrupt_state.context)
+    parked_interrupts = copy.deepcopy(interrupt_state.interrupts)
+    wire_map = copy.deepcopy(core.state.get(AG_UI_WIRE_MAP_STATE_KEY))
+    tool_metadata = copy.deepcopy(core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY))
+
+    with (
+        patch.object(core, "stream_async", wraps=core.stream_async) as stream_spy,
+        patch(
+            "ag_ui_strands.session_reconcile._correct_all_tools",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        resumed_events = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-2",
+                messages=[
+                    ToolMessage(
+                        id="t-fe",
+                        role="tool",
+                        tool_call_id=fe_wire_id,
+                        content='{"approved": true}',
+                    )
+                ],
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=interrupt_id,
+                        status="resolved",
+                        payload=True,
+                    )
+                ],
+                tools=[approve_tool],
+            ),
+        )
+
+    stream_spy.assert_not_called()
+    errors = [event for event in resumed_events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "INTERRUPT_RECONCILIATION_ERROR"
+    assert not any(event.type == EventType.RUN_FINISHED for event in resumed_events)
+    assert interrupt_state.activated
+    assert interrupt_state.context == parked_context
+    assert interrupt_state.interrupts == parked_interrupts
+    assert core.state.get(AG_UI_WIRE_MAP_STATE_KEY) == wire_map
     assert core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY) == tool_metadata
 
 
