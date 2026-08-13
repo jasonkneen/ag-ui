@@ -90,13 +90,13 @@ interrupt round-trip:
 
 - When a run pauses, it finishes with `RUN_FINISHED` carrying a
   `RunFinishedInterruptOutcome` (`outcome.type == "interrupt"`) and one AG-UI
-  `Interrupt` per Strands interrupt. The Strands interrupt *name* becomes the
-  AG-UI `reason`; the original (free-form) reason object is preserved under
-  `metadata.strands_reason`.
-- To resume, the client sends the next `RunAgentInput` on the **same
-  `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
-  payload=...)]`. Strands' resume gate is truthiness-based (`if
-  interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
+  `Interrupt` per reported Strands interrupt. Native interrupts use the AG-UI
+  reason `tool_call`; the Strands name and free-form reason are preserved as
+  `metadata.strands_name` and `metadata.strands_reason`.
+- To resume, the client sends the next `RunAgentInput` on the same `thread_id`
+  with `resume=[ResumeEntry(interrupt_id=..., status="resolved", payload=...)]`.
+  Strands' resume gate is truthiness-based (`if interrupt_.response:`), so a
+  falsy `payload` (`None`, `False`, `""`, `0`,
   `[]`, `{}`) would otherwise re-raise the same interrupt and re-run the tool
   body forever. To prevent that, `interrupt()` does **not** return `payload`
   directly — it returns a truthy envelope: `{"response": payload}` on
@@ -128,18 +128,34 @@ interrupt round-trip:
       return "charged"
   ```
 
-> **Persistence:** interrupt state lives on the per-thread agent instance. The
-> in-memory per-thread cache only preserves it within a single process, so
-> pause and resume must hit the same process. For stateless / multi-container
-> HTTP deployments, wire a durable `SessionManager` via
-> `StrandsAgentConfig.session_manager_provider` so interrupt state round-trips
-> across processes. Keep interrupt payloads and tool results JSON-safe (no raw
-> `bytes`) when doing so: Strands' `SessionAgent.to_dict()` — unlike
-> `SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
-> `bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
-> `ToolResult` in the same turn, raises `TypeError: Object of type bytes is
-> not JSON serializable` from `FileSessionManager`/`S3SessionManager` and
-> aborts the run.
+### Persistence and proxy-tool boundaries
+
+| Scenario                                                                      | Support boundary                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Native interrupts in the same live wrapper instance, process, and `thread_id` | Supported without a `SessionManager`: the cached per-thread agent retains the live interrupt checkpoint and tool metadata.                                                                                       |
+| Cross-process resume or wrapper/agent recreation                              | Requires a per-thread `SessionManager`, configured through `StrandsAgentConfig.session_manager_provider`, to restore the checkpoint and metadata.                                                                |
+| Frontend proxy tools only                                                     | Uses the legacy client handoff and normal AG-UI tool-call wire flow; it is not a canonical interrupt.                                                                                                            |
+| Frontend proxy and native interrupt in the same turn                          | Supported with a `SessionManager`. Without one, once the unsafe mixed state is observable the run emits one `RUN_ERROR` with code `INTERRUPT_SESSION_REQUIRED` and does not advertise or continue the interrupt. |
+
+While a native interrupt is active, any failure to reconcile a frontend proxy
+result emits `RUN_ERROR` with code `INTERRUPT_RECONCILIATION_ERROR` and stops
+that run. The interrupt and reconciliation metadata remain intact so the client
+can retry.
+
+This bridge does not promise canonical all-open interrupt batching, automatic
+event replay, end-to-end idempotency, or execution of frontend proxy tools as
+part of native-interrupt semantics. Proxy calls remain ordinary AG-UI tool
+calls even when they share a turn with a native interrupt. Because the native
+tool body re-executes on resume, make any pre-interrupt side effects idempotent
+or move them after the interrupt, as shown above.
+
+When using a `SessionManager`, keep interrupt payloads and tool results
+JSON-safe (no raw `bytes`): Strands' `SessionAgent.to_dict()` — unlike
+`SessionMessage.to_dict()` — does not base64-encode `bytes` values, so a
+`bytes`-bearing interrupt `reason`/`response`/resume `payload`, or a sibling
+`ToolResult` in the same turn, raises `TypeError: Object of type bytes is not
+JSON serializable` from `FileSessionManager`/`S3SessionManager` and aborts the
+run.
 
 ## Supported AG-UI Events
 
