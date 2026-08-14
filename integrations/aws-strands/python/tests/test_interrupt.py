@@ -6,7 +6,7 @@ AG-UI interrupt lifecycle:
 1. A paused run finishes with ``RunFinishedInterruptOutcome``.
 2. ``RunAgentInput.resume`` is translated into the Strands resume prompt shape.
 3. ``status == "cancelled"`` resumes with the documented denial sentinel.
-4. Runs that never interrupt finish bare (no behavior change).
+4. Runs that never interrupt finish with a success outcome.
 """
 
 from __future__ import annotations
@@ -20,8 +20,10 @@ import pytest
 from ag_ui.core import (
     CustomEvent,
     EventType,
+    Interrupt,
     ResumeEntry,
     RunAgentInput,
+    RunFinishedSuccessOutcome,
     Tool,
     ToolMessage,
     UserMessage,
@@ -35,7 +37,11 @@ from strands.models.model import Model as StrandsModel
 from strands.session import FileSessionManager
 from strands.types.session import SessionAgent, SessionMessage
 
-from ag_ui_strands.agent import INTERRUPT_CANCELLED, StrandsAgent
+from ag_ui_strands.agent import (
+    INTERRUPT_CANCELLED,
+    _INTERRUPT_BOOKKEEPING_STATE_KEY,
+    StrandsAgent,
+)
 from ag_ui_strands.client_proxy_tool import PROXY_RESULT_PLACEHOLDER
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 from ag_ui_strands.session_reconcile import (
@@ -186,7 +192,6 @@ class TestInterruptOutcome:
         )
         core = _MockStrandsCore(
             terminal_events=[{"result": _agent_result_with_interrupt([strands_interrupt])}],
-            interrupts=[strands_interrupt],
         )
         agent = _make_base_agent()
 
@@ -200,14 +205,9 @@ class TestInterruptOutcome:
 
         agui_interrupt = finished.outcome.interrupts[0]
         assert agui_interrupt.id == "v1:tool_call:tu-1:00000000-0000-0000-0000-000000000000"
-        # Every Strands interrupt is tool-call-bound; id embeds the toolUseId.
-        assert agui_interrupt.tool_call_id == "tu-1"
-        assert agui_interrupt.reason == "tool_call"
-        # The free-form Strands name/reason are preserved under metadata.
-        assert agui_interrupt.metadata == {
-            "strands_name": "confirm",
-            "strands_reason": {"summary": "delete all"},
-        }
+        assert agui_interrupt.tool_call_id is None
+        assert agui_interrupt.reason == "confirm"
+        assert agui_interrupt.metadata == {"reason": {"summary": "delete all"}}
 
     @pytest.mark.asyncio
     async def test_terminal_result_captured_despite_halt_in_same_cycle(self):
@@ -270,8 +270,19 @@ class TestInterruptOutcome:
         # path where the stream breaks before a terminal AgentResult is captured.
         core = _MockStrandsCore(
             terminal_events=[],
-            interrupts=[answered, open_interrupt],
         )
+
+        async def _activate_during_stream(prompt):
+            core.stream_prompts.append(prompt)
+            core._interrupt_state.interrupts = {
+                answered.id: answered,
+                open_interrupt.id: open_interrupt,
+            }
+            core._interrupt_state.activate()
+            if False:
+                yield None
+
+        core.stream_async = _activate_during_stream
         agent = _make_base_agent()
 
         with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
@@ -284,8 +295,8 @@ class TestInterruptOutcome:
         assert reported_ids == {open_interrupt.id}
 
     @pytest.mark.asyncio
-    async def test_no_interrupt_finishes_bare(self):
-        """A normal run finishes with no outcome (back-compat, no behavior change)."""
+    async def test_no_interrupt_finishes_with_success(self):
+        """A normal run finishes with the protocol's explicit success outcome."""
         result = MagicMock()
         result.stop_reason = "end_turn"
         result.interrupts = None
@@ -296,7 +307,7 @@ class TestInterruptOutcome:
             events = await _collect_events(agent, _make_run_input())
 
         finished = next(e for e in events if e.type == EventType.RUN_FINISHED)
-        assert finished.outcome is None
+        assert isinstance(finished.outcome, RunFinishedSuccessOutcome)
 
 
 class TestResumeConsumption:
@@ -457,13 +468,147 @@ async def test_resume_preflight_rejects_invalid_batch_before_any_mutation(case):
             _make_run_input(resume=resume, tools=[unexpected_tool]),
         )
 
-    _assert_single_run_error(events, "INTERRUPT_RESUME_ERROR")
+    expected_code = (
+        "UNKNOWN_INTERRUPT_ID" if case == "inactive" else "INTERRUPT_RESUME_ERROR"
+    )
+    _assert_single_run_error(events, expected_code)
+    assert core.stream_prompts == []
+    assert _snapshot_mutable_core_state(core) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        pytest.param("partial", "PARTIAL_RESUME", id="partial"),
+        pytest.param("expired", "INTERRUPT_EXPIRED", id="expired"),
+        pytest.param("invalid-payload", "INVALID_PAYLOAD", id="invalid-payload"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_protocol_resume_rejection_is_atomic(case, expected_code):
+    interrupts = [StrandsInterrupt(id="open", name="confirm")]
+    resume = [ResumeEntry(interrupt_id="open", status="resolved", payload=True)]
+    pending: dict[str, Interrupt] = {}
+
+    if case == "partial":
+        interrupts.append(StrandsInterrupt(id="other-open", name="confirm-other"))
+    elif case == "expired":
+        pending["open"] = Interrupt(
+            id="open",
+            reason="confirm",
+            expires_at="2000-01-01T00:00:00+00:00",
+        )
+    else:
+        pending["open"] = Interrupt(
+            id="open",
+            reason="confirm",
+            response_schema={
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}},
+                "required": ["approved"],
+            },
+        )
+        resume = [
+            ResumeEntry(
+                interrupt_id="open",
+                status="resolved",
+                payload={"approved": "true"},
+            )
+        ]
+
+    core = _MockStrandsCore(interrupts=interrupts)
+    agent = _make_base_agent()
+    if pending:
+        agent._pending_interrupts_by_thread["thread-1"] = pending
+    before = _snapshot_mutable_core_state(core)
+
+    with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+        events = await _collect_events(
+            agent,
+            _make_run_input(
+                resume=resume,
+                tools=[
+                    Tool(
+                        name="must_not_register",
+                        description="resume validation must be atomic",
+                        parameters={},
+                    )
+                ],
+            ),
+        )
+
+    _assert_single_run_error(events, expected_code)
     assert core.stream_prompts == []
     assert _snapshot_mutable_core_state(core) == before
 
 
 @pytest.mark.asyncio
-async def test_valid_partial_retry_succeeds_after_atomic_resume_rejection():
+async def test_pending_interrupt_blocks_new_input_before_any_mutation():
+    core = _MockStrandsCore(
+        interrupts=[StrandsInterrupt(id="open", name="confirm")]
+    )
+    agent = _make_base_agent()
+    before = _snapshot_mutable_core_state(core)
+
+    with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+        events = await _collect_events(
+            agent,
+            _make_run_input(
+                tools=[
+                    Tool(
+                        name="must_not_register",
+                        description="blocked input must not mutate the checkpoint",
+                        parameters={},
+                    )
+                ]
+            ),
+        )
+
+    _assert_single_run_error(events, "PENDING_INTERRUPTS")
+    assert core.stream_prompts == []
+    assert _snapshot_mutable_core_state(core) == before
+
+
+@pytest.mark.asyncio
+async def test_resume_only_requires_unanswered_interrupts():
+    answered = StrandsInterrupt(
+        id="answered",
+        name="confirm-answered",
+        response={"response": True},
+    )
+    open_interrupt = StrandsInterrupt(id="open", name="confirm-open")
+    core = _MockStrandsCore(interrupts=[answered, open_interrupt])
+    agent = _make_base_agent()
+
+    with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+        events = await _collect_events(
+            agent,
+            _make_run_input(
+                resume=[
+                    ResumeEntry(
+                        interrupt_id="open",
+                        status="resolved",
+                        payload=True,
+                    )
+                ]
+            ),
+        )
+
+    assert not any(event.type == EventType.RUN_ERROR for event in events)
+    assert core.stream_prompts == [
+        [
+            {
+                "interruptResponse": {
+                    "interruptId": "open",
+                    "response": {"response": True},
+                }
+            }
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_requires_complete_batch_after_atomic_resume_rejection():
     core = _MockStrandsCore(
         interrupts=[
             StrandsInterrupt(id="open", name="confirm"),
@@ -478,7 +623,7 @@ async def test_valid_partial_retry_succeeds_after_atomic_resume_rejection():
 
     with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
         rejected = await _collect_events(agent, _make_run_input(resume=invalid))
-        accepted = await _collect_events(
+        partial = await _collect_events(
             agent,
             _make_run_input(
                 run_id="run-2",
@@ -489,8 +634,23 @@ async def test_valid_partial_retry_succeeds_after_atomic_resume_rejection():
                 ],
             ),
         )
+        accepted = await _collect_events(
+            agent,
+            _make_run_input(
+                run_id="run-3",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id="open", status="resolved", payload=False
+                    ),
+                    ResumeEntry(
+                        interrupt_id="other-open", status="resolved", payload=True
+                    ),
+                ],
+            ),
+        )
 
     _assert_single_run_error(rejected, "INTERRUPT_RESUME_ERROR")
+    _assert_single_run_error(partial, "PARTIAL_RESUME")
     assert not any(event.type == EventType.RUN_ERROR for event in accepted)
     assert core.stream_prompts == [
         [
@@ -499,7 +659,13 @@ async def test_valid_partial_retry_succeeds_after_atomic_resume_rejection():
                     "interruptId": "open",
                     "response": {"response": False},
                 }
-            }
+            },
+            {
+                "interruptResponse": {
+                    "interruptId": "other-open",
+                    "response": {"response": True},
+                }
+            },
         ]
     ]
 
@@ -1030,6 +1196,114 @@ def _make_e2e_agent(config: StrandsAgentConfig) -> tuple[StrandsAgent, _Interrup
     model = _InterruptFlowModel()
     core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
     return StrandsAgent(core, name="e2e-interrupt", config=config), model
+
+
+@pytest.mark.asyncio
+async def test_interrupt_bookkeeping_is_durable_when_each_run_returns(tmp_path):
+    managers: dict[str, FileSessionManager] = {}
+
+    def session_manager_provider(input_data):
+        manager = FileSessionManager(
+            session_id=input_data.thread_id,
+            storage_dir=str(tmp_path),
+        )
+        managers[input_data.thread_id] = manager
+        return manager
+
+    config = StrandsAgentConfig(session_manager_provider=session_manager_provider)
+    model = _InterruptFlowModel(include_frontend=False)
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="e2e-interrupt", config=config)
+    thread_id = "durable-interrupt-bookkeeping"
+
+    paused_events = await _collect_events(
+        agent,
+        _make_run_input(
+            thread_id=thread_id,
+            messages=[UserMessage(id="u1", role="user", content="confirm")],
+        ),
+    )
+    paused = next(event for event in paused_events if event.type == EventType.RUN_FINISHED)
+    interrupt_id = paused.outcome.interrupts[0].id
+    strands_agent = agent._agents_by_thread[thread_id]
+    manager = managers[thread_id]
+
+    persisted_pause = manager.session_repository.read_agent(
+        thread_id, strands_agent.agent_id
+    )
+    pause_bookkeeping = persisted_pause.state[_INTERRUPT_BOOKKEEPING_STATE_KEY]
+    assert set(pause_bookkeeping["pending_interrupts"]) == {interrupt_id}
+    assert pause_bookkeeping["last_resume_fingerprint"] is None
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            thread_id=thread_id,
+            run_id="run-2",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="resolved",
+                    payload=True,
+                )
+            ],
+        ),
+    )
+    assert not any(event.type == EventType.RUN_ERROR for event in resumed_events)
+
+    persisted_resume = manager.session_repository.read_agent(
+        thread_id, strands_agent.agent_id
+    )
+    resume_bookkeeping = persisted_resume.state[_INTERRUPT_BOOKKEEPING_STATE_KEY]
+    assert resume_bookkeeping["pending_interrupts"] == {}
+    assert isinstance(resume_bookkeeping["last_resume_fingerprint"], str)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_emits_one_tool_result_inside_run_envelope():
+    config = StrandsAgentConfig(
+        tool_behaviors={
+            "confirm_action": ToolBehavior(interrupt_on_call=True),
+        }
+    )
+    model = _InterruptFlowModel(include_frontend=False)
+    core = StrandsAgentCore(model=model, tools=[confirm_action], system_prompt="test")
+    agent = StrandsAgent(core, name="e2e-interrupt", config=config)
+    thread_id = "cancelled-approval-result"
+
+    paused_events = await _collect_events(
+        agent,
+        _make_run_input(
+            thread_id=thread_id,
+            messages=[UserMessage(id="u1", role="user", content="confirm")],
+        ),
+    )
+    paused = next(event for event in paused_events if event.type == EventType.RUN_FINISHED)
+    interrupt_id = paused.outcome.interrupts[0].id
+
+    resumed_events = await _collect_events(
+        agent,
+        _make_run_input(
+            thread_id=thread_id,
+            run_id="run-2",
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt_id,
+                    status="cancelled",
+                )
+            ],
+        ),
+    )
+
+    tool_results = [
+        event
+        for event in resumed_events
+        if event.type == EventType.TOOL_CALL_RESULT
+        and event.tool_call_id == "native-confirm"
+    ]
+    assert len(tool_results) == 1
+    assert resumed_events[0].type == EventType.RUN_STARTED
+    assert resumed_events.index(tool_results[0]) > 0
 
 
 @pytest.mark.asyncio
