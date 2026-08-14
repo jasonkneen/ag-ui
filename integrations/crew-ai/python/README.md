@@ -328,20 +328,16 @@ Covers the grace window, force-cancel join, AND outer-cancel recovery
 
 ## To run the dojo examples
 
-The dojo server, its demo flows and the `__main__.py` launcher that the command
-below runs are development-only and are all deliberately kept out of the published
-`ag-ui-crewai` wheel and sdist, so this workflow requires a checkout of the
-[ag-ui repository](https://github.com/ag-ui-protocol/ag-ui) and does not work from
-an installed package.
+The dojo server and its demo flows are a separate project next door, so they are not
+part of this package. It needs a checkout of the
+[ag-ui repository](https://github.com/ag-ui-protocol/ag-ui) and does not work from an
+installed release.
 
 ```bash
-cd integrations/crew-ai/python
+cd integrations/crew-ai/python/examples
 uv sync
-uv run python -m ag_ui_crewai
+uv run dev
 ```
 
-The launcher defaults `CREWAI_DISABLE_TELEMETRY=true` so that Ctrl-C stops the
-server. crewai's telemetry installs a SIGINT handler that flushes queued spans to
-its OTLP endpoint before letting uvicorn shut down, and that network call from
-inside the handler wedges the reloader's worker until it is SIGKILLed. Setting the
-variable yourself overrides the default, at the cost of getting that hang back.
+See [`examples/README.md`](examples/README.md) for the routes it mounts and the
+environment variables it reads.
