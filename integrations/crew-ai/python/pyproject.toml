@@ -56,6 +56,12 @@ dev = [
     "pytest-asyncio>=0.24,<0.25",
     # Dev-only; <0.29 guards against a breaking httpx 0.x minor.
     "httpx>=0.27,<0.29",
+    # tests/test_packaging.py resolves this build's own file selection with the
+    # library hatchling matches with, so pattern semantics cannot drift from the
+    # real build. >=0.12 for GitIgnoreSpec.check_file; hatchling floors at 0.10.1.
+    "pathspec>=0.12,<2",
+    # tomllib is 3.11+ and requires-python still admits 3.10.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [build-system]
@@ -71,13 +77,14 @@ build-backend = "hatchling.build"
 # stay out of both artifacts. Nothing shipped may reference them: an entry point
 # declared in ``[project.scripts]`` survives the exclude and would install a
 # ``dev`` command that raises ModuleNotFoundError, and a shipped ``__main__.py``
-# importing the excluded ``dojo`` module would break the same way. Run the dojo
-# from a source checkout with ``uv run python -m ag_ui_crewai`` instead.
+# importing the excluded ``dojo`` module would break the same way. Both modes, and
+# this exact split, are enforced by ``tests/test_packaging.py``. Run the dojo from a
+# source checkout with ``uv run python -m ag_ui_crewai`` instead.
 #
-# That target must be the PACKAGE, not the module: ``-m ag_ui_crewai.dojo`` has
-# no ``__main__`` guard, so it builds the app and exits 0 having served nothing.
-# ``ag_ui_crewai/__main__.py`` owns the uvicorn call, which also keeps the app to
-# a single build under ``reload=True``.
+# That target must be the PACKAGE, not the module: ``-m ag_ui_crewai.dojo`` has no
+# ``__main__`` guard, so it builds the app and exits 0 having served nothing.
+# ``ag_ui_crewai/__main__.py`` owns the uvicorn call, which also keeps the app to a
+# single build under ``reload=True``.
 [tool.hatch.build]
 exclude = [
     "ag_ui_crewai/dojo.py",
