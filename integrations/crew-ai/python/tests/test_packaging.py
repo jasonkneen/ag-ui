@@ -1,35 +1,54 @@
-"""Packaging guard: nothing a published artifact contains may reference a module
-the build strips.
+"""Packaging guard: no published artifact may reference a module it does not contain.
 
 The regression this locks down: ``[project.scripts] dev = "ag_ui_crewai.dojo:main"``
-coexisted with a ``[tool.hatch.build] exclude`` that removes
-``ag_ui_crewai/dojo.py``, so every published wheel and sdist installed a ``dev``
-command that raised ``ModuleNotFoundError: No module named 'ag_ui_crewai.dojo'``.
-Nothing caught it: the suite runs against an editable install, which makes an
-excluded module importable from the source tree, so the break was invisible until
-a consumer ran the command. The same blind spot hides the second failure mode, a
-shipped module importing an excluded one, so both are checked here.
+coexisted with a ``[tool.hatch.build] exclude`` that removes ``ag_ui_crewai/dojo.py``,
+so every published wheel and sdist installed a ``dev`` command that raised
+``ModuleNotFoundError: No module named 'ag_ui_crewai.dojo'``. Nothing caught it: the
+suite runs against an editable install, which makes an excluded module importable
+from the source tree, so the break was invisible until a consumer ran the command.
+The same blind spot hides the second failure mode, a shipped module importing an
+excluded one, so both are checked here.
 
 crew-ai is the integration exposed to this because its dojo lives inside the
-publishable package. Where another integration declares a ``dev`` script, it sits
-in a ``python/examples/`` project that is never published.
+publishable package. Where another integration declares a ``dev`` script, it sits in
+a ``python/examples/`` project that is never published.
 
-The check is structural rather than a build, so it costs milliseconds and belongs
-in the unit suite. File selection is resolved with ``pathspec.GitIgnoreSpec``, the
-same library and spec class hatchling uses (``hatchling/builders/config.py``), so
-the pattern semantics cannot drift from the real build: a slash-less pattern
-matches at any depth, ``*`` stops at ``/``, a directory pattern takes its whole
-subtree, and ``!`` re-includes. Build options this guard does not model make it
-fail loudly instead of guessing, in either direction.
+THE ORACLE IS THE ARTIFACT, NOT A MODEL OF IT. Earlier revisions of this file
+re-implemented hatchling's file selection (its default-exclude constants, its
+``pathspec`` specs, its whitelist precedence) so the checks could run without a
+build. That model was wrong in the dangerous direction repeatedly: it called
+configurations green that ship a broken wheel, and reported ``.gitignore`` as
+stripped from an sdist that in fact contains it. So the session fixture below runs
+the real build once and every assertion reads the bytes it produced. There is
+nothing left for the guard to be incomplete about, and ``uv build`` costs under a
+second, which is noise against the rest of the suite.
+
+Two details of the build command are load-bearing. It is plain ``uv build``, which
+builds the sdist and then the wheel *from that sdist* — the same command
+``build-python-preview.yml`` and ``publish-release.yml`` run, so the wheel checked
+here is bounded by the sdist exactly as the published one is. And it is
+``--no-build-isolation``, so the backend comes from this project's own locked dev
+dependencies rather than a fresh network resolve: the guard works offline, and a
+hatchling upgrade arrives as a reviewable ``uv.lock`` change instead of a silent
+shift in what gets published.
 """
 
 import ast
+import configparser
+import importlib
 import os
 import re
+import runpy
+import shutil
+import subprocess
+import tarfile
+import zipfile
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-import pathspec
 import pytest
+import uvicorn
 
 try:  # tomllib is 3.11+, and requires-python still admits 3.10.
     import tomllib
@@ -37,17 +56,16 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the interpreter
     import tomli as tomllib
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-PYPROJECT = PACKAGE_ROOT / "pyproject.toml"
 IMPORT_NAME = "ag_ui_crewai"
 
 # Development-only code: the dojo server, the ``python -m ag_ui_crewai`` launcher
-# that runs it, and the demo flows. No artifact may ship any of it, and every
-# other module in the package must ship. Update these two lists (not the
-# assertions) when that split changes on purpose.
+# that runs it, and the demo flows. No artifact may ship any of it, and every other
+# file in the package must ship. Update these two lists (not the assertions) when
+# that split changes on purpose.
 DEV_ONLY_FILES = (f"{IMPORT_NAME}/dojo.py", f"{IMPORT_NAME}/__main__.py")
 DEV_ONLY_TREES = (f"{IMPORT_NAME}/examples/",)
 
-# Modules the published package exists to provide. Named so the equality check
+# Modules the published package exists to provide. Named so the set-equality check
 # below cannot pass by comparing two empty sets.
 CORE_MODULES = (
     f"{IMPORT_NAME}/__init__.py",
@@ -56,727 +74,520 @@ CORE_MODULES = (
     f"{IMPORT_NAME}/a2ui_tool.py",
 )
 
-# The hatchling file-selection options this guard mirrors.
-MODELED_OPTIONS = frozenset({"exclude", "include", "only-include", "packages"})
-
-# Options that cannot change which project files a published artifact contains:
-# archive naming, metadata version, editable-install layout, target version list,
-# reproducibility.
-INERT_OPTIONS = frozenset(
-    {
-        "core-metadata-version",
-        "dev-mode-dirs",
-        "dev-mode-exact",
-        "macos-max-compat",
-        "reproducible",
-        "strict-naming",
-        "versions",
-    }
+# The sdist payload outside the package directory, as the built tarball actually
+# carries it. Every one of these is force-included by the backend rather than
+# selected by ``[tool.hatch.build.targets.sdist] include``: the readme and the
+# license because ``[project]`` names them, ``pyproject.toml`` and ``PKG-INFO``
+# because an sdist is not a build input without them, and ``.gitignore`` which
+# hatchling adds to every sdist unconditionally. Emptying the include list of all
+# but ``ag_ui_crewai`` leaves this set unchanged, which is checkable and was checked.
+# Closed set on purpose: this is what catches an sdist that quietly starts shipping
+# the test suite and the lockfile.
+SDIST_NON_PACKAGE_FILES = frozenset(
+    {"README.md", "LICENSE", "pyproject.toml", "PKG-INFO", ".gitignore"}
 )
 
-# hatchling/builders/constants.py, plus the global excludes every target gets.
-EXCLUDED_DIRECTORIES = frozenset(
-    {
-        "__pycache__",
-        ".venv",
-        ".git",
-        ".hg",
-        ".hatch",
-        ".tox",
-        ".nox",
-        ".ruff_cache",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".pixi",
-    }
-)
-EXCLUDED_FILES = frozenset({".DS_Store", ".git"})
-GLOBAL_EXCLUDE_PATTERNS = ("*.py[cdo]", "/dist")
+# Byte-compilation and Finder droppings in a source checkout. They are not part of
+# the package, so they are not expected in an artifact; if a build ever started
+# shipping them the set-equality check would report them as extra files.
+DROPPING_SUFFIXES = (".pyc", ".pyo")
+DROPPING_NAMES = (".DS_Store",)
+DROPPING_DIRS = ("__pycache__",)
+
+# entry_points.txt group -> the pyproject table a maintainer would edit.
+ENTRY_POINT_TABLES = {
+    "console_scripts": "project.scripts",
+    "gui_scripts": "project.gui-scripts",
+}
 
 
-class UnmodeledBuildOption(AssertionError):
-    """A build option is in play that this guard cannot resolve.
+# -- the artifacts, built once per session ----------------------------------
 
-    Deliberately an ``AssertionError``, so it surfaces as a test failure telling
-    the maintainer to extend the guard rather than as a verdict that happens to be
-    wrong. Silent mis-reporting is the whole thing this file guards against.
+
+@dataclass(frozen=True)
+class Artifact:
+    """One built distribution, addressed by the paths a consumer sees.
+
+    ``contents`` is keyed relative to the archive's own root: for a wheel that is
+    the directory it unpacks into ``site-packages``, so ``ag_ui_crewai/sdk.py`` is
+    the installed import path; for an sdist it is the project root the backend
+    rebuilds from, with the ``<name>-<version>/`` prefix stripped.
     """
 
+    kind: str
+    filename: str
+    contents: Mapping[str, bytes]
 
-def _load_pyproject(path=PYPROJECT):
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+    def text(self, path):
+        return self.contents[path].decode("utf-8")
 
+    @property
+    def package_files(self):
+        """Files the artifact carries inside the package directory."""
+        return {
+            path for path in self.contents if path.startswith(f"{IMPORT_NAME}/")
+        }
 
-def _gitignore_lines(root):
-    """The ``.gitignore`` hatchling folds into every exclude spec.
-
-    ``ignore-vcs`` defaults to false, so hatchling loads the nearest
-    ``.gitignore`` at or above the project root, stopping at the repo boundary
-    (``hatchling.utils.fs.locate_file``). Skipping it here would make the guard
-    narrower than the build and miss a module a stray ignore rule strips.
-    """
-    current = root
-    while True:
-        candidate = current / ".gitignore"
-        if candidate.is_file():
-            return candidate.read_text(encoding="utf-8").splitlines()
-        if (current / ".git").exists() or current == current.parent:
-            return []
-        current = current.parent
-
-
-class TargetSelection:
-    """Which files one hatchling build target ships.
-
-    Mirrors ``hatchling.builders.config.BuilderConfig``: an exclude spec built
-    from hatchling's global patterns, the local ``.gitignore`` and the declared
-    ``exclude``; an include spec from ``include`` plus one ``/<dir>/`` pattern per
-    ``packages`` entry; and ``only-include`` roots, which ``packages`` populates
-    too. Files under an only-include root are selected "explicitly", which bypasses
-    the include spec but not the exclude spec.
-    """
-
-    def __init__(self, source, options, root, plugin_name, project_name):
-        self.source = source
-        unmodeled = sorted(set(options) - MODELED_OPTIONS - INERT_OPTIONS)
-        if unmodeled:
-            named = ", ".join(repr(option) for option in unmodeled)
-            raise UnmodeledBuildOption(
-                f"{source} declares {named}, which this guard does not model, so any "
-                "verdict about the files it ships would be a guess. Model the option "
-                "in TargetSelection (see hatchling/builders/config.py) or drop it."
-            )
-
-        packages = [package.strip("/") for package in options.get("packages", [])]
-        nested = [package for package in packages if "/" in package]
-        if nested:
-            raise UnmodeledBuildOption(
-                f"{source} declares nested packages {nested!r}, which also make "
-                "hatchling rewrite distribution paths via `sources`, so a module's "
-                "shipped import path stops matching its path in the tree. Model "
-                "`sources` in TargetSelection before using a src layout."
-            )
-
-        include = list(options.get("include", []))
-        only_include = [
-            path.strip("/") for path in options.get("only-include", [])
-        ] or packages
-        if plugin_name == "wheel" and not (include or only_include):
-            only_include = _auto_detected_wheel_packages(root, project_name, source)
-
-        self.only_include = only_include
-        self._exclude_patterns = [
-            *(("a hatchling default", p) for p in GLOBAL_EXCLUDE_PATTERNS),
-            *((".gitignore", line) for line in _gitignore_lines(root)),
-            *((f"{source} exclude", p) for p in options.get("exclude", [])),
-        ]
-        self._exclude_spec = pathspec.GitIgnoreSpec.from_lines(
-            pattern for _origin, pattern in self._exclude_patterns
-        )
-        self._include_patterns = [*include, *(f"/{package}/" for package in packages)]
-        self._include_spec = (
-            pathspec.GitIgnoreSpec.from_lines(self._include_patterns)
-            if self._include_patterns
-            else None
-        )
-
-    def ships(self, relpath):
-        return self.rejection(relpath) is None
-
-    def rejection(self, relpath):
-        """Why this target does not ship ``relpath``, or ``None`` when it does."""
-        parts = PurePosixPath(relpath).parts
-        if any(part in EXCLUDED_DIRECTORIES for part in parts[:-1]):
-            return "sits in a directory hatchling always skips"
-        if parts[-1] in EXCLUDED_FILES:
-            return "is a file hatchling always skips"
-
-        explicit = bool(self.only_include)
-        if explicit and not any(
-            relpath == root or relpath.startswith(f"{root}/")
-            for root in self.only_include
-        ):
-            return f"falls outside its only-include roots {self.only_include!r}"
-
-        if self._exclude_spec.match_file(relpath):
-            return f"is stripped by {self._describe_exclusion(relpath)}"
-
-        if (
-            not explicit
-            and self._include_spec is not None
-            and not self._include_spec.match_file(relpath)
-        ):
-            return f"is not selected by its include patterns {self._include_patterns!r}"
-
+    def resolve_module(self, module):
+        """The file in this artifact that ``module`` imports from, or None."""
+        for candidate in _module_candidates(module):
+            if candidate in self.contents:
+                return candidate
         return None
 
-    def _describe_exclusion(self, relpath):
-        """Name the pattern that stripped ``relpath``, for the failure message.
 
-        The verdict itself always comes from the combined spec above; this only
-        looks for the last pattern to claim the path so the message can quote it,
-        and stays vague when it cannot pin one down.
-        """
-        winner = None
-        for origin, pattern in self._exclude_patterns:
-            result = pathspec.GitIgnoreSpec.from_lines([pattern]).check_file(relpath)
-            if result.include is True:
-                winner = (origin, pattern)
-            elif result.include is False:
-                winner = None
-        if winner is None:
-            return "an exclude pattern"
-        origin, pattern = winner
-        return f"{origin} pattern {pattern!r}"
+def _read_wheel(path):
+    with zipfile.ZipFile(path) as archive:
+        return {
+            info.filename: archive.read(info)
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
 
 
-def _auto_detected_wheel_packages(root, project_name, source):
-    """hatchling's wheel fallback when no file selection is declared: the directory
-    named after the project."""
-    guess = re.sub(r"[^\w\d.]+", "_", project_name)
-    if guess and (root / guess / "__init__.py").is_file():
-        return [guess]
-    raise UnmodeledBuildOption(
-        f"{source} declares no `packages`, `include` or `only-include`, and there is "
-        f"no {guess or '<project name>'}/__init__.py, so hatchling falls back to "
-        "src-layout or single-module detection, which this guard does not model. "
-        "Declare `packages` on the target instead."
-    )
-
-
-def _target_selections(config, root):
-    """One ``TargetSelection`` per hatchling build target.
-
-    Target tables override the shared ``[tool.hatch.build]`` options per key. With
-    no target table declared at all, both artifacts are still built from the shared
-    options, so both are checked.
-    """
-    build = config.get("tool", {}).get("hatch", {}).get("build", {})
-    shared = {key: value for key, value in build.items() if key != "targets"}
-    project_name = config.get("project", {}).get("name", "")
-    targets = build.get("targets") or {"wheel": {}, "sdist": {}}
-    return [
-        TargetSelection(
-            f"tool.hatch.build.targets.{name}",
-            {**shared, **options},
-            root,
-            name,
-            project_name,
+def _read_sdist(path):
+    with tarfile.open(path, "r:gz") as archive:
+        members = [member for member in archive.getmembers() if member.isfile()]
+        prefixes = {PurePosixPath(member.name).parts[0] for member in members}
+        assert len(prefixes) == 1, (
+            f"{path.name} has more than one top-level directory {sorted(prefixes)!r}; "
+            "an sdist is required to unpack into exactly one"
         )
-        for name, options in targets.items()
-    ]
+        prefix = prefixes.pop()
+        return {
+            PurePosixPath(member.name).relative_to(prefix).as_posix(): archive.extractfile(
+                member
+            ).read()
+            for member in members
+        }
 
 
-def _declared_entry_points(config):
-    """Yield ``(source, name, value)`` for every entry point in ``[project]``.
+@pytest.fixture(scope="session")
+def built_artifacts(tmp_path_factory):
+    """Build the real wheel and sdist once, into a directory outside the repo.
 
-    Covers ``scripts``, ``gui-scripts`` and every ``entry-points.*`` group, since
-    all three land in the built distribution's ``entry_points.txt``.
+    ``uv build`` builds the sdist and then the wheel *from that sdist*, so a wheel
+    reaching this fixture is also proof the sdist is a complete build input. Keep the
+    command in step with the release workflows; a wheel built straight from the tree
+    is not the artifact consumers install.
     """
-    project = config.get("project", {})
-    for table in ("scripts", "gui-scripts"):
-        for name, value in project.get(table, {}).items():
-            yield f"project.{table}.{name}", name, value
-    for group, entries in project.get("entry-points", {}).items():
-        for name, value in entries.items():
-            yield f"project.entry-points.{group}.{name}", name, value
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.fail(
+            "this guard asserts against real built artifacts and `uv` is not on PATH. "
+            "Run the suite with `uv run python -m pytest` (see the package README)."
+        )
+
+    out_dir = tmp_path_factory.mktemp("dist")
+    command = [
+        uv,
+        "build",
+        "--offline",
+        # The backend comes from this project's locked dev dependencies, so the
+        # build needs no network and no populated uv cache.
+        "--no-build-isolation",
+        "--out-dir",
+        str(out_dir),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=PACKAGE_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "\n".join(
+                [
+                    f"`{' '.join(command)}` failed with exit status "
+                    f"{result.returncode}, so there is nothing to check the "
+                    "published layout against.",
+                    "Fix the build, or run `uv sync` if hatchling is missing from the "
+                    "environment.",
+                    result.stdout,
+                    result.stderr,
+                ]
+            )
+        )
+
+    artifacts = {}
+    for kind, pattern, reader in (
+        ("wheel", "*.whl", _read_wheel),
+        ("sdist", "*.tar.gz", _read_sdist),
+    ):
+        found = sorted(out_dir.glob(pattern))
+        assert len(found) == 1, f"expected exactly one {kind}, got {found!r}"
+        artifacts[kind] = Artifact(kind, found[0].name, reader(found[0]))
+    return artifacts
+
+
+@pytest.fixture(params=["wheel", "sdist"])
+def artifact(request, built_artifacts):
+    """Each invariant below runs against both published artifacts."""
+    return built_artifacts[request.param]
+
+
+# -- shared helpers ---------------------------------------------------------
 
 
 def _module_candidates(module):
-    """The file paths a dotted module name can resolve to, module before package."""
+    """The paths a dotted module name can occupy, module before package."""
     parts = module.split(".")
     return (
-        PurePosixPath(*parts).with_suffix(".py"),
-        PurePosixPath(*parts, "__init__.py"),
+        PurePosixPath(*parts).with_suffix(".py").as_posix(),
+        PurePosixPath(*parts, "__init__.py").as_posix(),
     )
 
 
-def _resolve_module(module, root):
-    for candidate in _module_candidates(module):
-        if (root / candidate).is_file():
-            return candidate.as_posix()
-    return None
-
-
-def _python_files(root):
-    """Every ``.py`` file in the source tree, as forward-slash relative paths."""
+def _source_package_files():
+    """Every file under the package directory in the source checkout."""
+    root = PACKAGE_ROOT / IMPORT_NAME
+    found = set()
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRECTORIES]
+        dirnames[:] = [name for name in dirnames if name not in DROPPING_DIRS]
         for filename in filenames:
-            if filename.endswith(".py"):
-                yield Path(dirpath, filename).relative_to(root).as_posix()
+            if filename.endswith(DROPPING_SUFFIXES) or filename in DROPPING_NAMES:
+                continue
+            path = Path(dirpath, filename).relative_to(PACKAGE_ROOT)
+            found.add(path.as_posix())
+    return found
 
 
-def _imported_source_files(relpath, root):
-    """Source-tree files ``relpath`` imports, parent packages included.
+def _is_dev_only(relpath):
+    return relpath in DEV_ONLY_FILES or relpath.startswith(DEV_ONLY_TREES)
 
-    Imports that resolve outside the tree (third-party, stdlib) and ``from``
-    targets that name a function rather than a submodule resolve to nothing and
-    drop out.
+
+def _entry_points(artifact):
+    """Yield ``(label, value)`` for every entry point the artifact would install.
+
+    For a wheel that is the backend's own ``entry_points.txt``, the file pip turns
+    into commands on a consumer's PATH. An sdist carries no such file, so it is read
+    from the ``pyproject.toml`` inside the sdist, which is what a wheel built from it
+    declares. Both are the artifact's own bytes; neither is the working tree's.
     """
-    tree = ast.parse((root / relpath).read_text(encoding="utf-8"), filename=relpath)
+    if artifact.kind == "wheel":
+        matches = [
+            path
+            for path in artifact.contents
+            if re.fullmatch(r"[^/]+\.dist-info/entry_points\.txt", path)
+        ]
+        if not matches:
+            return
+        parser = configparser.ConfigParser()
+        parser.optionxform = str  # entry point names are case-sensitive
+        parser.read_string(artifact.text(matches[0]))
+        for group in parser.sections():
+            table = ENTRY_POINT_TABLES.get(group, f"project.entry-points.{group}")
+            for name, value in parser.items(group):
+                yield f"{table}.{name}", value
+        return
+
+    project = tomllib.loads(artifact.text("pyproject.toml")).get("project", {})
+    for table in ("scripts", "gui-scripts"):
+        for name, value in project.get(table, {}).items():
+            yield f"project.{table}.{name}", value
+    for group, entries in project.get("entry-points", {}).items():
+        for name, value in entries.items():
+            yield f"project.entry-points.{group}.{name}", value
+
+
+def _docstring_node_ids(tree):
+    """Ids of the string constants that are docstrings rather than values.
+
+    A docstring naming a module is prose. Every other string literal can be a
+    runtime import target, which is exactly how the launcher reaches the dojo, so
+    those are scanned. Distinguishing the two is what stops this check from being
+    satisfied by a module's own documentation.
+    """
+    ids = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        if not node.body:
+            continue
+        first = node.body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+            if isinstance(first.value.value, str):
+                ids.add(id(first.value))
+    return ids
+
+
+_DOTTED_SELF_REFERENCE = re.compile(rf"\b{IMPORT_NAME}(?:\.[A-Za-z_]\w*)*")
+
+
+def _referenced_modules(source, relpath):
+    """Dotted module names ``relpath`` names, as absolute paths from the root.
+
+    Covers both mechanisms a module can name another by: ``import`` / ``from``
+    statements, and string literals such as the ``"ag_ui_crewai.dojo:app"`` uvicorn
+    target. An AST-only scan is blind to the second, and the second is the mechanism
+    the dojo launcher itself uses.
+    """
+    tree = ast.parse(source, filename=relpath)
     package = PurePosixPath(relpath).parts[:-1]
 
-    dotted = set()
+    names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            dotted.update(alias.name for alias in node.names)
+            names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level > len(package):
                 continue
             base = list(package[: len(package) - node.level + 1]) if node.level else []
             prefix = base + (node.module.split(".") if node.module else [])
             if prefix:
-                dotted.add(".".join(prefix))
-            dotted.update(".".join([*prefix, alias.name]) for alias in node.names)
+                names.add(".".join(prefix))
+            names.update(".".join([*prefix, alias.name]) for alias in node.names)
 
-    imported = set()
-    for name in dotted:
-        parts = name.split(".")
-        for depth in range(1, len(parts) + 1):
-            resolved = _resolve_module(".".join(parts[:depth]), root)
-            if resolved is not None:
-                imported.add(resolved)
-    return imported - {relpath}
-
-
-def _entry_point_violations(config, root):
-    """Every way ``config``'s entry points fail to survive its own build config."""
-    violations = []
-    selections = _target_selections(config, root)
-    for source, _name, value in _declared_entry_points(config):
-        module = value.split(":", 1)[0].strip()
-        resolved = _resolve_module(module, root)
-        if resolved is None:
-            tried = ", ".join(str(c) for c in _module_candidates(module))
-            violations.append(
-                f"{source} = {value!r} names module {module!r}, which has no file "
-                f"in the source tree (tried {tried})"
-            )
+    docstrings = _docstring_node_ids(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
-        for selection in selections:
-            rejection = selection.rejection(resolved)
-            if rejection is not None:
-                violations.append(
-                    f"{source} = {value!r} resolves to {resolved}, which "
-                    f"{selection.source} does not ship: it {rejection}"
-                )
-    return violations
+        if id(node) in docstrings:
+            continue
+        # The pattern stops at the ":" of an import string, so
+        # "ag_ui_crewai.dojo:app" yields the module and drops the attribute.
+        names.update(_DOTTED_SELF_REFERENCE.findall(node.value))
+
+    # Importing ``a.b.c`` needs ``a`` and ``a.b`` too, so every dotted prefix is a
+    # reference in its own right. Prefixes that name nothing in the tree (a
+    # third-party root, or the attribute tail of a ``from`` import) drop out during
+    # resolution.
+    return {
+        ".".join(name.split(".")[:depth])
+        for name in names
+        for depth in range(1, name.count(".") + 2)
+    }
 
 
-def _stripped_import_violations(config, root):
-    """Every shipped module that imports a module its own target strips."""
+def _stripped_reference_violations(artifact, source_files):
+    """Every module in ``artifact`` that names a project module the artifact lacks."""
     violations = []
-    for selection in _target_selections(config, root):
-        for relpath in sorted(_python_files(root)):
-            if not selection.ships(relpath):
+    for relpath in sorted(path for path in artifact.contents if path.endswith(".py")):
+        for name in sorted(_referenced_modules(artifact.text(relpath), relpath)):
+            if artifact.resolve_module(name) is not None:
                 continue
-            for imported in sorted(_imported_source_files(relpath, root)):
-                rejection = selection.rejection(imported)
-                if rejection is not None:
-                    violations.append(
-                        f"{selection.source} ships {relpath}, which imports "
-                        f"{imported}, but that file {rejection}"
-                    )
+            in_tree = next(
+                (c for c in _module_candidates(name) if c in source_files), None
+            )
+            if in_tree is None:
+                continue  # a dependency or the stdlib, not this project's code
+            violations.append(
+                f"{relpath} references {name!r}, which is {in_tree} in the source "
+                f"tree but is not in the {artifact.kind}"
+            )
     return violations
 
 
-# -- the invariants, against the real pyproject.toml ------------------------
+# -- 1. every entry point resolves inside every artifact --------------------
 
 
-def test_declared_entry_points_survive_the_build():
-    """No shipped entry point may point at a module the build strips or omits."""
-    violations = _entry_point_violations(_load_pyproject(), PACKAGE_ROOT)
+def test_every_entry_point_resolves_in_the_artifact(artifact):
+    """No published command may point at a module the build does not ship.
 
-    assert violations == [], "\n".join(
-        [
-            "pyproject.toml declares entry points that the build does not ship, so "
-            "the installed command would raise ModuleNotFoundError:",
-            *(f"  - {v}" for v in violations),
-            "Either drop the entry point (dev-only code runs via "
-            "`uv run python -m <module>` from a checkout) or stop excluding the "
-            "module.",
-        ]
-    )
-
-
-def test_no_shipped_module_imports_a_stripped_module():
-    """The other half of the invariant: a shipped module's imports have to ship too.
-
-    An editable install hides this completely, so a ``from .examples...`` added to
-    a runtime module would only fail on a consumer's machine.
+    Entry points survive any exclude list, so an installed ``dev`` command whose
+    module was stripped raises ModuleNotFoundError on a consumer's machine.
     """
-    violations = _stripped_import_violations(_load_pyproject(), PACKAGE_ROOT)
-
-    assert violations == [], "\n".join(
-        [
-            "modules the build ships import modules it strips, so importing the "
-            "installed package would raise ModuleNotFoundError:",
-            *(f"  - {v}" for v in violations),
-        ]
-    )
-
-
-def test_every_target_ships_the_runtime_package_and_no_dev_only_module():
-    """Pin the split in both directions.
-
-    Equality, not a one-way check: dropping a path from ``exclude`` fails here just
-    as loudly as excluding a module the package needs at runtime.
-    """
-    config = _load_pyproject()
-    modules = {
-        path
-        for path in _python_files(PACKAGE_ROOT)
-        if path.startswith(f"{IMPORT_NAME}/")
-    }
-    dev_only = {
-        path
-        for path in modules
-        if path in DEV_ONLY_FILES or path.startswith(DEV_ONLY_TREES)
-    }
-    runtime = modules - dev_only
-
-    assert set(DEV_ONLY_FILES) <= dev_only, "a dev-only module vanished from the tree"
-    assert set(CORE_MODULES) <= runtime, "a core module vanished from the tree"
-    assert len(dev_only) > len(DEV_ONLY_FILES), "the examples tree vanished"
-
-    for selection in _target_selections(config, PACKAGE_ROOT):
-        shipped = {path for path in modules if selection.ships(path)}
-
-        assert shipped == runtime, "\n".join(
-            [
-                f"{selection.source} does not ship exactly the runtime modules:",
-                *(
-                    f"  - needed at runtime but stripped: {p}"
-                    for p in sorted(runtime - shipped)
-                ),
-                *(f"  - dev-only but shipped: {p}" for p in sorted(shipped - runtime)),
-                "Fix the build config, or update DEV_ONLY_FILES / DEV_ONLY_TREES if "
-                "the split moved on purpose.",
-            ]
+    violations = []
+    for label, value in _entry_points(artifact):
+        module = value.split(":", 1)[0].strip()
+        if artifact.resolve_module(module) is not None:
+            continue
+        if module.split(".")[0] != IMPORT_NAME:
+            continue  # provided by a dependency; not ours to verify
+        tried = ", ".join(_module_candidates(module))
+        violations.append(
+            f"{label} = {value!r} needs module {module!r}, which the "
+            f"{artifact.kind} does not contain (looked for {tried})"
         )
 
-
-def test_the_dojo_launcher_stays_in_the_source_tree():
-    """``python -m ag_ui_crewai`` is what render.yaml and the dojo runner invoke, so
-    the launcher has to exist and reach the dojo even though no artifact ships it."""
-    launcher = f"{IMPORT_NAME}/__main__.py"
-
-    assert (PACKAGE_ROOT / launcher).is_file()
-    # Either an import of the dojo module or the uvicorn import string that names it.
-    assert f"{IMPORT_NAME}/dojo.py" in _imported_source_files(
-        launcher, PACKAGE_ROOT
-    ) or f"{IMPORT_NAME}.dojo" in (PACKAGE_ROOT / launcher).read_text(encoding="utf-8")
-
-
-# -- the checker itself, so the assertions above cannot pass vacuously -----
-#
-# Synthetic configs over a temporary tree: these must keep failing the way they do
-# regardless of what the real pyproject.toml comes to declare.
-
-
-@pytest.fixture
-def fake_package(tmp_path):
-    """A miniature source tree: shipped modules, a dev-only one, a demo subtree."""
-    files = {
-        "pkg/__init__.py": "from .shipped import serve\n",
-        "pkg/shipped.py": "import os\n\n\ndef serve():\n    pass\n",
-        "pkg/dev_only.py": "from .examples import demo\n",
-        "pkg/nested/__init__.py": "",
-        "pkg/nested/mod.py": "",
-        "pkg/examples/__init__.py": "",
-        "pkg/examples/demo.py": "",
-    }
-    for relpath, text in files.items():
-        path = tmp_path / relpath
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-    return tmp_path
-
-
-def _config(scripts, target="wheel", **build_options):
-    """A one-target config whose whitelist ships all of ``pkg``."""
-    return {
-        "project": {"name": "pkg", "scripts": scripts},
-        "tool": {
-            "hatch": {
-                "build": {
-                    "packages": ["pkg"],
-                    **build_options,
-                    "targets": {target: {}},
-                }
-            }
-        },
-    }
-
-
-def test_checker_accepts_a_script_pointing_at_shipped_code(fake_package):
-    config = _config(
-        {"serve": "pkg.shipped:serve"},
-        exclude=["pkg/dev_only.py", "pkg/examples/**"],
+    assert violations == [], "\n".join(
+        [
+            f"{artifact.filename} installs entry points whose modules it does not "
+            "contain, so running the command raises ModuleNotFoundError:",
+            *(f"  - {v}" for v in violations),
+            "Either drop the entry point (dev-only code runs via "
+            "`uv run python -m ag_ui_crewai` from a checkout) or stop excluding the "
+            "module in [tool.hatch.build].",
+        ]
     )
 
-    assert _entry_point_violations(config, fake_package) == []
+
+# -- 2. nothing shipped references anything stripped ------------------------
 
 
-def test_checker_flags_a_script_excluded_by_a_literal_pattern(fake_package):
-    config = _config(
-        {"dev": "pkg.dev_only:main"},
-        exclude=["pkg/dev_only.py", "pkg/examples/**"],
+def test_no_shipped_module_references_a_stripped_module(artifact):
+    """The other half of the invariant: what a shipped module names has to ship too.
+
+    An editable install hides this completely, so a ``from .examples import ...``
+    added to a runtime module would only fail on a consumer's machine.
+    """
+    violations = _stripped_reference_violations(artifact, _source_package_files())
+
+    assert violations == [], "\n".join(
+        [
+            f"{artifact.filename} contains modules that name modules it does not "
+            "contain, so importing the installed package raises ModuleNotFoundError:",
+            *(f"  - {v}" for v in violations),
+            "Either move the reference out of the shipped module or stop excluding "
+            "the module it names in [tool.hatch.build].",
+        ]
     )
 
-    violations = _entry_point_violations(config, fake_package)
 
-    assert len(violations) == 1
-    assert "pkg/dev_only.py" in violations[0]
-    assert "pattern 'pkg/dev_only.py'" in violations[0]
+# -- 3. the dev-only split, over complete file sets -------------------------
 
 
-def test_checker_flags_a_script_excluded_by_a_pattern_without_a_slash(fake_package):
-    """The idiomatic form: gitignore patterns with no slash match at any depth, so
-    ``dev_only.py`` strips ``pkg/dev_only.py``. Hand-rolled fnmatch logic anchors
-    the pattern instead and calls this config green."""
-    config = _config({"dev": "pkg.dev_only:main"}, exclude=["dev_only.py"])
+def test_the_source_tree_still_has_the_split_this_guard_pins():
+    """Preconditions, so the set comparisons below cannot pass by comparing nothing."""
+    source_files = _source_package_files()
+    dev_only = {path for path in source_files if _is_dev_only(path)}
 
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "pattern 'dev_only.py'" in violations[0]
-
-
-def test_checker_flags_a_script_excluded_by_a_recursive_glob(fake_package):
-    """``dir/**`` is the shape hatchling uses for demo trees, and it has to match
-    nested modules, not just direct children."""
-    config = _config({"demo": "pkg.examples.demo:main"}, exclude=["pkg/examples/**"])
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "pkg/examples/demo.py" in violations[0]
-
-
-def test_checker_flags_a_package_entry_point_excluded_as_a_directory(fake_package):
-    """A dotted name can resolve to ``__init__.py``; excluding the directory still
-    strips it."""
-    config = _config({"demo": "pkg.examples:main"}, exclude=["pkg/examples/**"])
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "pkg/examples/__init__.py" in violations[0]
-
-
-def test_checker_honours_a_negated_exclude_pattern(fake_package):
-    """``!`` re-includes, so an exclude list can strip a directory and keep one file
-    in it. Treating ``!`` as a literal pattern would report the kept file as gone."""
-    config = _config(
-        {"demo": "pkg.examples.demo:main"},
-        exclude=["pkg/examples/**", "!pkg/examples/demo.py"],
+    assert set(DEV_ONLY_FILES) <= dev_only, (
+        "a module listed in DEV_ONLY_FILES is gone from the tree; update the list or "
+        "restore the file"
+    )
+    assert set(CORE_MODULES) <= source_files - dev_only, (
+        "a module listed in CORE_MODULES is gone from the tree; update the list or "
+        "restore the file"
+    )
+    assert len(dev_only) > len(DEV_ONLY_FILES), "the examples tree is gone"
+    assert any(not path.endswith(".py") for path in dev_only), (
+        "the examples tree has no non-.py payload left, so `examples/**` staying out "
+        "of the artifacts would only be pinned for modules"
     )
 
-    assert _entry_point_violations(config, fake_package) == []
+
+def test_the_artifact_contains_exactly_the_runtime_package(artifact):
+    """Complete file sets, every extension, in both directions.
+
+    Equality rather than a one-way check: dropping ``__main__.py`` from the exclude
+    list fails here just as loudly as excluding a module the package needs at
+    runtime, and a package-data file going missing fails the same way a module does.
+    """
+    source_files = _source_package_files()
+    expected = {path for path in source_files if not _is_dev_only(path)}
+    shipped = artifact.package_files
+
+    assert shipped == expected, "\n".join(
+        [
+            f"{artifact.filename} does not contain exactly the runtime package:",
+            *(
+                f"  - needed at runtime but missing: {path}"
+                for path in sorted(expected - shipped)
+            ),
+            *(
+                f"  - dev-only but published: {path}"
+                for path in sorted(shipped - expected)
+            ),
+            "Fix [tool.hatch.build] in pyproject.toml, or update DEV_ONLY_FILES / "
+            "DEV_ONLY_TREES in this file if the split moved on purpose.",
+        ]
+    )
 
 
-def test_checker_does_not_let_a_star_cross_a_directory_separator(fake_package):
-    """``*`` stops at ``/`` in gitignore syntax, so ``pkg/*.py`` does not select a
-    nested module. A matcher where ``*`` crosses separators calls this shipped and
-    the module silently goes missing from the artifact."""
-    config = {
-        "project": {"name": "pkg", "scripts": {"serve": "pkg.nested.mod:main"}},
-        "tool": {"hatch": {"build": {"targets": {"sdist": {"include": ["pkg/*.py"]}}}}},
-    }
+def test_the_wheel_contains_nothing_but_the_package_and_its_metadata(built_artifacts):
+    """A wheel unpacks straight into site-packages, so a stray path is a stray
+    top-level install."""
+    wheel = built_artifacts["wheel"]
+    stray = sorted(
+        path
+        for path in wheel.contents
+        if path not in wheel.package_files
+        and not re.match(r"[^/]+\.dist-info/", path)
+    )
 
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "is not selected by its include patterns" in violations[0]
-
-
-def test_checker_treats_whitelist_options_as_alternatives(fake_package):
-    """hatchling ORs the whitelists: ``packages`` and ``include`` feed one spec, and
-    ``packages`` doubles as an only-include root. AND-ing them reports a shipped
-    module as omitted because the ``include`` list says nothing about it."""
-    config = {
-        "project": {"name": "pkg", "scripts": {"serve": "pkg.shipped:serve"}},
-        "tool": {
-            "hatch": {
-                "build": {
-                    "targets": {
-                        "wheel": {"packages": ["pkg"], "include": ["README.md"]},
-                        "sdist": {"include": ["pkg", "README.md"]},
-                    }
-                }
-            }
-        },
-    }
-
-    assert _entry_point_violations(config, fake_package) == []
+    assert stray == [], "\n".join(
+        [
+            f"{wheel.filename} would install these outside {IMPORT_NAME}/ and outside "
+            "its .dist-info:",
+            *(f"  - {path}" for path in stray),
+            "Narrow the wheel's file selection in [tool.hatch.build.targets.wheel] "
+            "(including any force-include it declares).",
+        ]
+    )
 
 
-def test_checker_covers_gui_scripts_and_entry_point_groups(fake_package):
-    config = {
-        "project": {
-            "name": "pkg",
-            "gui-scripts": {"dev-gui": "pkg.dev_only:gui"},
-            "entry-points": {"some.plugin.group": {"hook": "pkg.dev_only:hook"}},
-        },
-        "tool": {
-            "hatch": {
-                "build": {
-                    "packages": ["pkg"],
-                    "exclude": ["pkg/dev_only.py"],
-                    "targets": {"wheel": {}},
-                }
-            }
-        },
-    }
+def test_the_sdist_carries_only_the_package_and_its_metadata(built_artifacts):
+    """The lean-sdist promise, read off the tarball rather than trusted.
 
-    sources = [v.split(" = ")[0] for v in _entry_point_violations(config, fake_package)]
+    A closed set: this is what catches an sdist that quietly starts shipping the test
+    suite and the lockfile because its target table stopped narrowing the build.
+    """
+    sdist = built_artifacts["sdist"]
+    payload = {path for path in sdist.contents if path not in sdist.package_files}
 
-    assert sources == [
-        "project.gui-scripts.dev-gui",
-        "project.entry-points.some.plugin.group.hook",
-    ]
-
-
-def test_checker_flags_a_script_whose_module_does_not_exist(fake_package):
-    config = _config({"ghost": "pkg.missing:main"})
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "no file in the source tree" in violations[0]
+    assert payload == SDIST_NON_PACKAGE_FILES, "\n".join(
+        [
+            f"{sdist.filename} does not carry exactly the expected metadata payload:",
+            *(
+                f"  - unexpectedly published: {path}"
+                for path in sorted(payload - SDIST_NON_PACKAGE_FILES)
+            ),
+            *(
+                f"  - expected but missing: {path}"
+                for path in sorted(SDIST_NON_PACKAGE_FILES - payload)
+            ),
+            "Fix [tool.hatch.build.targets.sdist] include, or update "
+            "SDIST_NON_PACKAGE_FILES in this file if the payload changed on purpose.",
+        ]
+    )
 
 
-def test_checker_flags_a_script_left_out_of_a_target_whitelist(fake_package):
-    """An sdist ``include`` list is the other way to drop a module: the exclude list
-    stays innocent and the file simply never gets selected."""
-    config = {
-        "project": {"name": "pkg", "scripts": {"serve": "pkg.shipped:serve"}},
-        "tool": {
-            "hatch": {
-                "build": {
-                    "targets": {
-                        "wheel": {"packages": ["pkg"]},
-                        "sdist": {"include": ["README.md"]},
-                    }
-                }
-            }
-        },
-    }
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "targets.sdist does not ship" in violations[0]
+# -- 4. the launcher no artifact ships still serves the dojo ----------------
 
 
-def test_checker_applies_shared_excludes_to_every_target(fake_package):
-    """``[tool.hatch.build] exclude`` with no per-target override has to be checked
-    once per target, which is how the real config strips the dojo from both."""
-    config = {
-        "project": {"name": "pkg", "scripts": {"dev": "pkg.dev_only:main"}},
-        "tool": {
-            "hatch": {
-                "build": {
-                    "packages": ["pkg"],
-                    "exclude": ["pkg/dev_only.py"],
-                    "targets": {"wheel": {}, "sdist": {}},
-                }
-            }
-        },
-    }
+def test_python_dash_m_hands_uvicorn_a_resolvable_dojo_target(monkeypatch):
+    """``python -m ag_ui_crewai`` is what render.yaml and the dojo runner invoke.
 
-    targets = [
-        v.split("which ")[1].split(" does not ship")[0]
-        for v in _entry_point_violations(config, fake_package)
-    ]
+    Executed rather than read: ``runpy`` runs the launcher exactly as ``-m`` does,
+    with ``uvicorn.run`` captured, so the assertions are about the call that really
+    happens. Reading the file instead is how an earlier version of this test came to
+    be satisfied by the launcher's own docstring.
+    """
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: calls.append(app))
 
-    assert sorted(targets) == [
-        "tool.hatch.build.targets.sdist",
-        "tool.hatch.build.targets.wheel",
-    ]
+    try:
+        runpy.run_module(IMPORT_NAME, run_name="__main__")
+    except SystemExit as exit_signal:
+        exit_code = exit_signal.code
+    else:
+        pytest.fail(
+            f"`python -m {IMPORT_NAME}` ran to the end of "
+            f"{IMPORT_NAME}/__main__.py without exiting, so it served nothing and "
+            'reported success. Call main() under an `if __name__ == "__main__":` '
+            "guard."
+        )
 
+    assert exit_code == 0, f"`python -m {IMPORT_NAME}` exited {exit_code!r}, not 0"
+    assert len(calls) == 1, (
+        f"`python -m {IMPORT_NAME}` made {len(calls)} uvicorn.run calls, not 1; the "
+        f"launcher has to serve the dojo, and {IMPORT_NAME}/__main__.py is the only "
+        "place that can (no artifact ships it, so nothing else covers it)"
+    )
 
-def test_checker_flags_a_shipped_module_importing_a_stripped_one(fake_package):
-    config = _config({}, exclude=["pkg/dev_only.py", "pkg/examples/**"])
-    (fake_package / "pkg" / "shipped.py").write_text("from .examples import demo\n")
+    target = calls[0]
+    assert isinstance(target, str), (
+        f"`python -m {IMPORT_NAME}` passed uvicorn a {type(target).__name__} instead "
+        "of an import string. uvicorn sys.exit(1)s on a non-string app whenever "
+        "reload or workers is set, and building the app in the reload supervisor "
+        "builds a second copy nothing serves. Pass "
+        f'"{IMPORT_NAME}.dojo:app" instead.'
+    )
 
-    violations = _stripped_import_violations(config, fake_package)
+    module_name, _, attribute = target.partition(":")
+    assert module_name == f"{IMPORT_NAME}.dojo", (
+        f"`python -m {IMPORT_NAME}` serves {module_name!r}; the launcher exists to "
+        f"serve {IMPORT_NAME}.dojo, which is the module no artifact ships"
+    )
+    assert attribute, f"uvicorn target {target!r} names no application attribute"
 
-    stripped = "stripped by tool.hatch.build.targets.wheel exclude pattern"
-    assert [v.split("ships ")[1] for v in violations] == [
-        f"pkg/shipped.py, which imports pkg/examples/__init__.py, but that file is "
-        f"{stripped} 'pkg/examples/**'",
-        f"pkg/shipped.py, which imports pkg/examples/demo.py, but that file is "
-        f"{stripped} 'pkg/examples/**'",
-    ]
-
-
-def test_checker_ignores_a_stripped_module_importing_a_stripped_one(fake_package):
-    """``pkg/dev_only.py`` imports the demo subtree, and both are excluded, which is
-    exactly the real dojo layout: nothing shipped references either."""
-    config = _config({}, exclude=["pkg/dev_only.py", "pkg/examples/**"])
-
-    assert _stripped_import_violations(config, fake_package) == []
-
-
-def test_checker_refuses_an_unmodeled_build_option(fake_package):
-    """``force-include`` beats ``exclude``, so guessing either way is wrong."""
-    config = _config({"serve": "pkg.shipped:serve"}, **{"force-include": {"x": "y"}})
-
-    with pytest.raises(UnmodeledBuildOption, match="'force-include'"):
-        _entry_point_violations(config, fake_package)
-
-
-def test_checker_refuses_a_src_layout_package(fake_package):
-    config = {
-        "project": {"name": "pkg", "scripts": {"serve": "pkg.shipped:serve"}},
-        "tool": {"hatch": {"build": {"targets": {"wheel": {"packages": ["src/pkg"]}}}}},
-    }
-
-    with pytest.raises(UnmodeledBuildOption, match="sources"):
-        _entry_point_violations(config, fake_package)
-
-
-def test_checker_refuses_a_wheel_it_cannot_resolve(fake_package):
-    """No whitelist and no directory named after the project: hatchling falls back
-    to detection this guard does not model, so it must not answer."""
-    config = {
-        "project": {
-            "name": "unrelated-name",
-            "scripts": {"serve": "pkg.shipped:serve"},
-        },
-        "tool": {"hatch": {"build": {"targets": {"wheel": {}}}}},
-    }
-
-    with pytest.raises(UnmodeledBuildOption, match="src-layout"):
-        _entry_point_violations(config, fake_package)
-
-
-def test_checker_resolves_a_wheel_that_declares_no_file_selection(fake_package):
-    """hatchling's own fallback when the package is named after the project."""
-    config = {
-        "project": {"name": "pkg", "scripts": {"dev": "pkg.dev_only:main"}},
-        "tool": {
-            "hatch": {"build": {"targets": {"wheel": {"exclude": ["pkg/dev_only.py"]}}}}
-        },
-    }
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert "pkg/dev_only.py" in violations[0]
-
-
-def test_checker_applies_gitignore_patterns_like_the_build(fake_package):
-    """``ignore-vcs`` defaults to false, so a ``.gitignore`` rule strips a module
-    from the artifact just as an ``exclude`` entry would."""
-    (fake_package / ".gitignore").write_text("dev_only.py\n")
-    config = _config({"dev": "pkg.dev_only:main"})
-
-    violations = _entry_point_violations(config, fake_package)
-
-    assert len(violations) == 1
-    assert ".gitignore pattern 'dev_only.py'" in violations[0]
+    served = importlib.import_module(module_name)
+    assert hasattr(served, attribute), (
+        f"uvicorn target {target!r} names {attribute!r}, which {module_name} does not "
+        f"define, so `python -m {IMPORT_NAME}` fails at startup"
+    )
