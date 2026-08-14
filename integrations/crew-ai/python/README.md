@@ -328,8 +328,13 @@ Covers the grace window, force-cancel join, AND outer-cancel recovery
 
 ## To run the dojo examples
 
+The dojo server and its demo flows are development-only and are deliberately kept
+out of the published `ag-ui-crewai` wheel and sdist, so this workflow requires a
+checkout of the [ag-ui repository](https://github.com/ag-ui-protocol/ag-ui) and
+does not work from an installed package.
+
 ```bash
 cd integrations/crew-ai/python
 uv sync
-uv run python -m ag_ui_crewai.dojo
+uv run python -m ag_ui_crewai
 ```

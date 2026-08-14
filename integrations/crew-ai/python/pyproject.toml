@@ -64,14 +64,16 @@ build-backend = "hatchling.build"
 
 # Shared across wheel and sdist so the exclude list is not repeated per target.
 #
-# The dojo server and its demo flows are development-only, so they stay out of
-# both artifacts. Nothing in the published metadata may reference them: a
-# ``[project.scripts]`` entry point survives the exclude and would install a
-# ``dev`` command that raises ModuleNotFoundError. Run the dojo from a source
-# checkout with ``uv run python -m ag_ui_crewai.dojo`` instead.
+# The dojo server, its launcher and its demo flows are development-only, so they
+# stay out of both artifacts. Nothing shipped may reference them: an entry point
+# declared in ``[project.scripts]`` survives the exclude and would install a
+# ``dev`` command that raises ModuleNotFoundError, and a shipped ``__main__.py``
+# importing the excluded ``dojo`` module would break the same way. Run the dojo
+# from a source checkout with ``uv run python -m ag_ui_crewai`` instead.
 [tool.hatch.build]
 exclude = [
     "ag_ui_crewai/dojo.py",
+    "ag_ui_crewai/__main__.py",
     "ag_ui_crewai/examples/**",
 ]
 
