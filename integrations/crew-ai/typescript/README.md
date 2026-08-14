@@ -40,5 +40,5 @@ const result = await agent.runAgent({
 
 ```bash
 cd integrations/crew-ai/python
-poetry install && poetry run dev
+uv sync && uv run python -m ag_ui_crewai.dojo
 ```

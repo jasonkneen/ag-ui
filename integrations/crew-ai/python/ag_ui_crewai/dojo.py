@@ -135,3 +135,10 @@ def main():
         port=port,
         reload=True
     )
+
+
+# This module is excluded from the published wheel and sdist, so it is invoked
+# as ``python -m ag_ui_crewai.dojo`` from a source checkout rather than through
+# a console script (which would ship broken metadata).
+if __name__ == "__main__":
+    main()

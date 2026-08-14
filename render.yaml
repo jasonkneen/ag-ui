@@ -40,7 +40,9 @@ projects:
         sync: false
       region: virginia
       buildCommand: uv sync
-      startCommand: uv run dev
+      # No `dev` console script: the dojo module is excluded from the published
+      # artifacts, so it is run as a module from the source checkout.
+      startCommand: uv run python -m ag_ui_crewai.dojo
       autoDeployTrigger: commit
       rootDir: integrations/crew-ai/python
     - type: web

@@ -331,5 +331,5 @@ Covers the grace window, force-cancel join, AND outer-cancel recovery
 ```bash
 cd integrations/crew-ai/python
 uv sync
-uv run dev
+uv run python -m ag_ui_crewai.dojo
 ```
