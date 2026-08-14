@@ -1,18 +1,9 @@
 """Launcher for the development-only dojo server: ``python -m ag_ui_crewai``.
 
-Owns the ``uvicorn.run`` call and deliberately never imports
-``ag_ui_crewai.dojo``: with ``reload=True`` this process is only the file-watching
-supervisor, and uvicorn hands its worker the ``"ag_ui_crewai.dojo:app"`` import
-string, so the FastAPI app and every demo flow are built exactly once, in the
-process that serves traffic. Importing the app here would build a second copy
-that nothing uses.
-
-The ``-m`` target has to be the package, never ``ag_ui_crewai.dojo``: the
-reloader spawns its worker through multiprocessing, which re-executes a module
-``-m`` target as ``__mp_main__`` but skips that re-execution when the target is a
-package ``__main__``.
-
-Excluded from the published wheel and sdist alongside ``dojo.py``.
+Hands uvicorn the ``"ag_ui_crewai.dojo:app"`` import string and does not import the
+dojo here, so the app is built once, in the reloader's worker that serves traffic.
+``tests/test_launcher.py`` pins both halves of that and the ``PORT`` read below.
+Why the ``-m`` target is the package, and why none of this ships: pyproject.toml.
 """
 
 import os
@@ -22,11 +13,12 @@ import uvicorn
 
 
 def main() -> int:
-    """Serve the dojo, returning the process exit code.
+    """Serve the dojo, returning 0; ``tests/test_launcher.py`` pins that.
 
-    Under ``reload=True`` uvicorn never exits the process itself: it swallows
-    Ctrl-C and returns once the reload supervisor stops. So a normal return is a
-    clean shutdown, and 0 is the only status there is to report.
+    Not every outcome comes back here: a startup failure such as a bound port exits
+    non-zero from inside ``uvicorn.run``, and the reloader does not check on its
+    worker, so a worker that dies at import leaves this process up with the port
+    bound and requests hanging.
     """
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(

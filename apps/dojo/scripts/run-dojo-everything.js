@@ -93,10 +93,10 @@ const ALL_SERVICES = {
   ],
   "crew-ai": [
     {
-      // No `dev` console script exists for this dojo; rationale in
-      // integrations/crew-ai/python/pyproject.toml. The target must stay the
-      // package: `-m ag_ui_crewai.dojo` exits 0 without serving, and
-      // killOthersOn "success" below would take the whole fleet down with it.
+      // No `dev` console script exists for this dojo, and the target must stay the
+      // package; rationale in integrations/crew-ai/python/pyproject.toml. Getting
+      // it wrong exits 0, which killOthersOn "success" below turns into a
+      // fleet-wide stop.
       command: "uv run python -m ag_ui_crewai",
       name: "CrewAI",
       cwd: path.join(integrationsRoot, "crew-ai/python"),
