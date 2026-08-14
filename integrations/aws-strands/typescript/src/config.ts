@@ -122,7 +122,10 @@ export interface ToolBehavior {
   stateFromResult?: StateFromResult;
   /** Async iterator that can emit arbitrary AG-UI events in response to a result. */
   customResultHandler?: CustomResultHandler;
-  /** Interrupt before this tool executes, requiring human approval to proceed. */
+  /**
+   * Interrupt before a server-executed tool runs, requiring human approval.
+   * Client-provided tools should gate execution in the client.
+   */
   interruptOnCall?: boolean;
   /** Custom handler for mid-execution tool stream events. Suppresses default state snapshot behavior. */
   toolStreamEventHandler?: ToolStreamEventHandler;

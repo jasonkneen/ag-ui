@@ -94,7 +94,10 @@ interrupt round-trip:
   Strands name as the AG-UI reason and the free-form Strands reason under
   `metadata.reason`. Tools configured with `ToolBehavior(interrupt_on_call=True)`
   instead emit a `tool_call` approval interrupt with an `approved` response
-  schema.
+  schema. Applies to server-executed tools only. For client-provided tools, gate
+  execution in the client — define the tool with a `render` that calls `respond`,
+  not a `handler` — since the tool runs in the browser and the adapter has already
+  halted the run.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
 payload=...)]`. Strands' resume gate is truthiness-based (`if

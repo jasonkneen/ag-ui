@@ -46,7 +46,7 @@ import {
   type ToolCallContext,
   type ToolResultContext,
 } from "./config";
-import { syncProxyTools } from "./client-proxy-tool";
+import { isProxyTool, syncProxyTools } from "./client-proxy-tool";
 import {
   planA2UIInjection,
   isAutoInjectedA2UITool,
@@ -653,6 +653,12 @@ export class StrandsAgent {
           if (behavior.interruptOnCall) {
             strandsAgent.addHook(BeforeToolCallEvent, (event) => {
               if (event.toolUse?.name === toolName) {
+                if (isProxyTool(event.tool)) {
+                  this._log.warn(
+                    `${LOG_PREFIX} interruptOnCall is ignored for client-provided tool "${toolName}"; gate execution in the client.`,
+                  );
+                  return;
+                }
                 const response = event.interrupt({
                   name: `ag_ui:tool_call:${toolName}`,
                   reason: { tool_call: true, tool_name: toolName, tool_input: event.toolUse!.input ?? {}, tool_use_id: event.toolUse!.toolUseId },

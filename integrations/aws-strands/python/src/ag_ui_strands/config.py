@@ -118,6 +118,9 @@ class ToolBehavior:
     continue_after_frontend_call: bool = False
     stop_streaming_after_result: bool = False
     interrupt_on_call: bool = False
+    """Interrupt before a server-executed tool runs. Client-provided tools
+    should gate execution in the client.
+    """
     predict_state: Optional[Iterable[PredictStateMapping]] = None
     args_streamer: Optional[ArgsStreamer] = None
     state_from_args: Optional[StateFromArgs] = None

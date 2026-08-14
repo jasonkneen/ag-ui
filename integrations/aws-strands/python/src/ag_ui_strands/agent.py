@@ -387,7 +387,7 @@ from .a2ui_tool import (
     is_auto_injected_a2ui_tool,
     plan_a2ui_injection,
 )
-from .client_proxy_tool import sync_proxy_tools
+from .client_proxy_tool import _is_proxy, sync_proxy_tools
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
@@ -844,18 +844,21 @@ def _persist_interrupt_bookkeeping(
 # ---------------------------------------------------------------------------
 
 class StrandsInterruptHook:
-    """Raises a Strands native interrupt for tools configured with ``interrupt_on_call=True``.
+    """Interrupts server tools configured with ``interrupt_on_call=True``.
 
     Registered automatically by :class:`StrandsAgent` when any entry in
     ``config.tool_behaviors`` has ``interrupt_on_call=True``.
 
-    On the **first** call for a given tool the hook calls ``event.interrupt()``,
-    which raises ``InterruptException`` internally and suspends the Strands
-    agent loop.  On the **resume** call Strands has already written the human
-    response into the interrupt object, so ``event.interrupt()`` returns the
-    response payload instead of raising.  The hook then grants approval only
-    for ``{"approved": True}``; otherwise it sets ``event.cancel_tool`` so the
-    tool is skipped.
+    Client-provided proxy tools warn and skip the interrupt because their
+    execution must be gated in the client.
+
+    On the **first** call for a configured server-executed tool the hook calls
+    ``event.interrupt()``, which raises ``InterruptException`` internally and
+    suspends the Strands agent loop. On the **resume** call Strands has already
+    written the human response into the interrupt object, so
+    ``event.interrupt()`` returns the response payload instead of raising. The
+    hook then grants approval only for ``{"approved": True}``; otherwise it
+    sets ``event.cancel_tool`` so the tool is skipped.
     """
 
     def __init__(self, tool_behaviors: "Dict[str, ToolBehavior]") -> None:
@@ -867,10 +870,17 @@ class StrandsInterruptHook:
         registry.add_callback(_BeforeToolCallEvent, self._on_before_tool_call)
 
     def _on_before_tool_call(self, event: Any) -> None:
-        """Interrupt or enforce approval for interrupt_on_call tools."""
+        """Skip client proxies; interrupt or enforce approval for server tools."""
         tool_name = event.tool_use.get("name", "")
         behavior = self._tool_behaviors.get(tool_name)
         if not behavior or not behavior.interrupt_on_call:
+            return
+        if _is_proxy(event.selected_tool):
+            logger.warning(
+                "interrupt_on_call is ignored for client-provided tool '%s'; "
+                "gate execution in the client.",
+                tool_name,
+            )
             return
 
         # event.interrupt() either:
