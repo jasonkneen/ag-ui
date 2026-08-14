@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from strands.session.file_session_manager import FileSessionManager
 from strands.types.session import SessionAgent, SessionMessage
 
+from ag_ui_strands import session_reconcile
 from ag_ui_strands.session_reconcile import (
     has_placeholder_results,
     reconcile_frontend_tool_results,
@@ -46,6 +48,105 @@ def _tool_result_block(tool_use_id, text):
             "content": [{"text": text}],
         }
     }
+
+
+def test_active_proxy_placeholder_requires_exact_reserved_result_shape():
+    exact_result = {
+        "toolUseId": "native-proxy",
+        "status": "success",
+        "content": [{"text": PLACEHOLDER}],
+    }
+
+    def detected(result, *, activated=True):
+        agent = SimpleNamespace(
+            _interrupt_state=SimpleNamespace(
+                activated=activated,
+                context={"tool_results": [result]},
+            )
+        )
+        return bool(session_reconcile.active_proxy_placeholder_ids(agent))
+
+    assert detected(exact_result)
+    assert not detected(exact_result, activated=False)
+    assert not detected(
+        {**exact_result, "content": [{"text": f"prefix {PLACEHOLDER} suffix"}]}
+    )
+    assert not detected({**exact_result, "status": "error"})
+    assert not detected({**exact_result, "content": [{"text": PLACEHOLDER}, {"text": "extra"}]})
+    assert not detected({**exact_result, "unexpected": True})
+    assert not session_reconcile.active_proxy_placeholder_ids(SimpleNamespace())
+
+
+def test_repository_capability_requires_public_repository_api_and_stable_agent_id():
+    repository = SimpleNamespace(
+        list_messages=lambda session_id, agent_id: [],
+        update_message=lambda session_id, agent_id, message: None,
+    )
+    manager = SimpleNamespace(
+        session_id="session-1",
+        session_repository=repository,
+    )
+
+    assert session_reconcile._supports_repository_reconciliation(
+        manager, SimpleNamespace(agent_id="stable-agent")
+    )
+    assert not session_reconcile._supports_repository_reconciliation(
+        SimpleNamespace(session_id="session-1"),
+        SimpleNamespace(agent_id="stable-agent"),
+    )
+    assert not session_reconcile._supports_repository_reconciliation(
+        manager, SimpleNamespace()
+    )
+    assert not session_reconcile._supports_repository_reconciliation(
+        manager, SimpleNamespace(agent_id="")
+    )
+
+
+@pytest.mark.parametrize(
+    ("throwing_owner", "throwing_attribute"),
+    [
+        pytest.param("manager", "session_id", id="session-id"),
+        pytest.param("manager", "session_repository", id="session-repository"),
+        pytest.param("agent", "agent_id", id="agent-id"),
+        pytest.param("repository", "list_messages", id="list-messages"),
+        pytest.param("repository", "update_message", id="update-message"),
+    ],
+)
+def test_repository_capability_fails_closed_on_throwing_accessors(
+    throwing_owner, throwing_attribute
+):
+    class ThrowingAccessor(SimpleNamespace):
+        def __getattribute__(self, name):
+            if name == object.__getattribute__(self, "throwing_attribute"):
+                raise RuntimeError(f"{name} unavailable")
+            return super().__getattribute__(name)
+
+    repository = SimpleNamespace(
+        list_messages=lambda session_id, agent_id: [],
+        update_message=lambda session_id, agent_id, message: None,
+    )
+    manager = SimpleNamespace(
+        session_id="session-1",
+        session_repository=repository,
+    )
+    agent = SimpleNamespace(agent_id="stable-agent")
+    owners = {
+        "manager": manager,
+        "agent": agent,
+        "repository": repository,
+    }
+    throwing = ThrowingAccessor(
+        **vars(owners[throwing_owner]),
+        throwing_attribute=throwing_attribute,
+    )
+    if throwing_owner == "repository":
+        manager.session_repository = throwing
+    else:
+        owners[throwing_owner] = throwing
+
+    assert not session_reconcile._supports_repository_reconciliation(
+        owners["manager"], owners["agent"]
+    )
 
 
 def test_reconcile_overwrites_persisted_placeholder_in_store(tmp_path):
@@ -100,6 +201,30 @@ def test_reconcile_returns_set_of_corrected_tool_use_ids(tmp_path):
     assert corrected == {"tu-1"}
 
 
+def test_reconcile_recognizes_exact_persisted_result_without_rewriting(
+    tmp_path, monkeypatch
+):
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", "R")]},
+    )
+    monkeypatch.setattr(
+        sm.session_repository,
+        "update_message",
+        lambda *args: pytest.fail("exact persisted result must not be rewritten"),
+    )
+
+    corrected = reconcile_frontend_tool_results(
+        sm, SimpleNamespace(agent_id=agent_id, messages=[]), {"tu-1": ("R", False)}
+    )
+
+    assert corrected == {"tu-1"}
+
+
 def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
     sm = _make_session(tmp_path)
     agent_id = "default"
@@ -124,6 +249,62 @@ def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
 
     in_memory = agent.messages[1]["content"][0]["toolResult"]
     assert in_memory["content"] == [{"text": '{"approved": true}'}]
+
+
+def test_active_interrupt_context_reconciliation_error_is_not_swallowed(tmp_path):
+    sm = _make_session(tmp_path)
+
+    class ExplodingToolResults(list):
+        def __iter__(self):
+            raise RuntimeError("checkpoint unavailable")
+
+    parked_results = ExplodingToolResults(
+        [
+            {
+                "toolUseId": "native-proxy",
+                "status": "success",
+                "content": [{"text": PLACEHOLDER}],
+            }
+        ]
+    )
+    interrupt_state = SimpleNamespace(
+        activated=True,
+        context={"tool_results": parked_results},
+    )
+    agent = SimpleNamespace(
+        agent_id="default",
+        messages=[],
+        _interrupt_state=interrupt_state,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        reconcile_frontend_tool_results(
+            sm, agent, {"native-proxy": ('{"approved": true}', False)}
+        )
+
+    assert interrupt_state.activated
+    assert interrupt_state.context["tool_results"] is parked_results
+
+
+def test_reconcile_stamps_error_status_on_active_interrupt_context(tmp_path):
+    sm = _make_session(tmp_path)
+    parked_result = _tool_result_block("native-proxy", PLACEHOLDER)["toolResult"]
+    agent = SimpleNamespace(
+        agent_id="default",
+        messages=[],
+        _interrupt_state=SimpleNamespace(
+            activated=True,
+            context={"tool_results": [parked_result]},
+        ),
+    )
+
+    corrected = reconcile_frontend_tool_results(
+        sm, agent, {"native-proxy": ("boom", True)}
+    )
+
+    assert corrected == {"native-proxy"}
+    assert parked_result["content"] == [{"text": "boom"}]
+    assert parked_result["status"] == "error"
 
 
 def test_reconcile_handles_parallel_tool_calls_in_one_message(tmp_path):
