@@ -1138,7 +1138,7 @@ from ag_ui_crewai._reasoning import (  # noqa: E402
     reasoning_from_responses_event,
     responses_event_type,
 )
-from ag_ui_crewai.examples.agentic_chat_reasoning import (  # noqa: E402
+from agents.agentic_chat_reasoning import (  # noqa: E402
     AgenticChatReasoningFlow,
 )
 
@@ -2320,7 +2320,7 @@ class _ChannelSpy:
         # can exercise the registry -> probe -> degrade chain end to end.
         self.chat_calls = []
         self.responses_calls = []
-        import ag_ui_crewai.examples.agentic_chat_reasoning as demo
+        import agents.agentic_chat_reasoning as demo
 
         async def _fake_acompletion(**kwargs):
             self.chat_calls.append(kwargs)
@@ -2432,7 +2432,7 @@ async def test_reasoning_demo_omits_replayed_reasoning_from_chat_completions(
 async def test_reasoning_demo_degrades_without_the_responses_channel(monkeypatch):
     """With the Responses channel unavailable, OpenAI falls back to
     chat-completions rather than raising."""
-    import ag_ui_crewai.examples.agentic_chat_reasoning as demo
+    import agents.agentic_chat_reasoning as demo
 
     spy = _ChannelSpy(monkeypatch)
     # After the spy: it pins the probe live, and this test owns the dark branch.
