@@ -39,6 +39,10 @@ dependencies = [
     "uvicorn>=0.34.3,<0.35.0",
     "crewai>=1.0,<2",
     "litellm>=1.60.2",
+    # Imported directly at sdk.py:33, _conversation.py:12 and _responses.py:33,
+    # so it is declared rather than left to arrive through fastapi or crewai.
+    # v2 for ``TypeAdapter`` and ``model_dump_json``.
+    "pydantic>=2.0,<3",
     # A2UI subagent tool: the framework-agnostic recovery loop, validation,
     # prompt assembly and op builders live here; ``a2ui_tool.py`` is only the
     # CrewAI glue over it. Floor matches the aws-strands adapter.
