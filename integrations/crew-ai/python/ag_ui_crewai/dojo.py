@@ -1,5 +1,3 @@
-import os
-import uvicorn
 from fastapi import FastAPI
 
 from .endpoint import add_crewai_flow_fastapi_endpoint, add_crewai_crew_fastapi_endpoint
@@ -124,14 +122,4 @@ for feature, flow_type in CONVERSATIONAL_FLOW_TYPES.items():
         path=f"/conversational_flows/{feature}",
         conversational=True,
         emit_interrupt_outcome=feature == "interrupt",
-    )
-
-def main():
-    """Run the uvicorn server."""
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(
-        "ag_ui_crewai.dojo:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True
     )

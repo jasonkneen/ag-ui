@@ -64,12 +64,20 @@ build-backend = "hatchling.build"
 
 # Shared across wheel and sdist so the exclude list is not repeated per target.
 #
+# CANONICAL RATIONALE for how the dojo is launched. ``render.yaml`` and
+# ``apps/dojo/scripts/run-dojo-everything.js`` point here rather than repeat it.
+#
 # The dojo server, its launcher and its demo flows are development-only, so they
 # stay out of both artifacts. Nothing shipped may reference them: an entry point
 # declared in ``[project.scripts]`` survives the exclude and would install a
 # ``dev`` command that raises ModuleNotFoundError, and a shipped ``__main__.py``
 # importing the excluded ``dojo`` module would break the same way. Run the dojo
 # from a source checkout with ``uv run python -m ag_ui_crewai`` instead.
+#
+# That target must be the PACKAGE, not the module: ``-m ag_ui_crewai.dojo`` has
+# no ``__main__`` guard, so it builds the app and exits 0 having served nothing.
+# ``ag_ui_crewai/__main__.py`` owns the uvicorn call, which also keeps the app to
+# a single build under ``reload=True``.
 [tool.hatch.build]
 exclude = [
     "ag_ui_crewai/dojo.py",
@@ -80,7 +88,9 @@ exclude = [
 [tool.hatch.build.targets.wheel]
 packages = ["ag_ui_crewai"]
 
-# Lean sdist: package + metadata only (~31 KB), matching the pre-migration Poetry sdist.
+# Lean sdist: package plus metadata only, no tests and no build output. No size
+# figure here on purpose: the previous one rotted by 5x with nothing catching it,
+# and this ``include`` list is the actual guard.
 [tool.hatch.build.targets.sdist]
 include = [
     "ag_ui_crewai",

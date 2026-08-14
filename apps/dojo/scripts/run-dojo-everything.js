@@ -93,10 +93,10 @@ const ALL_SERVICES = {
   ],
   "crew-ai": [
     {
-      // The dojo lives inside the library package but is development-only, so
-      // no `dev` console script is declared for it: an entry point would ship in
-      // the published metadata and point at a module the build excludes. Run it
-      // as a module from the source checkout instead.
+      // No `dev` console script exists for this dojo; rationale in
+      // integrations/crew-ai/python/pyproject.toml. The target must stay the
+      // package: `-m ag_ui_crewai.dojo` exits 0 without serving, and
+      // killOthersOn "success" below would take the whole fleet down with it.
       command: "uv run python -m ag_ui_crewai",
       name: "CrewAI",
       cwd: path.join(integrationsRoot, "crew-ai/python"),
