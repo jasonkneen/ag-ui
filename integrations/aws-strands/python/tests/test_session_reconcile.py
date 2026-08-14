@@ -70,7 +70,7 @@ def test_reconcile_overwrites_persisted_placeholder_in_store(tmp_path):
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
     corrected = reconcile_frontend_tool_results(
-        sm, agent, {"tu-1": '{"approved": false}'}
+        sm, agent, {"tu-1": ('{"approved": false}', False)}
     )
 
     assert corrected == {"tu-1"}
@@ -93,7 +93,9 @@ def test_reconcile_returns_set_of_corrected_tool_use_ids(tmp_path):
         messages=[{"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]}],
     )
 
-    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": "R", "tu-absent": "X"})
+    corrected = reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": ("R", False), "tu-absent": ("X", False)}
+    )
 
     assert corrected == {"tu-1"}
 
@@ -118,7 +120,7 @@ def test_reconcile_corrects_in_memory_agent_messages(tmp_path):
         ],
     )
 
-    reconcile_frontend_tool_results(sm, agent, {"tu-1": '{"approved": true}'})
+    reconcile_frontend_tool_results(sm, agent, {"tu-1": ('{"approved": true}', False)})
 
     in_memory = agent.messages[1]["content"][0]["toolResult"]
     assert in_memory["content"] == [{"text": '{"approved": true}'}]
@@ -154,7 +156,7 @@ def test_reconcile_handles_parallel_tool_calls_in_one_message(tmp_path):
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
     corrected = reconcile_frontend_tool_results(
-        sm, agent, {"tu-1": "R1", "tu-2": "R2"}
+        sm, agent, {"tu-1": ("R1", False), "tu-2": ("R2", False)}
     )
 
     assert corrected == {"tu-1", "tu-2"}
@@ -171,11 +173,11 @@ def test_resolve_maps_wire_id_to_native_id():
     resolved = resolve_native_ids(
         wire_to_native={"wire-1": "native-1", "wire-2": "native-2"},
         frontend_results=[
-            {"wire_id": "wire-1", "text": "R1"},
-            {"wire_id": "wire-2", "text": "R2"},
+            {"wire_id": "wire-1", "text": "R1", "is_error": False},
+            {"wire_id": "wire-2", "text": "R2", "is_error": True},
         ],
     )
-    assert resolved == {"native-1": "R1", "native-2": "R2"}
+    assert resolved == {"native-1": ("R1", False), "native-2": ("R2", True)}
 
 
 def test_resolve_skips_results_absent_from_map():
@@ -184,11 +186,11 @@ def test_resolve_skips_results_absent_from_map():
     resolved = resolve_native_ids(
         wire_to_native={"wire-1": "native-1"},
         frontend_results=[
-            {"wire_id": "wire-1", "text": "R1"},
-            {"wire_id": "wire-unknown", "text": "R2"},
+            {"wire_id": "wire-1", "text": "R1", "is_error": False},
+            {"wire_id": "wire-unknown", "text": "R2", "is_error": False},
         ],
     )
-    assert resolved == {"native-1": "R1"}
+    assert resolved == {"native-1": ("R1", False)}
 
 
 def test_has_placeholder_results_detects_remaining_stub():
@@ -222,10 +224,131 @@ def test_reconcile_leaves_non_placeholder_results_untouched(tmp_path):
     )
 
     agent = SimpleNamespace(agent_id=agent_id, messages=[])
-    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": "SHOULD NOT APPLY"})
+    corrected = reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": ("SHOULD NOT APPLY", False)}
+    )
 
     assert corrected == set()
     block = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
         "content"
     ][0]["toolResult"]
     assert block["content"] == [{"text": "already the real result"}]
+
+
+def test_reconcile_stamps_error_status_on_the_persisted_result(tmp_path):
+    # The proxy wrote the placeholder with a hardcoded "success" status. A
+    # client-reported failure has to overwrite that too, or the model reads the
+    # real error text under a success flag.
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, messages=[])
+    corrected = reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": ("boom: invalid id", True)}
+    )
+
+    assert corrected == {"tu-1"}
+    block = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
+        "content"
+    ][0]["toolResult"]
+    assert block["content"] == [{"text": "boom: invalid id"}]
+    assert block["status"] == "error"
+
+
+def test_reconcile_keeps_success_status_when_the_tool_did_not_fail(tmp_path):
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, messages=[])
+    reconcile_frontend_tool_results(sm, agent, {"tu-1": ("all good", False)})
+
+    block = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
+        "content"
+    ][0]["toolResult"]
+    assert block["status"] == "success"
+
+
+def test_reconcile_stamps_error_status_on_the_in_memory_history(tmp_path):
+    # A same-process continuation reads agent.messages, not the store.
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]},
+    )
+    agent = SimpleNamespace(
+        agent_id=agent_id,
+        messages=[{"role": "user", "content": [_tool_result_block("tu-1", PLACEHOLDER)]}],
+    )
+
+    reconcile_frontend_tool_results(sm, agent, {"tu-1": ("boom", True)})
+
+    in_memory = agent.messages[0]["content"][0]["toolResult"]
+    assert in_memory["content"] == [{"text": "boom"}]
+    assert in_memory["status"] == "error"
+
+
+def test_reconcile_stamps_each_parallel_result_independently(tmp_path):
+    # One failed and one successful frontend tool in the same turn must not
+    # share a status.
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {
+            "role": "user",
+            "content": [
+                _tool_result_block("tu-1", PLACEHOLDER),
+                _tool_result_block("tu-2", PLACEHOLDER),
+            ],
+        },
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, messages=[])
+    reconcile_frontend_tool_results(
+        sm, agent, {"tu-1": ("ok", False), "tu-2": ("failed", True)}
+    )
+
+    blocks = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
+        "content"
+    ]
+    assert blocks[0]["toolResult"]["status"] == "success"
+    assert blocks[1]["toolResult"]["status"] == "error"
+
+
+def test_reconcile_leaves_status_alone_when_the_block_is_not_a_placeholder(tmp_path):
+    # Already-real results are never rewritten, so an unrelated error flag in
+    # pending_results must not leak onto them.
+    sm = _make_session(tmp_path)
+    agent_id = "default"
+    _seed(
+        sm,
+        agent_id,
+        0,
+        {"role": "user", "content": [_tool_result_block("tu-1", "already real")]},
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, messages=[])
+    corrected = reconcile_frontend_tool_results(sm, agent, {"tu-1": ("boom", True)})
+
+    assert corrected == set()
+    block = sm.session_repository.list_messages(sm.session_id, agent_id)[0].message[
+        "content"
+    ][0]["toolResult"]
+    assert block["status"] == "success"
