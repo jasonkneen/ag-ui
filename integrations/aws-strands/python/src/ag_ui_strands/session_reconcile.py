@@ -11,7 +11,7 @@ persisted placeholder by native id and overwrite it with the real result.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Tuple
 
 from .client_proxy_tool import PROXY_RESULT_PLACEHOLDER
 
@@ -55,7 +55,7 @@ def _supports_repository_reconciliation(session_manager: Any, agent: Any) -> boo
 def resolve_native_ids(
     wire_to_native: Mapping[str, str],
     frontend_results: Iterable[Mapping[str, Any]],
-) -> dict[str, str]:
+) -> dict[str, Tuple[str, bool]]:
     """Map client frontend results to Strands-native ``toolUseId``s.
 
     Frontend tools are emitted under a fresh wire ``tool_call_id`` that differs
@@ -68,21 +68,29 @@ def resolve_native_ids(
 
     Args:
         wire_to_native: Map of wire ``tool_call_id`` -> native ``toolUseId``.
-        frontend_results: Items with ``wire_id`` and ``text``.
+        frontend_results: Items with ``wire_id``, ``text`` and ``is_error``.
 
     Returns:
-        Map of native ``toolUseId`` -> real result text (unresolvable dropped).
+        Map of native ``toolUseId`` -> ``(real result text, is_error)``
+        (unresolvable dropped). The flag travels with the text so the
+        reconciled ``toolResult`` can carry the client's failure signal, not
+        just its output.
     """
-    resolved: dict[str, str] = {}
+    resolved: dict[str, Tuple[str, bool]] = {}
     for result in frontend_results:
         native = wire_to_native.get(result.get("wire_id"))
         if native is not None:
-            resolved[native] = result.get("text", "")
+            resolved[native] = (
+                result.get("text", ""),
+                bool(result.get("is_error")),
+            )
     return resolved
 
 
 def reconcile_frontend_tool_results(
-    session_manager: Any, agent: Any, pending_results: Mapping[str, str]
+    session_manager: Any,
+    agent: Any,
+    pending_results: Mapping[str, Tuple[str, bool]],
 ) -> set[str]:
     """Overwrite persisted placeholder ``toolResult`` blocks with real results.
 
@@ -93,7 +101,8 @@ def reconcile_frontend_tool_results(
         session_manager: A Strands ``RepositorySessionManager`` (exposes
             ``session_id`` and ``session_repository``).
         agent: The Strands agent (exposes ``agent_id``).
-        pending_results: Map of native ``toolUseId`` -> real result text.
+        pending_results: Map of native ``toolUseId`` -> ``(real result text,
+            is_error)``.
 
     Returns:
         The set of ``toolUseId``s whose pending result was already present or
@@ -182,9 +191,10 @@ def active_proxy_placeholder_ids(agent: Any) -> set[str]:
         and tool_result["content"] == [{"text": PROXY_RESULT_PLACEHOLDER}]
     }
 
+
 def _correct_single_tool(
     tool_result,
-    pending_results: Mapping[str, str],
+    pending_results: Mapping[str, Tuple[str, bool]],
     *,
     mutated_ids: set[str] | None = None,
 ) -> str | None:
@@ -196,20 +206,25 @@ def _correct_single_tool(
     if tool_use_id not in pending_results:
         return None
 
-    expected_content = [{"text": pending_results[tool_use_id]}]
+    text, is_error = pending_results[tool_use_id]
+    expected_content = [{"text": text}]
+    expected_status = "error" if is_error else "success"
     if (
-        tool_result.get("status") == "success"
+        tool_result.get("status") == expected_status
         and tool_result.get("content") == expected_content
     ):
         return tool_use_id
     if _is_placeholder(tool_result.get("content")):
         tool_result["content"] = expected_content
+        tool_result["status"] = expected_status
         if mutated_ids is not None:
             mutated_ids.add(tool_use_id)
         return tool_use_id
 
 
-def _correct_all_tools(tool_results, pending_results: Mapping[str, str]) -> set[str]:
+def _correct_all_tools(
+    tool_results, pending_results: Mapping[str, Tuple[str, bool]]
+) -> set[str]:
     """Reconcile matching ToolResult dicts in *tool_results* in place."""
     changed: set[str] = set()
     for tool_result in tool_results:
@@ -221,11 +236,16 @@ def _correct_all_tools(tool_results, pending_results: Mapping[str, str]) -> set[
 
 def _correct_message(
     message: Any,
-    pending_results: Mapping[str, str],
+    pending_results: Mapping[str, Tuple[str, bool]],
     *,
     mutated_ids: set[str] | None = None,
 ) -> set[str]:
     """Reconcile matching ``toolResult`` blocks in *message* in place.
+
+    Both the text and the status are rewritten: the placeholder was written by
+    the proxy tool with a hardcoded ``"success"`` (see ``client_proxy_tool``),
+    so leaving the status alone would assert a failed frontend tool to the
+    model as a success.
 
     Returns the set of ``toolUseId``s whose block was already real or corrected.
     """

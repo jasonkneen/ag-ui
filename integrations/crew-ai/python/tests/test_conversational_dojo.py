@@ -91,6 +91,36 @@ def test_untyped_mapping_flows_preserve_a2ui_runtime_input():
     assert flow.state.get("ag-ui") == {"inject_a2ui_tool": True}
 
 
+EXPECTED_REGULAR_ROUTES = {
+    "agentic_chat",
+    "agentic_chat_reasoning",
+    "agentic_chat_multimodal",
+    "backend_tool_rendering",
+    "interrupt",
+    "human_in_the_loop",
+    "agentic_generative_ui",
+    "predictive_state_updates",
+    "shared_state",
+    "tool_based_generative_ui",
+    "a2ui_dynamic_schema",
+    "a2ui_recovery",
+    "a2ui_fixed_schema",
+    "crew_chat",
+    "error_flow",
+}
+
+
+def test_dojo_registers_every_regular_flow_route():
+    """The regular Flow surface is the canonical one, so pin it against the live
+    app. `apps/dojo/src/crewai.test.ts` mirrors this set on the TypeScript side;
+    renaming a route has to update both or one of the two fails."""
+    dojo = importlib.import_module("ag_ui_crewai.dojo")
+    paths = {route.path for route in dojo.app.routes}
+
+    assert {f"/{feature}" for feature in EXPECTED_REGULAR_ROUTES}.issubset(paths)
+    assert "/subgraphs" not in paths
+
+
 def test_dojo_registers_a_conversational_route_for_every_feature():
     dojo = importlib.import_module("ag_ui_crewai.dojo")
     paths = {route.path for route in dojo.app.routes}
