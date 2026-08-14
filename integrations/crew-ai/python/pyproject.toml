@@ -23,6 +23,37 @@ requires-python = ">=3.10,<3.14"
 # optional ``crewai[litellm]`` extra at 1.0.0 — declaring it here resolves
 # our imports regardless of which crewai extras are installed (CPK-7718 #6).
 #
+# The litellm bound is a DECLARED SUPPORTED RANGE, deliberately unlike the
+# crewai capability detection in ``_capabilities.py``: litellm is a direct
+# dependency whose version this package controls, and the only alternative was
+# probing litellm's PRIVATE event-model registry, which is fragile regardless.
+#
+# Two independent facts set the 1.70.4 floor. Both were measured against real
+# installs, not read off a changelog:
+#   - 1.60.2-1.67 raise ``ValueError("Unknown event type: ...")`` from litellm's
+#     event-type lookup for the OpenAI Responses reasoning-summary deltas the
+#     bridge reads, so the trace this channel exists to surface cannot be parsed
+#     at all. 1.68.0 is the first build that maps an unknown event type onto its
+#     extras-allowing ``GenericEvent`` instead.
+#   - 1.68.0 through 1.70.2 pin ``openai<1.76``, which cannot co-exist with the
+#     ``openai>=2.30`` crewai 1.15 requires: forcing one of those builds
+#     downgrades openai and ``import crewai`` then dies on a missing
+#     ``ChatCompletionMessageFunctionToolCall``. 1.70.1 and 1.70.3 were never
+#     published to PyPI. 1.70.4 is therefore the lowest build that both parses the
+#     reasoning deltas and resolves alongside plain ``crewai``.
+#
+# This floor describes what THIS package supports, not what crewai prefers:
+# ``crewai[litellm]`` declares ``litellm>=1.84.0,<2`` of its own, so a consumer who
+# installs that extra resolves well above this floor (still inside the range). The
+# floor matters for the consumers who do not, since litellm is declared directly
+# here precisely so the bridge's own imports resolve without the extra.
+#
+# ``<2`` guards against the next major. Both ends of the range run the full suite
+# in CI (the crewai-python-litellm-floor / -ceiling matrix legs in
+# .github/workflows/unit-python-sdk.yml). The floor leg is pinned and gating; the
+# ceiling leg resolves the newest 1.x at install time and reports without gating,
+# because its input moves whenever litellm publishes.
+#
 # ``crewai-tools`` is NOT a runtime dependency (CPK-7721 review #6): the bridge
 # imports nothing from it (``grep -rn crewai_tools ag_ui_crewai/ tests/`` is
 # empty), yet as a hard dep it drags in ~37 transitive packages (pymupdf,
@@ -38,7 +69,7 @@ dependencies = [
     "fastapi>=0.115.12,<0.116.0",
     "uvicorn>=0.34.3,<0.35.0",
     "crewai>=1.0,<2",
-    "litellm>=1.60.2",
+    "litellm>=1.70.4,<2",
     # Imported directly at sdk.py:33, _conversation.py:12 and _responses.py:33,
     # so it is declared rather than left to arrive through fastapi or crewai.
     # v2 for ``TypeAdapter`` and ``model_dump_json``.
@@ -71,6 +102,11 @@ dev = [
     # tomllib is 3.11+ and requires-python still admits 3.10.
     "tomli>=2.0; python_version < '3.11'",
     "crewai-agui-dojo",
+    # The Responses tests build real ``openai.types.responses`` items rather than
+    # hand-rolled doubles. openai already arrives transitively through litellm and
+    # crewai, but a test-suite import is a direct use and is declared as one; the
+    # floor is crewai 1.15's own requirement.
+    "openai>=2.30,<3",
 ]
 
 [tool.uv.sources]
