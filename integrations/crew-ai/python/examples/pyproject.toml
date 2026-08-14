@@ -27,6 +27,17 @@ ag-ui-crewai = { path = "..", editable = true }
 [project.scripts]
 dev = "agents.dojo:main"
 
+# The dojo is demo code, but two things in it are load-bearing and tested here: the
+# uvicorn target stays an import string so the app is built once, and the telemetry
+# opt-out runs before crewai loads so Ctrl-C stops the server.
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
