@@ -12,6 +12,26 @@ import sys
 import uvicorn
 
 
+def _opt_out_of_crewai_telemetry() -> None:
+    """Keep Ctrl-C working, by not collecting anonymous usage stats in the dojo.
+
+    ``import crewai`` installs a SIGINT handler that chains in front of uvicorn's
+    and, before delegating to it, force-flushes queued spans to crewai's OTLP
+    endpoint. That is a network connect with a 30s timeout run from inside the
+    handler, so the reloader's worker never reaches uvicorn's ``handle_exit``,
+    and the reloader parent meanwhile blocks in ``process.join()`` still holding
+    the listening socket: Ctrl-C leaves a server that only SIGKILL stops.
+
+    This has to happen before ``uvicorn.run`` spawns the worker, since the worker
+    inherits this environment and is where the app, and so crewai, is imported.
+    It cannot move into ``dojo.py``: ``ag_ui_crewai/__init__.py`` imports crewai,
+    so by the time any submodule body runs the handler is already installed.
+
+    ``setdefault``, because opting a dojo run back in is a developer's call.
+    """
+    os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+
+
 def main() -> int:
     """Serve the dojo, returning 0; ``tests/test_launcher.py`` pins that.
 
@@ -20,6 +40,7 @@ def main() -> int:
     worker, so a worker that dies at import leaves this process up with the port
     bound and requests hanging.
     """
+    _opt_out_of_crewai_telemetry()
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(
         "ag_ui_crewai.dojo:app",

@@ -6,6 +6,7 @@ for the app to be built once. Neither survives a well-meaning simplification
 unless something asserts it, so this file asserts it.
 """
 
+import os
 import subprocess
 import sys
 
@@ -87,3 +88,33 @@ def test_a_non_numeric_port_fails_loudly(uvicorn_calls, monkeypatch):
 
 def test_main_returns_zero(uvicorn_calls):
     assert launcher.main() == 0
+
+
+def test_telemetry_is_opted_out_before_the_worker_is_spawned(uvicorn_calls, monkeypatch):
+    """Ctrl-C has to work.
+
+    crewai's telemetry chains a SIGINT handler that force-flushes spans over the
+    network, which wedges the reloader's worker mid-shutdown. The opt-out has to
+    be in the environment before ``uvicorn.run`` spawns that worker, because the
+    worker inherits this environment and imports crewai there.
+    """
+    monkeypatch.delenv("CREWAI_DISABLE_TELEMETRY", raising=False)
+    seen = []
+    monkeypatch.setattr(
+        launcher.uvicorn,
+        "run",
+        lambda *a, **k: seen.append(os.environ.get("CREWAI_DISABLE_TELEMETRY")),
+    )
+
+    launcher.main()
+
+    assert seen == ["true"]
+
+
+def test_an_explicit_telemetry_choice_is_left_alone(uvicorn_calls, monkeypatch):
+    """Opting back in is a developer's call to make, so don't overwrite it."""
+    monkeypatch.setenv("CREWAI_DISABLE_TELEMETRY", "false")
+
+    launcher.main()
+
+    assert os.environ["CREWAI_DISABLE_TELEMETRY"] == "false"

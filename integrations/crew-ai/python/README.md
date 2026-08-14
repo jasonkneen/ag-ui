@@ -339,3 +339,9 @@ cd integrations/crew-ai/python
 uv sync
 uv run python -m ag_ui_crewai
 ```
+
+The launcher defaults `CREWAI_DISABLE_TELEMETRY=true` so that Ctrl-C stops the
+server. crewai's telemetry installs a SIGINT handler that flushes queued spans to
+its OTLP endpoint before letting uvicorn shut down, and that network call from
+inside the handler wedges the reloader's worker until it is SIGKILLed. Setting the
+variable yourself overrides the default, at the cost of getting that hang back.
