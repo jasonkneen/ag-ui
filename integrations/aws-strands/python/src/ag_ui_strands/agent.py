@@ -1032,13 +1032,15 @@ class StrandsAgent:
             # when there is at least one NON-EMPTY frontend result: a void tool
             # returns nothing, and the synthetic "executed successfully with no
             # return value" continuation message conveys that better than an
-            # empty toolResult. When reconciling, void placeholders in the same
+            # empty toolResult. A failed void result is the exception: it must
+            # reconcile so its status replaces the proxy's hardcoded success.
+            # When reconciling, void placeholders in the same
             # turn are still cleared (to "") so the literal "Forwarded to client"
             # is never fed to the model.
             resolved_native_results: Dict[str, Tuple[str, bool]] = {}
             corrected_native_ids: set[str] = set()
             has_nonvoid_frontend_result = any(
-                (r["text"] or "").strip() for r in frontend_results
+                (r["text"] or "").strip() or r["is_error"] for r in frontend_results
             )
             if session_manager is not None and self.config.replay_history_into_strands:
                 resolved_native_results = resolve_native_ids(

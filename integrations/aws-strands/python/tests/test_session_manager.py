@@ -628,8 +628,13 @@ class TestSessionFrontendToolReconciliation:
             {"text": '{"approved": false}'}
         ]
 
+    @pytest.mark.parametrize(
+        "content", ["tool failed: invalid id", ""], ids=["with-text", "empty"]
+    )
     @pytest.mark.asyncio
-    async def test_client_reported_failure_lands_as_an_error_status(self, tmp_path):
+    async def test_client_reported_failure_lands_as_an_error_status(
+        self, tmp_path, content
+    ):
         # The placeholder was written by the proxy tool with a hardcoded
         # "success" status. Reconciliation must overwrite the status as well as
         # the text, or the model is told a failed frontend tool succeeded.
@@ -641,7 +646,7 @@ class TestSessionFrontendToolReconciliation:
             "default",
             messages=[
                 _payload_assistant("wire-1", "approve"),
-                _payload_tool("wire-1", "tool failed: invalid id", error="invalid id"),
+                _payload_tool("wire-1", content, error="invalid id"),
             ],
             tools=[_frontend_tool("approve")],
             wire_map={"wire-1": "native-1"},
@@ -649,7 +654,7 @@ class TestSessionFrontendToolReconciliation:
         )
         assert instance.stream_prompts == [None]
         block = _result_content(sm, "default", 1)[0]["toolResult"]
-        assert block["content"] == [{"text": "tool failed: invalid id"}]
+        assert block["content"] == [{"text": content}]
         assert block["status"] == "error"
 
     @pytest.mark.asyncio
