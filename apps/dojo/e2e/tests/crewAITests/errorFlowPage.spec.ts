@@ -167,3 +167,51 @@ test("[CrewAI] Error flow surfaces a terminal RunErrorEvent", async ({
   // from either run still fails.
   await expect(chat.agentMessage).toHaveCount(0);
 });
+
+test("[CrewAI] Error flow surfaces the error even when the runtime is slow to connect", async ({
+  page,
+}) => {
+  test.slow();
+
+  // Hold the runtime-info response so the page spends real time in the
+  // pre-registration window. Before the demo gated on agent registration, the
+  // banner and CopilotChat each held their own provisional agent here, and the
+  // first run's error reached the chat's agent only.
+  // The dojo runtime uses the SINGLE-endpoint transport: there is no `/info`
+  // URL, the handshake is a POST to the runtime url with `{"method":"info"}`.
+  // Delay only that one so the run requests are untouched.
+  await page.route("**/api/copilotkit/**", async (route) => {
+    const request = route.request();
+    if (
+      request.method() === "POST" &&
+      (request.postData() ?? "").includes('"method":"info"')
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+    await route.continue();
+  });
+
+  await page.goto("/crewai/feature/error_flow");
+
+  const chat = new AgenticChatPage(page);
+  await expect(chat.agentGreeting).toBeVisible({ timeout: SETTLE_TIMEOUT });
+  await trackRunningTransitions(page);
+
+  const beforeRun = (await readRunningHistory(page)).length;
+  await sendChatMessage(page, "trigger error");
+  await chat.assertUserMessageVisible("trigger error");
+  await awaitRunSettledSince(page, beforeRun);
+
+  const history = await readRunningHistory(page);
+  expect(history.slice(beforeRun)).toContain("true");
+  expect(history.at(-1)).toBe("false");
+
+  // The first run's error must reach the banner, not just the chat's agent.
+  const banner = page.getByTestId("run-error");
+  await expect(banner).toBeVisible({ timeout: SETTLE_TIMEOUT });
+  await expect(banner).toHaveAttribute("data-run-error-seq", "1");
+  await expect(page.getByTestId("run-error-code")).toHaveText(
+    "AGUI_CREWAI_FLOW_ERROR_RUNTIMEERROR",
+  );
+  await expect(chat.agentMessage).toHaveCount(0);
+});

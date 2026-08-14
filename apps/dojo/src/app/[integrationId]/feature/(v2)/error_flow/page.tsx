@@ -1,7 +1,11 @@
 "use client";
 import React from "react";
 import "@copilotkit/react-core/v2/styles.css";
-import { CopilotChat, useAgent } from "@copilotkit/react-core/v2";
+import {
+  CopilotChat,
+  useAgent,
+  useCopilotKit,
+} from "@copilotkit/react-core/v2";
 import { CopilotKit } from "@copilotkit/react-core";
 
 interface ErrorFlowProps {
@@ -75,6 +79,43 @@ const RunErrorBanner: React.FC = () => {
   );
 };
 
+/**
+ * Both the banner and `CopilotChat` call `useAgent`, which hands out a
+ * PER-HOOK provisional agent until the runtime registers the real one. Mounting
+ * them before that leaves them subscribed to two different agent objects, so a
+ * run that starts and errors on the chat's agent never reaches the banner. That
+ * is precisely the window this demo exists to cover, so both are gated until
+ * the shared agent is registered.
+ *
+ * The gate reopens because `useCopilotKit` re-renders on runtime connection
+ * status changes, and the runtime populates its agent map before it announces
+ * Connected.
+ */
+const RunErrorDemo: React.FC = () => {
+  const { copilotkit } = useCopilotKit();
+
+  if (!copilotkit.agents?.[AGENT_ID]) {
+    return (
+      <div
+        data-testid="run-error-connecting"
+        className="m-auto text-sm text-gray-500 dark:text-gray-400"
+      >
+        Connecting to the runtime...
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <RunErrorBanner />
+      <CopilotChat
+        agentId={AGENT_ID}
+        className="flex-1 min-h-0 rounded-2xl max-w-6xl mx-auto w-full"
+      />
+    </>
+  );
+};
+
 const ErrorFlowPage: React.FC<ErrorFlowProps> = ({ params }) => {
   const { integrationId } = React.use(params);
 
@@ -86,11 +127,7 @@ const ErrorFlowPage: React.FC<ErrorFlowProps> = ({ params }) => {
     >
       <div className="flex justify-center items-center h-full w-full">
         <div className="flex flex-col h-full w-full md:w-8/10 md:h-8/10 rounded-lg">
-          <RunErrorBanner />
-          <CopilotChat
-            agentId={AGENT_ID}
-            className="flex-1 min-h-0 rounded-2xl max-w-6xl mx-auto w-full"
-          />
+          <RunErrorDemo />
         </div>
       </div>
     </CopilotKit>
