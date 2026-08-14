@@ -167,8 +167,15 @@ AG-UI was born from CopilotKit's initial **partnership** with LangChain and Crew
 | --- | ------- | ---------------- | ------------- |
 | [CopilotKit](https://github.com/CopilotKit/CopilotKit) | ✅ Supported | ➡️ [Getting Started](https://docs.copilotkit.ai/direct-to-llm/guides/quickstart) | 1st Party |
 | [Terminal + Agent]() | ✅ Supported | ➡️ [Getting Started](https://docs.ag-ui.com/quickstart/clients) | Community |
-| Chat platforms (Slack, Microsoft Teams) | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
-| [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [Example](https://github.com/CopilotKit/CopilotKit/tree/main/examples/v2/react-native/demo) | Community |
+| Slack | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
+| Microsoft Teams | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
+| WhatsApp | 🛠️ In Progress | – | 1st Party |
+| Discord | 🛠️ In Progress | – | 1st Party |
+| Telegram | 🛠️ In Progress | – | 1st Party |
+| Google Chat | 🛠️ In Progress | – | 1st Party |
+| iMessage | 🛠️ In Progress | – | 1st Party |
+| SMS | 🛠️ In Progress | – | 1st Party |
+| [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [Example](https://github.com/CopilotKit/CopilotKit/tree/main/examples/v2/react-native/demo) | 1st Party |
 
 [View all supported integrations →](https://docs.ag-ui.com/introduction#supported-integrations)
 
