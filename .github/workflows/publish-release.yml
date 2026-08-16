@@ -1072,6 +1072,23 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
+          # The only uv command in this job is `uv publish`, which uploads
+          # already-built artifacts and never writes to the uv cache. With
+          # caching left on (setup-uv defaults to `enable-cache: auto`,
+          # `ignore-nothing-to-cache: false`), the post step tries to save a
+          # cache directory that was never created and errors:
+          #
+          #   Cache path /home/runner/work/_temp/setup-uv-cache does not exist
+          #
+          # That error fails the whole `publish` job after every package has
+          # already shipped. It only surfaces when the cache key misses, so it
+          # hid behind key hits until run 31929982725 (2026-08-16), where the
+          # release's own pyproject.toml bump changed the key. The damage is
+          # not cosmetic: `publish-dotnet` gates on this job's result, and
+          # `publish-maven` chains off that, so a release carrying both a
+          # Python package and a .NET or Java package would ship npm + PyPI
+          # and then skip the NuGet and Maven lanes.
+          enable-cache: false
 
       - name: Download Python build artifacts (stable)
         if: needs.build.outputs.mode == 'stable' && needs.build.outputs.py_count != '0'
