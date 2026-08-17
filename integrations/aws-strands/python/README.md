@@ -90,9 +90,14 @@ interrupt round-trip:
 
 - When a run pauses, it finishes with `RUN_FINISHED` carrying a
   `RunFinishedInterruptOutcome` (`outcome.type == "interrupt"`) and one AG-UI
-  `Interrupt` per Strands interrupt. Native interrupts use the AG-UI reason
-  `tool_call`; the Strands name and free-form reason are preserved under
-  `metadata.strands_name` and `metadata.strands_reason`.
+  `Interrupt` per Strands interrupt. Generic native interrupts preserve the
+  Strands name as the AG-UI reason and the free-form Strands reason under
+  `metadata.reason`. Tools configured with `ToolBehavior(interrupt_on_call=True)`
+  instead emit a `tool_call` approval interrupt with an `approved` response
+  schema. Applies to server-executed tools only. For client-provided tools, gate
+  execution in the client — define the tool with a `render` that calls `respond`,
+  not a `handler` — since the tool runs in the browser and the adapter has already
+  halted the run.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
 payload=...)]`. Strands' resume gate is truthiness-based (`if
@@ -101,10 +106,13 @@ interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
   body forever. To prevent that, `interrupt()` does **not** return `payload`
   directly — it returns a truthy envelope: `{"response": payload}` on
   resolve, `{"cancelled": True}` on cancel. Destructure it with
-  `.get("response")` / `.get("cancelled")`.
-- `status="cancelled"` resumes the tool with the sentinel
-  `{"cancelled": True}` (`ag_ui_strands.INTERRUPT_CANCELLED`) so it can
-  treat the pause as a denial.
+  `.get("response")` / `.get("cancelled")`. Adapter-managed
+  `interrupt_on_call` approvals are the exception: their
+  `{"approved": bool}` payload is passed through directly.
+- For generic native interrupts, `status="cancelled"` resumes the tool with
+  the sentinel `{"cancelled": True}` (`ag_ui_strands.INTERRUPT_CANCELLED`)
+  so it can treat the pause as a denial. An adapter-managed approval receives
+  `{"approved": False}` instead.
 - **Re-execution on resume:** resuming a paused tool re-runs its body from
   the top — any code before the `interrupt()` call executes again. Guard
   side effects that must not repeat:
@@ -138,11 +146,11 @@ interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
 
 Submitted resume batches are validated atomically before streaming or
 reconciliation. They must contain at least one unique, non-blank, currently
-open interrupt id; a partial subset of the open native interrupts is allowed.
-Invalid batches emit `INTERRUPT_RESUME_ERROR` and leave the checkpoint
-retryable. If reconciliation fails while an interrupt checkpoint is active,
-the run emits `INTERRUPT_RECONCILIATION_ERROR` without finishing or consuming
-the checkpoint.
+open interrupt id, and every open interrupt must be addressed in the batch.
+Malformed or unopened entries emit `INTERRUPT_RESUME_ERROR`; incomplete batches
+emit `PARTIAL_RESUME`. These failures leave the checkpoint retryable. If
+reconciliation fails while an interrupt checkpoint is active, the run emits
+`INTERRUPT_RECONCILIATION_ERROR` without finishing or consuming the checkpoint.
 
 When using a `SessionManager`, keep interrupt payloads and tool results
 JSON-safe (no raw `bytes`): Strands' `SessionAgent.to_dict()` — unlike
