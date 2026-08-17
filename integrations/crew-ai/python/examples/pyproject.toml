@@ -27,16 +27,12 @@ ag-ui-crewai = { path = "..", editable = true }
 [project.scripts]
 dev = "agents.dojo:main"
 
-# The dojo is demo code, but two things in it are load-bearing and tested here: the
-# uvicorn target stays an import string so the app is built once, and the telemetry
-# opt-out runs before crewai loads so Ctrl-C stops the server.
-[dependency-groups]
-dev = [
-    "pytest>=8.0,<9.0",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+# No test config, and no dev group: this is a demo app, and demo apps in this repo do
+# not carry unit tests. The bridge has its own suite next door, and dojo-e2e covers
+# this server by running against it. Two things in ``agents/dojo.py`` and
+# ``agents/__init__.py`` still have to hold for the deployed dojo — the ``0.0.0.0``
+# bind and the telemetry opt-out at package import — and both are argued for where
+# they are written rather than asserted here.
 
 [build-system]
 requires = ["hatchling"]
