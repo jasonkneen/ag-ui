@@ -9,8 +9,8 @@ from litellm import acompletion
 from pydantic import BaseModel
 from typing import Literal, List
 
-from .._config import resolve_provider_timeout_seconds
-from ..sdk import (
+from ag_ui_crewai._config import resolve_provider_timeout_seconds
+from ag_ui_crewai.sdk import (
   copilotkit_stream,
   CopilotKitState,
   copilotkit_predict_state,

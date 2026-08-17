@@ -31,11 +31,11 @@ import sys
 
 import pytest
 
-from ag_ui_crewai import examples
-from ag_ui_crewai.examples.crew_chat import CrewChatCrew
+import agents
+from agents.crew_chat import CrewChatCrew
 
 
-EXAMPLES_ROOT = pathlib.Path(examples.__file__).parent
+EXAMPLES_ROOT = pathlib.Path(agents.__file__).parent
 
 # Modules that reach no provider. Anything an example imports and that is not
 # listed here, not stdlib, and not a sibling example module is treated as
@@ -52,8 +52,16 @@ PROVIDER_FREE_MODULES = frozenset(
         "crewai.experimental.conversational",
         "crewai.llms.base_llm",
         # First-party helpers that resolve configuration rather than call a model.
-        ".._config",
-        ".._hitl",
+        "ag_ui_crewai._config",
+        "ag_ui_crewai._hitl",
+        # The demo server's own wiring, which now sits alongside the flows it
+        # serves: it mounts routes and runs an ASGI app. The provider calls belong
+        # to the flows it mounts, and those are audited at their own call sites.
+        # Named exactly, like every other entry here, so no submodule of the bridge
+        # is exempted along with the one that genuinely reaches no provider.
+        "fastapi",
+        "uvicorn",
+        "ag_ui_crewai.endpoint",
     }
 )
 
@@ -62,7 +70,7 @@ PROVIDER_FREE_MODULES = frozenset(
 PROVIDER_BEARING_MODULES = {
     "litellm": frozenset(),
     "crewai": frozenset({"Process", "Task"}),
-    "..sdk": frozenset(
+    "ag_ui_crewai.sdk": frozenset(
         {
             "CopilotKitState",
             "copilotkit_emit_state",
@@ -73,7 +81,7 @@ PROVIDER_BEARING_MODULES = {
             "responses_channel_available",
         }
     ),
-    "..a2ui_tool": frozenset({"apply_a2ui_plan_to_tools"}),
+    "ag_ui_crewai.a2ui_tool": frozenset({"apply_a2ui_plan_to_tools"}),
 }
 
 # Calls that ARE the bound rather than needing one, and where they come from.
@@ -90,7 +98,7 @@ BOUND_RESOLVERS = frozenset(
 # Where a bound resolver has to come from. Matching the NAME alone let anything
 # ending in a resolver's name vouch for a call, which is the same fail-open shape
 # the bound-helper check already closes.
-BOUND_RESOLVER_MODULES = frozenset({".._config", "._config"})
+BOUND_RESOLVER_MODULES = frozenset({"ag_ui_crewai._config"})
 
 CREWAI_LLM_KWARGS = ("llm", "chat_llm", "function_calling_llm", "manager_llm")
 
@@ -591,7 +599,7 @@ def test_the_crew_backed_examples_set_an_execution_ceiling():
 UNBOUNDED_SHAPES = {
     "bare_model_id_to_agent": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 agent = Agent(llm="openai/gpt-4o",
               max_execution_time=resolve_agent_execution_ceiling_seconds())
 """,
@@ -601,7 +609,7 @@ crew = Crew(chat_llm="openai/gpt-4o")
 """,
     "agent_with_no_llm_at_all": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 agent = Agent(role="r", goal="g", backstory="b",
               max_execution_time=resolve_agent_execution_ceiling_seconds())
 """,
@@ -623,11 +631,11 @@ from litellm import acompletion
 response = await acompletion(model="openai/gpt-4o", timeout=0)
 """,
     "bare_model_into_the_a2ui_planner": """
-from ..a2ui_tool import plan_a2ui_injection
+from ag_ui_crewai.a2ui_tool import plan_a2ui_injection
 plan = plan_a2ui_injection(model="openai/gpt-4o")
 """,
     "a2ui_planner_model_dict_without_a_timeout": """
-from ..a2ui_tool import plan_a2ui_injection
+from ag_ui_crewai.a2ui_tool import plan_a2ui_injection
 plan = plan_a2ui_injection(model={"model": "openai/gpt-4o"})
 """,
     # A mapping the provider client never reads a bound out of. The mapping form
@@ -655,7 +663,7 @@ from litellm import aresponses
 stream = await aresponses(model="openai/gpt-4o")
 """,
     "a_new_sdk_helper_nobody_classified": """
-from ..sdk import copilotkit_new_channel
+from ag_ui_crewai.sdk import copilotkit_new_channel
 stream = await copilotkit_new_channel(model="openai/gpt-4o")
 """,
     # Attribute chains deeper than one level. The classification has to follow the
@@ -680,7 +688,7 @@ agent = crewai.agent.Agent(role="r", goal="g", backstory="b")
     "a_bound_helper_name_that_is_not_the_helper": """
 from crewai import Agent
 from functools import partial as bounded_llm
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 agent = Agent(llm=bounded_llm(str, "openai/gpt-4o"),
               max_execution_time=resolve_agent_execution_ceiling_seconds())
 """,
@@ -701,7 +709,7 @@ response = await acompletion(
 """,
     "a_bare_model_id_vouched_for_from_another_scope": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 def unrelated():
     llm = bounded_llm("openai/gpt-4o")
@@ -715,7 +723,7 @@ agent = Agent(llm=llm,
     # point of dropping re-bound names is lost for every form it misses.
     "a_bare_model_id_annotated_over_a_vouched_name": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 def unrelated():
     llm = bounded_llm("openai/gpt-4o")
@@ -726,7 +734,7 @@ agent = Agent(llm=llm,
 """,
     "a_bare_model_id_loop_bound_over_a_vouched_name": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 def unrelated():
     llm = bounded_llm("openai/gpt-4o")
@@ -737,7 +745,7 @@ for llm in ("openai/gpt-4o",):
 """,
     "a_bare_model_id_walrus_bound_over_a_vouched_name": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 def unrelated():
     llm = bounded_llm("openai/gpt-4o")
@@ -748,7 +756,7 @@ agent = Agent(llm=(llm := "openai/gpt-4o"),
     "a_bare_model_id_context_bound_over_a_vouched_name": """
 from contextlib import nullcontext
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 def unrelated():
     llm = bounded_llm("openai/gpt-4o")
@@ -761,7 +769,7 @@ with nullcontext("openai/gpt-4o") as llm:
     # name that resolves to something the audit knows nothing about.
     "a_vouched_name_shadowed_by_an_import": """
 from crewai import Agent
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 from os import sep as llm
 def unrelated():
@@ -774,7 +782,7 @@ agent = Agent(llm=llm,
     # LLM object owned by two crewai objects carries one's settings into the other.
     "one_bounded_llm_shared_by_two_crewai_owners": """
 from crewai import Agent, Crew
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 llm = bounded_llm("openai/gpt-4o")
 agent = Agent(llm=llm,
@@ -810,12 +818,12 @@ def test_the_audit_accepts_the_bounded_form_of_each_shape(tmp_path):
         """
 from crewai import Agent, Crew, LLM, Process
 from litellm import acompletion
-from .._config import (
+from ag_ui_crewai._config import (
     resolve_agent_execution_ceiling_seconds,
     resolve_provider_timeout_seconds,
 )
-from ..a2ui_tool import plan_a2ui_injection
-from ..sdk import copilotkit_responses
+from ag_ui_crewai.a2ui_tool import plan_a2ui_injection
+from ag_ui_crewai.sdk import copilotkit_responses
 from ._crewai_llm import bounded_llm
 
 llm = bounded_llm("openai/gpt-4o")
@@ -855,7 +863,7 @@ def test_the_audit_accepts_a_bounded_call_down_a_deep_attribute_chain(tmp_path):
         """
 import crewai
 import litellm
-from .._config import (
+from ag_ui_crewai._config import (
     resolve_agent_execution_ceiling_seconds,
     resolve_provider_timeout_seconds,
 )

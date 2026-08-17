@@ -15,8 +15,8 @@ from crewai import Agent, Crew, Process, Task
 from crewai.flow.flow import Flow, start
 from crewai.tools import tool
 
-from .._config import resolve_agent_execution_ceiling_seconds
-from ..sdk import CopilotKitState, copilotkit_exit
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai.sdk import CopilotKitState, copilotkit_exit
 from ._crewai_llm import bounded_llm
 
 MODEL = "openai/gpt-5.4"

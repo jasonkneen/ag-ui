@@ -2,7 +2,7 @@
 
 from crewai import Agent, Crew, Task, Process
 
-from .._config import resolve_agent_execution_ceiling_seconds
+from ag_ui_crewai._config import resolve_agent_execution_ceiling_seconds
 from ._crewai_llm import bounded_llm
 
 MODEL = "openai/gpt-5.4"

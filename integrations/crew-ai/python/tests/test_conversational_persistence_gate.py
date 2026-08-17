@@ -298,7 +298,7 @@ def test_overlay_leaves_a_conversational_flow_conversational():
     ``type(self).flow_definition()`` during a turn. A synthesized subclass that
     re-derived its own definition would answer both differently.
     """
-    from ag_ui_crewai.examples.conversational import CONVERSATIONAL_FLOW_TYPES
+    from agents.conversational import CONVERSATIONAL_FLOW_TYPES
 
     flow_type = CONVERSATIONAL_FLOW_TYPES["agentic_chat"]
     flow = flow_type()

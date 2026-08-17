@@ -32,11 +32,8 @@ from .a2ui_tool import (
   is_auto_injected_a2ui_tool,
   A2UI_STREAM_KEY,
 )
-# from .enterprise import CrewEnterpriseEventListener
 
 from ._capabilities import get_capabilities
-
-# CREW_ENTERPRISE_EVENT_LISTENER = CrewEnterpriseEventListener()
 
 # The Crew chat path is reachable from the package top level: the
 # crew-endpoint factory, its input-prep helper, the flow, and the exit signal,
