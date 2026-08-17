@@ -39,6 +39,10 @@ dependencies = [
     "uvicorn>=0.34.3,<0.35.0",
     "crewai>=1.0,<2",
     "litellm>=1.60.2",
+    # Imported directly at sdk.py:33, _conversation.py:12 and _responses.py:33,
+    # so it is declared rather than left to arrive through fastapi or crewai.
+    # v2 for ``TypeAdapter`` and ``model_dump_json``.
+    "pydantic>=2.0,<3",
     # A2UI subagent tool: the framework-agnostic recovery loop, validation,
     # prompt assembly and op builders live here; ``a2ui_tool.py`` is only the
     # CrewAI glue over it. Floor matches the aws-strands adapter.
@@ -56,40 +60,32 @@ dev = [
     "pytest-asyncio>=0.24,<0.25",
     # Dev-only; <0.29 guards against a breaking httpx 0.x minor.
     "httpx>=0.27,<0.29",
-    # tests/test_packaging.py asserts against the real wheel and sdist, and builds
-    # them with `uv build --no-build-isolation` so the run needs neither network nor
-    # a warm uv cache. That takes the backend from here, which also means a hatchling
-    # upgrade arrives as a reviewable uv.lock change instead of a silent shift in
-    # what gets published. Mirrors build-system.requires below.
-    "hatchling>=1.27,<2",
+    # tests/test_packaging.py builds the real wheel and sdist with
+    # `uv build --no-build-isolation`, so the run needs neither network nor a warm uv
+    # cache and takes the backend from here. Exact, and identical to
+    # build-system.requires below: a publish builds isolated and resolves the backend
+    # fresh, so two overlapping ranges can still land on different hatchling versions,
+    # and hatchling changes artifact selection in minor releases.
+    # `test_the_guard_and_a_publish_agree_on_hatchling` fails if these drift apart.
+    "hatchling==1.32.0",
     # tomllib is 3.11+ and requires-python still admits 3.10.
     "tomli>=2.0; python_version < '3.11'",
+    "crewai-agui-dojo",
 ]
+
+[tool.uv.sources]
+crewai-agui-dojo = { path = "examples", editable = true }
 
 [build-system]
-requires = ["hatchling"]
+# Exact, and identical to the dev group's hatchling above. A publish builds isolated
+# and resolves this fresh; the guard builds against the installed one. Only equality
+# makes those the same backend.
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
-# Shared across wheel and sdist so the exclude list is not repeated per target.
-#
-# CANONICAL RATIONALE for how the dojo is launched. ``render.yaml`` and
-# ``apps/dojo/scripts/run-dojo-everything.js`` point here rather than repeat it.
-#
-# The dojo server, its launcher and its demo flows are development-only, so they
-# stay out of both artifacts and nothing shipped may reference them: an entry point
-# declared in ``[project.scripts]`` survives the exclude and would install a ``dev``
-# command that raises ModuleNotFoundError. ``tests/test_packaging.py`` enforces the
-# split. Run the dojo from a source checkout with ``uv run python -m ag_ui_crewai``.
-#
-# That target must be the PACKAGE, not the module: ``-m ag_ui_crewai.dojo`` has no
-# ``__main__`` guard, so it builds the app and exits 0 having served nothing.
-# ``ag_ui_crewai/__main__.py`` owns the uvicorn call.
-[tool.hatch.build]
-exclude = [
-    "ag_ui_crewai/dojo.py",
-    "ag_ui_crewai/__main__.py",
-    "ag_ui_crewai/examples/**",
-]
+# No exclude list. Everything in the package is library code that ships. The dojo
+# server and its demo flows live in ``examples/``, a separate project, which is why
+# this package declares no scripts and has nothing to strip.
 
 [tool.hatch.build.targets.wheel]
 packages = ["ag_ui_crewai"]
@@ -102,11 +98,14 @@ packages = ["ag_ui_crewai"]
 # and ``.gitignore`` into every sdist whatever this list says. The other three stay
 # listed as a statement of intent, and the guard catches it if that stops holding.
 [tool.hatch.build.targets.sdist]
+# Anchored with a leading slash. Unanchored, these match at any depth, and since the
+# examples project arrived one level down that pulled its README and pyproject into the
+# tarball. tests/test_packaging.py caught it.
 include = [
-    "ag_ui_crewai",
-    "README.md",
-    "LICENSE",
-    "pyproject.toml",
+    "/ag_ui_crewai",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
 ]
 
 [tool.pytest.ini_options]
