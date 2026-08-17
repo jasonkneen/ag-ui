@@ -840,6 +840,280 @@ def _persist_interrupt_bookkeeping(
 
 
 # ---------------------------------------------------------------------------
+# Multi-agent (Graph / Swarm) event translation
+# ---------------------------------------------------------------------------
+
+# Strands multi-agent event discriminators, as emitted by
+# ``Graph.stream_async`` / ``Swarm.stream_async``.
+MULTIAGENT_NODE_START = "multiagent_node_start"
+MULTIAGENT_NODE_STOP = "multiagent_node_stop"
+MULTIAGENT_NODE_STREAM = "multiagent_node_stream"
+MULTIAGENT_HANDOFF = "multiagent_handoff"
+MULTIAGENT_NODE_CANCEL = "multiagent_node_cancel"
+MULTIAGENT_NODE_INTERRUPT = "multiagent_node_interrupt"
+
+# AG-UI CUSTOM event names carrying multi-agent lifecycle detail that has no
+# first-class protocol event. Frontends match these strings exactly.
+CUSTOM_MULTIAGENT_HANDOFF = "MultiAgentHandoff"
+CUSTOM_MULTIAGENT_NODE_CANCEL = "MultiAgentNodeCancel"
+CUSTOM_MULTIAGENT_NODE_INTERRUPT = "MultiAgentNodeInterrupt"
+CUSTOM_MULTIAGENT_NODE_STATUS = "MultiAgentNodeStatus"
+
+
+def _multiagent_flatten_content(content: Any) -> str:
+    """Text view of AG-UI message content for an orchestrator task string.
+
+    Orchestrators take `str | list[ContentBlock]`, so a multimodal or
+    block-list message has to be flattened rather than stringified: `str()` on
+    a list yields a Python repr, which would reach the model verbatim.
+    Mirrors the TypeScript adapter's `flattenContentToText`.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return _coerce_text(content)
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively reduce a value to something the wire can carry.
+
+    Containers are walked rather than accepted wholesale: a dict whose own
+    values are native objects is still unserializable, which is exactly the
+    shape a Strands interrupt reason takes.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _multiagent_node_status(event: Dict[str, Any]) -> "str | None":
+    """Non-completed status of a stopped node, or None when it succeeded.
+
+    ``node_result.status`` is a ``Status`` enum on the SDK's ``NodeResult``.
+    Only abnormal outcomes are reported, so the common path stays quiet.
+    """
+    node_result = event.get("node_result")
+    status = getattr(node_result, "status", None)
+    if status is None:
+        return None
+    name = getattr(status, "value", None) or getattr(status, "name", None) or str(status)
+    name = str(name).lower()
+    return None if name == "completed" else name
+
+
+def _multiagent_step_name(node_id: Any, node_type: Any) -> str:
+    """STEP_STARTED / STEP_FINISHED name for a multi-agent node.
+
+    ``node_type`` is only present on ``multiagent_node_start``; the stop event
+    carries just ``node_id``. Callers pass the type remembered from the start
+    event so the two step names pair (events.mdx, StepFinished).
+    """
+    return f"{node_type or 'agent'}:{node_id or 'unknown'}"
+
+
+def _multiagent_handoff_value(event: Dict[str, Any]) -> Dict[str, Any]:
+    """CUSTOM payload for ``multiagent_handoff``.
+
+    Swarm emits single-element lists plus a ``message``; Graph emits batch
+    transitions and omits ``message`` entirely.
+    """
+    return {
+        "from_nodes": event.get("from_node_ids", []),
+        "to_nodes": event.get("to_node_ids", []),
+        "message": event.get("message"),
+    }
+
+
+def _multiagent_cancel_value(event: Dict[str, Any]) -> Dict[str, Any]:
+    """CUSTOM payload for ``multiagent_node_cancel``.
+
+    Raised when a ``BeforeNodeCallEvent`` hook sets ``cancel_node``. Strands
+    follows the cancel with a FAILED ``multiagent_node_stop`` and then raises,
+    so this event is the only place the cancellation reason is available.
+    """
+    return {
+        "node_id": event.get("node_id"),
+        "message": event.get("message"),
+    }
+
+
+def _multiagent_interrupt_value(event: Dict[str, Any]) -> Dict[str, Any]:
+    """CUSTOM payload for ``multiagent_node_interrupt``.
+
+    ``interrupts`` holds native Strands ``Interrupt`` objects, which are not
+    JSON-serializable, so each is reduced to its wire-safe identity fields.
+    """
+    raw = event.get("interrupts")
+    # A string is iterable, so a malformed payload would otherwise be walked
+    # one character at a time and emit junk entries.
+    interrupts = raw if isinstance(raw, (list, tuple)) else []
+    serialized = [
+        {
+            "id": getattr(interrupt, "id", ""),
+            "name": getattr(interrupt, "name", None) or "interrupt",
+            "reason": _json_safe(getattr(interrupt, "reason", None)),
+        }
+        for interrupt in interrupts
+    ]
+    return {"node_id": event.get("node_id"), "interrupts": serialized}
+
+
+class _MultiAgentNodeStreams:
+    """Per-node text and reasoning envelopes for one orchestrator run.
+
+    A Graph executes a batch of nodes as concurrent tasks whose events are
+    multiplexed into a single queue, so envelopes have to be keyed by node:
+    one shared message id would splice two nodes' text together and close the
+    envelope as soon as either node stopped.
+    """
+
+    def __init__(self) -> None:
+        self._text: Dict[str, str] = {}
+        self._reasoning: Dict[str, str] = {}
+
+    def text(self, node_id: str, delta: str) -> List[Any]:
+        events: List[Any] = []
+        message_id = self._text.get(node_id)
+        if message_id is None:
+            # Reasoning precedes the answer it explains, so close it here
+            # rather than leaving the two envelopes overlapping.
+            events.extend(self._close_reasoning(node_id))
+            message_id = str(uuid.uuid4())
+            self._text[node_id] = message_id
+            events.append(
+                TextMessageStartEvent(
+                    type=EventType.TEXT_MESSAGE_START,
+                    message_id=message_id,
+                    role="assistant",
+                )
+            )
+        events.append(
+            TextMessageContentEvent(
+                type=EventType.TEXT_MESSAGE_CONTENT,
+                message_id=message_id,
+                delta=delta,
+            )
+        )
+        return events
+
+    def reasoning(self, node_id: str, delta: str) -> List[Any]:
+        events: List[Any] = []
+        message_id = self._reasoning.get(node_id)
+        if message_id is None:
+            # Symmetric with text(): the two envelopes never overlap, so a
+            # node that goes text, then reasoning, then text again produces
+            # three separate messages rather than nesting one inside another.
+            events.extend(self._close_text(node_id))
+            message_id = str(uuid.uuid4())
+            self._reasoning[node_id] = message_id
+            events.append(
+                ReasoningStartEvent(
+                    type=EventType.REASONING_START, message_id=message_id
+                )
+            )
+            events.append(
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START,
+                    message_id=message_id,
+                    role="reasoning",
+                )
+            )
+        events.append(
+            ReasoningMessageContentEvent(
+                type=EventType.REASONING_MESSAGE_CONTENT,
+                message_id=message_id,
+                delta=delta,
+            )
+        )
+        return events
+
+    def _close_text(self, node_id: str) -> List[Any]:
+        message_id = self._text.pop(node_id, None)
+        if message_id is None:
+            return []
+        return [
+            TextMessageEndEvent(
+                type=EventType.TEXT_MESSAGE_END, message_id=message_id
+            )
+        ]
+
+    def _close_reasoning(self, node_id: str) -> List[Any]:
+        message_id = self._reasoning.pop(node_id, None)
+        if message_id is None:
+            return []
+        return [
+            ReasoningMessageEndEvent(
+                type=EventType.REASONING_MESSAGE_END, message_id=message_id
+            ),
+            ReasoningEndEvent(
+                type=EventType.REASONING_END, message_id=message_id
+            ),
+        ]
+
+    def close(self, node_id: str) -> List[Any]:
+        events = self._close_text(node_id)
+        events.extend(self._close_reasoning(node_id))
+        return events
+
+    def close_all(self) -> List[Any]:
+        events: List[Any] = []
+        for node_id in list(self._text) + [
+            n for n in self._reasoning if n not in self._text
+        ]:
+            events.extend(self.close(node_id))
+        return events
+
+
+def _close_open_multiagent(
+    nodes: "_MultiAgentNodeStreams",
+    open_steps: Dict[str, str],
+    failed: bool = False,
+) -> List[Any]:
+    """Terminate every envelope and step this run left open.
+
+    Shared by the success and error paths. A node that interrupts never emits
+    a stop event, and a Graph that fails fast re-raises mid-node, so both exits
+    can leave a message unterminated and a step the UI still shows running.
+
+    On the error path the still-open nodes are the ones that did not finish, so
+    each is reported as failed before its step closes. Without that the close
+    itself reads as success and the node settles green.
+    """
+    events = nodes.close_all()
+    for node_id, step_name in list(open_steps.items()):
+        if failed:
+            events.append(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=CUSTOM_MULTIAGENT_NODE_STATUS,
+                    value={"node_id": node_id, "status": "failed"},
+                )
+            )
+        events.append(
+            StepFinishedEvent(
+                type=EventType.STEP_FINISHED, step_name=step_name
+            )
+        )
+    open_steps.clear()
+    return events
+
+
+# ---------------------------------------------------------------------------
 # Strands-native interrupt hook
 # ---------------------------------------------------------------------------
 
@@ -923,15 +1197,41 @@ class StrandsAgent:
         hooks: "list | None" = None,
         agents_by_thread: "Dict[str, Any] | None" = None,
     ):
-        # Store template agent configuration for creating fresh instances
-        self._model = agent.model
-        self._system_prompt = agent.system_prompt
-        self._tools = (
-            list(agent.tool_registry.registry.values())
-            if hasattr(agent, "tool_registry")
-            else []
+        # Detect a multi-agent orchestrator structurally. A Graph or Swarm has
+        # no ``model`` (a real Agent always resolves one, defaulting to
+        # BedrockModel even when constructed with ``model=None``) and owns a
+        # ``nodes`` collection it streams through. Both halves are required:
+        # a modelless agent that is not an orchestrator would otherwise be
+        # driven down this path and produce a silent empty run instead of
+        # failing loudly.
+        #
+        # Probing attributes rather than importing ``strands.multiagent``
+        # matters because a deprecation shim can keep the import working after
+        # the symbol has moved.
+        self._orchestrator = (
+            agent
+            if getattr(agent, "model", None) is None
+            and getattr(agent, "nodes", None) is not None
+            and callable(getattr(agent, "stream_async", None))
+            else None
         )
-        self._agent_kwargs = _extract_agent_kwargs(agent)
+
+        # Store template agent configuration for creating fresh instances.
+        # Orchestrators are invoked directly, so there is no template to clone.
+        if self._orchestrator is None:
+            self._model = agent.model
+            self._system_prompt = agent.system_prompt
+            self._tools = (
+                list(agent.tool_registry.registry.values())
+                if hasattr(agent, "tool_registry")
+                else []
+            )
+            self._agent_kwargs = _extract_agent_kwargs(agent)
+        else:
+            self._model = None
+            self._system_prompt = None
+            self._tools = []
+            self._agent_kwargs = {}
 
         # Hook providers forwarded to each per-thread StrandsAgentCore.
         #
@@ -965,7 +1265,8 @@ class StrandsAgent:
         # Forwarding it would make every AG-UI thread share one session_id.
         template_session_manager = getattr(agent, "_session_manager", None)
         if (
-            template_session_manager is not None
+            self._orchestrator is None
+            and template_session_manager is not None
             and self.config.session_manager_provider is None
         ):
             logger.warning(
@@ -989,6 +1290,10 @@ class StrandsAgent:
         # same new thread_id could otherwise both create an agent and one
         # would clobber the other.
         self._thread_init_lock = asyncio.Lock()
+        # Threads with an in-flight orchestrator run. A Graph or Swarm holds
+        # its node agents, which reject overlapping invocations, so a second
+        # run on the same thread is rejected rather than allowed to collide.
+        self._active_orchestrator_runs: set[str] = set()
 
     def _will_emit_tool_snapshot(self, behavior: Any, emit_snapshots: bool) -> bool:
         # ``emit_snapshots`` is the per-run gate (config flag AND not a
@@ -998,8 +1303,226 @@ class StrandsAgent:
             behavior and behavior.skip_messages_snapshot
         )
 
+    async def _run_orchestrator(
+        self, input_data: RunAgentInput
+    ) -> AsyncIterator[Any]:
+        """Drive a multi-agent orchestrator and translate its event stream.
+
+        Mirrors the TypeScript adapter's orchestrator path. Per-thread agent
+        caching, session managers and proxy-tool sync do not apply: a Graph or
+        Swarm owns its own nodes, so there is no template to clone.
+        """
+        yield RunStartedEvent(
+            type=EventType.RUN_STARTED,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+        )
+
+        # Bound before the try so the except path can always close them, even
+        # when the failure happens before the stream is opened.
+        #
+        # Per-node, not global: a Graph runs a whole batch of nodes as
+        # concurrent tasks multiplexed into one queue, so a single shared
+        # message id would interleave two nodes into one envelope and close it
+        # when whichever finished first stopped.
+        nodes = _MultiAgentNodeStreams()
+        # node_id -> step name, so STEP_FINISHED reuses the node_type that only
+        # the start event carries, and so any step left open by a terminal
+        # interrupt is still closed before RUN_FINISHED.
+        open_steps: Dict[str, str] = {}
+
+        try:
+            state = input_data.state
+            if isinstance(state, dict):
+                yield StateSnapshotEvent(
+                    type=EventType.STATE_SNAPSHOT,
+                    snapshot={
+                        k: v for k, v in state.items() if k != "messages"
+                    },
+                )
+
+            # Orchestrators take a task string (MultiAgentInput); use the text
+            # of the last user or tool turn.
+            prompt = "Hello"
+            for message in reversed(input_data.messages or []):
+                role = getattr(message, "role", None)
+                content = getattr(message, "content", None)
+                if role in ("user", "tool") and content is not None:
+                    prompt = _multiagent_flatten_content(content)
+                    break
+
+            stream = self._orchestrator.stream_async(prompt)
+            try:
+                async for event in stream:
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = event.get("type")
+
+                    if event_type == MULTIAGENT_NODE_START:
+                        node_id = event.get("node_id", "unknown")
+                        step_name = _multiagent_step_name(
+                            node_id, event.get("node_type")
+                        )
+                        # A node re-entered without an intervening stop (a
+                        # Swarm hand-back, a cyclic graph) would otherwise
+                        # produce two STEP_STARTED for one STEP_FINISHED,
+                        # which frontends cannot pair.
+                        if node_id in open_steps:
+                            for closing in nodes.close(node_id):
+                                yield closing
+                            yield StepFinishedEvent(
+                                type=EventType.STEP_FINISHED,
+                                step_name=open_steps[node_id],
+                            )
+                        open_steps[node_id] = step_name
+                        yield StepStartedEvent(
+                            type=EventType.STEP_STARTED, step_name=step_name
+                        )
+
+                    elif event_type == MULTIAGENT_NODE_STOP:
+                        node_id = event.get("node_id", "unknown")
+                        for closing in nodes.close(node_id):
+                            yield closing
+                        status = _multiagent_node_status(event)
+                        # A node can stop FAILED (a cancelling hook, a node
+                        # timeout, an execution limit) without the stream
+                        # raising. STEP_FINISHED alone reads as success, so the
+                        # outcome is published rather than discarded.
+                        if status is not None:
+                            yield CustomEvent(
+                                type=EventType.CUSTOM,
+                                name=CUSTOM_MULTIAGENT_NODE_STATUS,
+                                value={"node_id": node_id, "status": status},
+                            )
+                        # Only close a step this run actually opened: an
+                        # unpaired STEP_FINISHED is a protocol violation that
+                        # a strict client rejects outright.
+                        step_name = open_steps.pop(node_id, None)
+                        if step_name is not None:
+                            yield StepFinishedEvent(
+                                type=EventType.STEP_FINISHED,
+                                step_name=step_name,
+                            )
+
+                    elif event_type == MULTIAGENT_HANDOFF:
+                        yield CustomEvent(
+                            type=EventType.CUSTOM,
+                            name=CUSTOM_MULTIAGENT_HANDOFF,
+                            value=_multiagent_handoff_value(event),
+                        )
+
+                    elif event_type == MULTIAGENT_NODE_CANCEL:
+                        yield CustomEvent(
+                            type=EventType.CUSTOM,
+                            name=CUSTOM_MULTIAGENT_NODE_CANCEL,
+                            value=_multiagent_cancel_value(event),
+                        )
+
+                    elif event_type == MULTIAGENT_NODE_INTERRUPT:
+                        yield CustomEvent(
+                            type=EventType.CUSTOM,
+                            name=CUSTOM_MULTIAGENT_NODE_INTERRUPT,
+                            value=_multiagent_interrupt_value(event),
+                        )
+
+                    elif event_type == MULTIAGENT_NODE_STREAM:
+                        # The nested value is the wrapped agent's own event, in
+                        # the same shape the single-agent loop consumes.
+                        inner = event.get("event")
+                        if not isinstance(inner, dict):
+                            continue
+                        node_id = event.get("node_id", "unknown")
+                        if inner.get("data"):
+                            for text_event in nodes.text(node_id, inner["data"]):
+                                yield text_event
+                        elif inner.get("reasoningText") and inner.get("reasoning"):
+                            for reasoning_event in nodes.reasoning(
+                                node_id, inner["reasoningText"]
+                            ):
+                                yield reasoning_event
+            finally:
+                # Orchestrator streams take no cancel signal, so closing the
+                # iterator is the only way to stop one when the consumer bails.
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:
+                        logger.debug(
+                            "orchestrator stream teardown failed", exc_info=True
+                        )
+
+            for closing in _close_open_multiagent(nodes, open_steps):
+                yield closing
+
+            yield RunFinishedEvent(
+                type=EventType.RUN_FINISHED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+        except Exception as e:
+            code = (
+                "ADAPTER_BUG"
+                if isinstance(e, (TypeError, AttributeError, NameError))
+                else "STRANDS_ERROR"
+            )
+            logger.error(f"_run_orchestrator failed: {e}", exc_info=True)
+            # A Graph fails fast: the first node exception cancels its siblings
+            # and re-raises, so a raise landing mid-text is routine. Without
+            # this the run would end on a dangling message envelope and a step
+            # the UI still shows running.
+            for closing in _close_open_multiagent(nodes, open_steps, failed=True):
+                yield closing
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR, message=str(e), code=code
+            )
+
     async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
         """Run the Strands agent and yield AG-UI events."""
+
+        if self._orchestrator is not None:
+            # An orchestrator carries execution state on the instance and its
+            # node agents are not safe to invoke concurrently, so overlapping
+            # runs either clobber that state or surface a raw SDK error with a
+            # half-drawn pipeline behind it. Reject the collision up front with
+            # the protocol-shaped code the TypeScript adapter uses. Note this
+            # guards one thread; a caller sharing a single long-lived
+            # orchestrator across threads has to build one per run instead
+            # (which is what the multi-agent example does).
+            orchestrator_thread = input_data.thread_id or "default"
+            if orchestrator_thread in self._active_orchestrator_runs:
+                yield RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+                yield RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=(
+                        f'Another run is already in progress on thread '
+                        f'"{orchestrator_thread}". Wait for RUN_FINISHED before '
+                        "starting a new run on the same thread."
+                    ),
+                    code="THREAD_BUSY",
+                )
+                return
+            self._active_orchestrator_runs.add(orchestrator_thread)
+            # Close the delegate explicitly: when the consumer abandons this
+            # generator, `async for` alone would leave the inner one suspended
+            # until GC, so the orchestrator stream would keep running.
+            orchestrator_events = self._run_orchestrator(input_data)
+            try:
+                async for event in orchestrator_events:
+                    yield event
+            finally:
+                # Released only after teardown finishes: freeing the slot
+                # first would let a queued run start while this one still
+                # holds the orchestrator.
+                try:
+                    await orchestrator_events.aclose()
+                finally:
+                    self._active_orchestrator_runs.discard(orchestrator_thread)
+            return
 
         # Get or create agent instance for this thread. When a
         # session_manager_provider is configured, the SessionManager handles
@@ -1699,6 +2222,9 @@ class StrandsAgent:
             # native interrupt pause (``stop_reason == "interrupt"``).
             terminal_result = None
             pending_interrupt_outcome: RunFinishedInterruptOutcome | None = None
+            # node_id -> STEP_STARTED name, so the stop event (which carries no
+            # node_type) can emit the matching STEP_FINISHED name.
+            multiagent_step_names: Dict[str, str] = {}
 
             # Reasoning/thinking state tracking
             reasoning_started = False
@@ -2136,33 +2662,54 @@ class StrandsAgent:
                         logger.debug(f"Received reasoning signature: {str(sig)[:20]}...")
 
                     # Handle multi-agent node start (maps to STEP_STARTED)
-                    elif isinstance(event, dict) and event.get("type") == "multiagent_node_start":
+                    elif isinstance(event, dict) and event.get("type") == MULTIAGENT_NODE_START:
                         node_id = event.get("node_id", "unknown")
-                        node_type = event.get("node_type", "agent")
+                        step_name = _multiagent_step_name(
+                            node_id, event.get("node_type")
+                        )
+                        multiagent_step_names[node_id] = step_name
                         yield StepStartedEvent(
-                            type=EventType.STEP_STARTED,
-                            step_name=f"{node_type}:{node_id}"
+                            type=EventType.STEP_STARTED, step_name=step_name
                         )
 
-                    # Handle multi-agent node stop (maps to STEP_FINISHED)
-                    elif isinstance(event, dict) and event.get("type") == "multiagent_node_stop":
+                    # Handle multi-agent node stop (maps to STEP_FINISHED).
+                    # The stop event carries no node_type, so reuse the name
+                    # built from the start event to keep the pair matched.
+                    elif isinstance(event, dict) and event.get("type") == MULTIAGENT_NODE_STOP:
                         node_id = event.get("node_id", "unknown")
-                        node_type = event.get("node_type", "agent")
+                        step_name = multiagent_step_names.pop(
+                            node_id,
+                            _multiagent_step_name(node_id, event.get("node_type")),
+                        )
                         yield StepFinishedEvent(
-                            type=EventType.STEP_FINISHED,
-                            step_name=f"{node_type}:{node_id}"
+                            type=EventType.STEP_FINISHED, step_name=step_name
                         )
 
                     # Handle multi-agent handoff (emit as CUSTOM event)
-                    elif isinstance(event, dict) and event.get("type") == "multiagent_handoff":
+                    elif isinstance(event, dict) and event.get("type") == MULTIAGENT_HANDOFF:
                         yield CustomEvent(
                             type=EventType.CUSTOM,
-                            name="MultiAgentHandoff",
-                            value={
-                                "from_nodes": event.get("from_node_ids", []),
-                                "to_nodes": event.get("to_node_ids", []),
-                                "message": event.get("message")
-                            }
+                            name=CUSTOM_MULTIAGENT_HANDOFF,
+                            value=_multiagent_handoff_value(event),
+                        )
+
+                    # Handle multi-agent node cancel (emit as CUSTOM event).
+                    # Must precede the user-message branch below: this event
+                    # carries `message` as a plain string, which that branch
+                    # would call `.get("role")` on.
+                    elif isinstance(event, dict) and event.get("type") == MULTIAGENT_NODE_CANCEL:
+                        yield CustomEvent(
+                            type=EventType.CUSTOM,
+                            name=CUSTOM_MULTIAGENT_NODE_CANCEL,
+                            value=_multiagent_cancel_value(event),
+                        )
+
+                    # Handle multi-agent node interrupt (emit as CUSTOM event)
+                    elif isinstance(event, dict) and event.get("type") == MULTIAGENT_NODE_INTERRUPT:
+                        yield CustomEvent(
+                            type=EventType.CUSTOM,
+                            name=CUSTOM_MULTIAGENT_NODE_INTERRUPT,
+                            value=_multiagent_interrupt_value(event),
                         )
 
                     # Handle tool streaming events for real-time state updates
