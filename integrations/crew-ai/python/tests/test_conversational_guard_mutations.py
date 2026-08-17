@@ -31,6 +31,7 @@ import pytest
 
 import ag_ui_crewai
 
+from .conftest import MUTATION_BACKUP_SUFFIX, MUTATION_IN_FLIGHT_ENV_VAR
 
 pytestmark = pytest.mark.mutation
 
@@ -61,14 +62,14 @@ MUTATIONS = [
     Mutation(
         "terminal: run_finished dropped from the predicate",
         EP,
-        2847,
+        2848,
         "                if not (translator.run_finished or stream_exhausted):",
         "                if not stream_exhausted:",
     ),
     Mutation(
         "terminal: nothing is ever abandoned",
         EP,
-        2847,
+        2848,
         "                if not (translator.run_finished or stream_exhausted):",
         "                if False:",
     ),
@@ -281,7 +282,7 @@ def _apply(mutation):
     return "".join(lines)
 
 
-def _child_env():
+def _child_env(*, in_flight=True):
     """The child's environment, with the parent's ``PYTEST_ADDOPTS`` removed.
 
     Whatever the parent was invoked with must not reach the child. The obvious case
@@ -289,8 +290,17 @@ def _child_env():
     spawns its own children. The dangerous case is quieter: any ``-k`` or ``-m``
     that SHRINKS the child suite silently drops the test that would have caught a
     mutation, and the mutation is then reported as a survivor.
+
+    ``in_flight`` tells the child that its parent is alive and holding a mutation,
+    so conftest leaves the backup alone. Only the test that checks the repair
+    itself passes False, because it is standing in for a parent that died.
     """
-    return {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    env = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    if in_flight:
+        env[MUTATION_IN_FLIGHT_ENV_VAR] = "1"
+    else:
+        env.pop(MUTATION_IN_FLIGHT_ENV_VAR, None)
+    return env
 
 
 def _child_args(*extra):
@@ -374,13 +384,19 @@ def test_neutralizing_a_containment_guard_fails_the_suite(mutation):
     """One guard removed; some test has to notice."""
     original = mutation.path.read_text()
     mutated = _apply(mutation)
+    # The original on DISK before the package is touched, because a ``finally``
+    # only runs while this process is alive: a timeout, a Ctrl-C at the wrong
+    # moment or an OOM kill leaves the mutated file behind, and then every run
+    # after it reports a pass for a guard that is switched off. conftest honours
+    # this backup at the start of EVERY run and fails the session saying so.
+    backup = mutation.path.with_name(mutation.path.name + MUTATION_BACKUP_SUFFIX)
+    backup.write_text(original)
     mutation.path.write_text(mutated)
     try:
         proc = _run_suite()
     finally:
-        # In a ``finally`` and unconditional: leaving the package mutated would
-        # poison every later test in this process and the working tree with it.
         mutation.path.write_text(original)
+        backup.unlink(missing_ok=True)
 
     failed = sorted(
         {
@@ -399,6 +415,53 @@ def test_neutralizing_a_containment_guard_fails_the_suite(mutation):
     )
     # Reported so a mutation caught only by an unrelated collapse is visible.
     print(f"killed by {failed[:3]}")
+
+
+def test_a_killed_run_is_repaired_and_reported_by_the_next_one():
+    """The backup is honoured, and honouring it is not silent.
+
+    This is the failure this harness actually had: it was killed mid-mutation, so
+    the ``finally`` never ran, and the package sat in the working tree with a guard
+    switched off. Every run after it passed, including the one that reported "no
+    survivors". Checked in a CHILD run, because the repair happens before
+    collection and cannot be observed from inside the session it repairs.
+    """
+    target = CONV
+    original = target.read_text()
+    backup = target.with_name(target.name + MUTATION_BACKUP_SUFFIX)
+    # A mutation whose absence no assertion depends on, so what fails in the child
+    # is the repair guard rather than some guard's own test.
+    marker = "# a mutation the child must not be left holding\n"
+    backup.write_text(original)
+    target.write_text(original + marker)
+    try:
+        proc = subprocess.run(
+            _child_args("--collect-only"),
+            cwd=PROJECT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=_child_env(in_flight=False),
+        )
+        repaired = target.read_text()
+    finally:
+        target.write_text(original)
+        backup.unlink(missing_ok=True)
+
+    reported = proc.stdout + proc.stderr
+    assert repaired == original, "the child did not restore the package from its backup"
+    assert proc.returncode != 0, (
+        "the child repaired the package and said nothing, so a killed run stays "
+        f"invisible: {reported[-2000:]}"
+    )
+    assert "died before restoring" in reported, (
+        f"the refusal does not say what happened: {reported[-2000:]}"
+    )
+    # Refused BEFORE any test ran, not after a suite's worth of results the
+    # operator might read as a pass with one odd failure at the end.
+    assert "tests collected" not in reported, (
+        f"the child collected and ran tests on a tree it had just repaired: {reported[-2000:]}"
+    )
 
 
 def test_every_anchor_still_points_at_its_guard():

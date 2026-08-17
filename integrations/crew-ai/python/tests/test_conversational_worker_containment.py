@@ -36,6 +36,7 @@ from .conftest import (
     WORKER_WAIT,
     capture_stream_sink,
     completing_conversational_flow_type,
+    drain_in_task,
     driver_frames,
     frame_stream,
     requires_conversational_turn_api,
@@ -612,7 +613,8 @@ async def test_worker_pool_is_capped_and_recovers_its_slots(monkeypatch):
     flow = _FakeConversationalFlow([held_session])
 
     live = frame_stream(flow, _input("thread-a", "run-a"))
-    pending = asyncio.create_task(live.__anext__())
+    live_body: list = []
+    pending = drain_in_task(live, live_body)
     await _wait(held_session.parked)
     assert conversation_worker_stats().active == 1
 
@@ -627,19 +629,12 @@ async def test_worker_pool_is_capped_and_recovers_its_slots(monkeypatch):
 
     # The held worker runs to completion: its slot comes back.
     held_session.release()
-    # PINS A KNOWN-DEFERRED DEFECT, it does not endorse it. These frames are
-    # untranslatable stand-ins, so the stream exhausts without the translator ever
-    # opening the run, and the driver ends the response as an empty 200 with no
-    # lifecycle event at all -- no RUN_STARTED, no RUN_FINISHED, no RUN_ERROR. The
-    # first ``__anext__`` therefore raises instead of yielding, which is what this
-    # asserts. The fix is for the driver to emit a correlated terminal event on
-    # that path; when it lands, this becomes ``assert "RUN_" in await pending``
-    # (and the same pin in ``test_conversational_readme_guarantees`` with it).
-    # Nothing else in the suite goes red for it, so without this note the fix
-    # looks like it broke the pool test.
-    with pytest.raises(StopAsyncIteration):
-        await pending
-    await live.aclose()
+    # These frames are untranslatable stand-ins, so the stream exhausts without
+    # the translator ever opening the run. The driver still owes the client a
+    # correlated terminal event, so the response opens and closes the run rather
+    # than answering an empty 200 the client's run never ends on.
+    await pending
+    assert any("RUN_STARTED" in chunk for chunk in live_body)
     await _settle(
         lambda: conversation_worker_stats().active == 0,
         "the finished worker never released its slot",

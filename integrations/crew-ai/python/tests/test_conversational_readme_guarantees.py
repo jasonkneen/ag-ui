@@ -44,6 +44,7 @@ from .conftest import (
     WORKER_WAIT,
     capture_stream_sink,
     completing_conversational_flow_type,
+    drain_in_task,
     driver_frames,
     frame_stream,
     requires_conversational_turn_api,
@@ -386,7 +387,8 @@ async def test_the_worker_pool_cap_is_enforced_and_its_slots_come_back(monkeypat
     held = _session(block_at=0)
     flow = _FakeConversationalFlow([held])
     live = frame_stream(flow, _input("thread-cap-a", "run-cap-a"))
-    pending = asyncio.create_task(live.__anext__())
+    live_body: list = []
+    pending = drain_in_task(live, live_body)
     await _wait(held.parked)
     assert conversation_worker_stats().active == 1
 
@@ -410,14 +412,11 @@ async def test_the_worker_pool_cap_is_enforced_and_its_slots_come_back(monkeypat
     assert MAX_CONVERSATION_WORKERS_ENV_VAR in refused
 
     held.release()
-    # PINS A KNOWN-DEFERRED DEFECT, as its twin in
-    # ``test_conversational_worker_containment`` does and explains: these frames
-    # are untranslatable stand-ins, so the run never opens and the response ends
-    # as an empty 200 with no lifecycle event. When the driver learns to emit a
-    # correlated terminal event there, both pins go green-to-red together.
-    with pytest.raises(StopAsyncIteration):
-        await pending
-    await live.aclose()
+    # These frames are untranslatable stand-ins, so the run never opens off a
+    # frame; the driver opens and closes it anyway rather than answering an empty
+    # 200 with no lifecycle event for the client to end the run on.
+    await pending
+    assert any("RUN_STARTED" in chunk for chunk in live_body)
     await _settle(
         lambda: conversation_worker_stats().active == 0,
         "the finished worker never released its slot",

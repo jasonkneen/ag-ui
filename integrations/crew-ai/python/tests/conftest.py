@@ -11,10 +11,12 @@ fail with the same traceback — a clearer diagnostic than a confused test
 suite running against a half-initialised module.
 """
 
+import asyncio
 import copy
 import functools
 import inspect
 import os
+import pathlib
 import shutil
 import sys
 import tempfile
@@ -335,12 +337,54 @@ class WorkerGuard:
 WORKER_GUARD = WorkerGuard()
 
 
+MUTATION_BACKUP_SUFFIX = ".mutation-backup"
+# Set by the mutation harness on the child runs it judges each guard by. Those
+# children run WITH a backup on disk on purpose, because their parent is alive and
+# holding the mutation; repairing it there would undo the very guard under test.
+MUTATION_IN_FLIGHT_ENV_VAR = "AGUI_CREWAI_MUTATION_IN_FLIGHT"
+PACKAGE_DIR = pathlib.Path(ep.__file__).parent
+
+# Filled by ``pytest_configure`` below, read by the session guard.
+_REPAIRED_BY_CONFIGURE: list = []
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "mutation: neutralizes a containment guard and reruns the suite; slow, "
         "opt in with -m mutation",
     )
+    # The mutation suite edits the package IN PLACE and restores it in a
+    # ``finally``, which a hard kill (a timeout, a Ctrl-C at the wrong moment, an
+    # OOM) does not run. What is left behind is a NEUTRALIZED guard in the working
+    # tree, and every run after it reports a pass for a guard that is switched
+    # off. So the backup is a file rather than a variable, and it is honoured here
+    # in EVERY run: before collection, so the repair lands before anything imports
+    # the package, and in the default run rather than only under ``-m mutation``,
+    # since the default run is what is usually live when the kill happens.
+    #
+    # Skipped only for the harness's own child runs, whose parent is alive and
+    # deliberately holding a mutation: repairing there would restore the guard the
+    # child exists to judge, and every guard would report as untested.
+    if os.environ.get(MUTATION_IN_FLIGHT_ENV_VAR):
+        return
+    for backup in sorted(PACKAGE_DIR.glob("*" + MUTATION_BACKUP_SUFFIX)):
+        source = backup.with_suffix("")
+        source.write_text(backup.read_text())
+        backup.unlink()
+        _REPAIRED_BY_CONFIGURE.append(source.name)
+    if _REPAIRED_BY_CONFIGURE:
+        # Refused here rather than as a failing test: the tree just changed under
+        # the operator, and a repair nobody was told about is the whole defect
+        # repeating one level up. ``UsageError`` because it stops the run before a
+        # single test executes and prints the reason, where an assertion inside a
+        # fixture would let ``--collect-only`` and anything else that skips
+        # fixtures carry on quietly.
+        raise pytest.UsageError(
+            "a mutation run died before restoring the package; these files were "
+            f"repaired from their backups just now: {_REPAIRED_BY_CONFIGURE}. "
+            "Confirm with git that they match what you expect, then re-run."
+        )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -581,6 +625,24 @@ def frame_stream(flow, input_data, *, timeout=None, emit_raw_events=False):
         emit_raw_events=emit_raw_events,
         conversational_turn=prepare_conversational_turn(input_data.messages),
     )
+
+
+def drain_in_task(agen, collected: list):
+    """Drive an already-built driver stream to exhaustion inside ONE task.
+
+    Tests that need a turn parked in the background cannot simply iterate the
+    driver, so they hand its advance to a task. The driver sets its contextvar
+    tokens in whichever context first advances it and resets them where it
+    unwinds, so advancing it in a task and then closing it from the test's own
+    context resets tokens that context never set. Draining it inside one task
+    keeps set and reset together, and leaves nothing for the test to close.
+    """
+
+    async def _drain():
+        async for chunk in agen:
+            collected.append(chunk)
+
+    return asyncio.create_task(_drain())
 
 
 class TailedSession:

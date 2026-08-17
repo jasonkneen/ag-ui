@@ -2692,13 +2692,14 @@ async def _run_flow_frame_stream(
             # client never sees a run that never ends. The RUN_ERROR paths below
             # are the terminator for the errored case and never reach here.
             #
-            # Open the run first when a pause was captured but RUN_STARTED never
-            # went out (no flow_started frame): otherwise finalize() would
-            # short-circuit and strand the paused run with an empty stream.
-            interrupt_open = (
-                translator.ensure_run_started() if translator.interrupted else []
-            )
-            for event in (*interrupt_open, *translator.finalize()):
+            # Open the run first whenever RUN_STARTED never went out: a pause
+            # captured with no ``flow_started`` frame, or a stream that exhausted
+            # before any translatable frame at all. Otherwise finalize() would
+            # short-circuit on its run-is-open guard and the request would answer
+            # 200 with an empty body, leaving the client's run with no terminal
+            # event to end it. Both calls are idempotent, so an already-open run
+            # reaches finalize() unchanged.
+            for event in (*translator.ensure_run_started(), *translator.finalize()):
                 _stamp_correlation_ids(
                     event,
                     thread_id=input_data.thread_id,

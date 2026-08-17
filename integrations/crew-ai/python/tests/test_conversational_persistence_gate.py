@@ -1027,7 +1027,18 @@ async def test_each_workers_own_run_gates_it_through_the_real_driver():
     # worker is still parked. A different thread id, because the same one would be
     # refused as busy -- which is the other half of this change.
     live_run = _conversational_stream(flow, "thread-b", "run-live")
-    live = asyncio.create_task(live_run.__anext__())
+
+    # Driven to exhaustion inside ONE task, rather than one ``__anext__`` per
+    # step. The driver sets its contextvar tokens in whichever context first
+    # advances it, so advancing it here and closing it there would reset those
+    # tokens from a context that never set them.
+    live_body: list = []
+
+    async def _drain_live():
+        async for chunk in live_run:
+            live_body.append(chunk)
+
+    live = asyncio.create_task(_drain_live())
     await _parked("live")
 
     sessions["live"].release()
@@ -1040,11 +1051,11 @@ async def test_each_workers_own_run_gates_it_through_the_real_driver():
         "the abandoned run's write went through the shared gate ungated"
     )
 
-    # The live turn's session is exhausted by now, so its read either returns the
-    # finalize tail or ends the stream; both are a finished run.
-    with contextlib.suppress(StopAsyncIteration):
-        await live
-    await live_run.aclose()
+    # The live turn's session is exhausted by now, so the stream ends. It still
+    # owes the client a terminal event, even though no frame it carried was
+    # translatable.
+    await live
+    assert any("RUN_STARTED" in chunk for chunk in live_body)
     await abandoned_run.aclose()
     await _settle(
         lambda: conversation_worker_stats().active == 0,
