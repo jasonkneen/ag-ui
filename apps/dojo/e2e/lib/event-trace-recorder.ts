@@ -28,14 +28,16 @@ function toError(error: unknown) {
 
 export class EventTraceRecorder {
   private readonly settleMs: number;
+  private readonly settleTimeoutMs: number;
   private readonly streams: CapturedStream[] = [];
   private readonly active = new Set<Promise<void>>();
   private assertionCount = 0;
   private assertedStreamCount?: number;
   private overlap?: { firstUrl: string; secondUrl: string };
 
-  constructor(options: { settleMs?: number } = {}) {
+  constructor(options: { settleMs?: number; settleTimeoutMs?: number } = {}) {
     this.settleMs = options.settleMs ?? 100;
+    this.settleTimeoutMs = options.settleTimeoutMs ?? 10_000;
   }
 
   observeStream(stream: ObservedStream) {
@@ -71,13 +73,44 @@ export class EventTraceRecorder {
   }
 
   async settle() {
+    const deadline = Date.now() + this.settleTimeoutMs;
     let observedCount: number;
 
     do {
       observedCount = this.streams.length;
-      await Promise.all(this.active);
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(
+          `AG-UI response bodies did not settle within ${this.settleTimeoutMs}ms`,
+        );
+      }
+
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.all(this.active),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `AG-UI response bodies did not settle within ${this.settleTimeoutMs}ms`,
+                  ),
+                ),
+              remainingMs,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+
       if (this.settleMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, this.settleMs));
+        const settleDelayMs = Math.min(
+          this.settleMs,
+          Math.max(0, deadline - Date.now()),
+        );
+        await new Promise((resolve) => setTimeout(resolve, settleDelayMs));
       } else {
         await Promise.resolve();
       }
@@ -153,8 +186,8 @@ export class EventTraceRecorder {
   }
 
   async finalize(options: { testAlreadyFailed: boolean }) {
-    await this.settle();
     if (options.testAlreadyFailed) return;
+    await this.settle();
 
     const actual = this.readJourney();
     if (this.assertedStreamCount !== undefined) {

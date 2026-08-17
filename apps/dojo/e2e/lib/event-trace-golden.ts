@@ -15,11 +15,14 @@ export function defineEventTrace<const Golden extends EventTraceShape>(
   sourceUrl: string,
   golden: Golden,
 ): Golden {
+  const defined: { [journeyKey: string]: readonly TraceEvent[] } = {};
   for (const [journeyKey, journey] of Object.entries(golden)) {
-    destinations.set(journey, { sourceUrl, journeyKey });
+    const definedJourney = [...journey];
+    destinations.set(definedJourney, { sourceUrl, journeyKey });
+    defined[journeyKey] = definedJourney;
   }
 
-  return golden;
+  return defined as Golden;
 }
 
 export function getEventTraceDestination(

@@ -26,7 +26,7 @@ type RenderEventTraceOptions = {
   journeys: { readonly [journeyKey: string]: readonly TraceEvent[] };
 };
 
-type CandidateMismatch = {
+type TraceComparison = {
   sourceUrl: string;
   journeyKey: string;
   leftLane: string;
@@ -153,7 +153,7 @@ function eventTypeCounts(events: readonly TraceEvent[]) {
   return counts;
 }
 
-function formatEventTypeComparison(mismatch: CandidateMismatch) {
+function formatEventTypeComparison(mismatch: TraceComparison) {
   const leftCounts = eventTypeCounts(mismatch.leftEvents);
   const rightCounts = eventTypeCounts(mismatch.rightEvents);
   const types = [
@@ -205,61 +205,6 @@ function firstDifferentEventIndex(
   return commonLength;
 }
 
-function formatCandidateMismatch(mismatch: CandidateMismatch) {
-  const eventIndex = firstDifferentEventIndex(
-    mismatch.leftEvents,
-    mismatch.rightEvents,
-  );
-  const leftType = mismatch.leftEvents[eventIndex]?.type ?? "<end>";
-  const rightType = mismatch.rightEvents[eventIndex]?.type ?? "<end>";
-  const difference = findFirstDifference(
-    mismatch.leftEvents,
-    mismatch.rightEvents,
-    ["events"],
-  );
-
-  return [
-    `${formatDestination(mismatch.sourceUrl)}#${mismatch.journeyKey}`,
-    `  lanes: ${mismatch.leftLane} vs ${mismatch.rightLane}`,
-    `  events: ${mismatch.leftLane}=${mismatch.leftEvents.length}, ${mismatch.rightLane}=${mismatch.rightEvents.length}`,
-    `  ${formatEventTypeComparison(mismatch)}`,
-    `  event ${eventIndex}: ${leftType} vs ${rightType}`,
-    `  first difference: ${formatPath(difference?.path ?? ["events"])}`,
-    `    ${mismatch.leftLane}: ${formatValue(difference?.left)}`,
-    `    ${mismatch.rightLane}: ${formatValue(difference?.right)}`,
-  ].join("\n");
-}
-
-function compareLanes(left: string, right: string) {
-  const preferredOrder = ["typescript", "python"];
-  const leftIndex = preferredOrder.indexOf(left);
-  const rightIndex = preferredOrder.indexOf(right);
-  if (leftIndex !== -1 || rightIndex !== -1) {
-    if (leftIndex === -1) return 1;
-    if (rightIndex === -1) return -1;
-    return leftIndex - rightIndex;
-  }
-  return left.localeCompare(right);
-}
-
-export class EventTraceMismatchError extends Error {
-  constructor(mismatches: readonly CandidateMismatch[]) {
-    const pairWord =
-      mismatches.length === 1 ? "pair disagrees" : "pairs disagree";
-    super(
-      [
-        `Event trace mismatch: ${mismatches.length} lane ${pairWord}; no files were written.`,
-        "",
-        ...mismatches.flatMap((mismatch, index) => [
-          ...(index === 0 ? [] : [""]),
-          formatCandidateMismatch(mismatch),
-        ]),
-      ].join("\n"),
-    );
-    this.name = "EventTraceMismatchError";
-  }
-}
-
 export class EventTraceAssertionError extends Error {
   constructor(options: {
     actual: readonly TraceEvent[];
@@ -269,7 +214,7 @@ export class EventTraceAssertionError extends Error {
     const label = destination
       ? `${formatDestination(destination.sourceUrl)}#${destination.journeyKey}`
       : "<event trace>";
-    const mismatch: CandidateMismatch = {
+    const mismatch: TraceComparison = {
       sourceUrl: destination?.sourceUrl ?? label,
       journeyKey: destination?.journeyKey ?? "<unknown journey>",
       leftLane: "expected",
@@ -364,18 +309,17 @@ export async function writeEventTraceUpdateCandidate(options: {
 export function planEventTraceUpdates(
   candidates: readonly EventTraceUpdateCandidate[],
 ): EventTraceUpdate[] {
-  const byDestination = new Map<string, EventTraceUpdateCandidate[]>();
+  const byDestination = new Map<string, EventTraceUpdateCandidate>();
 
   for (const candidate of candidates) {
     const destination = `${candidate.sourceUrl}\0${candidate.journeyKey}`;
-    const matching = byDestination.get(destination) ?? [];
-    if (matching.some((existing) => existing.lane === candidate.lane)) {
+    const existing = byDestination.get(destination);
+    if (existing) {
       throw new Error(
-        `Duplicate ${candidate.lane} candidate for ${candidate.sourceUrl}#${candidate.journeyKey}`,
+        `Duplicate Event trace candidates for ${candidate.sourceUrl}#${candidate.journeyKey}: ${existing.lane} and ${candidate.lane}`,
       );
     }
-    matching.push(candidate);
-    byDestination.set(destination, matching);
+    byDestination.set(destination, candidate);
   }
 
   const bySource = new Map<
@@ -383,42 +327,17 @@ export function planEventTraceUpdates(
     { [journeyKey: string]: readonly TraceEvent[] }
   >();
 
-  const mismatches: CandidateMismatch[] = [];
-  const candidateGroups = [...byDestination.values()].sort((left, right) => {
-    const leftCandidate = left[0];
-    const rightCandidate = right[0];
-    if (!leftCandidate || !rightCandidate) return 0;
+  const orderedCandidates = [...byDestination.values()].sort((left, right) => {
     return (
-      leftCandidate.sourceUrl.localeCompare(rightCandidate.sourceUrl) ||
-      leftCandidate.journeyKey.localeCompare(rightCandidate.journeyKey)
+      left.sourceUrl.localeCompare(right.sourceUrl) ||
+      left.journeyKey.localeCompare(right.journeyKey)
     );
   });
 
-  for (const matching of candidateGroups) {
-    matching.sort((left, right) => compareLanes(left.lane, right.lane));
-    const [first, ...rest] = matching;
-    if (!first) continue;
-
-    for (const candidate of rest) {
-      if (!isDeepStrictEqual(first.events, candidate.events)) {
-        mismatches.push({
-          sourceUrl: first.sourceUrl,
-          journeyKey: first.journeyKey,
-          leftLane: first.lane,
-          leftEvents: first.events,
-          rightLane: candidate.lane,
-          rightEvents: candidate.events,
-        });
-      }
-    }
-
-    const journeys = bySource.get(first.sourceUrl) ?? {};
-    journeys[first.journeyKey] = first.events;
-    bySource.set(first.sourceUrl, journeys);
-  }
-
-  if (mismatches.length > 0) {
-    throw new EventTraceMismatchError(mismatches);
+  for (const candidate of orderedCandidates) {
+    const journeys = bySource.get(candidate.sourceUrl) ?? {};
+    journeys[candidate.journeyKey] = candidate.events;
+    bySource.set(candidate.sourceUrl, journeys);
   }
 
   return [...bySource.entries()]

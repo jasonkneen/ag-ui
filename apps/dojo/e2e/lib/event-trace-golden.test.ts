@@ -20,3 +20,20 @@ test("associates each plain journey array with its generated destination", () =>
     journeyKey: "retainsMemory",
   });
 });
+
+test("keeps distinct destinations when compact goldens reuse one journey array", () => {
+  const sharedJourney = [{ type: "RUN_STARTED" }] as const;
+  const golden = defineEventTrace("file:///a2uiRecovery.event-trace.ts", {
+    staysUsable: sharedJourney,
+    showsHardFailure: sharedJourney,
+  });
+
+  assert.deepEqual(getEventTraceDestination(golden.staysUsable), {
+    sourceUrl: "file:///a2uiRecovery.event-trace.ts",
+    journeyKey: "staysUsable",
+  });
+  assert.deepEqual(getEventTraceDestination(golden.showsHardFailure), {
+    sourceUrl: "file:///a2uiRecovery.event-trace.ts",
+    journeyKey: "showsHardFailure",
+  });
+});

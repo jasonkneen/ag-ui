@@ -28,6 +28,23 @@ test("parses every ordered non-RAW event without deduplicating snapshots", () =>
   );
 });
 
+test("ignores empty SSE data frames", () => {
+  const events = parseEventTraceSse(
+    [
+      "data:",
+      "",
+      "data:   ",
+      "",
+      "data",
+      "",
+      'data: {"type":"RUN_STARTED"}',
+      "",
+    ].join("\n"),
+  );
+
+  assert.deepEqual(events, [{ type: "RUN_STARTED" }]);
+});
+
 test("normalizes generated identities while retaining their relationships", () => {
   const normalized = normalizeEventTrace([
     {
@@ -101,6 +118,8 @@ test("normalizes LangGraph and model identities only in captured test traces", (
             langgraph_request_id: requestId,
             parent_ids: [runId, requestId],
             langgraph_api_url: "http://127.0.0.1:8985",
+            langgraph_version: "1.3.0",
+            langgraph_api_version: "0.7.96",
             graph_id: "semantic-agent-id",
             langgraph_checkpoint_ns: `agent:${checkpointId}:tools`,
             checkpoint_ns: checkpointId,
@@ -146,6 +165,8 @@ test("normalizes LangGraph and model identities only in captured test traces", (
             langgraph_request_id: "id-5",
             parent_ids: ["id-2", "id-5"],
             langgraph_api_url: "<langgraph-api-url>",
+            langgraph_version: "<langgraph-version>",
+            langgraph_api_version: "<langgraph-api-version>",
             graph_id: "semantic-agent-id",
             langgraph_checkpoint_ns: "agent:id-6:tools",
             checkpoint_ns: "id-6",

@@ -21,7 +21,6 @@ import {
 import { isTraceEvent, type TraceEvent } from "../lib/event-trace-events";
 import { getEventTraceDestination } from "../lib/event-trace-golden";
 import {
-  EventTraceMismatchError,
   type EventTraceUpdateCandidate,
   planEventTraceUpdates,
   renderEventTraceModule,
@@ -244,7 +243,11 @@ async function main() {
     runLane(lane, target);
   }
   if (ranLanes.length === 0) {
-    throw new Error(`No matching LangGraph spec found for ${options.spec}`);
+    throw new Error(
+      options.spec
+        ? `No matching LangGraph spec found for ${options.spec}`
+        : "No LangGraph Event trace test directories were found",
+    );
   }
 
   const candidates = await readCandidates();
@@ -304,14 +307,4 @@ async function main() {
   );
 }
 
-try {
-  await main();
-} catch (error) {
-  if (!(error instanceof EventTraceMismatchError)) throw error;
-
-  console.error(`\n${error.message}\n`);
-  console.error(
-    `Full normalized candidates remain in ${relative(e2eRoot, stagingDirectory)}/`,
-  );
-  process.exitCode = 1;
-}
+await main();

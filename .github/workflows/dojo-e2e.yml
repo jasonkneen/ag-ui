@@ -115,6 +115,10 @@ jobs:
         working-directory: apps/dojo/e2e
         run: pnpm test:event-trace-unit
 
+      - name: Type-check event trace harness
+        working-directory: apps/dojo/e2e
+        run: pnpm check:event-trace-types
+
   dojo:
     name: dojo / ${{ matrix.suite }}
     needs: check-generated-files

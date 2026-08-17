@@ -75,126 +75,26 @@ test("writes update candidates only to the requested staging directory", async (
   }
 });
 
-test("pairs identical language candidates by golden destination", () => {
+test("rejects multiple candidates for one golden destination", () => {
   const events = [{ type: "RUN_STARTED", threadId: "id-1" }];
-  const updates = planEventTraceUpdates([
-    {
-      lane: "typescript",
-      sourceUrl: "file:///repo/agenticChatPage.event-trace.ts",
-      journeyKey: "sendsAndReceivesMessage",
-      events,
-    },
-    {
-      lane: "python",
-      sourceUrl: "file:///repo/agenticChatPage.event-trace.ts",
-      journeyKey: "sendsAndReceivesMessage",
-      events,
-    },
-  ]);
-
-  assert.deepEqual(updates, [
-    {
-      sourceUrl: "file:///repo/agenticChatPage.event-trace.ts",
-      journeys: { sendsAndReceivesMessage: events },
-    },
-  ]);
-});
-
-test("reports every language mismatch with bounded structural evidence", () => {
-  const typescriptContent = `typescript-${"x".repeat(300)}`;
-  const pythonContent = `python-${"y".repeat(300)}`;
-  const sourceUrl =
-    "file:///repo/apps/dojo/e2e/tests/langgraphTypescriptTests/agenticChatPage.event-trace.ts";
 
   assert.throws(
     () =>
       planEventTraceUpdates([
         {
           lane: "typescript",
-          sourceUrl,
-          journeyKey: "changesBackground",
-          events: [
-            { type: "RUN_STARTED" },
-            {
-              type: "STATE_SNAPSHOT",
-              snapshot: { messages: [{ content: typescriptContent }] },
-            },
-          ],
+          sourceUrl: "file:///repo/agenticChatPage.event-trace.ts",
+          journeyKey: "sendsAndReceivesMessage",
+          events,
         },
         {
           lane: "python",
-          sourceUrl,
-          journeyKey: "changesBackground",
-          events: [
-            { type: "RUN_STARTED" },
-            {
-              type: "STATE_SNAPSHOT",
-              snapshot: { messages: [{ content: pythonContent }] },
-            },
-          ],
-        },
-        {
-          lane: "typescript",
-          sourceUrl,
-          journeyKey: "retainsMemory",
-          events: [{ type: "RUN_STARTED" }],
-        },
-        {
-          lane: "python",
-          sourceUrl,
-          journeyKey: "retainsMemory",
-          events: [
-            { type: "RUN_STARTED" },
-            { type: "MESSAGES_SNAPSHOT", messages: [] },
-            { type: "RUN_FINISHED" },
-          ],
+          sourceUrl: "file:///repo/agenticChatPage.event-trace.ts",
+          journeyKey: "sendsAndReceivesMessage",
+          events,
         },
       ]),
-    (error) => {
-      assert.ok(error instanceof Error);
-      assert.match(
-        error.message,
-        /Event trace mismatch: 2 lane pairs disagree; no files were written\./,
-      );
-
-      assert.match(
-        error.message,
-        /tests\/langgraphTypescriptTests\/agenticChatPage\.event-trace\.ts#changesBackground/,
-      );
-      assert.match(error.message, /lanes: typescript vs python/);
-      assert.match(error.message, /events: typescript=2, python=2/);
-      assert.match(
-        error.message,
-        /event type counts: identical across 2 types/,
-      );
-      assert.match(error.message, /event 1: STATE_SNAPSHOT vs STATE_SNAPSHOT/);
-      assert.match(
-        error.message,
-        /first difference: events\[1\]\.snapshot\.messages\[0\]\.content/,
-      );
-      assert.match(error.message, /typescript: "typescript-x+/);
-      assert.match(error.message, /python: "python-y+/);
-      assert.match(error.message, /… \d+ chars omitted/);
-
-      assert.match(
-        error.message,
-        /tests\/langgraphTypescriptTests\/agenticChatPage\.event-trace\.ts#retainsMemory/,
-      );
-      assert.match(error.message, /events: typescript=1, python=3/);
-      assert.match(
-        error.message,
-        /event type differences:\n    MESSAGES_SNAPSHOT: typescript=0, python=1\n    RUN_FINISHED: typescript=0, python=1/,
-      );
-      assert.match(error.message, /event 1: <end> vs MESSAGES_SNAPSHOT/);
-      assert.match(error.message, /first difference: events\[1\]/);
-      assert.match(error.message, /typescript: <missing>/);
-      assert.match(
-        error.message,
-        /python: \{"type":"MESSAGES_SNAPSHOT","messages":\[\]\}/,
-      );
-      assert.ok(error.message.length < 2_500);
-      return true;
-    },
+    /Duplicate Event trace candidates.*typescript and python/,
   );
 });
 

@@ -57,6 +57,8 @@ const FORWARDED_HEADER_TOKENS = new Map([
 ]);
 const ENVIRONMENT_VALUE_TOKENS = new Map([
   ["langgraph_api_url", "<langgraph-api-url>"],
+  ["langgraph_version", "<langgraph-version>"],
+  ["langgraph_api_version", "<langgraph-api-version>"],
 ]);
 const APP_CONTEXT_PREFIX = "App Context:\n";
 
@@ -110,9 +112,12 @@ export function parseEventTraceSse(body: string): TraceEvent[] {
   const flushFrame = () => {
     if (dataLines.length === 0) return;
 
-    const event = parseDataFrame(dataLines.join("\n"), body, frameIndex);
-    if (event.type !== "RAW") events.push(event);
+    const data = dataLines.join("\n");
     dataLines = [];
+    if (data.trim().length === 0) return;
+
+    const event = parseDataFrame(data, body, frameIndex);
+    if (event.type !== "RAW") events.push(event);
     frameIndex += 1;
   };
 

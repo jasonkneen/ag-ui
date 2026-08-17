@@ -62,6 +62,41 @@ test("reports an unasserted journey only when the test would otherwise pass", as
   await failedTestRecorder.finalize({ testAlreadyFailed: true });
 });
 
+test("does not wait for a pending SSE body after the test already failed", async () => {
+  const recorder = new EventTraceRecorder({ settleMs: 0 });
+  recorder.observeStream({
+    url: "http://dojo.test/api/copilotkit/hung",
+    body: new Promise(() => {}),
+  });
+
+  const result = await Promise.race([
+    recorder
+      .finalize({ testAlreadyFailed: true })
+      .then(() => "finalized" as const),
+    new Promise<"timed-out">((resolve) =>
+      setTimeout(() => resolve("timed-out"), 25),
+    ),
+  ]);
+
+  assert.equal(result, "finalized");
+});
+
+test("fails clearly when an SSE body does not settle before the deadline", async () => {
+  const recorder = new EventTraceRecorder({
+    settleMs: 0,
+    settleTimeoutMs: 10,
+  });
+  recorder.observeStream({
+    url: "http://dojo.test/api/copilotkit/hung",
+    body: new Promise(() => {}),
+  });
+
+  await assert.rejects(
+    recorder.settle(),
+    /AG-UI response bodies did not settle within 10ms/,
+  );
+});
+
 test("rejects a second journey assertion in one test", async () => {
   const recorder = new EventTraceRecorder({ settleMs: 0 });
   recorder.observeStream({
