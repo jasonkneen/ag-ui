@@ -137,6 +137,9 @@ public static class AGUIChatMessageExtensions
                         case AGUITextInputContent textInput:
                             contents.Add(new TextContent(textInput.Text));
                             break;
+                        case AGUIMediaInputContent mediaInput:
+                            contents.Add(ConvertMediaInputContent(mediaInput));
+                            break;
                         case AGUIBinaryInputContent binaryInput:
                             if (binaryInput.Url is not null)
                             {
@@ -204,6 +207,53 @@ public static class AGUIChatMessageExtensions
             yield return WithSubagentRunId(
                 new ChatMessage(ChatRole.Assistant, pendingToolCallContents) { MessageId = pendingToolCallId },
                 pendingToolCallSubagentRunId);
+        }
+    }
+
+    private static AIContent ConvertMediaInputContent(AGUIMediaInputContent mediaInput)
+    {
+        AIContent content = mediaInput.Source switch
+        {
+            AGUIInputContentDataSource dataSource =>
+                new DataContent(Convert.FromBase64String(dataSource.Value), dataSource.MimeType),
+            AGUIInputContentUrlSource urlSource =>
+                new UriContent(new Uri(urlSource.Value, UriKind.RelativeOrAbsolute), urlSource.MimeType),
+            _ => throw new NotSupportedException(
+                $"Input content source type '{mediaInput.Source?.Type ?? "<null>"}' is not supported.")
+        };
+
+        ApplyMediaMetadata(content, mediaInput.Metadata);
+        return content;
+    }
+
+    private static void ApplyMediaMetadata(AIContent content, JsonElement? metadata)
+    {
+        if (metadata is not { } value)
+        {
+            return;
+        }
+
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in value.EnumerateObject())
+            {
+                content.AdditionalProperties ??= new AdditionalPropertiesDictionary();
+                content.AdditionalProperties[property.Name] = property.Value.Clone();
+
+                if (content is DataContent dataContent &&
+                    property.NameEquals("filename") &&
+                    property.Value.ValueKind == JsonValueKind.String)
+                {
+                    dataContent.Name = property.Value.GetString();
+                }
+            }
+        }
+        else
+        {
+            content.AdditionalProperties = new AdditionalPropertiesDictionary
+            {
+                ["metadata"] = value.Clone()
+            };
         }
     }
 
