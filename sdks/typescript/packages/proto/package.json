@@ -21,6 +21,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "lint": "eslint \"src/**/*.ts*\"",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "clean": "git clean -fdX --exclude=\"!.env\"",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
