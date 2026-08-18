@@ -6,9 +6,11 @@ Translates Strands streaming events into the AG-UI event protocol.
 import asyncio
 import base64
 import hashlib
+import functools
 import inspect
 import json
 import logging
+import types
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Tuple
@@ -852,6 +854,9 @@ MULTIAGENT_HANDOFF = "multiagent_handoff"
 MULTIAGENT_NODE_CANCEL = "multiagent_node_cancel"
 MULTIAGENT_NODE_INTERRUPT = "multiagent_node_interrupt"
 
+# Depth cap for unwrapping nested orchestrator node streams.
+_MAX_MULTIAGENT_NESTING = 10
+
 # AG-UI CUSTOM event names carrying multi-agent lifecycle detail that has no
 # first-class protocol event. Frontends match these strings exactly.
 CUSTOM_MULTIAGENT_HANDOFF = "MultiAgentHandoff"
@@ -860,29 +865,117 @@ CUSTOM_MULTIAGENT_NODE_INTERRUPT = "MultiAgentNodeInterrupt"
 CUSTOM_MULTIAGENT_NODE_STATUS = "MultiAgentNodeStatus"
 
 
-def _multiagent_flatten_content(content: Any) -> str:
-    """Text view of AG-UI message content for an orchestrator task string.
+# Guard key used when one orchestrator instance is shared by every run, so any
+# overlap is refused rather than only a same-thread one.
+_SHARED_ORCHESTRATOR_RUN_KEY = "\x00shared-orchestrator"
 
-    Orchestrators take `str | list[ContentBlock]`, so a multimodal or
-    block-list message has to be flattened rather than stringified: `str()` on
-    a list yields a Python repr, which would reach the model verbatim.
-    Mirrors the TypeScript adapter's `flattenContentToText`.
+
+def _busy_scope(key: str) -> str:
+    """Human-readable description of what the busy guard is protecting."""
+    if key == _SHARED_ORCHESTRATOR_RUN_KEY:
+        return "this orchestrator, which is shared by every thread"
+    return f'thread "{key}"'
+
+
+def _is_orchestrator(candidate: Any) -> bool:
+    """Whether an object is a Strands multi-agent orchestrator.
+
+    A Graph or Swarm has no ``model`` (a real Agent always resolves one), owns
+    a ``nodes`` collection, and streams through ``stream_async``. All three are
+    required: a modelless object that is not an orchestrator would otherwise be
+    driven down this path and produce a silent empty run.
     """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-                continue
-            text = getattr(block, "text", None)
-            if text is None and isinstance(block, dict):
-                text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-        return "".join(parts)
-    return _coerce_text(content)
+    return (
+        getattr(candidate, "model", None) is None
+        and getattr(candidate, "nodes", None) is not None
+        and callable(getattr(candidate, "stream_async", None))
+    )
+
+
+def _is_orchestrator_factory(candidate: Any) -> bool:
+    """Whether ``agent`` is a callable that builds an orchestrator per run.
+
+    Callability alone is not enough to tell a factory from an agent: a Strands
+    ``Agent`` is callable too, and so is a test double. A factory is therefore
+    required to be a plain function, method or ``functools.partial``, which an
+    agent instance never is.
+    """
+    if _is_orchestrator(candidate):
+        return False
+    return isinstance(
+        candidate,
+        (
+            types.FunctionType,
+            types.MethodType,
+            types.BuiltinFunctionType,
+            functools.partial,
+        ),
+    )
+
+
+def _snapshot_orchestrator_nodes(orchestrator: Any) -> "Dict[str, list] | None":
+    """Copy each node agent's conversation so a run can be undone.
+
+    A Python Graph does not snapshot and restore its node agents around an
+    execution, so a reused instance carries one run's messages into the next.
+    Returns None when the shape is not recognised, in which case the caller
+    warns rather than silently assuming isolation.
+    """
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return None
+    snapshot: Dict[str, list] = {}
+    for node_id, node in nodes.items():
+        executor = getattr(node, "executor", None)
+        messages = getattr(executor, "messages", None)
+        if not isinstance(messages, list):
+            return None
+        snapshot[str(node_id)] = list(messages)
+    return snapshot
+
+
+def _restore_orchestrator_nodes(
+    orchestrator: Any, snapshot: "Dict[str, list] | None"
+) -> None:
+    """Put each node agent's conversation back to its pre-run state."""
+    if snapshot is None:
+        return
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return
+    for node_id, node in nodes.items():
+        messages = snapshot.get(str(node_id))
+        executor = getattr(node, "executor", None)
+        current = getattr(executor, "messages", None)
+        if messages is None or not isinstance(current, list):
+            continue
+        current[:] = messages
+
+
+def _unwrap_multiagent_node_stream(
+    event: Dict[str, Any],
+) -> "Tuple[str, Dict[str, Any] | None]":
+    """Innermost agent event of a node-stream wrapper, and the node it came from.
+
+    A nested Graph or Swarm wraps its own node-stream event inside the outer
+    one, so a single unwrap yields another wrapper rather than the agent event.
+    The OUTER node id is kept: that is the node the run has a step open for, so
+    the text envelope closes with its step rather than being swept at the end.
+    """
+    node_id = event.get("node_id", "unknown")
+    inner = event.get("event")
+    # Bounded so a malformed or self-referential payload cannot spin here.
+    for _ in range(_MAX_MULTIAGENT_NESTING):
+        if not isinstance(inner, dict):
+            return node_id, None
+        if inner.get("type") != MULTIAGENT_NODE_STREAM:
+            return node_id, inner
+        inner = inner.get("event")
+    logger.warning(
+        "multi-agent node stream nested deeper than %d levels; dropping event",
+        _MAX_MULTIAGENT_NESTING,
+    )
+    return node_id, None
 
 
 def _json_safe(value: Any) -> Any:
@@ -1208,13 +1301,34 @@ class StrandsAgent:
         # Probing attributes rather than importing ``strands.multiagent``
         # matters because a deprecation shim can keep the import working after
         # the symbol has moved.
-        self._orchestrator = (
-            agent
-            if getattr(agent, "model", None) is None
-            and getattr(agent, "nodes", None) is not None
-            and callable(getattr(agent, "stream_async", None))
-            else None
-        )
+        # A callable is treated as a factory: it is invoked per run, so each
+        # run gets its own orchestrator and nothing can carry between them.
+        # This is the safe way to wrap a Graph or Swarm.
+        self._orchestrator_factory = agent if _is_orchestrator_factory(agent) else None
+        if self._orchestrator_factory is not None:
+            self._orchestrator = self._orchestrator_factory()
+            if not _is_orchestrator(self._orchestrator):
+                raise TypeError(
+                    "The callable passed as `agent` did not return a Strands "
+                    "orchestrator (an object with `nodes` and `stream_async` "
+                    f"and no `model`); got {type(self._orchestrator).__name__}."
+                )
+        else:
+            self._orchestrator = agent if _is_orchestrator(agent) else None
+
+        # A shared instance is reused across runs, so its node conversations
+        # are snapshotted and restored around each one. Warn when that is not
+        # possible rather than letting one run's history reach the next.
+        self._orchestrator_reusable = True
+        if self._orchestrator is not None and self._orchestrator_factory is None:
+            if _snapshot_orchestrator_nodes(self._orchestrator) is None:
+                self._orchestrator_reusable = False
+                logger.warning(
+                    "A multi-agent orchestrator was passed directly and its "
+                    "node conversations cannot be snapshotted, so history may "
+                    "carry between runs and between threads. Pass a callable "
+                    "that builds and returns a fresh orchestrator instead."
+                )
 
         # Store template agent configuration for creating fresh instances.
         # Orchestrators are invoked directly, so there is no template to clone.
@@ -1303,6 +1417,51 @@ class StrandsAgent:
             behavior and behavior.skip_messages_snapshot
         )
 
+    def _orchestrator_resume_prompt(
+        self, input_data: RunAgentInput, thread_id: str
+    ) -> "List[Dict[str, Any]] | None":
+        """Response blocks for an orchestrator parked at an interrupt.
+
+        Returns None when this run is not a resume, in which case the caller
+        builds an ordinary task string. Entries whose interrupt this thread
+        never raised are ignored, so a stale or invented id cannot wedge the
+        orchestrator by resuming it with something it is not waiting for.
+        """
+        resume_entries = list(getattr(input_data, "resume", None) or [])
+        if not resume_entries:
+            return None
+
+        pending = self._pending_interrupts_by_thread.get(thread_id, {})
+        responses: List[Dict[str, Any]] = []
+        for entry in resume_entries:
+            interrupt_id = getattr(entry, "interrupt_id", None)
+            # Strictly: an empty pending map means this thread has nothing
+            # parked, so every id is stale. Being lenient there let a stale id
+            # through and wedged the orchestrator, which is the failure this
+            # check exists to prevent.
+            if interrupt_id is None or interrupt_id not in pending:
+                logger.warning(
+                    "Ignoring resume for interrupt %r: this thread has no such "
+                    "pending interrupt.",
+                    interrupt_id,
+                )
+                continue
+            responses.append(
+                {
+                    "interruptResponse": {
+                        "interruptId": interrupt_id,
+                        # Always a truthy envelope: Strands' resume gate is
+                        # truthiness-based, so a falsy payload re-raises the
+                        # same interrupt forever.
+                        "response": _wrap_resume_response(
+                            getattr(entry, "status", "resolved"),
+                            getattr(entry, "payload", None),
+                        ),
+                    }
+                }
+            )
+        return responses or None
+
     async def _run_orchestrator(
         self, input_data: RunAgentInput
     ) -> AsyncIterator[Any]:
@@ -1326,6 +1485,9 @@ class StrandsAgent:
         # message id would interleave two nodes into one envelope and close it
         # when whichever finished first stopped.
         nodes = _MultiAgentNodeStreams()
+        # Native interrupts raised during this run, reported on RUN_FINISHED so
+        # the client knows the run paused rather than completed.
+        native_interrupts: List[Any] = []
         # node_id -> step name, so STEP_FINISHED reuses the node_type that only
         # the start event carries, and so any step left open by a terminal
         # interrupt is still closed before RUN_FINISHED.
@@ -1341,17 +1503,37 @@ class StrandsAgent:
                     },
                 )
 
-            # Orchestrators take a task string (MultiAgentInput); use the text
-            # of the last user or tool turn.
-            prompt = "Hello"
-            for message in reversed(input_data.messages or []):
-                role = getattr(message, "role", None)
-                content = getattr(message, "content", None)
-                if role in ("user", "tool") and content is not None:
-                    prompt = _multiagent_flatten_content(content)
-                    break
+            # A run that resumes an interrupt must hand Strands its response
+            # blocks, not a task string: the orchestrator is parked at a
+            # checkpoint and rejects a string outright. Getting this wrong
+            # leaves the orchestrator interrupted forever, so every later run
+            # fails too.
+            thread_id = input_data.thread_id or "default"
+            resume_prompt = self._orchestrator_resume_prompt(input_data, thread_id)
 
-            stream = self._orchestrator.stream_async(prompt)
+            if resume_prompt is not None:
+                prompt: Any = resume_prompt
+            else:
+                # Orchestrators take a task string (MultiAgentInput); use the
+                # text of the last user or tool turn.
+                prompt = "Hello"
+                for message in reversed(input_data.messages or []):
+                    role = getattr(message, "role", None)
+                    content = getattr(message, "content", None)
+                    if role in ("user", "tool") and content is not None:
+                        prompt = flatten_content_to_text(content)
+                        break
+
+            if self._orchestrator_factory is not None:
+                # Fresh per run: nothing can carry from a previous run, and two
+                # runs never touch the same instance.
+                orchestrator = self._orchestrator_factory()
+                node_snapshot = None
+            else:
+                orchestrator = self._orchestrator
+                node_snapshot = _snapshot_orchestrator_nodes(orchestrator)
+
+            stream = orchestrator.stream_async(prompt)
             try:
                 async for event in stream:
                     if not isinstance(event, dict):
@@ -1419,6 +1601,10 @@ class StrandsAgent:
                         )
 
                     elif event_type == MULTIAGENT_NODE_INTERRUPT:
+                        raw = event.get("interrupts")
+                        native_interrupts.extend(
+                            raw if isinstance(raw, (list, tuple)) else []
+                        )
                         yield CustomEvent(
                             type=EventType.CUSTOM,
                             name=CUSTOM_MULTIAGENT_NODE_INTERRUPT,
@@ -1426,12 +1612,13 @@ class StrandsAgent:
                         )
 
                     elif event_type == MULTIAGENT_NODE_STREAM:
-                        # The nested value is the wrapped agent's own event, in
-                        # the same shape the single-agent loop consumes.
-                        inner = event.get("event")
-                        if not isinstance(inner, dict):
+                        # A Graph or Swarm can itself be a node, in which case
+                        # the payload is another node-stream wrapper rather
+                        # than the agent event. Unwrap to the innermost one, or
+                        # a nested orchestrator streams nothing at all.
+                        node_id, inner = _unwrap_multiagent_node_stream(event)
+                        if inner is None:
                             continue
-                        node_id = event.get("node_id", "unknown")
                         if inner.get("data"):
                             for text_event in nodes.text(node_id, inner["data"]):
                                 yield text_event
@@ -1451,14 +1638,34 @@ class StrandsAgent:
                         logger.debug(
                             "orchestrator stream teardown failed", exc_info=True
                         )
+                # Undo this run's additions to a reused instance, so the next
+                # run (and the next user) starts from the same state this one
+                # did.
+                _restore_orchestrator_nodes(orchestrator, node_snapshot)
 
             for closing in _close_open_multiagent(nodes, open_steps):
                 yield closing
+
+            outcome = None
+            if native_interrupts:
+                ag_ui_interrupts = [
+                    _strands_interrupt_to_agui(interrupt)
+                    for interrupt in native_interrupts
+                ]
+                outcome = RunFinishedInterruptOutcome(
+                    type="interrupt", interrupts=ag_ui_interrupts
+                )
+                self._pending_interrupts_by_thread[thread_id] = {
+                    interrupt.id: interrupt for interrupt in ag_ui_interrupts
+                }
+            else:
+                self._pending_interrupts_by_thread.pop(thread_id, None)
 
             yield RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
                 thread_id=input_data.thread_id,
                 run_id=input_data.run_id,
+                outcome=outcome,
             )
         except Exception as e:
             code = (
@@ -1485,11 +1692,15 @@ class StrandsAgent:
             # node agents are not safe to invoke concurrently, so overlapping
             # runs either clobber that state or surface a raw SDK error with a
             # half-drawn pipeline behind it. Reject the collision up front with
-            # the protocol-shaped code the TypeScript adapter uses. Note this
-            # guards one thread; a caller sharing a single long-lived
-            # orchestrator across threads has to build one per run instead
-            # (which is what the multi-agent example does).
-            orchestrator_thread = input_data.thread_id or "default"
+            # the protocol-shaped code the TypeScript adapter uses.
+            # A factory builds a fresh orchestrator per run, so only the same
+            # thread can collide. A shared instance cannot be multiplexed at
+            # all, so ANY overlapping run is refused, whatever its thread.
+            orchestrator_thread = (
+                (input_data.thread_id or "default")
+                if self._orchestrator_factory is not None
+                else _SHARED_ORCHESTRATOR_RUN_KEY
+            )
             if orchestrator_thread in self._active_orchestrator_runs:
                 yield RunStartedEvent(
                     type=EventType.RUN_STARTED,
@@ -1499,9 +1710,9 @@ class StrandsAgent:
                 yield RunErrorEvent(
                     type=EventType.RUN_ERROR,
                     message=(
-                        f'Another run is already in progress on thread '
-                        f'"{orchestrator_thread}". Wait for RUN_FINISHED before '
-                        "starting a new run on the same thread."
+                        "Another run is already in progress on "
+                        f"{_busy_scope(orchestrator_thread)}. Wait for "
+                        "RUN_FINISHED before starting another."
                     ),
                     code="THREAD_BUSY",
                 )

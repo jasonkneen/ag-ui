@@ -51,12 +51,11 @@ WRITER_PROMPT = """
 def _build_graph():
     """Build a fresh Graph with fresh node agents.
 
-    Deliberately not a module-level singleton, for two reasons. A Python
-    Strands Graph does not snapshot and restore its node agents around an
-    execution, so reusing one carries every previous run's messages into the
-    next: each agent's history grows without bound and one user's topic
-    reaches another user's run. And a graph holds execution state on the
-    instance, so two concurrent visitors sharing one would interfere.
+    Passed to the adapter as a factory rather than as a built instance. A
+    Python Strands Graph does not snapshot and restore its node agents around
+    an execution, and it holds execution state on the instance, so one graph
+    shared across runs would carry a previous run's messages into the next and
+    would make two concurrent visitors interfere.
     """
     researcher = Agent(
         model=model,
@@ -87,37 +86,10 @@ def _build_graph():
     return builder.build()
 
 
-class PerRunGraph:
-    """Orchestrator that builds a fresh Graph for each run.
-
-    The adapter detects an orchestrator structurally and drives whatever
-    ``stream_async`` it is given, so this stands in for a Graph while keeping
-    runs isolated from one another.
-    """
-
-    def __init__(self):
-        self.id = "multi_agent_graph"
-        # The adapter detects an orchestrator by its shape: no model, a nodes
-        # collection, and stream_async. A representative graph supplies the
-        # node ids without holding any per-run state.
-        self.nodes = dict(_build_graph().nodes)
-
-    async def stream_async(self, task, invocation_state=None, **kwargs):
-        stream = _build_graph().stream_async(
-            task, invocation_state=invocation_state, **kwargs
-        )
-        # Closed explicitly: a bare `async for` relay leaves the inner stream
-        # suspended until garbage collection, so the adapter's teardown on
-        # client disconnect would not actually stop the graph.
-        try:
-            async for event in stream:
-                yield event
-        finally:
-            await stream.aclose()
-
-
 agui_agent = StrandsAgent(
-    agent=PerRunGraph(),
+    # A callable, not an instance: the adapter invokes it per run, so no run
+    # can see another's conversation and two visitors never share a graph.
+    agent=_build_graph,
     name="multi_agent",
     description="Strands Graph of researcher, analyst and writer agents",
 )

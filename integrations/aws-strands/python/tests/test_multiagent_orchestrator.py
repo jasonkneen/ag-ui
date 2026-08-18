@@ -546,7 +546,9 @@ async def test_list_content_is_flattened_not_repr_ed():
             messages=[
                 FakeMessage(
                     "user",
-                    [{"type": "text", "text": "summarise "}, {"type": "text", "text": "this"}],
+                    # Neither block ends in whitespace, so a missing separator
+                    # would show up as "summarisethis".
+                    [{"type": "text", "text": "summarise"}, {"type": "text", "text": "this"}],
                 )
             ]
         ),
@@ -939,3 +941,292 @@ async def test_real_swarm_streams_through_the_adapter():
         e.delta for e in events if e.type == EventType.TEXT_MESSAGE_CONTENT
     )
     assert "Only node speaks." in text
+
+
+# ---------------------------------------------------------------------------
+# Per-run isolation of a caller-supplied orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _real_two_node_graph():
+    from strands import Agent
+    from strands.multiagent import GraphBuilder
+
+    first = Agent(model=ScriptedModel("A."), name="first", callback_handler=None)
+    second = Agent(model=ScriptedModel("B."), name="second", callback_handler=None)
+    builder = GraphBuilder()
+    builder.add_node(first, "first")
+    builder.add_node(second, "second")
+    builder.add_edge("first", "second")
+    builder.set_entry_point("first")
+    return builder.build(), first
+
+
+def _texts_seen_by(agent) -> list:
+    return [
+        block["text"]
+        for message in agent.messages
+        for block in (message.get("content") or [])
+        if isinstance(block, dict) and "text" in block
+    ]
+
+
+@pytest.mark.asyncio
+async def test_directly_wrapped_graph_does_not_leak_between_threads():
+    # A Python Graph does not snapshot its node agents around an execution, so
+    # a reused instance would carry one thread's turns into the next one's
+    # model input. The adapter has to undo each run itself.
+    graph, first = _real_two_node_graph()
+    agent = StrandsAgent(graph, name="multi_agent")
+
+    for thread, message in (("thread-a", "SECRET_ALPHA"), ("thread-b", "PUBLIC_BETA")):
+        run_input = FakeInput(messages=[FakeMessage("user", message)])
+        run_input.thread_id = thread
+        await collect(agent, run_input)
+
+    assert "SECRET_ALPHA" not in _texts_seen_by(first)
+    assert _texts_seen_by(first) == []
+
+
+@pytest.mark.asyncio
+async def test_shared_orchestrator_refuses_overlap_on_any_thread():
+    # One instance cannot be multiplexed, so a second concurrent run is
+    # refused even when it belongs to a different thread.
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class ParkedGraph:
+        nodes: dict = {}
+
+        async def stream_async(self, task, invocation_state=None, **kwargs):
+            started.set()
+            await release.wait()
+            yield {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"}
+
+    agent = StrandsAgent(ParkedGraph(), name="test")
+
+    first_input = FakeInput()
+    first_input.thread_id = "thread-a"
+    task = asyncio.create_task(_drain(agent.run(first_input)))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    other_input = FakeInput()
+    other_input.thread_id = "thread-b"
+    second = await asyncio.wait_for(_drain(agent.run(other_input)), timeout=5)
+    release.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert [e.type for e in second] == [
+        EventType.RUN_STARTED,
+        EventType.RUN_ERROR,
+    ]
+    assert second[-1].code == "THREAD_BUSY"
+
+
+@pytest.mark.asyncio
+async def test_a_factory_builds_a_fresh_orchestrator_per_run():
+    built = []
+
+    def build():
+        orchestrator = FakeOrchestrator(
+            [{"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+             {"type": "multiagent_node_stop", "node_id": "a"}]
+        )
+        built.append(orchestrator)
+        return orchestrator
+
+    agent = StrandsAgent(build, name="multi_agent")
+    await collect(agent)
+    await collect(agent)
+
+    # One at construction to validate the factory, then one per run.
+    assert len(built) == 3
+    assert built[1] is not built[2]
+
+
+@pytest.mark.asyncio
+async def test_a_factory_returning_the_wrong_thing_fails_at_construction():
+    with pytest.raises(TypeError, match="did not return a Strands orchestrator"):
+        StrandsAgent(lambda: object(), name="multi_agent")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_are_allowed_when_each_builds_its_own_graph():
+    def build():
+        return FakeOrchestrator(
+            [{"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+             {"type": "multiagent_node_stop", "node_id": "a"}]
+        )
+
+    agent = StrandsAgent(build, name="multi_agent")
+
+    first_input = FakeInput()
+    first_input.thread_id = "thread-a"
+    other_input = FakeInput()
+    other_input.thread_id = "thread-b"
+    both = await asyncio.gather(
+        _drain(agent.run(first_input)), _drain(agent.run(other_input))
+    )
+
+    for events in both:
+        assert [e.type for e in events][-1] == EventType.RUN_FINISHED
+        assert EventType.RUN_ERROR not in [e.type for e in events]
+
+
+# ---------------------------------------------------------------------------
+# Nested orchestrators
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nested_orchestrator_node_still_streams_its_text():
+    # A Graph or Swarm can be a graph node, in which case its events arrive
+    # wrapped twice. Reading only one level emitted a successful empty run.
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "outer", "node_type": "multiagent"},
+            node_stream("outer", node_stream("inner", {"data": "NESTED_OUTPUT"})),
+            {"type": "multiagent_node_stop", "node_id": "outer"},
+        ]
+    )
+
+    events = await collect(make_agent(orchestrator))
+
+    # Attributed to the outer node, which is the one holding the open step, so
+    # the envelope closes with its step rather than being swept at the end.
+    assert shape(events) == [
+        (EventType.RUN_STARTED,),
+        (EventType.STEP_STARTED, "multiagent:outer"),
+        (EventType.TEXT_MESSAGE_START,),
+        (EventType.TEXT_MESSAGE_CONTENT, "NESTED_OUTPUT"),
+        (EventType.TEXT_MESSAGE_END,),
+        (EventType.STEP_FINISHED, "multiagent:outer"),
+        (EventType.RUN_FINISHED,),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pathologically_nested_node_stream_is_dropped_not_looped():
+    deep: dict = {"data": "buried"}
+    for _ in range(30):
+        deep = node_stream("n", deep)
+    orchestrator = FakeOrchestrator([deep])
+
+    events = await collect(make_agent(orchestrator))
+    types = [e.type for e in events]
+
+    assert EventType.TEXT_MESSAGE_CONTENT not in types
+    assert types[-1] == EventType.RUN_FINISHED
+
+
+# ---------------------------------------------------------------------------
+# Interrupt outcome and resume
+# ---------------------------------------------------------------------------
+
+
+class NativeInterrupt:
+    def __init__(self, interrupt_id="i1", name="confirm", reason="APPROVAL"):
+        self.id = interrupt_id
+        self.name = name
+        self.reason = reason
+        self.response = None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_is_reported_as_the_run_outcome():
+    # A run that paused must not report plain success, or the client has no way
+    # to know an answer is owed.
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+            {
+                "type": "multiagent_node_interrupt",
+                "node_id": "a",
+                "interrupts": [NativeInterrupt()],
+            },
+        ]
+    )
+
+    events = await collect(make_agent(orchestrator))
+    finished = events[-1]
+
+    assert finished.type == EventType.RUN_FINISHED
+    assert finished.outcome is not None
+    assert finished.outcome.type == "interrupt"
+    assert [i.id for i in finished.outcome.interrupts] == ["i1"]
+
+
+@pytest.mark.asyncio
+async def test_resume_sends_interrupt_responses_not_a_task_string():
+    # Strands rejects a string once a node is parked at a checkpoint, and the
+    # orchestrator then stays interrupted for every later run.
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+            {
+                "type": "multiagent_node_interrupt",
+                "node_id": "a",
+                "interrupts": [NativeInterrupt()],
+            },
+        ]
+    )
+    agent = make_agent(orchestrator)
+    await collect(agent)
+
+    class Entry:
+        interrupt_id = "i1"
+        status = "resolved"
+        payload = {"approved": True}
+
+    resume_input = FakeInput(messages=[FakeMessage("user", "ignored on resume")])
+    resume_input.resume = [Entry()]
+    await collect(agent, resume_input)
+
+    assert orchestrator.prompts[1] == [
+        {"interruptResponse": {"interruptId": "i1", "response": {"response": {"approved": True}}}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_for_an_unknown_interrupt_falls_back_to_a_task_string():
+    # A stale or invented id must not be handed to an orchestrator that is not
+    # waiting for it.
+    orchestrator = FakeOrchestrator([])
+    agent = make_agent(orchestrator)
+
+    class Entry:
+        interrupt_id = "never-raised"
+        status = "resolved"
+        payload = {"approved": True}
+
+    resume_input = FakeInput(messages=[FakeMessage("user", "carry on")])
+    resume_input.resume = [Entry()]
+    await collect(agent, resume_input)
+
+    assert orchestrator.prompts == ["carry on"]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_run_clears_the_pending_interrupt():
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+            {
+                "type": "multiagent_node_interrupt",
+                "node_id": "a",
+                "interrupts": [NativeInterrupt()],
+            },
+        ]
+    )
+    agent = make_agent(orchestrator)
+    await collect(agent)
+    assert agent._pending_interrupts_by_thread.get("test-thread")
+
+    orchestrator.events = [
+        {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+        {"type": "multiagent_node_stop", "node_id": "a"},
+    ]
+    events = await collect(agent)
+
+    assert events[-1].outcome is None
+    assert not agent._pending_interrupts_by_thread.get("test-thread")

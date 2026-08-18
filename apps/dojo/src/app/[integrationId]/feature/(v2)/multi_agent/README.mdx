@@ -35,9 +35,12 @@ Ask for anything you would like researched, for example
   `from_nodes`, `to_nodes` and an optional `message`. Swarm sends
   single-element lists with a message; Graph sends batch transitions without
   one
-- The graph is rebuilt for each run. A graph holds execution state on the
-  instance, and a Python graph also carries node history across executions, so
-  a long-lived one would leak a previous run's conversation into the next
+- The graph is built per run rather than once at startup. It holds execution
+  state on the instance, and a Python graph also carries node history across
+  executions, so a long-lived one would leak a previous run's conversation into
+  the next and would make two concurrent visitors interfere. The Python adapter
+  accepts a callable for exactly this, and isolates a directly-passed instance
+  by restoring its node conversations after each run
 - Only the latest user turn is forwarded. An orchestrator takes a task string
   rather than a conversation, so this demo answers each question on its own
   and does not carry chat history between turns
@@ -59,7 +62,12 @@ invisible:
   interrupt events require a recent Strands release; on older ones the graph
   simply never emits them and nothing is lost
 - A node that interrupts never emits a stop event, so its step is closed
-  before the run ends rather than left running in the UI
+  before the run ends rather than left running in the UI. The run reports an
+  interrupt outcome rather than plain success, and answering it through the
+  protocol's resume entries continues the graph from its checkpoint
+- A nested graph or swarm node wraps its events a second time, so they are
+  unwrapped to the innermost agent event; reading one level reported a
+  successful run with no output at all
 - `STEP_FINISHED` reuses the node type remembered from the start event, since
   the Python stop event carries only the node id
 
