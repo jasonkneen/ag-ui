@@ -117,16 +117,20 @@ public sealed class RunTelemetryTest
         var context = new RunAgentInput { ThreadId = _threadId, RunId = _runId }
             .ToChatRequestContext(SerializerOptions);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        var events = new List<BaseEvent>();
+        await foreach (var evt in ThrowingUpdates().AsAGUIEventStreamAsync(context).ConfigureAwait(false))
         {
-            await foreach (var _ in ThrowingUpdates().AsAGUIEventStreamAsync(context).ConfigureAwait(false))
-            {
-            }
-        });
+            events.Add(evt);
+        }
 
         var run = SingleRun(capture);
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("StreamingError", error.Code);
+        Assert.Equal("An error occurred while streaming the agent response.", error.Message);
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
         Assert.Equal("error", run.GetTagItem("agui.run.outcome"));
         Assert.Equal(typeof(InvalidOperationException).FullName, run.GetTagItem("error.type"));
+        Assert.Equal(events.Count, run.GetTagItem("agui.events.count"));
         Assert.Equal(ActivityStatusCode.Error, run.Status);
     }
 

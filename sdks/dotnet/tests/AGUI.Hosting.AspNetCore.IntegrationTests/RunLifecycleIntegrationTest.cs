@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using AGUI.Abstractions;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.AI;
@@ -41,5 +42,40 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
                 var finished = Assert.IsType<RunFinishedEvent>(u.RawRepresentation);
                 Assert.Equal(u.ResponseId, finished.RunId);
             });
+    }
+
+    [Theory]
+    [InlineData(TransportFormat.Json)]
+    [InlineData(TransportFormat.Protobuf)]
+    public async Task PostRun_StreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished(
+        TransportFormat format)
+    {
+        var client = CreateClient((messages, options, ct) => EmitUpdateThenThrow(ct), format);
+
+        var updates = await CollectUpdates(client, [new ChatMessage(ChatRole.User, "Hi")]);
+
+        Assert.Collection(updates,
+            u => Assert.IsType<RunStartedEvent>(u.RawRepresentation),
+            u =>
+            {
+                Assert.Equal("partial", u.Text);
+                Assert.IsType<TextMessageContentEvent>(u.RawRepresentation);
+            },
+            u =>
+            {
+                var content = Assert.IsType<ErrorContent>(Assert.Single(u.Contents));
+                Assert.Equal("StreamingError", content.ErrorCode);
+                Assert.Equal("An error occurred while streaming the agent response.", content.Message);
+                Assert.IsType<RunErrorEvent>(u.RawRepresentation);
+            });
+        Assert.DoesNotContain(updates, u => u.RawRepresentation is RunFinishedEvent);
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        await Task.Yield();
+        throw new InvalidOperationException("sensitive provider failure details");
     }
 }

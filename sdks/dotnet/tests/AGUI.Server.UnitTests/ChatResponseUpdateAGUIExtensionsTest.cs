@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using AGUI.Abstractions;
 using Microsoft.Extensions.AI;
@@ -35,6 +36,25 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
                 Assert.Equal(RunId, finished.RunId);
                 Assert.IsType<RunFinishedSuccessOutcome>(finished.Outcome);
             });
+    }
+
+    [Fact]
+    public async Task InputStreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished()
+    {
+        var events = await CollectEvents(EmitUpdateThenThrow());
+
+        Assert.Collection(events,
+            e => Assert.IsType<RunStartedEvent>(e),
+            e => Assert.IsType<TextMessageStartEvent>(e),
+            e => Assert.IsType<TextMessageContentEvent>(e),
+            e =>
+            {
+                var error = Assert.IsType<RunErrorEvent>(e);
+                Assert.Equal("StreamingError", error.Code);
+                Assert.Equal("An error occurred while streaming the agent response.", error.Message);
+                Assert.DoesNotContain("sensitive", error.Message, StringComparison.OrdinalIgnoreCase);
+            });
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
     }
 
     [Fact]
@@ -934,7 +954,7 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         Assert.Same(runError, passedError);
         Assert.Equal("Something went wrong", passedError.Message);
         Assert.Equal("INTERNAL_ERROR", passedError.Code);
-        Assert.IsType<RunFinishedEvent>(events[2]);
+        Assert.Equal(2, events.Count);
     }
 
     [Fact]
@@ -1499,6 +1519,27 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         Assert.IsType<RunStartedEvent>(collected[0]);
     }
 
+    [Fact]
+    public async Task OperationCanceledException_PropagatesWithoutRunError()
+    {
+        using var cts = new CancellationTokenSource();
+        var events = new List<BaseEvent>();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var evt in EmitUpdateThenCancel(cts.Token)
+                .AsAGUIEventStreamAsync(BuildContext(), cts.Token).ConfigureAwait(false))
+            {
+                events.Add(evt);
+                cts.Cancel();
+            }
+        });
+
+        Assert.NotEmpty(events);
+        Assert.DoesNotContain(events, e => e is RunErrorEvent);
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
+    }
+
     #endregion
 
     #region Tool Call Result
@@ -1751,6 +1792,21 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         }
 
         await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow()
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        await Task.Yield();
+        throw new InvalidOperationException("sensitive provider failure details");
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenCancel(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        await Task.Yield();
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> GenerateInfiniteUpdates(
