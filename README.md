@@ -116,6 +116,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangChain and Crew
 | Framework | Status | AG-UI Resources |
 | ---------- | ------- | ---------------- |
 | [Claude Agent SDK](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-agent-sdk) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/claude-agent-sdk-python/feature/shared_state) |
+| [Claude Managed Agents SDK](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-managed-agents) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/claude-managed-agents-python/feature/tool_based_generative_ui) |
 | [Langroid](https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/langroid) | ✅ Supported | 🎮 [Demos](https://dojo.ag-ui.com/langroid/feature/shared_state) |
 | [OpenAI Agent SDK](https://openai.github.io/openai-agents-python/) | 🛠️ In Progress | – |
 | [Cloudflare Agents](https://developers.cloudflare.com/agents/) | 🛠️ In Progress | – |
@@ -167,7 +168,7 @@ AG-UI was born from CopilotKit's initial **partnership** with LangChain and Crew
 | --- | ------- | ---------------- | ------------- |
 | [CopilotKit](https://github.com/CopilotKit/CopilotKit) | ✅ Supported | ➡️ [Getting Started](https://docs.copilotkit.ai/direct-to-llm/guides/quickstart) | 1st Party |
 | [Terminal + Agent]() | ✅ Supported | ➡️ [Getting Started](https://docs.ag-ui.com/quickstart/clients) | Community |
-| Chat platforms (Slack, Microsoft Teams) | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
+| [Chat platforms]() (Slack, Microsoft Teams) | ✅ Supported | ➡️ [Channels SDK](https://github.com/CopilotKit/channels-sdk) 🎮 [OpenTag example](https://github.com/CopilotKit/OpenTag) | 1st Party |
 | [React Native](https://reactnative.dev/) | ✅ Supported | ➡️ [Example](https://github.com/CopilotKit/CopilotKit/tree/main/examples/v2/react-native/demo) | 1st Party |
 
 [View all supported integrations →](https://docs.ag-ui.com/introduction#supported-integrations)
