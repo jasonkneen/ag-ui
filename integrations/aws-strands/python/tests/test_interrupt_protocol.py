@@ -20,7 +20,7 @@ Covers:
 - Resume: no pending interrupt on thread yields RunErrorEvent
 - Resume: a payload is checked against the schema recorded in AG-UI bookkeeping
 - Resume: a tool approval is payload-checked without surviving AG-UI bookkeeping
-- An interrupt carrying a recorded answer, falsy included, counts as answered
+- Answered/open classification matches the installed Strands response contract
 - A checkpoint the SDK still holds active blocks a fresh turn, untouched
 - Every stream double reaches Strands through the shared checkpoint-resume step
 - That step's stand-in matches the installed SDK's own resume
@@ -32,6 +32,7 @@ import ast
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Callable, Sequence
 from unittest.mock import MagicMock
 
@@ -44,13 +45,15 @@ from ag_ui.core import (
     UserMessage,
 )
 from strands.agent.state import AgentState
-from strands.interrupt import Interrupt as StrandsInterrupt
+from strands.interrupt import Interrupt as StrandsInterrupt, InterruptException
 from strands.tools.registry import ToolRegistry
+from strands.types.tools import ToolContext
 
 from ag_ui_strands.agent import (
     StrandsAgent,
     _native_interrupt_is_answered,
     _open_native_interrupts,
+    _strands_uses_presence_based_interrupt_responses,
 )
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 from ag_ui_strands import (
@@ -111,6 +114,39 @@ def _make_generic_strands_interrupt(
         name=name,
         reason=reason or {"question": "Which environment?"},
     )
+
+
+def _make_preemptive_sdk_interrupt(
+    response: Any,
+) -> tuple[bool, StrandsInterrupt]:
+    """Exercise Strands' public preemptive-response contract.
+
+    Strands 1.15 through 1.18 re-raise an interrupt whose recorded response is
+    falsy; 1.19 and later return every response except ``None``. Build a real
+    ``ToolContext`` so compatibility assertions follow the installed SDK
+    instead of restating either implementation in this test suite.
+    """
+    interrupt_state = SimpleNamespace(interrupts={})
+    tool_context = ToolContext(
+        tool_use={
+            "toolUseId": "preemptive-response-contract",
+            "name": "contract_tool",
+            "input": {},
+        },
+        agent=SimpleNamespace(_interrupt_state=interrupt_state),
+        invocation_state={},
+    )
+
+    try:
+        returned = tool_context.interrupt("preanswered", response=response)
+    except InterruptException:
+        sdk_answered = False
+    else:
+        assert returned == response
+        sdk_answered = True
+
+    [native_interrupt] = interrupt_state.interrupts.values()
+    return sdk_answered, native_interrupt
 
 
 # ---------------------------------------------------------------------------
@@ -1197,31 +1233,47 @@ class TestResumeValidationWithoutAgUiBookkeeping:
 # ---------------------------------------------------------------------------
 
 class TestAnsweredInterruptClassification:
-    """An interrupt counts as answered once an answer is recorded on it.
+    """The adapter classifies answers exactly as the installed Strands does.
 
-    Strands records whatever answer arrives, so a legitimate "no" lands on
-    ``Interrupt.response`` as ``False`` (likewise ``0`` or ``""``), and hands
-    that answer back rather than re-raising for a human. The adapter has to
-    classify it the same way, in both the resume-validation path and the
-    pause-reporting path, or it re-asks a question the human already answered.
+    Strands changed its response predicate in 1.19: older supported releases
+    use truthiness, while newer releases use presence. The adapter must follow
+    that installed contract in both resume validation and pause reporting or it
+    can hide a question that Strands is still waiting to have answered.
     """
 
     THREAD = "answered-classification-thread"
 
-    # Answers that are falsy but genuinely recorded. ``None`` is deliberately
-    # absent: Strands' Python ``Interrupt.response`` defaults to ``None``, so
-    # ``None`` reads as "no answer recorded". (The TypeScript SDK instead keys
-    # off ``undefined``, which makes a recorded ``null`` an answer there; the two
-    # SDKs do not agree on that value.)
+    @pytest.mark.parametrize(
+        ("installed_version", "expected"),
+        [
+            ("1.15.0", False),
+            ("1.18.0", False),
+            ("1.19.0", True),
+            ("2.0.0", True),
+        ],
+    )
+    def test_response_contract_boundary(self, installed_version, expected):
+        assert (
+            _strands_uses_presence_based_interrupt_responses(installed_version)
+            is expected
+        )
+
+    # Bare falsy responses cross the SDK's 1.19 behavior boundary. ``None`` is
+    # deliberately absent because it remains the unanswered default on both
+    # sides of that boundary.
     FALSY_ANSWERS = [False, 0, "", [], {}]
     FALSY_ANSWER_IDS = ["false", "zero", "empty-string", "empty-list", "empty-dict"]
 
     @pytest.mark.parametrize("recorded_answer", FALSY_ANSWERS, ids=FALSY_ANSWER_IDS)
-    def test_a_falsy_recorded_answer_closes_the_interrupt(self, recorded_answer):
-        answered = _make_strands_interrupt("my_tool", {}, "st-falsy-predicate")
-        answered.response = recorded_answer
-        assert _native_interrupt_is_answered(answered) is True
-        assert _open_native_interrupts({answered.id: answered}) == {}
+    def test_bare_falsy_response_matches_installed_sdk(self, recorded_answer):
+        sdk_answered, native_interrupt = _make_preemptive_sdk_interrupt(
+            recorded_answer
+        )
+
+        assert _native_interrupt_is_answered(native_interrupt) is sdk_answered
+        assert _open_native_interrupts({native_interrupt.id: native_interrupt}) == (
+            {} if sdk_answered else {native_interrupt.id: native_interrupt}
+        )
 
     def test_an_unanswered_interrupt_stays_open(self):
         open_interrupt = _make_strands_interrupt("my_tool", {}, "st-open-predicate")
@@ -1231,10 +1283,10 @@ class TestAnsweredInterruptClassification:
         }
 
     async def test_resume_addresses_only_the_open_sibling(self):
-        """A falsy-answered sibling is settled, so the resume batch is complete."""
+        """A wrapped answer is settled on every supported Strands release."""
         open_interrupt = _make_strands_interrupt("my_tool", {}, "st-open")
         answered = _make_strands_interrupt("my_tool", {}, "st-answered")
-        answered.response = False
+        answered.response = {"response": False}
         interrupt_state = InterruptStateStub(
             interrupts={open_interrupt.id: open_interrupt, answered.id: answered},
         )
@@ -1287,8 +1339,8 @@ class TestAnsweredInterruptClassification:
     async def test_pause_reports_only_the_interrupts_still_open(self):
         """The pause reports exactly what the SDK still holds open.
 
-        A preemptive falsy answer settles its interrupt, so re-reporting it would
-        ask the human the same question twice.
+        A bare preemptive ``False`` remains open through Strands 1.18 and closes
+        in 1.19+, so this integration path must move with the real SDK contract.
         """
         resumed = _make_strands_interrupt("my_tool", {}, "st-resumed")
         interrupt_state = InterruptStateStub(interrupts={resumed.id: resumed})
@@ -1296,12 +1348,7 @@ class TestAnsweredInterruptClassification:
 
         # The resumed tool answers a cached decision preemptively with a "no"
         # and then pauses on a fresh question.
-        cached = StrandsInterrupt(
-            id="v1:custom:use_cached_plan",
-            name="use_cached_plan",
-            reason=None,
-            response=False,
-        )
+        sdk_answered, cached = _make_preemptive_sdk_interrupt(False)
         follow_up = StrandsInterrupt(
             id="v1:custom:need_clarification",
             name="need_clarification",
@@ -1344,10 +1391,9 @@ class TestAnsweredInterruptClassification:
         assert len(finished) == 1
         outcome = finished[0].outcome
         assert isinstance(outcome, RunFinishedInterruptOutcome)
-        assert [interrupt.id for interrupt in outcome.interrupts] == [follow_up.id]
-        assert [interrupt.reason for interrupt in outcome.interrupts] == [
-            "need_clarification"
-        ]
+        assert [interrupt.id for interrupt in outcome.interrupts] == (
+            [follow_up.id] if sdk_answered else [cached.id, follow_up.id]
+        )
 
     async def test_unanswered_interrupt_still_blocks_a_partial_resume(self):
         """The partial-resume guard keeps firing for genuinely open interrupts."""
@@ -1385,14 +1431,14 @@ class TestAnsweredInterruptClassification:
 
     @pytest.mark.parametrize("recorded_answer", FALSY_ANSWERS, ids=FALSY_ANSWER_IDS)
     async def test_resume_submits_only_the_open_interrupt_answer(self, recorded_answer):
-        """Every falsy recorded answer settles its own interrupt.
+        """The adapter's truthy envelope settles every falsy client payload.
 
         Asserts the exact ``interruptResponse`` batch reaching Strands: the open
         interrupt's answer and nothing else.
         """
         open_interrupt = _make_strands_interrupt("my_tool", {}, "st-open")
         answered = _make_strands_interrupt("my_tool", {}, "st-answered")
-        answered.response = recorded_answer
+        answered.response = {"response": recorded_answer}
         interrupt_state = InterruptStateStub(
             interrupts={open_interrupt.id: open_interrupt, answered.id: answered},
         )
@@ -1439,10 +1485,10 @@ class TestAnsweredInterruptClassification:
         ]
 
     @pytest.mark.parametrize("recorded_answer", FALSY_ANSWERS, ids=FALSY_ANSWER_IDS)
-    async def test_pause_omits_a_falsy_answered_interrupt(
+    async def test_pause_omits_a_wrapped_falsy_answer(
         self, recorded_answer
     ):
-        """The pause reporter settles every falsy answer, as the SDK does."""
+        """The pause reporter settles every wrapped falsy client answer."""
         resumed = _make_strands_interrupt("my_tool", {}, "st-resumed")
         interrupt_state = InterruptStateStub(interrupts={resumed.id: resumed})
         interrupt_state.activate()
@@ -1453,7 +1499,7 @@ class TestAnsweredInterruptClassification:
             id="v1:custom:use_cached_plan",
             name="use_cached_plan",
             reason=None,
-            response=recorded_answer,
+            response={"response": recorded_answer},
         )
         follow_up = StrandsInterrupt(
             id="v1:custom:need_clarification",
@@ -1689,15 +1735,14 @@ class TestAnsweredInterruptClassification:
         }
         assert interrupt_state.context == {"tool_use_message": {"role": "assistant"}}
 
-    async def test_falsy_answered_interrupt_is_not_open_for_a_resume(self):
-        """A settled interrupt is not something a resume can address.
+    async def test_wrapped_falsy_answer_is_not_open_for_a_resume(self):
+        """An adapter-managed settled interrupt cannot be addressed again.
 
-        The SDK hands its recorded answer back rather than re-raising, so a
-        resume naming it is answering a question no longer being asked, and
-        nothing may reach Strands on its behalf.
+        The truthy response envelope works across every supported Strands
+        release, so nothing may reach Strands on this interrupt's behalf.
         """
         answered = _make_strands_interrupt("my_tool", {}, "st-falsy-resumed")
-        answered.response = False
+        answered.response = {"response": False}
         interrupt_state = InterruptStateStub(interrupts={answered.id: answered})
         interrupt_state.activate()
 

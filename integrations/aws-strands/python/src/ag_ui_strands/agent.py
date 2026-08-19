@@ -11,6 +11,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from importlib.metadata import version as distribution_version
 from typing import Any, AsyncIterator, Dict, List, Tuple
 
 from strands import Agent as StrandsAgentCore
@@ -84,6 +85,27 @@ INTERRUPT_CANCELLED = {"cancelled": True}
 _TOOL_APPROVAL_NAME_PREFIX = "ag_ui:tool_call:"
 
 
+def _strands_uses_presence_based_interrupt_responses(installed_version: str) -> bool:
+    """Return the interrupt-response contract of a Strands SDK version."""
+    try:
+        major, minor = map(int, installed_version.split(".", 2)[:2])
+    except ValueError as exc:
+        raise RuntimeError(
+            "Cannot determine interrupt response semantics for "
+            f"strands-agents version {installed_version!r}"
+        ) from exc
+    return (major, minor) >= (1, 19)
+
+
+# Strands 1.15 through 1.18 returns a recorded response only when it is truthy.
+# Version 1.19 changed that predicate to presence (``response is not None``).
+_STRANDS_USES_PRESENCE_BASED_INTERRUPT_RESPONSES = (
+    _strands_uses_presence_based_interrupt_responses(
+        distribution_version("strands-agents")
+    )
+)
+
+
 def _tool_approval_response_schema() -> dict:
     """The response contract advertised for a tool-approval interrupt.
 
@@ -111,12 +133,11 @@ def _is_tool_approval_interrupt(native_interrupt: Any) -> bool:
 def _wrap_resume_response(status: str, payload: Any) -> dict:
     """Package a ``ResumeEntry`` for Strands' ``interruptResponse`` shape.
 
-    Strands reads a recorded answer by its presence, and ``None`` is the
-    unanswered default, so forwarding a raw ``None`` payload re-raises the same
-    interrupt and re-runs the tool body, an infinite approve loop. Always hand
-    Strands an envelope it cannot read as absent; up to the tool implementation
-    to properly destructures it (e.g. via ``.get("cancelled")`` /
-    ``.get("response")``).
+    Supported Strands releases read a recorded answer either by truthiness
+    (1.15 through 1.18) or by presence (1.19+). Forwarding a raw falsy payload
+    can therefore re-raise the same interrupt and re-run the tool body on the
+    compatibility floor. Always hand Strands a truthy envelope; the tool
+    implementation unwraps it via ``.get("cancelled")`` / ``.get("response")``.
     """
     if status == "cancelled":
         return dict(INTERRUPT_CANCELLED)
@@ -215,11 +236,14 @@ def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
 def _native_interrupt_is_answered(interrupt: Any) -> bool:
     """True when this interrupt already carries an answer Strands will hand back.
 
-    Presence decides, not truthiness: a legitimate answer can be ``False``,
-    ``0`` or ``""``, and Strands returns any recorded response rather than
-    re-raising for a human. ``None`` is the unanswered default.
+    Match the installed SDK's own ``ToolContext.interrupt`` predicate. Strands
+    1.15 through 1.18 uses truthiness; 1.19 and later uses presence, with
+    ``None`` as the unanswered default.
     """
-    return getattr(interrupt, "response", None) is not None
+    response = getattr(interrupt, "response", None)
+    if _STRANDS_USES_PRESENCE_BASED_INTERRUPT_RESPONSES:
+        return response is not None
+    return bool(response)
 
 
 def _open_native_interrupts(interrupts: Any) -> dict:
@@ -256,11 +280,12 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
             getattr(interrupt_state, "interrupts", {})
         )
         if not open_interrupts:
-            # The checkpoint is still activated yet every interrupt is answered,
-            # so this run reports success while the agent may remain parked.
+            # The checkpoint is still activated yet every interrupt is answered
+            # under the installed SDK's semantics, so this run reports success
+            # while the agent may remain parked.
             logger.debug(
-                "Native interrupt state is activated but every interrupt carries "
-                "a response; reporting no pending interrupts"
+                "Native interrupt state is activated but every interrupt is "
+                "answered; reporting no pending interrupts"
             )
         return list(open_interrupts.values())
     return []
