@@ -310,18 +310,23 @@ describe("metadata on reasoning messages", () => {
         type: EventType.REASONING_MESSAGE_START,
         messageId: "r1",
         role: "reasoning",
-      } as ReasoningMessageStartEvent,
+      } satisfies ReasoningMessageStartEvent,
       {
         type: EventType.REASONING_ENCRYPTED_VALUE,
         subtype: "message",
         entityId: "r1",
         encryptedValue: "secret",
         metadata: { sealed: true },
-      } as ReasoningEncryptedValueEvent,
+      } satisfies ReasoningEncryptedValueEvent,
     ]);
 
-    expect(messages[0].encryptedValue).toBe("secret");
-    expect(messages[0]).not.toHaveProperty("metadata");
+    const message = messages[0];
+    if (message?.role !== "reasoning") {
+      throw new Error(`Expected reasoning message, got role ${message?.role}`);
+    }
+
+    expect(message.encryptedValue).toBe("secret");
+    expect(message).not.toHaveProperty("metadata");
   });
 });
 
