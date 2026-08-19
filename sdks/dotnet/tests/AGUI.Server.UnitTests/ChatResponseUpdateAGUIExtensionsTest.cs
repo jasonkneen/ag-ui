@@ -38,10 +38,12 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
             });
     }
 
-    [Fact]
-    public async Task InputStreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InputStreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished(bool yieldThread)
     {
-        var events = await CollectEvents(EmitUpdateThenThrow());
+        var events = await CollectEvents(EmitUpdateThenThrow(yieldThread));
 
         Assert.Collection(events,
             e => Assert.IsType<RunStartedEvent>(e),
@@ -1519,15 +1521,17 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         Assert.IsType<RunStartedEvent>(collected[0]);
     }
 
-    [Fact]
-    public async Task OperationCanceledException_PropagatesWithoutRunError()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OperationCanceledException_PropagatesWithoutRunError(bool yieldThread)
     {
         using var cts = new CancellationTokenSource();
         var events = new List<BaseEvent>();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var evt in EmitUpdateThenCancel(cts.Token)
+            await foreach (var evt in EmitUpdateThenCancel(yieldThread, cts.Token)
                 .AsAGUIEventStreamAsync(BuildContext(), cts.Token).ConfigureAwait(false))
             {
                 events.Add(evt);
@@ -1794,18 +1798,27 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         await Task.CompletedTask.ConfigureAwait(false);
     }
 
-    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow()
+    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow(bool yieldThread)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
-        await Task.Yield();
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
         throw new InvalidOperationException("sensitive provider failure details");
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenCancel(
+        bool yieldThread,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
-        await Task.Yield();
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
     }
 

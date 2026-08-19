@@ -45,12 +45,15 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
     }
 
     [Theory]
-    [InlineData(TransportFormat.Json)]
-    [InlineData(TransportFormat.Protobuf)]
+    [InlineData(TransportFormat.Json, false)]
+    [InlineData(TransportFormat.Json, true)]
+    [InlineData(TransportFormat.Protobuf, false)]
+    [InlineData(TransportFormat.Protobuf, true)]
     public async Task PostRun_StreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished(
-        TransportFormat format)
+        TransportFormat format,
+        bool yieldThread)
     {
-        var client = CreateClient((messages, options, ct) => EmitUpdateThenThrow(ct), format);
+        var client = CreateClient((messages, options, ct) => EmitUpdateThenThrow(yieldThread, ct), format);
 
         var updates = await CollectUpdates(client, [new ChatMessage(ChatRole.User, "Hi")]);
 
@@ -72,10 +75,15 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow(
+        bool yieldThread,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
-        await Task.Yield();
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
         throw new InvalidOperationException("sensitive provider failure details");
     }
 }

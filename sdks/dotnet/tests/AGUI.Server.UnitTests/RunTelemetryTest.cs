@@ -109,8 +109,10 @@ public sealed class RunTelemetryTest
         Assert.Equal(_runId, second.GetTagItem("agui.parent_run_id"));
     }
 
-    [Fact]
-    public async Task FailingRun_SetsErrorStatusAndErrorType()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailingRun_SetsErrorStatusAndErrorType(bool yieldThread)
     {
         using var capture = CaptureActivities(AGUIServerInstrumentation.ActivitySourceName);
 
@@ -118,7 +120,7 @@ public sealed class RunTelemetryTest
             .ToChatRequestContext(SerializerOptions);
 
         var events = new List<BaseEvent>();
-        await foreach (var evt in ThrowingUpdates().AsAGUIEventStreamAsync(context).ConfigureAwait(false))
+        await foreach (var evt in ThrowingUpdates(yieldThread).AsAGUIEventStreamAsync(context).ConfigureAwait(false))
         {
             events.Add(evt);
         }
@@ -184,10 +186,15 @@ public sealed class RunTelemetryTest
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> ThrowingUpdates(
+        bool yieldThread,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
-        await Task.Yield();
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
         throw new InvalidOperationException("boom");
     }
 
