@@ -1,147 +1,205 @@
-"""Tests for force_stop event handling when no content has been emitted.
+"""Regression tests for terminal Strands stream events.
 
-When Bedrock raises a ValidationException (input too long), Strands converts
-it to a force_stop event.  The adapter must emit a human-readable error
-message rather than silently producing RUN_STARTED → RUN_FINISHED with no
-content in between.
+``force_stop`` reports a failed model cycle, while ``result`` reports a normal
+terminal result. The adapter must preserve that distinction and consume the
+underlying async generator to completion in both cases.
 """
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import MagicMock
-from ag_ui.core import EventType
+import strands.event_loop.event_loop as strands_event_loop
+from ag_ui.core import EventType, RunAgentInput, UserMessage
+from strands import Agent
+from strands.models import Model
+from strands.types.exceptions import ModelThrottledException
 
 from ag_ui_strands.agent import StrandsAgent
 
-
-class MockStrandsAgent:
-    def __init__(self, events):
-        self.events = events
-        self.model = MagicMock()
-        self.system_prompt = "test"
-        self.tool_registry = MagicMock()
-        self.tool_registry.registry = {}
-        self.record_direct_tool_call = True
-
-    async def stream_async(self, message):
-        for event in self.events:
-            yield event
+_THREAD_ID = "terminal-event-thread"
+_THROTTLE_REASON = "Too many requests"
 
 
-def make_input_data(messages=None, state=None, tools=None):
-    input_data = MagicMock()
-    input_data.thread_id = "test-thread"
-    input_data.run_id = "test-run"
-    input_data.state = state or {}
-    input_data.messages = messages or []
-    input_data.tools = tools or []
-    return input_data
+class _UnusedModel(Model):
+    """Complete Model implementation for agents whose stream is scripted."""
+
+    def get_config(self):
+        return {"model_id": "unused-test-model"}
+
+    def update_config(self, **kwargs):
+        pass
+
+    async def structured_output(
+        self, output_model, prompt, **kwargs
+    ):  # pragma: no cover
+        if False:
+            yield {}
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        raise AssertionError("the scripted stream should bypass the model")
+        yield  # pragma: no cover
 
 
-def create_agent(mock_events):
-    mock_base = MockStrandsAgent(mock_events)
-    agent = StrandsAgent(mock_base, name="test", description="test")
-    agent._agents_by_thread["test-thread"] = MockStrandsAgent(mock_events)
-    return agent
+class _ThrottledModel(_UnusedModel):
+    """Model that drives Strands' real ``ForceStopEvent`` failure path."""
+
+    def get_config(self):
+        return {"model_id": "throttled-test-model"}
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        raise ModelThrottledException(_THROTTLE_REASON)
+        yield  # pragma: no cover
 
 
-@pytest.mark.asyncio
-async def test_force_stop_with_no_content_emits_error_message():
-    """force_stop before any text emits a TEXT_MESSAGE with an error."""
-    agent = create_agent([{"force_stop": True}])
-    events = [e async for e in agent.run(make_input_data())]
-    types = [e.type for e in events]
-
-    assert EventType.TEXT_MESSAGE_START in types
-    assert EventType.TEXT_MESSAGE_CONTENT in types
-    assert EventType.TEXT_MESSAGE_END in types
-    assert EventType.RUN_FINISHED in types
-
-    # Error message should appear before RUN_FINISHED
-    assert types.index(EventType.TEXT_MESSAGE_START) < types.index(EventType.RUN_FINISHED)
+class _StreamProbe:
+    finalized = False
 
 
-@pytest.mark.asyncio
-async def test_force_stop_with_no_content_exactly_one_text_message():
-    """force_stop must not emit a duplicate TextMessageEndEvent.
-
-    A previous bug set message_started=True after the error sequence, causing
-    the post-loop cleanup to emit a second TextMessageEndEvent with the original
-    (never-started) message_id — triggering a client error.
-    """
-    agent = create_agent([{"force_stop": True}])
-    events = [e async for e in agent.run(make_input_data())]
-    types = [e.type for e in events]
-
-    assert types.count(EventType.TEXT_MESSAGE_START) == 1
-    assert types.count(EventType.TEXT_MESSAGE_END) == 1
-
-    # The single START and END must share the same message_id
-    start = next(e for e in events if e.type == EventType.TEXT_MESSAGE_START)
-    end = next(e for e in events if e.type == EventType.TEXT_MESSAGE_END)
-    assert start.message_id == end.message_id
+def _run_input() -> RunAgentInput:
+    return RunAgentInput(
+        thread_id=_THREAD_ID,
+        run_id="terminal-event-run",
+        state={},
+        messages=[UserMessage(id="user-1", role="user", content="Hello")],
+        tools=[],
+        context=[],
+        forwarded_props={},
+    )
 
 
-@pytest.mark.asyncio
-async def test_force_stop_with_no_reason_uses_generic_message():
-    """Generic force_stop with no force_stop_reason emits a generic fallback."""
-    agent = create_agent([{"force_stop": True}])
-    events = [e async for e in agent.run(make_input_data())]
+def _adapter(core: Agent) -> StrandsAgent:
+    return StrandsAgent(
+        core,
+        name="terminal-event-agent",
+        agents_by_thread={_THREAD_ID: core},
+    )
 
-    content_events = [e for e in events if e.type == EventType.TEXT_MESSAGE_CONTENT]
-    assert content_events, "Expected at least one TEXT_MESSAGE_CONTENT event"
-    # No reason → generic "stopped unexpectedly" fallback.  Do NOT mention
-    # conversation history — Strands re-raises real context-overflow
-    # exceptions separately, so a force_stop almost never means that.
-    body = content_events[0].delta.lower()
-    assert "stopped unexpectedly" in body
-    assert "history" not in body
-    assert "too long" not in body
+
+def _scripted_adapter(
+    events: list[dict], *, stream_error: Exception | None = None
+) -> tuple[StrandsAgent, _StreamProbe]:
+    """Use a real Agent container with an instrumented deterministic stream."""
+
+    core = Agent(model=_UnusedModel(), tools=[])
+    probe = _StreamProbe()
+
+    async def stream_async(_prompt):
+        try:
+            for event in events:
+                yield event
+            if stream_error is not None:
+                raise stream_error
+        finally:
+            probe.finalized = True
+
+    core.stream_async = stream_async
+    return _adapter(core), probe
+
+
+async def _collect(adapter: StrandsAgent) -> list:
+    return [event async for event in adapter.run(_run_input())]
 
 
 @pytest.mark.asyncio
-async def test_force_stop_with_string_reason_includes_reason():
-    """ForceStopEvent shape is {force_stop: True, force_stop_reason: str(exc)} —
-    the adapter must surface force_stop_reason in the user-facing message."""
+async def test_real_force_stop_emits_run_error_and_logs_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A provider failure is a failed run, not successful assistant content."""
+
+    monkeypatch.setattr(strands_event_loop, "MAX_ATTEMPTS", 1)
+
+    with caplog.at_level(logging.ERROR, logger="ag_ui_strands.agent"):
+        events = await _collect(_adapter(Agent(model=_ThrottledModel(), tools=[])))
+
+    event_types = [event.type for event in events]
+    assert event_types[-1] == EventType.RUN_ERROR
+    assert EventType.RUN_FINISHED not in event_types
+    assert EventType.TEXT_MESSAGE_START not in event_types
+    assert EventType.TEXT_MESSAGE_CONTENT not in event_types
+
+    error = events[-1]
+    assert _THROTTLE_REASON in error.message
+    assert any(
+        record.levelno >= logging.ERROR and _THROTTLE_REASON in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_force_stop_is_an_error_even_if_stream_ends_without_raising():
+    """Legacy/custom streams cannot turn ``force_stop`` into RUN_FINISHED."""
+
     reason = "ValidationException: Tool use is not supported for this model"
-    agent = create_agent([{"force_stop": True, "force_stop_reason": reason}])
-    events = [e async for e in agent.run(make_input_data())]
+    adapter, probe = _scripted_adapter(
+        [{"force_stop": True, "force_stop_reason": reason}]
+    )
 
-    content_events = [e for e in events if e.type == EventType.TEXT_MESSAGE_CONTENT]
-    assert content_events
-    # The "ValidationException: " prefix is stripped for readability; the
-    # informative tail must survive.
-    assert "Tool use is not supported for this model" in content_events[0].delta
-    assert "ValidationException" not in content_events[0].delta
+    events = await _collect(adapter)
 
-
-@pytest.mark.asyncio
-async def test_force_stop_after_content_does_not_add_error():
-    """If text was already streaming, force_stop should NOT inject an extra message."""
-    agent = create_agent([
-        {"data": "Here is my answer."},
-        {"force_stop": True},
-    ])
-    events = [e async for e in agent.run(make_input_data())]
-    types = [e.type for e in events]
-
-    # Only one TEXT_MESSAGE_START (the real one, not an injected error)
-    assert types.count(EventType.TEXT_MESSAGE_START) == 1
-
-    content_events = [e for e in events if e.type == EventType.TEXT_MESSAGE_CONTENT]
-    assert any("Here is my answer." in e.delta for e in content_events)
+    assert probe.finalized
+    assert events[-1].type == EventType.RUN_ERROR
+    assert events[-1].message == reason
+    assert all(event.type != EventType.RUN_FINISHED for event in events)
 
 
 @pytest.mark.asyncio
-async def test_complete_event_with_no_content_does_not_emit_error():
-    """complete (normal finish) with no text should NOT inject an error message.
+async def test_force_stop_preserves_a_followup_stream_exception_in_error_logs(
+    caplog: pytest.LogCaptureFixture,
+):
+    """A distinct unwind failure must not disappear below production log level."""
 
-    A run that calls only tools and finishes cleanly via 'complete' is valid;
-    the no-content error path is only for force_stop (abnormal termination).
-    """
-    agent = create_agent([{"complete": True}])
-    events = [e async for e in agent.run(make_input_data())]
-    types = [e.type for e in events]
+    cleanup_error = RuntimeError("cleanup callback exploded")
+    adapter, _ = _scripted_adapter(
+        [{"force_stop": True, "force_stop_reason": "provider throttled"}],
+        stream_error=cleanup_error,
+    )
 
-    assert EventType.TEXT_MESSAGE_START not in types
+    with caplog.at_level(logging.ERROR, logger="ag_ui_strands.agent"):
+        events = await _collect(adapter)
+
+    assert events[-1].type == EventType.RUN_ERROR
+    assert any(
+        record.levelno >= logging.ERROR
+        and record.exc_info is not None
+        and record.exc_info[1] is cleanup_error
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "expect_agent_stopped"),
+    [
+        ("end_turn", False),
+        ("max_tokens", True),
+        ("guardrail_intervened", True),
+        ("content_filtered", True),
+    ],
+)
+async def test_result_event_is_consumed_before_run_finishes(
+    stop_reason: str,
+    expect_agent_stopped: bool,
+):
+    """A normal result retains cleanup and optional stop-reason signaling."""
+
+    adapter, probe = _scripted_adapter(
+        [{"result": SimpleNamespace(stop_reason=stop_reason)}]
+    )
+
+    events = await _collect(adapter)
+
+    assert probe.finalized, "the adapter left the Strands result stream suspended"
+    assert events[-1].type == EventType.RUN_FINISHED
+
+    stopped = [
+        event
+        for event in events
+        if event.type == EventType.CUSTOM and event.name == "AgentStopped"
+    ]
+    assert bool(stopped) is expect_agent_stopped
+    if expect_agent_stopped:
+        assert stopped[0].value == {"stop_reason": stop_reason}
