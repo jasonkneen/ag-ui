@@ -81,6 +81,8 @@ AGUI.Abstractions.AGUIResume
 AGUI.Abstractions.AGUIResume.AGUIResume() -> void
 AGUI.Abstractions.AGUIResume.InterruptId.get -> string!
 AGUI.Abstractions.AGUIResume.InterruptId.set -> void
+AGUI.Abstractions.AGUIResume.Metadata.get -> System.Text.Json.JsonElement?
+AGUI.Abstractions.AGUIResume.Metadata.set -> void
 AGUI.Abstractions.AGUIResume.Payload.get -> System.Text.Json.JsonElement?
 AGUI.Abstractions.AGUIResume.Payload.set -> void
 AGUI.Abstractions.AGUIResume.Status.get -> string!
