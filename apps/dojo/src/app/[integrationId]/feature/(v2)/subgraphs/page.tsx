@@ -355,7 +355,7 @@ function TravelPlanner() {
     }
     // DEFERRED (PNI-307): mount-only by design — seeds the travel state once.
     // Adding `agent`/`agentState` would re-seed INITIAL_STATE if the agent
-    // state ever becomes falsy mid-session (e.g. across subgraph remounts).
+    // state ever becomes falsy later within the same mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
