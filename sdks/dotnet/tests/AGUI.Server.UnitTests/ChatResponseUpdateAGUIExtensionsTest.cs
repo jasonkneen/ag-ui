@@ -602,6 +602,34 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
     }
 
     [Fact]
+    public async Task Continuation_ReplayedMixedToolCallBatch_EmitsOnlyLifecycleEvents()
+    {
+        var updates = ToAsyncEnumerable(
+            new ChatResponseUpdate
+            {
+                Role = ChatRole.Assistant,
+                Contents =
+                [
+                    new FunctionCallContent("call-existing", "confirm",
+                        new Dictionary<string, object?>()),
+                    new FunctionCallContent("call-server", "server_tool",
+                        new Dictionary<string, object?>())
+                ]
+            },
+            new ChatResponseUpdate
+            {
+                Role = ChatRole.Tool,
+                Contents = [new FunctionResultContent("call-existing", """{"choice":"yes"}""")]
+            });
+
+        var events = await CollectEvents(updates, BuildMixedContinuationContext());
+
+        Assert.Collection(events,
+            e => Assert.IsType<RunStartedEvent>(e),
+            e => Assert.IsType<RunFinishedEvent>(e));
+    }
+
+    [Fact]
     public async Task Continuation_EmptyResponse_EmitsOnlyLifecycleEvents()
     {
         var events = await CollectEvents(
@@ -1900,6 +1928,53 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
                             Function = new AGUIToolCallFunction
                             {
                                 Name = "confirm",
+                                Arguments = "{}"
+                            }
+                        }
+                    ]
+                },
+                new AGUIToolMessage
+                {
+                    ToolCallId = "call-existing",
+                    Content = """{"choice":"yes"}"""
+                }
+            ]
+        }.ToChatRequestContext(SerializerOptions);
+
+    private static ChatRequestContext BuildMixedContinuationContext() =>
+        new RunAgentInput
+        {
+            ThreadId = ThreadId,
+            RunId = RunId,
+            Tools =
+            [
+                new AGUITool
+                {
+                    Name = "confirm",
+                    Parameters = JsonDocument.Parse("""{"type":"object"}""").RootElement.Clone()
+                }
+            ],
+            Messages =
+            [
+                new AGUIAssistantMessage
+                {
+                    ToolCalls =
+                    [
+                        new AGUIToolCall
+                        {
+                            Id = "call-existing",
+                            Function = new AGUIToolCallFunction
+                            {
+                                Name = "confirm",
+                                Arguments = "{}"
+                            }
+                        },
+                        new AGUIToolCall
+                        {
+                            Id = "call-server",
+                            Function = new AGUIToolCallFunction
+                            {
+                                Name = "server_tool",
                                 Arguments = "{}"
                             }
                         }

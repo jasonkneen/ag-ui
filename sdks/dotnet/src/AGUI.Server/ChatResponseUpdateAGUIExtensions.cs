@@ -149,7 +149,7 @@ public static class ChatResponseUpdateAGUIExtensions
         var isContinuation = context.IsContinuation;
         var clientToolNames = context.ClientToolNames;
         var preExistingToolCalls = isContinuation
-            ? GetToolCalls(context.Messages)
+            ? GetMostRecentToolCalls(context.Messages)
             : null;
 
         bool runStartedEmitted = false;
@@ -630,30 +630,42 @@ public static class ChatResponseUpdateAGUIExtensions
         }
     }
 
-    private static Dictionary<string, string> GetToolCalls(IEnumerable<ChatMessage> messages)
+    private static Dictionary<string, string> GetMostRecentToolCalls(List<ChatMessage> messages)
     {
-        var toolCalls = new Dictionary<string, string>(StringComparer.Ordinal);
-
-        foreach (var message in messages)
+        // Continuation reconstruction may append user approval responses after the source
+        // assistant batch. Only that most recent assistant tool-call batch can be replayed.
+        for (var i = messages.Count - 1; i >= 0; i--)
         {
+            var message = messages[i];
+            if (message.Role != ChatRole.Assistant)
+            {
+                continue;
+            }
+
+            Dictionary<string, string>? toolCalls = null;
             foreach (var content in message.Contents)
             {
                 FunctionCallContent? call = content switch
                 {
                     FunctionCallContent functionCall => functionCall,
                     ToolApprovalRequestContent { ToolCall: FunctionCallContent functionCall } => functionCall,
-                    ToolApprovalResponseContent { ToolCall: FunctionCallContent functionCall } => functionCall,
                     _ => null,
                 };
 
                 if (call is not null)
                 {
+                    toolCalls ??= new Dictionary<string, string>(StringComparer.Ordinal);
                     toolCalls[call.CallId] = call.Name;
                 }
             }
+
+            if (toolCalls is not null)
+            {
+                return toolCalls;
+            }
         }
 
-        return toolCalls;
+        return new Dictionary<string, string>(StringComparer.Ordinal);
     }
 
     private static string? SerializeResultContent(FunctionResultContent frc, JsonSerializerOptions options)
