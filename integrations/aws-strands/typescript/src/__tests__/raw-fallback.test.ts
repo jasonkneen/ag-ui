@@ -2,7 +2,9 @@
  * Issue #2291 — the adapter's event dispatch has no terminal fallback, so any
  * Strands event it does not translate is dropped with no error and no log.
  * Provider extensions the adapter predates (Bedrock citations being the
- * reported case) vanish before they reach the frontend.
+ * reported case) vanish before they reach the frontend. Citations arrive as a
+ * delta kind inside an event the adapter does handle, so the delta branch must
+ * let unrecognised kinds fall through rather than consuming them.
  *
  * The adapter must forward anything it does not map as a RAW event carrying
  * the original Strands payload, while the deliberate lifecycle skips stay
@@ -15,12 +17,23 @@ import { EventType } from "@ag-ui/core";
 
 import { collect, scriptedStrandsAgent } from "./helpers";
 
+// The shape `@strands-agents/sdk` 1.1.0 actually emits for Bedrock citations:
+// a `modelContentBlockDeltaEvent` whose delta discriminates as
+// `citationsDelta` (models/streaming.d.ts, `ContentBlockDelta`). The adapter
+// has no branch for that delta kind, so it is what the fallback must forward.
 const CITATION_EVENT = {
-  type: "modelCitationEvent",
-  citation: {
-    title: "quarterly-report.pdf",
-    sourceContent: [{ text: "revenue grew 12%" }],
-    location: { documentChar: { documentIndex: 0, start: 10, end: 26 } },
+  type: "modelContentBlockDeltaEvent",
+  delta: {
+    type: "citationsDelta",
+    citations: [
+      {
+        title: "quarterly-report.pdf",
+        source: "s3://reports/quarterly-report.pdf",
+        sourceContent: [{ text: "revenue grew 12%" }],
+        location: { documentChar: { documentIndex: 0, start: 10, end: 26 } },
+      },
+    ],
+    content: [{ text: "revenue grew 12%" }],
   },
 } as unknown as AgentStreamEvent;
 
@@ -38,7 +51,9 @@ describe("RAW fallback for unmapped Strands events", () => {
 
     const raws = rawEvents(events as Array<{ type: string }>);
     const citationRaws = raws.filter(
-      (e) => e.event?.type === "modelCitationEvent",
+      (e) =>
+        (e.event as { delta?: { type?: string } })?.delta?.type ===
+        "citationsDelta",
     );
 
     expect(citationRaws).toHaveLength(1);
@@ -58,7 +73,9 @@ describe("RAW fallback for unmapped Strands events", () => {
     const events = await collect(agent);
 
     const raws = rawEvents(events as Array<{ type: string }>);
-    expect(raws.map((e) => e.event?.type)).toContain("modelCitationEvent");
+    expect(
+      raws.map((e) => (e.event as { delta?: { type?: string } })?.delta?.type),
+    ).toContain("citationsDelta");
     expect(raws.map((e) => e.event?.type)).not.toContain(
       "modelStreamUpdateEvent",
     );

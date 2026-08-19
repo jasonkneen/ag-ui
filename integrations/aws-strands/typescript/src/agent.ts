@@ -1822,7 +1822,19 @@ export class StrandsAgent {
                 }
               }
             }
-            continue;
+
+            // Only the delta kinds handled above are consumed here. Anything
+            // else falls through to the RAW fallback: Bedrock citations reach
+            // the adapter as `citationsDelta` inside this event, so an
+            // unconditional continue is what kept them off the wire.
+            const handled: ReadonlyArray<string> = [
+              "textDelta",
+              "reasoningContentDelta",
+              "toolUseInputDelta",
+            ];
+            if (handled.includes((delta as { type: string }).type)) {
+              continue;
+            }
           }
 
           // Reasoning signature (verification token) — not exposed to UI.
