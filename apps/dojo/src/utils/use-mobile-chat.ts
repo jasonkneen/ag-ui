@@ -45,6 +45,11 @@ export function useMobileChat(defaultChatHeight = 50) {
       document.removeEventListener('mouseup', handleMouseUp);
       document.body.style.userSelect = '';
     };
+    // DEFERRED (PNI-307): `defaultChatHeight` is intentionally omitted — it is
+    // only read inside the mouseup close-and-reset path, and callers pass a
+    // constant. Including it would re-bind the document listeners mid-drag if
+    // a caller ever passed a changing value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDragging, dragStartY, dragStartHeight, chatHeight]);
 
   const handleDragStart = (e: React.MouseEvent) => {
