@@ -32,7 +32,6 @@
     "@ag-ui/proto": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "^20.11.19",
     "@vitest/coverage-istanbul": "^4.0.18",
     "eslint": "^9.37.0",
     "publint": "^0.3.12",

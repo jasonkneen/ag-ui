@@ -1,10 +1,6 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
-import { describe, expect, it } from "vitest";
-
 import { EventSchemas } from "@ag-ui/core";
+
+import fixture from "../../../../../fixtures/null-omission.json";
 
 import { EventEncoder } from "../encoder";
 
@@ -29,13 +25,7 @@ interface FixtureCase {
   expected: Record<string, unknown>;
 }
 
-const fixturePath = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../../../../fixtures/null-omission.json",
-);
-
-const fixture: { stream: FixtureCase[] } = JSON.parse(readFileSync(fixturePath, "utf8"));
-const cases = fixture.stream.filter((entry) => entry.producedBy.includes(SDK_NAME));
+const cases: FixtureCase[] = fixture.stream.filter((entry) => entry.producedBy.includes(SDK_NAME));
 
 describe("null omission cross-language fixture", () => {
   it("covers this SDK", () => {
