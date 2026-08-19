@@ -13,11 +13,10 @@ from types import SimpleNamespace
 import pytest
 import strands.event_loop.event_loop as strands_event_loop
 from ag_ui.core import EventType, RunAgentInput, UserMessage
+from ag_ui_strands.agent import StrandsAgent
 from strands import Agent
 from strands.models import Model
 from strands.types.exceptions import ModelThrottledException
-
-from ag_ui_strands.agent import StrandsAgent
 
 _THREAD_ID = "terminal-event-thread"
 _THROTTLE_REASON = "Too many requests"
