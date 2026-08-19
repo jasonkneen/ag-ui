@@ -47,10 +47,56 @@ export interface CreateStrandsAppOptions {
    *
    * Note: with the `cors` package, a literal `"*"` is emitted verbatim as
    * `Access-Control-Allow-Origin: *`, whereas `true` would reflect the request's
-   * `Origin` header back per-request — a different (more permissive) posture when
-   * combined with credentials. Stick to `"*"` to match the Python adapter.
+   * `Origin` header back per-request, a more permissive posture. Stick to `"*"`
+   * to match the Python adapter.
+   *
+   * An array containing `"*"`, and an empty array, are both normalized to the
+   * bare `"*"` so they mean allow-all as they do in Python. Credentials follow
+   * from the resolved value: only a concrete allow-list enables them.
    */
   corsOrigin?: string | string[] | boolean;
+}
+
+/**
+ * Reduce an origin option to the form the `cors` package actually honours.
+ *
+ * `cors` compares array entries to the request Origin by string equality, so
+ * a `"*"` sitting inside an array never matches and an empty array matches
+ * nothing either: both deny every origin. Starlette reads both as allow-all,
+ * and `create_strands_app` maps a falsy list to `["*"]` besides, so an
+ * unnormalized array is a silent cross-SDK divergence. Collapse those cases
+ * to the bare string, which `cors` does treat as a wildcard.
+ */
+function normalizeCorsOrigin(
+  origin: string | string[] | boolean,
+): string | string[] | boolean {
+  if (!Array.isArray(origin)) return origin;
+  if (origin.length === 0 || origin.includes("*")) return "*";
+  return origin;
+}
+
+/**
+ * Whether credentialed cross-origin requests may be allowed for `origin`.
+ *
+ * Only a concrete origin qualifies, whether given as a single string or a
+ * list. `Access-Control-Allow-Origin: *`
+ * together with `Access-Control-Allow-Credentials: true` is a pairing browsers
+ * reject outright, and `origin: true` reflects whatever Origin the caller sent,
+ * which would extend credentials to every site. The Python adapter applies the
+ * same rule via `allow_credentials=bool(origins) and not is_wildcard`.
+ *
+ * Call this on the output of {@link normalizeCorsOrigin}, so the wildcard
+ * spellings have already collapsed to `"*"`.
+ */
+function allowsCredentials(origin: string | string[] | boolean): boolean {
+  // An empty string disables CORS in the `cors` package, so there is no
+  // origin to grant credentials against.
+  if (typeof origin === "string") return origin !== "*" && origin !== "";
+  // Normalization has already collapsed the wildcard spellings, so a
+  // surviving array is always a concrete list. Kept as a guard rather than a
+  // bare `true` so calling this on an unnormalized value stays safe.
+  if (Array.isArray(origin)) return origin.length > 0 && !origin.includes("*");
+  return false;
 }
 
 /** Create an Express app with a single Strands agent endpoint and optional ping endpoint. */
@@ -75,7 +121,13 @@ export async function createStrandsApp(
   const cors = (corsModule.default ?? corsModule) as typeof import("cors");
 
   const app = express();
-  app.use(cors({ origin: corsOrigin, credentials: true }));
+  const resolvedCorsOrigin = normalizeCorsOrigin(corsOrigin);
+  app.use(
+    cors({
+      origin: resolvedCorsOrigin,
+      credentials: allowsCredentials(resolvedCorsOrigin),
+    }),
+  );
   app.use(express.json({ limit: "50mb" }));
 
   addStrandsExpressEndpoint(app, agent, { path });
