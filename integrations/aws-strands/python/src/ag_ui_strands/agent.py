@@ -913,43 +913,48 @@ def _is_orchestrator_factory(candidate: Any) -> bool:
     )
 
 
-def _snapshot_orchestrator_nodes(orchestrator: Any) -> "Dict[str, list] | None":
-    """Copy each node agent's conversation so a run can be undone.
+def _snapshot_orchestrator_nodes(
+    orchestrator: Any, _depth: int = 0
+) -> "List[Tuple[list, list]] | None":
+    """Copy every leaf agent's conversation so a run can be undone.
 
     A Python Graph does not snapshot and restore its node agents around an
     execution, so a reused instance carries one run's messages into the next.
-    Returns None when the shape is not recognised, in which case the caller
-    warns rather than silently assuming isolation.
+    A node can itself be a Graph or Swarm, so this recurses to the leaf agents
+    rather than only looking one level down.
+
+    Returns pairs of (live list, copy). None means some node exposed neither a
+    conversation nor nested nodes, so isolation cannot be guaranteed and the
+    caller must refuse to reuse the instance rather than leak between runs.
     """
+    if _depth > _MAX_MULTIAGENT_NESTING:
+        return None
     nodes = getattr(orchestrator, "nodes", None)
     if not isinstance(nodes, dict):
         return None
-    snapshot: Dict[str, list] = {}
-    for node_id, node in nodes.items():
+    pairs: List[Tuple[list, list]] = []
+    for node in nodes.values():
         executor = getattr(node, "executor", None)
         messages = getattr(executor, "messages", None)
-        if not isinstance(messages, list):
+        if isinstance(messages, list):
+            pairs.append((messages, list(messages)))
+            continue
+        # A nested orchestrator has no conversation of its own; its leaves do.
+        nested = _snapshot_orchestrator_nodes(executor, _depth + 1)
+        if nested is None:
             return None
-        snapshot[str(node_id)] = list(messages)
-    return snapshot
+        pairs.extend(nested)
+    return pairs
 
 
 def _restore_orchestrator_nodes(
-    orchestrator: Any, snapshot: "Dict[str, list] | None"
+    snapshot: "List[Tuple[list, list]] | None",
 ) -> None:
-    """Put each node agent's conversation back to its pre-run state."""
+    """Put every leaf agent's conversation back to its pre-run state."""
     if snapshot is None:
         return
-    nodes = getattr(orchestrator, "nodes", None)
-    if not isinstance(nodes, dict):
-        return
-    for node_id, node in nodes.items():
-        messages = snapshot.get(str(node_id))
-        executor = getattr(node, "executor", None)
-        current = getattr(executor, "messages", None)
-        if messages is None or not isinstance(current, list):
-            continue
-        current[:] = messages
+    for live, copy in snapshot:
+        live[:] = copy
 
 
 def _unwrap_multiagent_node_stream(
@@ -1319,15 +1324,18 @@ class StrandsAgent:
         # A shared instance is reused across runs, so its node conversations
         # are snapshotted and restored around each one. Warn when that is not
         # possible rather than letting one run's history reach the next.
-        self._orchestrator_reusable = True
         if self._orchestrator is not None and self._orchestrator_factory is None:
             if _snapshot_orchestrator_nodes(self._orchestrator) is None:
-                self._orchestrator_reusable = False
-                logger.warning(
-                    "A multi-agent orchestrator was passed directly and its "
-                    "node conversations cannot be snapshotted, so history may "
-                    "carry between runs and between threads. Pass a callable "
-                    "that builds and returns a fresh orchestrator instead."
+                # Refused rather than warned: a shared instance whose leaf
+                # conversations cannot be restored carries one thread's turns
+                # into the next thread's model input, and a warning does not
+                # stop that reaching another user.
+                raise TypeError(
+                    "This multi-agent orchestrator was passed directly, but "
+                    "its node conversations cannot be isolated between runs, "
+                    "so one run's history would reach the next. Pass a "
+                    "callable that builds and returns a fresh orchestrator "
+                    "per run instead."
                 )
 
         # Store template agent configuration for creating fresh instances.
@@ -1408,6 +1416,10 @@ class StrandsAgent:
         # its node agents, which reject overlapping invocations, so a second
         # run on the same thread is rejected rather than allowed to collide.
         self._active_orchestrator_runs: set[str] = set()
+        # Orchestrators holding an unanswered interrupt, by thread. A resume
+        # has to reach the instance that paused; a fresh one was never
+        # interrupted and rejects the response.
+        self._parked_orchestrators_by_thread: Dict[str, Any] = {}
 
     def _will_emit_tool_snapshot(self, behavior: Any, emit_snapshots: bool) -> bool:
         # ``emit_snapshots`` is the per-run gate (config flag AND not a
@@ -1488,6 +1500,7 @@ class StrandsAgent:
         # Native interrupts raised during this run, reported on RUN_FINISHED so
         # the client knows the run paused rather than completed.
         native_interrupts: List[Any] = []
+        node_snapshot: "List[Tuple[list, list]] | None" = None
         # node_id -> step name, so STEP_FINISHED reuses the node_type that only
         # the start event carries, and so any step left open by a terminal
         # interrupt is still closed before RUN_FINISHED.
@@ -1525,12 +1538,21 @@ class StrandsAgent:
                         break
 
             if self._orchestrator_factory is not None:
-                # Fresh per run: nothing can carry from a previous run, and two
-                # runs never touch the same instance.
-                orchestrator = self._orchestrator_factory()
+                parked = self._parked_orchestrators_by_thread.get(thread_id)
+                if resume_prompt is not None and parked is not None:
+                    # An interrupt lives on the instance that raised it, so a
+                    # resume has to reach that one. A freshly built graph was
+                    # never interrupted and rejects the response outright.
+                    orchestrator = parked
+                else:
+                    # Otherwise fresh per run: nothing carries from a previous
+                    # run, and two runs never touch the same instance.
+                    orchestrator = self._orchestrator_factory()
                 node_snapshot = None
             else:
                 orchestrator = self._orchestrator
+                # A run that pauses must keep its interrupt state, so the
+                # conversation is only rewound once the interrupt resolves.
                 node_snapshot = _snapshot_orchestrator_nodes(orchestrator)
 
             stream = orchestrator.stream_async(prompt)
@@ -1638,10 +1660,6 @@ class StrandsAgent:
                         logger.debug(
                             "orchestrator stream teardown failed", exc_info=True
                         )
-                # Undo this run's additions to a reused instance, so the next
-                # run (and the next user) starts from the same state this one
-                # did.
-                _restore_orchestrator_nodes(orchestrator, node_snapshot)
 
             for closing in _close_open_multiagent(nodes, open_steps):
                 yield closing
@@ -1658,8 +1676,17 @@ class StrandsAgent:
                 self._pending_interrupts_by_thread[thread_id] = {
                     interrupt.id: interrupt for interrupt in ag_ui_interrupts
                 }
+                # Held so the resume reaches the instance that paused, and its
+                # conversation is left as the interrupt left it: rewinding here
+                # would discard the very state the resume needs.
+                self._parked_orchestrators_by_thread[thread_id] = orchestrator
             else:
                 self._pending_interrupts_by_thread.pop(thread_id, None)
+                self._parked_orchestrators_by_thread.pop(thread_id, None)
+                # Undo this run's additions to a reused instance, so the next
+                # run (and the next user) starts from the same state this one
+                # did.
+                _restore_orchestrator_nodes(node_snapshot)
 
             yield RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
@@ -1674,6 +1701,7 @@ class StrandsAgent:
                 else "STRANDS_ERROR"
             )
             logger.error(f"_run_orchestrator failed: {e}", exc_info=True)
+            _restore_orchestrator_nodes(node_snapshot)
             # A Graph fails fast: the first node exception cancels its siblings
             # and re-raises, so a raise landing mid-text is routine. Without
             # this the run would end on a dangling message envelope and a step

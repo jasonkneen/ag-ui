@@ -39,8 +39,10 @@ Ask for anything you would like researched, for example
   state on the instance, and a Python graph also carries node history across
   executions, so a long-lived one would leak a previous run's conversation into
   the next and would make two concurrent visitors interfere. The Python adapter
-  accepts a callable for exactly this, and isolates a directly-passed instance
-  by restoring its node conversations after each run
+  accepts a callable for exactly this. A directly passed instance is isolated
+  instead by restoring its leaf conversations after each run, recursing through
+  nested graphs; one whose leaves cannot be reached is refused rather than
+  reused, since a warning would not stop the leak
 - Only the latest user turn is forwarded. An orchestrator takes a task string
   rather than a conversation, so this demo answers each question on its own
   and does not carry chat history between turns
@@ -64,7 +66,10 @@ invisible:
 - A node that interrupts never emits a stop event, so its step is closed
   before the run ends rather than left running in the UI. The run reports an
   interrupt outcome rather than plain success, and answering it through the
-  protocol's resume entries continues the graph from its checkpoint
+  protocol's resume entries continues the graph from its checkpoint. The
+  instance that paused is held for that thread until the interrupt resolves,
+  because the interrupt lives on it: a freshly built graph was never
+  interrupted and rejects the response
 - A nested graph or swarm node wraps its events a second time, so they are
   unwrapped to the innermost agent event; reading one level reported a
   successful run with no output at all

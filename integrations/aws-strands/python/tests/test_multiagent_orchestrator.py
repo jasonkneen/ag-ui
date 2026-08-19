@@ -1230,3 +1230,177 @@ async def test_a_completed_run_clears_the_pending_interrupt():
 
     assert events[-1].outcome is None
     assert not agent._pending_interrupts_by_thread.get("test-thread")
+
+
+# ---------------------------------------------------------------------------
+# Nested orchestrators: isolation and reuse safety
+# ---------------------------------------------------------------------------
+
+
+def _nested_real_graph():
+    from strands import Agent
+    from strands.multiagent import GraphBuilder
+
+    leaf = Agent(model=ScriptedModel("LEAF."), name="leaf", callback_handler=None)
+    inner = GraphBuilder()
+    inner.add_node(leaf, "leaf")
+    inner.set_entry_point("leaf")
+    outer = GraphBuilder()
+    outer.add_node(inner.build(), "nested")
+    outer.set_entry_point("nested")
+    return outer.build(), leaf
+
+
+@pytest.mark.asyncio
+async def test_nested_graph_leaves_are_isolated_between_threads():
+    # A nested orchestrator holds no conversation of its own, so isolating only
+    # the top level left the leaf agent accumulating every thread's turns.
+    outer, leaf = _nested_real_graph()
+    agent = StrandsAgent(outer, name="multi_agent")
+
+    for thread, message in (("thread-a", "SECRET_ALPHA"), ("thread-b", "PUBLIC_BETA")):
+        run_input = FakeInput(messages=[FakeMessage("user", message)])
+        run_input.thread_id = thread
+        await collect(agent, run_input)
+
+    assert "SECRET_ALPHA" not in _texts_seen_by(leaf)
+    assert _texts_seen_by(leaf) == []
+
+
+@pytest.mark.asyncio
+async def test_an_orchestrator_that_cannot_be_isolated_is_refused():
+    # Warning and continuing would still ship one thread's turns to the next.
+    class OpaqueNode:
+        executor = object()
+
+    class OpaqueGraph:
+        nodes = {"a": OpaqueNode()}
+
+        async def stream_async(self, task, invocation_state=None, **kwargs):
+            yield {}
+
+    with pytest.raises(TypeError, match="cannot be isolated between runs"):
+        StrandsAgent(OpaqueGraph(), name="multi_agent")
+
+    # The same orchestrator is fine behind a factory: each run builds its own.
+    agent = StrandsAgent(lambda: OpaqueGraph(), name="multi_agent")
+    assert agent._orchestrator_factory is not None
+
+
+# ---------------------------------------------------------------------------
+# Resume against a factory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_reaches_the_orchestrator_that_paused():
+    # An interrupt lives on the instance that raised it. Building a fresh one
+    # for the resume sends the response to a graph that was never interrupted.
+    built = []
+
+    def build():
+        orchestrator = FakeOrchestrator(
+            [
+                {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+                {
+                    "type": "multiagent_node_interrupt",
+                    "node_id": "a",
+                    "interrupts": [NativeInterrupt()],
+                },
+            ]
+        )
+        built.append(orchestrator)
+        return orchestrator
+
+    agent = StrandsAgent(build, name="multi_agent")
+    await collect(agent)
+    paused = built[-1]
+
+    class Entry:
+        interrupt_id = "i1"
+        status = "resolved"
+        payload = {"approved": True}
+
+    resume_input = FakeInput(messages=[FakeMessage("user", "ignored")])
+    resume_input.resume = [Entry()]
+    await collect(agent, resume_input)
+
+    # The resume went to the paused instance, not a newly built one.
+    assert built[-1] is paused
+    assert paused.prompts[-1] == [
+        {"interruptResponse": {"interruptId": "i1", "response": {"response": {"approved": True}}}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_paused_orchestrator_is_released_once_the_run_completes():
+    built = []
+
+    def build():
+        orchestrator = FakeOrchestrator(
+            [
+                {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+                {
+                    "type": "multiagent_node_interrupt",
+                    "node_id": "a",
+                    "interrupts": [NativeInterrupt()],
+                },
+            ]
+        )
+        built.append(orchestrator)
+        return orchestrator
+
+    agent = StrandsAgent(build, name="multi_agent")
+    await collect(agent)
+    assert agent._parked_orchestrators_by_thread.get("test-thread") is built[-1]
+
+    # The resume run completes, so nothing stays parked and the next ordinary
+    # run gets a fresh orchestrator again.
+    built[-1].events = [
+        {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+        {"type": "multiagent_node_stop", "node_id": "a"},
+    ]
+
+    class Entry:
+        interrupt_id = "i1"
+        status = "resolved"
+        payload = {"approved": True}
+
+    resume_input = FakeInput()
+    resume_input.resume = [Entry()]
+    await collect(agent, resume_input)
+
+    assert not agent._parked_orchestrators_by_thread.get("test-thread")
+
+    before = len(built)
+    await collect(agent)
+    assert len(built) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_run_does_not_rewind_the_conversation():
+    # Rewinding a paused instance would discard the state its resume needs.
+    from strands import Agent
+    from strands.multiagent import GraphBuilder
+
+    node = Agent(model=ScriptedModel("A."), name="solo", callback_handler=None)
+    builder = GraphBuilder()
+    builder.add_node(node, "solo")
+    builder.set_entry_point("solo")
+
+    agent = StrandsAgent(builder.build(), name="multi_agent")
+    agent._orchestrator.stream_async = FakeOrchestrator(  # type: ignore[method-assign]
+        [
+            {"type": "multiagent_node_start", "node_id": "solo", "node_type": "agent"},
+            {
+                "type": "multiagent_node_interrupt",
+                "node_id": "solo",
+                "interrupts": [NativeInterrupt()],
+            },
+        ]
+    ).stream_async
+    node.messages.append({"role": "user", "content": [{"text": "mid-interrupt"}]})
+
+    await collect(agent, FakeInput(messages=[FakeMessage("user", "go")]))
+
+    assert _texts_seen_by(node) == ["mid-interrupt"]
