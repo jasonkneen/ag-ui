@@ -15,8 +15,6 @@ export function isInterruptExpired(interrupt: Interrupt, now: Date = new Date())
   return new Date(interrupt.expiresAt) <= now;
 }
 
-// `metadata` carries envelope data about the response (signatures, routing
-// keys) on either status — a cancellation can be signed too.
 type ResumeResponse =
   | { status: "resolved"; payload?: unknown; metadata?: Metadata }
   | { status: "cancelled"; metadata?: Metadata };
