@@ -28,6 +28,5 @@ public sealed class RunFinishedEvent : BaseEvent
     // was reported, so the field is omitted on the wire and legacy events
     // round-trip unchanged.
     [JsonPropertyName("usage")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IList<TokenUsage>? Usage { get; set; }
 }

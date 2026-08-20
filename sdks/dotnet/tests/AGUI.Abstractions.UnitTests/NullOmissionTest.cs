@@ -158,6 +158,37 @@ public sealed class NullOmissionTest
     }
 
     [Fact]
+    public void NoPerPropertyNullIgnoreAttributesOutsideTheAllowlist()
+    {
+        // The omission rule lives in ONE place — DefaultIgnoreCondition on the
+        // context — and this asserts nobody quietly reintroduces the per-property
+        // spelling. A re-added [JsonIgnore(WhenWritingNull)] is not a harmless
+        // duplicate: while it is present, a green sweep above no longer proves the
+        // context-wide setting works, which is how three wire bugs stayed hidden
+        // the first time. This is not hypothetical either — within days of the
+        // sweep landing, new feature work reintroduced fourteen of them.
+        //
+        // Allowlist: the interrupt content types are registered onto caller-owned
+        // JsonSerializerOptions and cannot inherit the context's setting, so their
+        // attributes are load-bearing. See the comments on those classes.
+        var allowlist = new HashSet<Type> { typeof(InterruptRequestContent), typeof(InterruptResponseContent) };
+
+        var offenders = typeof(BaseEvent).Assembly
+            .GetTypes()
+            .Where(type => !allowlist.Contains(type))
+            .SelectMany(type => type.GetProperties(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly))
+            .Where(property => property
+                .GetCustomAttributes<JsonIgnoreAttribute>()
+                .Any(attribute => attribute.Condition == JsonIgnoreCondition.WhenWritingNull))
+            .Select(property => $"{property.DeclaringType!.Name}.{property.Name}")
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Empty(offenders);
+    }
+
+    [Fact]
     public void OmissionSurvivesCallerOwnedSerializerOptions()
     {
         // Composing AG-UI types into caller-owned options means inserting a resolver, not

@@ -42,6 +42,5 @@ public abstract class BaseEvent
     /// cref="AGUIMetadata.ReservedKey"/>.
     /// </remarks>
     [JsonPropertyName("metadata")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Metadata { get; set; }
 }

@@ -38,6 +38,5 @@ public abstract class AGUIMessage
     /// reducer of its own is separate work.
     /// </remarks>
     [JsonPropertyName("metadata")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Metadata { get; set; }
 }

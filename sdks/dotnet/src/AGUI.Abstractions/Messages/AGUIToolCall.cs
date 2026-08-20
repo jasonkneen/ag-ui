@@ -27,6 +27,5 @@ public sealed class AGUIToolCall
     /// share one parent.
     /// </remarks>
     [JsonPropertyName("metadata")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Metadata { get; set; }
 }
