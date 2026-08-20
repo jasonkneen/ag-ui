@@ -27,9 +27,12 @@ test.describe("[Integration] LlamaIndex - Agentic Chat Multimodal", () => {
     await sendChatMessage(page, "Tell me what do you see in this image");
     await awaitLLMResponseDone(page);
 
-    // Verify the agent responded about the image
+    // Verify the image actually reached the LLM request: the aimock predicate
+    // fixture returns this marker ONLY when an image_url content part is
+    // present. A canned prompt-text match (image silently stripped) responds
+    // without the marker and this assertion fails.
     const lastAssistant = CopilotSelectors.assistantMessages(page).last();
-    await expect(lastAssistant).toContainText(/image|visual|content/i, {
+    await expect(lastAssistant).toContainText("multimodal-image-verified", {
       timeout: 10000,
     });
   });
