@@ -557,6 +557,14 @@ async def test_list_content_is_flattened_not_repr_ed():
     assert orchestrator.prompts == ["summarise this"]
 
 
+class _ResumeEntry:
+    """Resolved resume for the interrupt the fake orchestrators raise."""
+
+    interrupt_id = "i1"
+    status = "resolved"
+    payload = {"approved": True}
+
+
 @pytest.mark.asyncio
 async def test_node_cancel_emits_custom_event_with_reason():
     # Strands emits cancel, then a FAILED stop, then raises. The cancel event
@@ -1226,7 +1234,10 @@ async def test_a_completed_run_clears_the_pending_interrupt():
         {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
         {"type": "multiagent_node_stop", "node_id": "a"},
     ]
-    events = await collect(agent)
+    # A resume, because a parked orchestrator refuses an unrelated run.
+    resume_input = FakeInput()
+    resume_input.resume = [_ResumeEntry()]
+    events = await collect(agent, resume_input)
 
     assert events[-1].outcome is None
     assert not agent._pending_interrupts_by_thread.get("test-thread")
@@ -1352,7 +1363,7 @@ async def test_the_paused_orchestrator_is_released_once_the_run_completes():
 
     agent = StrandsAgent(build, name="multi_agent")
     await collect(agent)
-    assert agent._parked_orchestrators_by_thread.get("test-thread") is built[-1]
+    assert agent._parked_orchestrators_by_thread["test-thread"].orchestrator is built[-1]
 
     # The resume run completes, so nothing stays parked and the next ordinary
     # run gets a fresh orchestrator again.
@@ -1404,3 +1415,156 @@ async def test_an_interrupted_run_does_not_rewind_the_conversation():
     await collect(agent, FakeInput(messages=[FakeMessage("user", "go")]))
 
     assert _texts_seen_by(node) == ["mid-interrupt"]
+
+
+# ---------------------------------------------------------------------------
+# Shared-instance isolation across the whole run lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _interrupting_graph(script):
+    """Direct Graph whose single node interrupts, then answers on resume."""
+    from strands import Agent
+    from strands.multiagent import GraphBuilder
+
+    node = Agent(model=ScriptedModel("unused"), name="solo", callback_handler=None)
+    builder = GraphBuilder()
+    builder.add_node(node, "solo")
+    builder.set_entry_point("solo")
+    graph = builder.build()
+    replay = FakeOrchestrator([])
+    replay.events = script
+    graph.stream_async = replay.stream_async  # type: ignore[method-assign]
+    return graph, node, replay
+
+
+def _interrupt_then(*, after):
+    return [
+        {"type": "multiagent_node_start", "node_id": "solo", "node_type": "agent"},
+        {
+            "type": "multiagent_node_interrupt",
+            "node_id": "solo",
+            "interrupts": [NativeInterrupt()],
+        },
+    ] if after is None else [
+        {"type": "multiagent_node_start", "node_id": "solo", "node_type": "agent"},
+        node_stream("solo", {"data": after}),
+        {"type": "multiagent_node_stop", "node_id": "solo"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completing_a_resume_rewinds_to_before_the_run_that_paused():
+    # The rewind target is the state from before the FIRST run, not the paused
+    # state a resume run starts from. Snapshotting again on resume left the
+    # interrupted turns on the shared instance for the next thread.
+    graph, node, replay = _interrupting_graph(_interrupt_then(after=None))
+    agent = StrandsAgent(graph, name="multi_agent")
+
+    first = FakeInput(messages=[FakeMessage("user", "SECRET_ALPHA")])
+    first.thread_id = "thread-a"
+    await collect(agent, first)
+    # The pause leaves its turns in place, which is what the resume needs.
+    node.messages.append({"role": "user", "content": [{"text": "SECRET_ALPHA"}]})
+
+    replay.events = _interrupt_then(after="answered")
+    resume = FakeInput(messages=[FakeMessage("user", "ignored")])
+    resume.thread_id = "thread-a"
+    resume.resume = [_ResumeEntry()]
+    await collect(agent, resume)
+
+    assert _texts_seen_by(node) == []
+    assert not agent._parked_orchestrators_by_thread
+
+
+@pytest.mark.asyncio
+async def test_abandoning_the_stream_still_rewinds_the_shared_instance():
+    # Closing the AG-UI generator (an HTTP client disconnecting) exits through
+    # GeneratorExit. Cleanup placed after the stream loop never runs on that
+    # path, which left the instance carrying the abandoned run's turns.
+    graph, node, _ = _interrupting_graph(
+        [
+            {"type": "multiagent_node_start", "node_id": "solo", "node_type": "agent"},
+            node_stream("solo", {"data": "partial"}),
+            {"type": "multiagent_node_stop", "node_id": "solo"},
+        ]
+    )
+    agent = StrandsAgent(graph, name="multi_agent")
+
+    first = FakeInput(messages=[FakeMessage("user", "SECRET_ALPHA")])
+    first.thread_id = "thread-a"
+    stream = agent.run(first)
+    async for event in stream:
+        if event.type == EventType.TEXT_MESSAGE_CONTENT:
+            # Simulate the node having written its turns before the disconnect.
+            node.messages.append(
+                {"role": "user", "content": [{"text": "SECRET_ALPHA"}]}
+            )
+            break
+    await stream.aclose()
+
+    assert _texts_seen_by(node) == []
+    assert not agent._parked_orchestrators_by_thread
+    assert not agent._active_orchestrator_runs
+
+
+@pytest.mark.asyncio
+async def test_a_second_interrupt_keeps_the_original_baseline():
+    # A resume that interrupts again must not overwrite the baseline with the
+    # conversation it started from, or the final completion rewinds to a paused
+    # state instead of a clean one.
+    graph, node, replay = _interrupting_graph(_interrupt_then(after=None))
+    agent = StrandsAgent(graph, name="multi_agent")
+
+    run_input = FakeInput(messages=[FakeMessage("user", "SECRET_ALPHA")])
+    run_input.thread_id = "thread-a"
+    await collect(agent, run_input)
+    node.messages.append({"role": "user", "content": [{"text": "turn-one"}]})
+    first_baseline = agent._parked_orchestrators_by_thread["thread-a"].baseline
+
+    # Resume, and interrupt a second time.
+    resume = FakeInput()
+    resume.thread_id = "thread-a"
+    resume.resume = [_ResumeEntry()]
+    await collect(agent, resume)
+    node.messages.append({"role": "user", "content": [{"text": "turn-two"}]})
+
+    assert agent._parked_orchestrators_by_thread["thread-a"].baseline is first_baseline
+
+    # Final resume completes, and the rewind goes all the way back.
+    replay.events = _interrupt_then(after="done")
+    final = FakeInput()
+    final.thread_id = "thread-a"
+    final.resume = [_ResumeEntry()]
+    await collect(agent, final)
+
+    assert _texts_seen_by(node) == []
+    assert not agent._parked_orchestrators_by_thread
+
+
+@pytest.mark.asyncio
+async def test_a_parked_shared_instance_refuses_an_unrelated_run():
+    # While one thread's interrupt is outstanding, the shared graph is still
+    # parked mid-execution, so another thread must not be handed it.
+    graph, _, _ = _interrupting_graph(_interrupt_then(after=None))
+    agent = StrandsAgent(graph, name="multi_agent")
+
+    first = FakeInput(messages=[FakeMessage("user", "first")])
+    first.thread_id = "thread-a"
+    await collect(agent, first)
+
+    other = FakeInput(messages=[FakeMessage("user", "second")])
+    other.thread_id = "thread-b"
+    events = await collect(agent, other)
+
+    assert [e.type for e in events] == [
+        EventType.RUN_STARTED,
+        EventType.RUN_ERROR,
+    ]
+    assert events[-1].code == "THREAD_BUSY"
+
+    # A non-resume run on the parked thread is refused for the same reason.
+    same_thread = FakeInput(messages=[FakeMessage("user", "third")])
+    same_thread.thread_id = "thread-a"
+    again = await collect(agent, same_thread)
+    assert again[-1].code == "THREAD_BUSY"
