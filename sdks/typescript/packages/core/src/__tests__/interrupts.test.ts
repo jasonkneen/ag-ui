@@ -50,9 +50,7 @@ describe("ResumeEntrySchema", () => {
   });
 
   it("rejects unknown status value", () => {
-    expect(() =>
-      ResumeEntrySchema.parse({ interruptId: "int-1", status: "denied" }),
-    ).toThrow();
+    expect(() => ResumeEntrySchema.parse({ interruptId: "int-1", status: "denied" })).toThrow();
   });
 });
 
@@ -158,6 +156,19 @@ describe("RunAgentInput.resume", () => {
     context: [],
     forwardedProps: {},
   };
+
+  it("reads a bare null state as absent, and preserves nulls inside state", () => {
+    // The state contract: optional, absent means "no state", and a bare null is
+    // the same statement — every consumer collapses the two, and .NET cannot
+    // represent the difference. Coercing here keeps a hand-rolled client that
+    // sends "state": null on the same footing as one that omits the key.
+    const { state, ...withoutState } = baseInput;
+    expect(RunAgentInputSchema.parse(withoutState).state).toBeUndefined();
+    expect(RunAgentInputSchema.parse({ ...baseInput, state: null }).state).toBeUndefined();
+    expect(RunAgentInputSchema.parse({ ...baseInput, state: { selectedId: null } }).state).toEqual({
+      selectedId: null,
+    });
+  });
 
   it("accepts input without resume (back-compat)", () => {
     const parsed = RunAgentInputSchema.parse(baseInput);

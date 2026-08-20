@@ -270,7 +270,11 @@ class TestLegitimateNullsRoundTrip(unittest.TestCase):
         self.assertIn("snapshot", serialized)
         self.assertIsNone(serialized["snapshot"])
 
-    def test_run_agent_input_with_null_state_round_trips(self):
+    def test_run_agent_input_with_no_state_omits_the_key(self):
+        """The state contract: optional, absent means no state, bare null reads
+        as absent. All consumers surveyed collapse null into "no state", so the
+        wire carries the one spelling every SDK can represent: omission.
+        forwarded_props stays null — it is required, so its None is a value."""
         original = types_module.RunAgentInput(
             thread_id="thread_1",
             run_id="run_1",
@@ -281,10 +285,18 @@ class TestLegitimateNullsRoundTrip(unittest.TestCase):
             forwarded_props=None,
         )
         encoded = original.model_dump_json(by_alias=True)
-        self.assertIn('"state":null', encoded)
+        self.assertNotIn('"state"', encoded)
+        self.assertIn('"forwardedProps":null', encoded)
         self.assertEqual(
             original, types_module.RunAgentInput.model_validate_json(encoded)
         )
+
+    def test_run_agent_input_accepts_absent_state(self):
+        parsed = types_module.RunAgentInput.model_validate(
+            {"threadId": "t", "runId": "r", "messages": [], "tools": [],
+             "context": [], "forwardedProps": None}
+        )
+        self.assertIsNone(parsed.state)
 
 
 class TestNullOmissionCrossLanguageFixture(unittest.TestCase):

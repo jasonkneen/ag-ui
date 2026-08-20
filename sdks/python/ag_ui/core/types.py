@@ -101,12 +101,13 @@ class MetadataMixin(ConfiguredBaseModel):
     Open by key — any JSON value is allowed under a key, including ``None``. A
     ``None`` value under a key is meaningful data and is preserved.
 
-    The object itself is absent or a mapping, never ``None``. ``EventEncoder``
-    serializes with ``exclude_none=True``, so an absent object is omitted from
-    the wire rather than emitted as ``null``. Parsing is more forgiving than
-    that: an explicit ``null`` is read back as absent, which is what makes a
-    plain ``model_dump_json()`` — without ``exclude_none=True`` — round-trip.
-    The TypeScript schema does the same, for the same reason.
+    The object itself is absent or a mapping, never ``None``.
+    ``ConfiguredBaseModel`` omits an unset optional field on every
+    serialization path, so an absent metadata object never reaches the wire as
+    ``null`` — no ``exclude_none=True`` needed at any call site. The TypeScript
+    client enforces the same contract from the other side and rejects a
+    ``null`` metadata object: metadata postdates the omission fix, so unlike
+    some older optional fields there is no legacy producer to tolerate.
     """
 
     metadata: Optional[Metadata] = None
@@ -390,7 +391,11 @@ class RunAgentInput(ConfiguredBaseModel):
     thread_id: str
     run_id: str
     parent_run_id: Optional[str] = None
-    state: Any
+    # Optional by contract: absent means "no state", and a bare null on the wire
+    # reads as absent (every consumer collapses the two, and .NET's representation
+    # cannot tell them apart). Defaulting to None makes the base model omit it
+    # when unset. Nulls INSIDE a state object are values and survive.
+    state: Any = None
     messages: List[Message]
     tools: List[Tool]
     context: List[Context]

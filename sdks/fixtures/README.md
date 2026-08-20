@@ -109,3 +109,9 @@ Nulls _nested inside_ any of these payloads always survive, in every SDK. Closin
 gaps means changing those properties to non-nullable `JsonElement` with
 `JsonIgnoreCondition.WhenWritingDefault` — a breaking type change, so it is deliberately out of
 scope here.
+
+`RunAgentInput.state` is **not** in this table, on purpose: there the null-collapse is the
+contract, not a limitation. `state` is optional, absent means "no state", and a bare `null` is
+read as absent — a survey of every integration found none that distinguishes the two, so all three
+SDKs converge on omission (see the `run_started_input_with_bare_null_state_converges_on_omission`
+case). Nulls _inside_ a state object are values and survive.
