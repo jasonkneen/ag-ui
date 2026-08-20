@@ -178,30 +178,43 @@ describe("createStrandsApp CORS", () => {
     }
   });
 
-  it("treats an empty allow-list as allow-all, as Python does", async () => {
+  // Deliberately NOT widened to a wildcard. An empty allow-list denies every
+  // origin, and normalizing it would turn a deliberate deny-all into
+  // allow-all. Python coerces an empty list to a wildcard via `origins or
+  // ["*"]`; that is a quirk to fix on that side, not one to mirror here.
+  it("leaves an empty allow-list denying every origin", async () => {
     const { port, close } = await startApp({ corsOrigin: [] });
     try {
-      const { allowOrigin, allowCredentials } = await preflight(
-        port,
-        OTHER_ORIGIN,
-      );
-      expect(allowOrigin).toBe("*");
-      expect(allowCredentials).toBeNull();
+      const { allowOrigin } = await preflight(port, OTHER_ORIGIN);
+      expect(allowOrigin).toBeNull();
     } finally {
       await close();
     }
   });
 
-  it("withholds credentials when the origin is reflected", async () => {
-    // `corsOrigin: true` echoes whatever Origin arrived, so granting
-    // credentials would extend them to every caller.
+  // A reflected origin is still a concrete one, so credentials are valid and
+  // deployments that pass `true` depend on them. Only a literal `"*"` is the
+  // pairing browsers refuse.
+  it("keeps credentials when the origin is reflected", async () => {
+    const origin = "https://reflected.example.com";
     const { port, close } = await startApp({ corsOrigin: true });
+    try {
+      const { allowOrigin, allowCredentials } = await preflight(port, origin);
+      expect(allowOrigin).toBe(origin);
+      expect(allowCredentials).toBe("true");
+    } finally {
+      await close();
+    }
+  });
+
+  it("disables CORS entirely for `false`, with no credentials", async () => {
+    const { port, close } = await startApp({ corsOrigin: false });
     try {
       const { allowOrigin, allowCredentials } = await preflight(
         port,
         OTHER_ORIGIN,
       );
-      expect(allowOrigin).toBe(OTHER_ORIGIN);
+      expect(allowOrigin).toBeNull();
       expect(allowCredentials).toBeNull();
     } finally {
       await close();

@@ -14,6 +14,11 @@ pass-through observable: treating a wildcard as accepting protobuf, as the
 TypeScript `EventEncoder` does. It deliberately does not implement q
 handling, because the guard under test resolves `q=0` before any encoder
 sees the header.
+
+The double encodes real bytes on its protobuf path. A double that named
+protobuf while emitting SSE text would let the endpoint advertise a content
+type it cannot produce and still pass, which is the state
+`TextOnlyNegotiatingEncoder` now pins as a fallback to SSE instead.
 """
 
 from __future__ import annotations
@@ -29,12 +34,11 @@ from ag_ui_strands.endpoint import SSE_MEDIA_TYPE, add_strands_fastapi_endpoint
 from tests.endpoint_helpers import FakeAgent, valid_run_input
 
 
-class NegotiatingEncoder:
-    """An `EventEncoder` that actually negotiates, like the TypeScript one.
+class TextOnlyNegotiatingEncoder:
+    """Negotiates protobuf but has no binary encode path.
 
-    Selects protobuf whenever the Accept header admits it, wildcards
-    included. Encoding stays textual so the tests can read the frames; only
-    the negotiated content type matters here.
+    This is the shape of the encoder that actually ships: it can name a
+    protobuf content type without being able to produce protobuf.
     """
 
     def __init__(self, accept: str | None = None) -> None:
@@ -49,6 +53,13 @@ class NegotiatingEncoder:
 
     def encode(self, event) -> str:
         return f"data: {event.model_dump_json(by_alias=True, exclude_none=True)}\n\n"
+
+
+class NegotiatingEncoder(TextOnlyNegotiatingEncoder):
+    """A negotiating encoder that can also produce binary frames."""
+
+    def encode_binary(self, event) -> bytes:
+        return b"\x00" + event.model_dump_json(by_alias=True, exclude_none=True).encode()
 
 
 def _client(agent: FakeAgent | None = None) -> TestClient:
@@ -78,6 +89,11 @@ def _content_type(response) -> str:
 @pytest.fixture
 def negotiating_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(endpoint_module, "EventEncoder", NegotiatingEncoder)
+
+
+@pytest.fixture
+def text_only_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(endpoint_module, "EventEncoder", TextOnlyNegotiatingEncoder)
 
 
 @pytest.mark.parametrize(
@@ -179,3 +195,37 @@ def test_protobuf_named_on_a_later_accept_line_is_still_found(
         )
 
     assert _content_type(response) == AGUI_MEDIA_TYPE
+
+
+@pytest.mark.parametrize(
+    "accept",
+    [
+        pytest.param(AGUI_MEDIA_TYPE, id="alone"),
+        pytest.param(f"{AGUI_MEDIA_TYPE}, {SSE_MEDIA_TYPE};q=0.9", id="ranked-first"),
+    ],
+)
+def test_protobuf_is_refused_when_the_encoder_cannot_produce_it(
+    text_only_encoder, accept
+) -> None:
+    """Serving text under a protobuf content type would make the header a lie.
+
+    This is the shipped encoder's shape, so it is the path real clients take
+    today: naming protobuf gets SSE, and the response says SSE.
+    """
+    response = _client().post("/", json=valid_run_input(), headers={"Accept": accept})
+
+    assert response.status_code == 200
+    assert _content_type(response) == SSE_MEDIA_TYPE
+    assert response.text.startswith("data: ")
+
+
+def test_protobuf_frames_are_binary_when_the_encoder_can_produce_them(
+    negotiating_encoder,
+) -> None:
+    """The negotiated content type has to match what the body actually carries."""
+    response = _client().post(
+        "/", json=valid_run_input(), headers={"Accept": AGUI_MEDIA_TYPE}
+    )
+
+    assert _content_type(response) == AGUI_MEDIA_TYPE
+    assert response.content.startswith(b"\x00")

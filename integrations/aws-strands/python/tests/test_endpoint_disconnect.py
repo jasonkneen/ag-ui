@@ -73,6 +73,80 @@ class NeverEndingAgent:
             self.cleanup_ran.set()
 
 
+class AwaitingTeardownAgent:
+    """Streams forever, and awaits during its own cleanup.
+
+    The await is the point: releasing anything real (closing a session,
+    unregistering proxy tools) is asynchronous, so a teardown that cannot
+    await is a teardown that cannot release.
+    """
+
+    name = "awaiting-teardown"
+
+    def __init__(self) -> None:
+        self.cleanup_entered = threading.Event()
+        self.cleanup_completed = threading.Event()
+
+    async def run(self, input_data: Any) -> AsyncIterator[BaseEvent]:
+        try:
+            while True:
+                yield run_started()
+                await asyncio.sleep(0.02)
+        finally:
+            self.cleanup_entered.set()
+            await asyncio.sleep(0.05)
+            self.cleanup_completed.set()
+
+
+def _serve(agent: Any) -> Iterator[tuple[Any, str]]:
+    app = FastAPI()
+    add_strands_fastapi_endpoint(app, agent, "/")
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + SERVER_START_TIMEOUT_SECONDS
+        while not server.started:
+            if not thread.is_alive():
+                raise RuntimeError("uvicorn exited before it finished starting")
+            if time.monotonic() > deadline:
+                raise RuntimeError("uvicorn did not start within the timeout")
+            time.sleep(0.02)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield agent, f"http://127.0.0.1:{port}/"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=SERVER_STOP_TIMEOUT_SECONDS)
+        assert not thread.is_alive(), "uvicorn thread outlived its shutdown"
+
+
+@pytest.fixture
+def awaiting_teardown_server() -> Iterator[tuple[AwaitingTeardownAgent, str]]:
+    yield from _serve(AwaitingTeardownAgent())
+
+
+def test_an_awaiting_teardown_runs_to_completion_after_a_disconnect(
+    awaiting_teardown_server,
+) -> None:
+    """Entering cleanup is not enough; it has to be able to finish.
+
+    Awaited directly, the agent is cancelled at its own await, its teardown
+    starts, and the first await inside that teardown is cancelled as well, so
+    anything released after that point leaks with nothing raised to catch.
+    """
+    agent, url = awaiting_teardown_server
+
+    _abandon_stream_after_first_frame(url)
+
+    assert agent.cleanup_entered.wait(CLEANUP_TIMEOUT_SECONDS)
+    assert agent.cleanup_completed.wait(CLEANUP_TIMEOUT_SECONDS), (
+        "the agent's teardown was cut short at its first await, so whatever it "
+        "releases after that point was never released"
+    )
+
+
 @pytest.fixture
 def live_server() -> Iterator[tuple[NeverEndingAgent, str]]:
     """Run the endpoint on a real uvicorn server bound to an ephemeral port."""
@@ -183,7 +257,12 @@ async def test_a_disconnect_is_never_turned_into_a_run_error() -> None:
 
     await asyncio.wait_for(app(scope, receive, send), timeout=REQUEST_TIMEOUT_SECONDS)
 
-    assert agent.cleanup_ran.wait(CLEANUP_TIMEOUT_SECONDS)
+    # The close runs on a task deliberately detached from the cancelled scope,
+    # so it settles just after the response ends rather than during it.
+    deadline = time.monotonic() + CLEANUP_TIMEOUT_SECONDS
+    while not agent.cleanup_ran.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert agent.cleanup_ran.is_set()
     streamed = b"".join(
         m.get("body", b"") for m in sent if m["type"] == "http.response.body"
     )

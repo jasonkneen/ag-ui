@@ -1,3 +1,4 @@
+import asyncio
 """FastAPI endpoint utilities for AWS Strands integration."""
 
 from fastapi import FastAPI, Request
@@ -69,7 +70,55 @@ def _describe(error: BaseException) -> str:
         return type(error).__name__
 
 
-def _encoded_or_none(encoder: EventEncoder, event) -> str | None:
+async def _settle_and_close(iterator, step) -> None:
+    """Close an agent left running after its consumer was cancelled.
+
+    Runs detached from the cancelled scope, so the agent's own teardown can
+    await without being cut short. The in-flight step is settled first:
+    closing an async generator while another task is inside `__anext__` is an
+    error, not merely a race.
+    """
+    try:
+        await step
+    except BaseException:
+        pass
+    closer = getattr(iterator, "aclose", None)
+    if closer is not None:
+        try:
+            await closer()
+        except BaseException:
+            pass
+
+
+def _binary_encoder(encoder: EventEncoder):
+    """The encoder's binary entry point, or None if it has no such path.
+
+    `EventEncoder` may negotiate a protobuf content type without being able
+    to produce protobuf bytes. Serving text under that content type would
+    make the header a lie, so the endpoint checks for the entry point before
+    honouring the negotiation.
+    """
+    encode_binary = getattr(encoder, "encode_binary", None)
+    return encode_binary if callable(encode_binary) else None
+
+
+def _negotiated_encoder(accept_header: str | None) -> EventEncoder:
+    """Build the encoder for this request, refusing to over-promise.
+
+    A protobuf content type is honoured only when the encoder can actually
+    encode protobuf. The `ag-ui-protocol` encoder currently cannot, so a
+    client naming protobuf is served SSE and told so, rather than being sent
+    text labelled as binary.
+    """
+    if not _client_explicitly_requests_protobuf(accept_header):
+        return EventEncoder(accept=SSE_MEDIA_TYPE)
+    encoder = EventEncoder(accept=accept_header)
+    if encoder.get_content_type() == AGUI_MEDIA_TYPE and _binary_encoder(encoder) is None:
+        return EventEncoder(accept=SSE_MEDIA_TYPE)
+    return encoder
+
+
+def _encoded_or_none(encoder: EventEncoder, event) -> str | bytes | None:
     """Encode an event, or return None when the encoder itself fails.
 
     Used for the frames that report a failure. Those cannot raise their way
@@ -77,7 +126,7 @@ def _encoded_or_none(encoder: EventEncoder, event) -> str | None:
     is left with the truncated stream the frame existed to explain.
     """
     try:
-        return encoder.encode(event)
+        return (_binary_encoder(encoder) or encoder.encode)(event)
     except Exception:
         return None
 
@@ -104,11 +153,8 @@ def add_strands_fastapi_endpoint(
         # the first, which would hide a protobuf entry on a later one; Node
         # joins them before the Express peer ever sees the header.
         accept_header = ", ".join(request.headers.getlist("accept")) or None
-        encoder = EventEncoder(
-            accept=accept_header
-            if _client_explicitly_requests_protobuf(accept_header)
-            else SSE_MEDIA_TYPE
-        )
+        encoder = _negotiated_encoder(accept_header)
+        encode = _binary_encoder(encoder) or encoder.encode
 
         async def event_generator():
             run_is_open = False
@@ -127,10 +173,28 @@ def add_strands_fastapi_endpoint(
 
             try:
                 while iterator is not None:
+                    # Each step runs in its own task, awaited through a
+                    # shield, so a client disconnect cancels this handler
+                    # without cancelling the agent. Awaited directly, the
+                    # cancellation lands inside the agent, its teardown starts,
+                    # and the first `await` in that teardown is cancelled too,
+                    # which leaves whatever it releases after that point
+                    # released by nobody. anyio's cancel scope re-delivers on
+                    # every await, so there is no recovering from it after the
+                    # fact: the agent has to be outside the scope to begin with.
+                    #
+                    # Costs one task per event. Cheap next to encoding a frame
+                    # and writing it to a socket.
+                    step = asyncio.ensure_future(iterator.__anext__())
                     try:
-                        event = await iterator.__anext__()
+                        event = await asyncio.shield(step)
                     except StopAsyncIteration:
                         break
+                    except asyncio.CancelledError:
+                        # Hand the agent to a task outside this scope so its
+                        # teardown can finish, then let the cancellation go.
+                        asyncio.ensure_future(_settle_and_close(iterator, step))
+                        raise
                     except Exception as e:
                         # The agent converts its own failures into RUN_ERROR.
                         # Anything reaching here escaped that, and without this net
@@ -140,7 +204,7 @@ def add_strands_fastapi_endpoint(
                         break
 
                     try:
-                        chunk = encoder.encode(event)
+                        chunk = encode(event)
                     except Exception as e:
                         failure = ("ENCODING_ERROR", f"Encoding error: {_describe(e)}")
                         break
