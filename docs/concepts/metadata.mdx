@@ -46,11 +46,12 @@ The object itself is either **absent or an object — never `null`**. An empty
 object is valid and means "nothing to say", which is the same as omitting it.
 
 <Note>
-  Producers must not emit `"metadata": null`. Consumers are more forgiving and
-  read it as absent, because some serializers emit `null` for any unset optional
-  field — Pydantic's `model_dump_json()` does this without `exclude_none=True`.
-  Note the asymmetry: a `null` **value under a key** is meaningful data and is
-  always preserved. Only a `null` standing in for the whole object is ignored.
+  Producers never emit `"metadata": null`: an optional field with no value is
+  omitted from the JSON entirely, in every official SDK. The TypeScript client
+  enforces this and rejects a `null` metadata object — unlike some older
+  optional fields, metadata has no legacy producers to tolerate. Note the
+  asymmetry: a `null` **value under a key** is meaningful data and is always
+  preserved. Only a `null` standing in for the whole object is invalid.
 </Note>
 
 ## The reserved key
