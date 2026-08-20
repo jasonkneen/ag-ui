@@ -52,7 +52,8 @@ describe("multimodal pass-through", () => {
         type: "image",
         source: {
           type: "data",
-          value: Buffer.from("fake-png-bytes").toString("base64"),
+          // base64 of "fake-png-bytes"
+          value: "ZmFrZS1wbmctYnl0ZXM=",
           mimeType: "image/png",
         },
       },
