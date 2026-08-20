@@ -750,15 +750,15 @@ wheels = [
 
 [[package]]
 name = "llama-index-protocols-ag-ui"
-version = "0.4.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
     { name = "llama-index-core" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/e5/254168693307dca60fe2c17641047c3b9ca7f6dbd9bc959b7ec804d5b60f/llama_index_protocols_ag_ui-0.4.0.tar.gz", hash = "sha256:22e72402f9ab5f1e4e26cf807a6b0cbfe5f5e1cc867e0f55d9f844a093f0f5ff", size = 13196, upload-time = "2026-08-17T04:44:05.522Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e5/53/dfdca60962f5056c0ef7c2ea259f39e4611d9c13671bec74b4bf4b73e71d/llama_index_protocols_ag_ui-0.4.1.tar.gz", hash = "sha256:603c5fef10028410183cde9d5893d27be1c6bfd9e3a9c44fe90e175607381ff4", size = 13297, upload-time = "2026-08-20T14:01:43.445Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fb/8e/cfde102a77115842fdc18855148990337ab65f90885a9a6f54a0058a7c50/llama_index_protocols_ag_ui-0.4.0-py3-none-any.whl", hash = "sha256:147a4a1ae2cd46509e593a933bc4a1a3153eba3ba35530a827f7b5f02a1def3a", size = 14905, upload-time = "2026-08-17T04:44:04.505Z" },
+    { url = "https://files.pythonhosted.org/packages/55/d3/d0a45bbe36db0408303ae47a5e8402096f2052d034b101de50e411180f16/llama_index_protocols_ag_ui-0.4.1-py3-none-any.whl", hash = "sha256:842bd10bf7dc37cccd2afedd182baa6b161ed3f25e6459c9f5c072245825206d", size = 15014, upload-time = "2026-08-20T14:01:42.498Z" },
 ]
 
 [[package]]
@@ -1590,7 +1590,7 @@ requires-dist = [
     { name = "jsonpatch", specifier = ">=1.33" },
     { name = "llama-index-core", specifier = ">=0.14.1,<0.15" },
     { name = "llama-index-llms-openai", specifier = ">=0.5.0,<0.6.0" },
-    { name = "llama-index-protocols-ag-ui", specifier = ">=0.4.0,<0.5" },
+    { name = "llama-index-protocols-ag-ui", specifier = ">=0.4.1,<0.5" },
     { name = "uvicorn", specifier = ">=0.27.0" },
 ]
 
