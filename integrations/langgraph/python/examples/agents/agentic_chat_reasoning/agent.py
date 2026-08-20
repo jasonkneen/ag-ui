@@ -39,7 +39,7 @@ async def chat_node(state: AgentState, config: Optional[RunnableConfig] = None):
     selected_model = state.get("model", "OpenAI")
     if selected_model == "Anthropic":
         model = ChatAnthropic(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             thinking={"type": "enabled", "budget_tokens": 2000}
         )
     elif selected_model == "Gemini":
