@@ -116,8 +116,12 @@ describe("Multimodal Message Conversion", () => {
 
       const content = lcMessages[0].content as Array<any>;
       expect(content).toHaveLength(2);
-      expect(content[1].type).toBe("image_url");
-      expect(content[1].image_url.url).toBe("https://example.com/audio.mp3");
+      // An `audio` block, NOT `image_url`: providers validate the block kind, so
+      // audio announced as an image is rejected outright.
+      expect(content[1]).toEqual({
+        type: "audio",
+        url: "https://example.com/audio.mp3",
+      });
     });
 
     it("should convert VideoInputContent to LangChain", () => {
@@ -141,10 +145,11 @@ describe("Multimodal Message Conversion", () => {
 
       const content = lcMessages[0].content as Array<any>;
       expect(content).toHaveLength(2);
-      expect(content[1].type).toBe("image_url");
-      expect(content[1].image_url.url).toBe(
-        "data:video/mp4;base64,dmlkZW9kYXRh"
-      );
+      expect(content[1]).toEqual({
+        type: "video",
+        base64: "dmlkZW9kYXRh",
+        mime_type: "video/mp4",
+      });
     });
 
     it("should convert DocumentInputContent to LangChain", () => {
@@ -167,8 +172,119 @@ describe("Multimodal Message Conversion", () => {
 
       const content = lcMessages[0].content as Array<any>;
       expect(content).toHaveLength(2);
-      expect(content[1].type).toBe("image_url");
-      expect(content[1].image_url.url).toBe("https://example.com/doc.pdf");
+      expect(content[1]).toEqual({
+        type: "file",
+        url: "https://example.com/doc.pdf",
+      });
+    });
+
+    it("should send an attached PDF as a file block, not an image", () => {
+      // THE REGRESSION THIS GUARDS. A PDF handed to a provider as `image_url` —
+      // with `application/pdf` sitting inside the data URL — is rejected on the
+      // block kind:
+      //
+      //     BadRequestError: 400 - Invalid MIME type. Only image types are
+      //     supported. (code: invalid_image_format)
+      //
+      // and the exception kills the run rather than degrading it.
+      const aguiMessage: UserMessage = {
+        id: "test-doc-data",
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize this invoice" },
+          {
+            type: "document",
+            source: {
+              type: "data",
+              value: "JVBERi0xLjQK",
+              mimeType: "application/pdf",
+            },
+            metadata: { filename: "invoice-q2.pdf" },
+          } as DocumentInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      const content = lcMessages[0].content as Array<any>;
+      expect(content[1]).toEqual({
+        type: "file",
+        base64: "JVBERi0xLjQK",
+        mime_type: "application/pdf",
+        // `@langchain/core`'s OpenAI translator substitutes a placeholder when a
+        // file block has no filename, and `metadata: { filename }` is where AG-UI
+        // puts it.
+        filename: "invoice-q2.pdf",
+      });
+      // The metadata OBJECT still must not ride along: a non-standard top-level
+      // `metadata` key makes strict providers 400 (issue #2100).
+      expect(content[1]).not.toHaveProperty("metadata");
+    });
+
+    it("should keep a document a document across the LangChain round trip", () => {
+      // This is the MESSAGES_SNAPSHOT path. A block kind the return leg does not
+      // understand is an attachment that disappears from the thread on the next
+      // snapshot: the file was sent, the model read it, and a reopened thread
+      // shows a bare line of text.
+      const aguiMessage: UserMessage = {
+        id: "test-doc-roundtrip",
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize this invoice" },
+          {
+            type: "document",
+            source: {
+              type: "data",
+              value: "JVBERi0xLjQK",
+              mimeType: "application/pdf",
+            },
+            metadata: { filename: "invoice-q2.pdf" },
+          } as DocumentInputContent,
+        ],
+      };
+
+      const roundTripped = langchainMessagesToAgui(
+        aguiMessagesToLangChain([aguiMessage])
+      );
+
+      const content = (roundTripped[0] as UserMessage).content as Array<any>;
+      expect(content[1]).toEqual({
+        type: "document",
+        source: {
+          type: "data",
+          value: "JVBERi0xLjQK",
+          mimeType: "application/pdf",
+        },
+        metadata: { filename: "invoice-q2.pdf" },
+      });
+    });
+
+    it("should send a legacy binary PDF as a file block", () => {
+      // `BinaryInputContent` is deprecated but still accepted, and a deprecated
+      // path that 400s is not meaningfully more supported than one that raises.
+      const aguiMessage: UserMessage = {
+        id: "test-binary-pdf",
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize this" },
+          {
+            type: "binary",
+            mimeType: "application/pdf",
+            data: "JVBERi0xLjQK",
+            filename: "legacy-invoice.pdf",
+          } as BinaryInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      const content = lcMessages[0].content as Array<any>;
+      expect(content[1]).toEqual({
+        type: "file",
+        base64: "JVBERi0xLjQK",
+        mime_type: "application/pdf",
+        filename: "legacy-invoice.pdf",
+      });
     });
 
     it("should handle BinaryInputContent for backwards compatibility", () => {

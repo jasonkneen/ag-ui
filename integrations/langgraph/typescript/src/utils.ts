@@ -41,6 +41,51 @@ export function getStreamPayloadInput({
 
 const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
 
+/**
+ * Which LangChain standard content block each AG-UI media type becomes.
+ *
+ * `image` is absent on purpose: it keeps the legacy `image_url` shape, because it
+ * is the one media path that already worked end to end and changing a working
+ * payload is not part of fixing the broken ones. Everything else maps to the
+ * standard block for its modality (`@langchain/core` >= 1), which is what
+ * providers validate — an audio clip announced as an image is rejected on the
+ * block kind no matter what its data URL says.
+ */
+const STANDARD_BLOCK_TYPES: Record<string, "audio" | "video" | "file"> = {
+  audio: "audio",
+  video: "video",
+  document: "file",
+};
+
+/** The return leg of {@link STANDARD_BLOCK_TYPES}. */
+const AGUI_MEDIA_TYPES: Record<string, "audio" | "video" | "document" | "image"> = {
+  audio: "audio",
+  video: "video",
+  file: "document",
+  image: "image",
+};
+
+/**
+ * A LangChain standard media block (`image` / `audio` / `video` / `file`).
+ *
+ * All four share one field set, so the modality only decides `type`. `filename`
+ * is carried because `@langchain/core`'s OpenAI translator substitutes a
+ * placeholder when a file block has none.
+ */
+interface StandardMediaBlock {
+  type: "image" | "audio" | "video" | "file";
+  url?: string;
+  base64?: string;
+  mime_type?: string;
+  filename?: string;
+}
+
+/** A LangChain content block as this adapter emits it. */
+type LangchainContentBlock =
+  | { type: "text"; text?: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | StandardMediaBlock;
+
 function mediaSourceToUrl(source: InputContentDataSource | InputContentUrlSource): string | null {
   if (source.type === "data") {
     return `data:${source.mimeType};base64,${source.value}`;
@@ -51,14 +96,62 @@ function mediaSourceToUrl(source: InputContentDataSource | InputContentUrlSource
 }
 
 /**
+ * The attachment's original filename, if the client sent one.
+ *
+ * `metadata: { filename }` is the established AG-UI carrier for it — the client's
+ * own `backward-compatibility-0-0-47` middleware migrates the legacy
+ * `BinaryInputContent.filename` into exactly that shape. Note this reads ONE key
+ * out of metadata rather than copying the object: a top-level `metadata` key on
+ * the block itself is what issue #2100 was about, and `filename` is a documented
+ * field of the block.
+ */
+function filenameFromMetadata(metadata: unknown): string | undefined {
+  if (metadata && typeof metadata === "object") {
+    const filename = (metadata as { filename?: unknown }).filename;
+    if (typeof filename === "string" && filename) return filename;
+  }
+  return undefined;
+}
+
+function standardMediaBlock(
+  type: StandardMediaBlock["type"],
+  source: InputContentDataSource | InputContentUrlSource,
+  filename?: string
+): StandardMediaBlock | null {
+  const block: StandardMediaBlock = { type };
+  if (source.type === "data") {
+    block.base64 = source.value;
+    block.mime_type = source.mimeType;
+  } else if (source.type === "url") {
+    block.url = source.value;
+    if (source.mimeType) block.mime_type = source.mimeType;
+  } else {
+    return null;
+  }
+  if (filename) block.filename = filename;
+  return block;
+}
+
+/**
  * Convert LangChain's multimodal content to AG-UI format.
  *
- * LangChain only supports `text` and `image_url` content blocks.
- * `image_url` blocks are converted to `ImageInputContent` with the
- * appropriate source type (data or URL).
+ * `image_url` blocks are converted to `ImageInputContent` with the appropriate
+ * source type (data or URL). LangChain's standard media blocks (`image` /
+ * `audio` / `video` / `file`) are converted back to the matching AG-UI content
+ * type, which is what keeps a non-image attachment in the thread across a
+ * MESSAGES_SNAPSHOT — a block kind missing here is an attachment that vanishes
+ * from a reopened thread.
  */
 function convertLangchainMultimodalToAgui(
-  content: Array<{ type: string; text?: string; image_url?: any }>
+  content: Array<{
+    type: string;
+    text?: string;
+    image_url?: any;
+    url?: string;
+    base64?: string;
+    mime_type?: string;
+    filename?: string;
+  }>
 ): InputContent[] {
   const aguiContent: InputContent[] = [];
 
@@ -68,6 +161,34 @@ function convertLangchainMultimodalToAgui(
         type: "text",
         text: item.text,
       });
+    } else if (AGUI_MEDIA_TYPES[item.type] && (item.base64 || item.url)) {
+      const type = AGUI_MEDIA_TYPES[item.type];
+      const metadata = item.filename ? { filename: item.filename } : undefined;
+
+      if (item.base64) {
+        aguiContent.push({
+          type,
+          source: {
+            type: "data",
+            value: item.base64,
+            // A base64 block with no MIME type is malformed rather than merely
+            // terse, but an AG-UI data source REQUIRES one, so fall back to the
+            // least wrong thing instead of dropping the attachment.
+            mimeType: item.mime_type || "application/octet-stream",
+          },
+          ...(metadata ? { metadata } : {}),
+        } as InputContent);
+      } else {
+        aguiContent.push({
+          type,
+          source: {
+            type: "url",
+            value: item.url!,
+            ...(item.mime_type ? { mimeType: item.mime_type } : {}),
+          },
+          ...(metadata ? { metadata } : {}),
+        } as InputContent);
+      }
     } else if (item.type === "image_url") {
       // LangChain only uses `image_url` blocks for all media, so we always
       // produce ImageInputContent here. The true media type is not recoverable.
@@ -114,13 +235,22 @@ function convertLangchainMultimodalToAgui(
  *
  * Handles the new typed content classes (ImageInputContent, AudioInputContent,
  * VideoInputContent, DocumentInputContent) as well as legacy BinaryInputContent
- * for backwards compatibility. All media types are routed through LangChain's
- * `image_url` format since that is the only media block type LangChain supports.
+ * for backwards compatibility.
+ *
+ * Images use LangChain's `image_url` block. Audio, video and documents use the
+ * standard block for their modality (`audio`, `video`, `file`), because the block
+ * KIND is what providers validate: a PDF sent as `image_url` carries its real MIME
+ * type inside the data URL and is still rejected —
+ *
+ *     BadRequestError: 400 - Invalid MIME type. Only image types are supported.
+ *     (code: invalid_image_format)
+ *
+ * — which killed the run rather than degrading it. Routing every modality through
+ * `image_url` was correct when this converter was written (#1457) and stopped
+ * being correct once LangChain grew standard multimodal blocks.
  */
-function convertAguiMultimodalToLangchain(
-  content: InputContent[]
-): Array<{ type: string; text?: string; image_url?: { url: string } }> {
-  const langchainContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainContentBlock[] {
+  const langchainContent: LangchainContentBlock[] = [];
 
   for (const item of content) {
     if (item.type === "text") {
@@ -131,6 +261,22 @@ function convertAguiMultimodalToLangchain(
     } else if (MEDIA_CONTENT_TYPES.has(item.type)) {
       // ImageInputContent, AudioInputContent, VideoInputContent, DocumentInputContent
       const mediaItem = item as ImageInputContent | AudioInputContent | VideoInputContent | DocumentInputContent;
+      const blockType = STANDARD_BLOCK_TYPES[item.type];
+
+      if (blockType) {
+        const block = standardMediaBlock(
+          blockType,
+          mediaItem.source,
+          filenameFromMetadata((mediaItem as { metadata?: unknown }).metadata)
+        );
+        if (block) {
+          langchainContent.push(block);
+        } else {
+          console.warn(`[convertAguiMultimodalToLangchain] Dropping ${item.type} content: unrecognized source type`);
+        }
+        continue;
+      }
+
       const url = mediaSourceToUrl(mediaItem.source);
       if (url) {
         langchainContent.push({
@@ -141,7 +287,29 @@ function convertAguiMultimodalToLangchain(
         console.warn(`[convertAguiMultimodalToLangchain] Dropping ${item.type} content: source could not be converted to URL`);
       }
     } else if (item.type === "binary") {
-      // Legacy BinaryInputContent — backwards compatibility
+      // Legacy BinaryInputContent — backwards compatibility.
+      //
+      // Split on the MIME type, which is the only modality signal a legacy item
+      // carries (the typed classes above announce their own). An `id`-only item
+      // cannot be classified at all, so it keeps the historical `image_url`
+      // reference form.
+      const mimeType = item.mimeType ?? "";
+
+      if (!mimeType.startsWith("image/") && (item.url || item.data)) {
+        const blockType = mimeType.startsWith("audio/")
+          ? "audio"
+          : mimeType.startsWith("video/")
+            ? "video"
+            : "file";
+        const source: InputContentDataSource | InputContentUrlSource = item.url
+          ? { type: "url", value: item.url, ...(item.mimeType ? { mimeType: item.mimeType } : {}) }
+          : { type: "data", value: item.data!, mimeType };
+
+        const block = standardMediaBlock(blockType, source, item.filename);
+        if (block) langchainContent.push(block);
+        continue;
+      }
+
       let url: string;
 
       // Prioritize url, then data, then id
