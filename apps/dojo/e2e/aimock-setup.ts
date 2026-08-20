@@ -1508,11 +1508,13 @@ export async function setupLLMock(): Promise<void> {
                 !!(p as { image_url?: { url?: string } }).image_url?.url,
             ),
         );
+        // "llamaindex-mm-check" scopes this fixture to the LlamaIndex suite:
+        // other integrations' multimodal specs send similar prompts with
+        // image_url parts, and without a unique token this fixture would
+        // intercept them (first match wins).
         return (
           hasImagePart &&
-          textOf(lastUser?.content)
-            .toLowerCase()
-            .includes("what do you see in this image")
+          textOf(lastUser?.content).toLowerCase().includes("llamaindex-mm-check")
         );
       },
     },

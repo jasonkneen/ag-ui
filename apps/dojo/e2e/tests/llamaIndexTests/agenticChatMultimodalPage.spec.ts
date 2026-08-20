@@ -23,8 +23,15 @@ test.describe("[Integration] LlamaIndex - Agentic Chat Multimodal", () => {
     const fileInput = page.locator('input[type="file"]');
     await fileInput.setInputFiles(TEST_IMAGE);
 
-    // Send a message asking about the image
-    await sendChatMessage(page, "Tell me what do you see in this image");
+    // Send a message asking about the image. The "llamaindex-mm-check"
+    // token scopes the aimock predicate fixture to this suite so it never
+    // intercepts other integrations' multimodal requests; the generic
+    // "what do you see in this image" phrase keeps the fallback JSON
+    // fixture matching when the image is stripped (no marker -> failure).
+    await sendChatMessage(
+      page,
+      "llamaindex-mm-check: tell me what do you see in this image",
+    );
     await awaitLLMResponseDone(page);
 
     // Verify the image actually reached the LLM request: the aimock predicate
