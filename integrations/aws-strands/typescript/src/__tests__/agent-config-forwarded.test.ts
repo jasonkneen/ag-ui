@@ -106,14 +106,20 @@ describe("AgentConfig forwarding", () => {
     expect(cfg.modelState).toEqual({ responseId: "abc" });
   });
 
-  it("forwards traceAttributes, structuredOutputSchema, toolExecutor", async () => {
+  it("forwards traceAttributes and toolExecutor, but not structuredOutputSchema", async () => {
     capturedConfigs.length = 0;
     const sa = new StrandsAgent({ agent: richTemplate(), name: "t" });
     await collect(sa);
     const cfg = capturedConfigs.at(-1)!;
     expect(cfg.traceAttributes).toEqual({ team: "agui" });
-    expect(cfg.structuredOutputSchema).toBeDefined();
     expect(cfg.toolExecutor).toBe("concurrent");
+    // structuredOutputSchema is deliberately left behind. Carrying it makes
+    // Strands inject its structured-output tool, which this adapter streams to
+    // the client as a visible tool call and which fails a plain text turn when
+    // the model does not call it. A real Agent keeps the schema under a
+    // private name that the previous field list never read, so it has never
+    // reached a per-thread agent in practice; this pins that.
+    expect(cfg.structuredOutputSchema).toBeUndefined();
   });
 
   it("omits optional fields entirely when the template doesn't set them", async () => {
@@ -174,6 +180,29 @@ describe("AgentConfig forwarding", () => {
     const cfg = capturedConfigs.at(-1)!;
     expect(cfg.name).toBe("my-template-agent");
     expect(cfg.plugins).toEqual([plugin]);
+  });
+
+  it("does not forward plugins found on the template itself", async () => {
+    // Plugins reach per-thread agents only through the explicit option above.
+    // A template's own plugins are registered against the template alongside
+    // Strands' built-ins, and a second Agent refuses to register a built-in
+    // twice, so carrying them across breaks construction.
+    //
+    // A real Agent keeps plugins somewhere this adapter does not read, so the
+    // template here exposes them plainly: that is what makes the assertion
+    // able to fail if the field is ever reclassified as copyable.
+    capturedConfigs.length = 0;
+    const plugin: Plugin = { name: "on-template", initAgent: () => {} };
+    const template = {
+      ...richTemplate(),
+      plugins: [plugin],
+    } as unknown as import("@strands-agents/sdk").Agent;
+
+    const sa = new StrandsAgent({ agent: template, name: "t" });
+    await collect(sa);
+
+    const cfg = capturedConfigs.at(-1)!;
+    expect(cfg.plugins).toBeUndefined();
   });
 
   it("forwards the Model instance, preserving provider-specific config like Bedrock thinking", async () => {

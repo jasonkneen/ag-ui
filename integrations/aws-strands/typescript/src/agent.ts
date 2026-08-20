@@ -71,81 +71,179 @@ interface StrandsOrchestrator {
 }
 
 /**
- * Fields cloned from the caller-supplied template Agent into every per-thread
- * Agent. Mirrors Python's `_extract_agent_kwargs`. Deliberately NOT forwarded:
- *   - sessionManager: supplied per-thread via sessionManagerProvider.
- *   - plugins: supplied explicitly via StrandsAgentOptions.plugins.
- *   - conversationManager: bound to template state; sharing across threads
- *     would share conversation-window state. Rely on Strands' default.
- *   - messages: per-thread agents start empty; AG-UI delivers at runtime.
- *   - hooks: Strands' HookRegistry ephemeral state, not forwarded.
+ * How each `AgentConfig` field reaches a per-thread agent.
+ *
+ * - `copy`: read off the template and passed to every per-thread agent.
+ * - `perThread`: the adapter supplies it per thread; a template value is
+ *   deliberately ignored.
+ * - `adapterOwned`: the adapter fixes the value; a template value is
+ *   irrelevant rather than lost.
+ * - `unsafeToShare`: readable, but owned by the template. Handing the same
+ *   instance to every thread would share mutable state between conversations,
+ *   so it is dropped and recorded.
+ * - `notForwarded`: deliberately left behind, either because the SDK does not
+ *   keep it anywhere readable or because carrying it across does more harm
+ *   than losing it. Each one says which, above.
+ *
+ * Only `unsafeToShare` produces a per-construction record, and only at debug
+ * level: Strands populates several of these on every Agent whether or not the
+ * caller asked for them, so anything louder would fire for callers who set
+ * nothing. `notForwarded` fields are not read at all, so there is nothing to
+ * report about them beyond what this table says.
  */
-interface TemplateAgentCloneFields {
+type FieldDisposition =
+  | "copy"
+  | "perThread"
+  | "adapterOwned"
+  | "unsafeToShare"
+  | "notForwarded";
+
+/**
+ * Every `AgentConfig` field, and what happens to it.
+ *
+ * The `Record<keyof Required<AgentConfig>, ...>` is the point: when Strands
+ * adds a field to `AgentConfig`, this object stops type-checking until someone
+ * says what should happen to it. The previous hand-written list could fall
+ * behind the SDK silently, and did. Nothing here is optional, so nothing can
+ * be forgotten.
+ */
+const THREAD_FIELD_PLAN: Record<keyof Required<AgentConfig>, FieldDisposition> =
+  {
+    // Forward the existing Model instance rather than a model id: Strands
+    // accepts `model: string` and rebuilds a BedrockModel from it, but that
+    // path discards every other field, silently breaking reasoning,
+    // guardrails, and per-model tuning.
+    model: "copy",
+    tools: "copy",
+    systemPrompt: "copy",
+    name: "copy",
+    description: "copy",
+    id: "copy",
+    appState: "copy",
+    // Carries provider-side conversation state for models that keep it (a
+    // response id to chain from, say). Copied because that is the shipped
+    // behaviour, but a template that sets it hands the same starting point to
+    // every thread; per-thread construction is tracked as follow-up work.
+    modelState: "copy",
+    // Turning this on makes Strands inject its structured-output tool, which
+    // this adapter then streams to the client as a visible tool call, and an
+    // ordinary text turn fails outright when the model does not invoke it.
+    // Never actually forwarded before, because the old field list read a name
+    // a built Agent does not carry. Enabling it is a protocol change, not a
+    // dropped-setting fix, so it stays off until it is asked for on purpose.
+    structuredOutputSchema: "notForwarded",
+    toolExecutor: "copy",
+    // Registered into a registry alongside Strands' own built-ins, and a
+    // second Agent refuses a built-in it has already registered itself. The
+    // caller's plugins reach per-thread agents through the explicit `plugins`
+    // option instead.
+    plugins: "notForwarded",
+    // Per-thread agents start empty; AG-UI delivers history at runtime.
+    messages: "perThread",
+    // Supplied per thread via StrandsAgentConfig.sessionManagerProvider.
+    // Forwarding the template's would make every thread share one session id.
+    sessionManager: "perThread",
+    // The adapter drives the stream itself and never prints.
+    printer: "adapterOwned",
+    // Holds the conversation window / summarisation state for one
+    // conversation. Sharing one instance across threads would let one
+    // conversation trim or summarise another's history.
+    conversationManager: "unsafeToShare",
+    // Copied when the Agent exposes it under its own name. A real Agent hands
+    // it to the tracer and keeps nothing, so on the current SDK this finds
+    // nothing and nothing is carried; the classification costs nothing and
+    // starts working if a later release keeps it.
+    traceAttributes: "copy",
+    // Turned into plugins and registered into the plugin registry, so what is
+    // reachable is the registered strategies rather than the caller's list,
+    // and re-registering those against a second agent is the same hazard as
+    // plugins. A template that passes `null` to disable retries therefore gets
+    // the default strategy back on each per-thread agent, which is a real
+    // difference from the template and is tracked as follow-up work.
+    retryStrategy: "notForwarded",
+  };
+
+/** Fields the adapter copies from the template, keyed as `AgentConfig` does. */
+type TemplateAgentCloneFields = Partial<AgentConfig> & {
   model: AgentConfig["model"];
   tools: StrandsAgentCore["tools"];
-  systemPrompt?: AgentConfig["systemPrompt"];
-  name?: string;
-  description?: string;
-  id?: string;
-  appState?: Record<string, JSONValue>;
-  modelState?: Record<string, JSONValue>;
-  traceAttributes?: AgentConfig["traceAttributes"];
-  structuredOutputSchema?: AgentConfig["structuredOutputSchema"];
-  toolExecutor?: AgentConfig["toolExecutor"];
+};
+
+/**
+ * Read a template field, trying the conventions Strands stores it under.
+ *
+ * Which convention applies is not stable: `toolExecutor` is only reachable as
+ * `_toolExecutor`, and reading it under its public name (as this adapter used
+ * to) silently yields `undefined` for a field the caller did set.
+ *
+ * Only these two forms are probed. Matching a field's name against whatever
+ * objects the Agent happens to hold finds coincidences as readily as storage,
+ * and a wrong value forwarded confidently is worse than a field reported as
+ * not carried.
+ */
+function _readTemplateField(agent: StrandsAgentCore, key: string): unknown {
+  const record = agent as unknown as Record<string, unknown>;
+  for (const attribute of [key, `_${key}`]) {
+    const value = record[attribute];
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+/** `StateStore`-shaped values serialize to a plain object; others pass through. */
+function _normalizeTemplateValue(key: string, value: unknown): unknown {
+  if (key === "appState" || key === "modelState") {
+    const dump = (
+      value as { getAll?: () => Record<string, JSONValue> }
+    )?.getAll?.();
+    return dump && Object.keys(dump).length > 0 ? dump : undefined;
+  }
+  if (key === "tools") {
+    return Array.isArray(value) ? value.slice() : undefined;
+  }
+  return value;
 }
 
 /**
  * Extract every forwardable field from the template Agent into per-thread
  * clones. Mirrors Python's ``_extract_agent_kwargs``.
+ *
+ * Returns the fields to copy plus the names of any the caller set that will
+ * not reach per-thread agents, so the adapter can say so rather than dropping
+ * them in silence.
  */
-function _extractTemplateFields(
-  agent: StrandsAgentCore,
-): TemplateAgentCloneFields {
-  const model = agent.model;
-  // Forward the existing Model instance to per-thread clones so that any
-  // provider-specific config the caller set on the template (e.g. Bedrock
-  // `additionalRequestFields.thinking`, `temperature`, guardrails) is
-  // preserved. Strands also accepts `model: string` and rebuilds a
-  // BedrockModel from it, but that path discards every other field — which
-  // silently breaks reasoning, guardrails, and per-model tuning.
-  const fields: TemplateAgentCloneFields = {
-    model,
+function _extractTemplateFields(agent: StrandsAgentCore): {
+  fields: TemplateAgentCloneFields;
+  ignored: string[];
+} {
+  const fields = {
+    model: agent.model,
     tools: agent.tools.slice(),
-  };
-  if (agent.systemPrompt !== undefined)
-    fields.systemPrompt = agent.systemPrompt;
-  // Strands defaults `name` to "Strands Agent" and `id` to "agent" when the
-  // caller doesn't set them — forward them unconditionally so the per-thread
-  // agent matches the template regardless of whether the default or an
-  // override was used.
-  if (agent.name !== undefined) fields.name = agent.name;
-  if (agent.id !== undefined) fields.id = agent.id;
-  if (agent.description !== undefined) fields.description = agent.description;
-  // appState / modelState are StateStore instances; serialize to plain dicts.
-  const appStateDump = (
-    agent.appState as { getAll?: () => Record<string, JSONValue> }
-  )?.getAll?.();
-  if (appStateDump && Object.keys(appStateDump).length > 0)
-    fields.appState = appStateDump;
-  const modelStateDump = (
-    agent.modelState as { getAll?: () => Record<string, JSONValue> }
-  )?.getAll?.();
-  if (modelStateDump && Object.keys(modelStateDump).length > 0)
-    fields.modelState = modelStateDump;
-  // These aren't exposed via the Agent's public accessors in all SDK versions;
-  // read them optimistically and forward only when set.
-  const extra = agent as unknown as {
-    traceAttributes?: AgentConfig["traceAttributes"];
-    structuredOutputSchema?: AgentConfig["structuredOutputSchema"];
-    toolExecutor?: AgentConfig["toolExecutor"];
-  };
-  if (extra.traceAttributes !== undefined)
-    fields.traceAttributes = extra.traceAttributes;
-  if (extra.structuredOutputSchema !== undefined)
-    fields.structuredOutputSchema = extra.structuredOutputSchema;
-  if (extra.toolExecutor !== undefined)
-    fields.toolExecutor = extra.toolExecutor;
-  return fields;
+  } as TemplateAgentCloneFields;
+  const ignored: string[] = [];
+
+  for (const [key, disposition] of Object.entries(THREAD_FIELD_PLAN)) {
+    if (disposition === "perThread" || disposition === "adapterOwned") continue;
+
+    if (disposition === "notForwarded") {
+      // Deliberately left behind; the plan above says why for each one.
+      continue;
+    }
+
+    const raw = _readTemplateField(agent, key);
+    if (raw === undefined) continue;
+
+    if (disposition === "unsafeToShare") {
+      ignored.push(key);
+      continue;
+    }
+
+    const value = _normalizeTemplateValue(key, raw);
+    if (value === undefined) continue;
+    (fields as Record<string, unknown>)[key] = value;
+  }
+
+  return { fields, ignored };
 }
 
 /** Best-effort string view of an AG-UI message content field. */
@@ -646,8 +744,19 @@ export class StrandsAgent {
 
     this._orchestrator = null;
     const agentCore = agent as StrandsAgentCore;
-    this._templateFields = _extractTemplateFields(agentCore);
+    const extracted = _extractTemplateFields(agentCore);
+    this._templateFields = extracted.fields;
     this._plugins = plugins ? [...plugins] : [];
+    if (extracted.ignored.length > 0) {
+      // Debug rather than warn: Strands populates some of these on every Agent
+      // whether or not the caller asked for them, so warning here would fire
+      // for callers who set nothing.
+      this._log.debug(
+        `${LOG_PREFIX} not shared with per-thread agents: ` +
+          `${extracted.ignored.join(", ")}. Each is wired to the Agent that owns ` +
+          "it, so one instance cannot serve every thread.",
+      );
+    }
 
     // Detect the common pitfall: sessionManager set on the template Agent
     // with no per-thread provider. Forwarding it would make every AG-UI
@@ -2814,24 +2923,17 @@ export class StrandsAgent {
     seedMessages?: AgentConfig["messages"],
   ): AgentConfig {
     const t = this._templateFields;
+    // Every "copy" field the template carried, without naming them one by one:
+    // the plan above decides what lands here, so a field added to the SDK and
+    // classified as copyable is forwarded without editing this method.
     const cfg: AgentConfig = {
-      model: t.model,
+      ...t,
       tools: t.tools.slice(),
       printer: false,
     };
-    if (t.systemPrompt !== undefined) cfg.systemPrompt = t.systemPrompt;
-    if (t.name !== undefined) cfg.name = t.name;
-    if (t.description !== undefined) cfg.description = t.description;
     // Always set a stable id so SessionManager can locate snapshots after
     // the in-memory agent cache is cleared (stateless resume / restart).
     cfg.id = t.id ?? this.name;
-    if (t.appState !== undefined) cfg.appState = t.appState;
-    if (t.modelState !== undefined) cfg.modelState = t.modelState;
-    if (t.traceAttributes !== undefined)
-      cfg.traceAttributes = t.traceAttributes;
-    if (t.structuredOutputSchema !== undefined)
-      cfg.structuredOutputSchema = t.structuredOutputSchema;
-    if (t.toolExecutor !== undefined) cfg.toolExecutor = t.toolExecutor;
     if (sessionManager) cfg.sessionManager = sessionManager;
     if (seedMessages && seedMessages.length > 0) cfg.messages = seedMessages;
     // Only forward plugins when the caller supplied them explicitly. Passing
