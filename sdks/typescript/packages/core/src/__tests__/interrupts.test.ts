@@ -97,13 +97,15 @@ describe("ResumeEntry.metadata", () => {
     expect(parsed.metadata).toBeUndefined();
   });
 
-  it("reads an explicit null as absent", () => {
-    const parsed = ResumeEntrySchema.parse({
-      interruptId: "int-1",
-      status: "resolved",
-      metadata: null,
-    });
-    expect(parsed.metadata).toBeUndefined();
+  it("rejects an explicit null", () => {
+    // See OptionalMetadataSchema: absent-or-object, never null.
+    expect(() =>
+      ResumeEntrySchema.parse({
+        interruptId: "int-1",
+        status: "resolved",
+        metadata: null,
+      }),
+    ).toThrow();
   });
 
   it("serializes without the key when absent, rather than emitting null", () => {
