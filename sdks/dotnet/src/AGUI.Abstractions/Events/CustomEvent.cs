@@ -23,7 +23,6 @@ public sealed class CustomEvent : BaseEvent
     /// The custom event payload as a raw JSON element.
     /// </summary>
     [JsonPropertyName("value")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Value { get; set; }
 
     /// <summary>

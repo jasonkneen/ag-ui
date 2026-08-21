@@ -35,7 +35,6 @@ public sealed class ActivitySnapshotEvent : BaseEvent
     /// Whether to replace the existing activity content or merge. Defaults to <see langword="true"/>.
     /// </summary>
     [JsonPropertyName("replace")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Replace { get; set; }
 
     /// <summary>
