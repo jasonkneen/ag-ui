@@ -3,7 +3,7 @@
  *
  * This agent supports multiple model providers with reasoning/thinking capabilities:
  * - OpenAI (default): Uses o3 model
- * - Anthropic: Uses claude-sonnet-4-6 with thinking enabled
+ * - Anthropic: Uses claude-sonnet-4-6 with manual thinking
  * - Gemini: Uses gemini-2.5-pro with thinking budget
  *
  * The model is selected based on the `model` field in the agent state.
