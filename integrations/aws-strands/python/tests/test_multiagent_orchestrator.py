@@ -1568,3 +1568,33 @@ async def test_a_parked_shared_instance_refuses_an_unrelated_run():
     same_thread.thread_id = "thread-a"
     again = await collect(agent, same_thread)
     assert again[-1].code == "THREAD_BUSY"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_after", ["RUN_STARTED", "STATE_SNAPSHOT"])
+async def test_closing_the_stream_early_tears_down_cleanly(stop_after):
+    # Cleanup runs however far the generator got. It previously referenced a
+    # name bound further down the body, so closing before that point raised
+    # from teardown instead of cleaning up.
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+            {"type": "multiagent_node_stop", "node_id": "a"},
+        ]
+    )
+    agent = make_agent(orchestrator)
+
+    stream = agent.run(FakeInput(messages=[FakeMessage("user", "go")], state={"topic": "x"}))
+    async for event in stream:
+        if event.type.value == stop_after:
+            break
+
+    # No exception, and the thread is left usable rather than wedged.
+    await stream.aclose()
+
+    assert not agent._active_orchestrator_runs
+    assert not agent._parked_orchestrators_by_thread
+    assert not agent._pending_interrupts_by_thread
+
+    later = await collect(agent, FakeInput(messages=[FakeMessage("user", "again")]))
+    assert later[-1].type == EventType.RUN_FINISHED

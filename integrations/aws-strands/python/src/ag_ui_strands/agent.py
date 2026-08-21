@@ -1528,6 +1528,11 @@ class StrandsAgent:
         # the start event carries, and so any step left open by a terminal
         # interrupt is still closed before RUN_FINISHED.
         open_steps: Dict[str, str] = {}
+        # Resolved before the guarded body, not inside it: the cleanup below
+        # runs however far this generator got, including a consumer closing
+        # the stream after the very first event, and it cannot reference a
+        # name that a later statement was going to bind.
+        thread_id = input_data.thread_id or "default"
 
         try:
           try:
@@ -1545,7 +1550,6 @@ class StrandsAgent:
               # checkpoint and rejects a string outright. Getting this wrong
               # leaves the orchestrator interrupted forever, so every later run
               # fails too.
-              thread_id = input_data.thread_id or "default"
               resume_prompt = self._orchestrator_resume_prompt(input_data, thread_id)
 
               if resume_prompt is not None:
