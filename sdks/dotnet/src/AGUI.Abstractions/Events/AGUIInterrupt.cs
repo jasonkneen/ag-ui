@@ -35,6 +35,5 @@ public sealed class AGUIInterrupt
     /// interrupts from several subagents.
     /// </summary>
     [JsonPropertyName("subagentRunId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SubagentRunId { get; set; }
 }

@@ -30,6 +30,5 @@ public sealed class RawEvent : BaseEvent
     /// produced it directly.
     /// </summary>
     [JsonPropertyName("subagentRunId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SubagentRunId { get; set; }
 }

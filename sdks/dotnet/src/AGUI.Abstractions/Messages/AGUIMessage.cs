@@ -23,7 +23,6 @@ public abstract class AGUIMessage
     /// that ran, so attribution has to travel per message rather than per event.
     /// </summary>
     [JsonPropertyName("subagentRunId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SubagentRunId { get; set; }
 
     /// <summary>
