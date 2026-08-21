@@ -1026,6 +1026,10 @@ export class LangGraphAgent extends AbstractAgent {
             latestRootStateValues,
             hasOrderedRootStateValues,
           );
+          // A root values snapshot describes the boundary that follows it. Do
+          // not reuse it after crossing that boundary: a subgraph may commit
+          // newer state before the next root values event arrives.
+          hasOrderedRootStateValues = false;
         }
 
         // Set server-assigned run id as soon as available
