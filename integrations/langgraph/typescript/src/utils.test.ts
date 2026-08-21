@@ -13,6 +13,13 @@ import {
   VideoInputContent,
   DocumentInputContent,
 } from "@ag-ui/client";
+// Imported at the TOP LEVEL, not dynamically inside the boundary tests below.
+// `@langchain/openai` pulls a large module graph, and on a cold CI runner the
+// first `await import()` of it took 7.9s — charged to the test that happened to
+// run first, which then failed vitest's 5s default while the later ones passed
+// on the warm cache. File-level import time is not charged to a test.
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage } from "@langchain/core/messages";
 import { aguiMessagesToLangChain, langchainMessagesToAgui, resolveReasoningContent } from "./utils";
 
 describe("Multimodal Message Conversion", () => {
@@ -511,9 +518,6 @@ describe("Multimodal Message Conversion", () => {
   describe("provider boundary (@langchain/openai)", () => {
     /** Convert through ChatOpenAI and return the outgoing content parts. */
     async function partsOnTheWire(blocks: unknown[]): Promise<any[]> {
-      const { ChatOpenAI } = await import("@langchain/openai");
-      const { HumanMessage } = await import("@langchain/core/messages");
-
       let body: any;
       const model = new ChatOpenAI({
         apiKey: "test-not-used",
