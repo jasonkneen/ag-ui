@@ -26,6 +26,7 @@ load_dotenv(dotenv_path=env_path)
 # Import agent apps
 from .api import (
     a2ui_dynamic_schema_app,
+    a2ui_fixed_schema_app,
     a2ui_recovery_app,
     agentic_chat_app,
     agentic_chat_reasoning_app,
@@ -39,17 +40,25 @@ from .api import (
 # Create main app
 app = FastAPI(title='AWS Strands Integration 2 - Dojo')
 
-# Add CORS
+# Add CORS.
+# Origins come from CORS_ALLOW_ORIGINS (comma-separated) and default to the "*"
+# wildcard for local development. Credentials are only enabled for explicit,
+# non-wildcard origins — a wildcard can never be combined with
+# allow_credentials=True (any site could then read authenticated responses).
+_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+cors_origins = _origins or ["*"]
+is_wildcard = "*" in cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=bool(_origins) and not is_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Mount agents
 app.mount('/a2ui-dynamic-schema', a2ui_dynamic_schema_app, 'A2UI Dynamic Schema')
+app.mount('/a2ui-fixed-schema', a2ui_fixed_schema_app, 'A2UI Fixed Schema')
 app.mount('/a2ui-recovery', a2ui_recovery_app, 'A2UI Recovery')
 app.mount('/agentic-chat', agentic_chat_app, 'Agentic Chat')
 app.mount('/agentic-chat-reasoning', agentic_chat_reasoning_app, 'Agentic Chat Reasoning')
@@ -65,6 +74,7 @@ def root():
         "message": "AWS Strands Integration 2 - AG-UI Dojo",
         "endpoints": {
             "a2ui_dynamic_schema": "/a2ui-dynamic-schema",
+            "a2ui_fixed_schema": "/a2ui-fixed-schema",
             "a2ui_recovery": "/a2ui-recovery",
             "agentic_chat": "/agentic-chat",
             "agentic_chat_reasoning": "/agentic-chat-reasoning",
