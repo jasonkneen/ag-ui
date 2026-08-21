@@ -1,4 +1,5 @@
 import type { MenuIntegrationConfig } from "./types/integration";
+import { CREWAI_CONVERSATIONAL_FEATURES, CREWAI_FLOW_FEATURES } from "./crewai";
 export * from "./types/integration";
 
 /**
@@ -158,6 +159,7 @@ export const menuIntegrations = [
     name: "Pydantic AI",
     features: [
       "agentic_chat",
+      "agentic_chat_multimodal",
       "v1_agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
@@ -222,6 +224,7 @@ export const menuIntegrations = [
     name: "Microsoft Agent Framework (Python)",
     features: [
       "agentic_chat",
+      "agentic_chat_multimodal",
       "v1_agentic_chat",
       "backend_tool_rendering",
       "human_in_the_loop",
@@ -237,6 +240,7 @@ export const menuIntegrations = [
     features: [
       "agentic_chat",
       "v1_agentic_chat",
+      "agentic_chat_multimodal",
       "backend_tool_rendering",
       "human_in_the_loop",
       "agentic_generative_ui",
@@ -266,6 +270,7 @@ export const menuIntegrations = [
     features: [
       "agentic_chat",
       "v1_agentic_chat",
+      "agentic_chat_multimodal",
       "backend_tool_rendering",
       "human_in_the_loop",
       "agentic_generative_ui",
@@ -274,23 +279,13 @@ export const menuIntegrations = [
   },
   {
     id: "crewai",
-    name: "CrewAI",
-    features: [
-      "agentic_chat",
-      "v1_agentic_chat",
-      "backend_tool_rendering",
-      "interrupt",
-      "human_in_the_loop",
-      "agentic_generative_ui",
-      "predictive_state_updates",
-      "shared_state",
-      "tool_based_generative_ui",
-      "crew_chat",
-      "error_flow",
-      "a2ui_dynamic_schema",
-      "a2ui_recovery",
-      "a2ui_fixed_schema",
-    ],
+    name: "CrewAI Flows",
+    features: [...CREWAI_FLOW_FEATURES],
+  },
+  {
+    id: "crewai-conversational-flows",
+    name: "CrewAI Conversational Flows",
+    features: [...CREWAI_CONVERSATIONAL_FEATURES],
   },
   // {
   //   id: "builtin",
