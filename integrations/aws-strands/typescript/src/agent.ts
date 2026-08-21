@@ -203,6 +203,47 @@ type FieldDisposition =
   | "notForwarded";
 
 /**
+ * Fields added by Strands releases newer than the one this package was built
+ * against.
+ *
+ * Spread into the table below so that table stays exhaustive against whichever
+ * `AgentConfig` this build compiles against. Two different failures are being
+ * prevented, and they need different halves of this arrangement:
+ *
+ * - Building against a newer SDK: the table would be missing these keys and
+ *   would stop compiling. Spreading them in is what keeps the build honest
+ *   without anyone having to notice the SDK moved.
+ * - Shipping to a consumer on a newer SDK: the compile-time check already
+ *   happened here, against the older type, and can say nothing about a field
+ *   the consumer's SDK added. These keys are read at runtime regardless of
+ *   whether the compiled `AgentConfig` declares them, so the setting is
+ *   carried or reported rather than dropped in silence.
+ *
+ * Keys the running SDK does not have simply never resolve and cost nothing.
+ */
+const NEWER_SDK_FIELD_PLAN = {
+  // Registered into an intervention registry, which keeps the caller's own
+  // handler objects. This is the field that turns on native human-in-the-loop,
+  // and the Python adapter already carries it, so it is carried here too.
+  interventions: "copy",
+  // A plain flag.
+  checkpointing: "copy",
+  // An execution environment rather than per-conversation state. Dropping it
+  // would quietly move tool execution back onto the host, which is a worse
+  // failure than sharing one environment between threads.
+  sandbox: "copy",
+  // A facade the SDK resolves into a conversation manager plus plugins and
+  // then does not keep, so there is nothing to read back. Its effect travels
+  // through those two instead.
+  contextManager: "notForwarded",
+  // Both hold conversation-scoped data. Handing one instance to every thread
+  // is the same hazard as sharing the conversation manager, so they are
+  // dropped and recorded rather than cross-wired.
+  memoryManager: "unsafeToShare",
+  storage: "unsafeToShare",
+} satisfies Record<string, FieldDisposition>;
+
+/**
  * Every `AgentConfig` field, and what happens to it.
  *
  * The `Record<keyof Required<AgentConfig>, ...>` is the point: when Strands
@@ -210,9 +251,13 @@ type FieldDisposition =
  * says what should happen to it. The previous hand-written list could fall
  * behind the SDK silently, and did. Nothing here is optional, so nothing can
  * be forgotten.
+ *
+ * The spread above adds fields from releases newer than the one this build
+ * compiles against; see its own note for why both halves are needed.
  */
 const THREAD_FIELD_PLAN: Record<keyof Required<AgentConfig>, FieldDisposition> =
   {
+    ...NEWER_SDK_FIELD_PLAN,
     // Forward the existing Model instance rather than a model id: Strands
     // accepts `model: string` and rebuilds a BedrockModel from it, but that
     // path discards every other field, silently breaking reasoning,
@@ -253,11 +298,12 @@ const THREAD_FIELD_PLAN: Record<keyof Required<AgentConfig>, FieldDisposition> =
     // conversation. Sharing one instance across threads would let one
     // conversation trim or summarise another's history.
     conversationManager: "unsafeToShare",
-    // Copied when the Agent exposes it under its own name. A real Agent hands
-    // it to the tracer and keeps nothing, so on the current SDK this finds
-    // nothing and nothing is carried; the classification costs nothing and
-    // starts working if a later release keeps it.
-    traceAttributes: "copy",
+    // Handed to the tracer the Agent builds, which keeps it; the Agent itself
+    // keeps nothing under this name or its underscore form, so there is
+    // nothing here to read and nothing to carry. Digging into the tracer to
+    // recover it matched on spelling rather than storage and produced wrong
+    // answers, so it is declared unsupported instead of guessed at.
+    traceAttributes: "notForwarded",
     // Turned into plugins and registered into the plugin registry, so what is
     // reachable is the registered strategies rather than the caller's list,
     // and re-registering those against a second agent is the same hazard as
@@ -291,6 +337,33 @@ function _readTemplateField(agent: StrandsAgentCore, key: string): unknown {
     const value = record[attribute];
     if (value !== undefined) return value;
   }
+  return _readRegistryContents(agent, key);
+}
+
+/**
+ * The values a registry was built from, or `undefined`.
+ *
+ * Some fields are consumed into a registry rather than kept under their own
+ * name. The registry holds the caller's own objects, so the contents can be
+ * handed to the next agent; the container around them is an implementation
+ * detail and a fresh one is fine.
+ */
+function _readRegistryContents(
+  agent: StrandsAgentCore,
+  key: string,
+): unknown[] | undefined {
+  const singular = key.endsWith("s") ? key.slice(0, -1) : key;
+  const record = agent as unknown as Record<string, unknown>;
+  for (const name of [`_${singular}Registry`, `_${key}Registry`]) {
+    const registry = record[name];
+    if (registry === null || typeof registry !== "object") continue;
+    for (const held of Object.values(registry as Record<string, unknown>)) {
+      if (Array.isArray(held)) return held.length > 0 ? [...held] : undefined;
+      if (held instanceof Map) {
+        return held.size > 0 ? [...held.values()] : undefined;
+      }
+    }
+  }
   return undefined;
 }
 
@@ -319,23 +392,32 @@ function _normalizeTemplateValue(key: string, value: unknown): unknown {
 function _extractTemplateFields(agent: StrandsAgentCore): {
   fields: TemplateAgentCloneFields;
   ignored: string[];
+  unsupported: string[];
 } {
   const fields = {
     model: agent.model,
     tools: agent.tools.slice(),
   } as TemplateAgentCloneFields;
   const ignored: string[] = [];
+  const unsupported: string[] = [];
 
-  for (const [key, disposition] of Object.entries(THREAD_FIELD_PLAN)) {
+  for (const [key, disposition] of Object.entries(
+    THREAD_FIELD_PLAN as Record<string, FieldDisposition>,
+  )) {
     if (disposition === "perThread" || disposition === "adapterOwned") continue;
-
-    if (disposition === "notForwarded") {
-      // Deliberately left behind; the plan above says why for each one.
-      continue;
-    }
 
     const raw = _readTemplateField(agent, key);
     if (raw === undefined) continue;
+
+    if (disposition === "notForwarded") {
+      // Read first, then report. Skipping the read made an explicitly set
+      // value that this adapter will not carry look identical to one the
+      // caller never set, which is the silent change of behaviour this whole
+      // change exists to remove. Where the SDK keeps nothing readable there is
+      // still nothing to report, and the plan says so per field.
+      unsupported.push(key);
+      continue;
+    }
 
     if (disposition === "unsafeToShare") {
       ignored.push(key);
@@ -347,7 +429,7 @@ function _extractTemplateFields(agent: StrandsAgentCore): {
     (fields as Record<string, unknown>)[key] = value;
   }
 
-  return { fields, ignored };
+  return { fields, ignored, unsupported };
 }
 
 /** Best-effort string view of an AG-UI message content field. */
@@ -859,6 +941,16 @@ export class StrandsAgent {
         `${LOG_PREFIX} not shared with per-thread agents: ` +
           `${extracted.ignored.join(", ")}. Each is wired to the Agent that owns ` +
           "it, so one instance cannot serve every thread.",
+      );
+    }
+    if (extracted.unsupported.length > 0) {
+      // Warn, not debug: reaching this means the caller set a value that is
+      // readable, so it is not an SDK default, and it will not reach any
+      // per-thread agent.
+      this._log.warn(
+        `${LOG_PREFIX} these template settings are not carried to per-thread ` +
+          `agents and have no effect: ${extracted.unsupported.join(", ")}. ` +
+          "Set them on the Strands Agent this adapter builds per thread instead.",
       );
     }
 

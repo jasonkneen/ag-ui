@@ -101,6 +101,17 @@ class _Unsynthesizable(Exception):
     """No value satisfying this annotation could be constructed."""
 
 
+def _is_declared_dict_shape(annotation: typing.Any) -> bool:
+    """Whether the annotation is a dict with declared keys (a TypedDict).
+
+    Checked structurally rather than with ``typing.is_typeddict``, which does
+    not recognise one declared through ``typing_extensions``.
+    """
+    return hasattr(annotation, "__required_keys__") or hasattr(
+        annotation, "__optional_keys__"
+    )
+
+
 def _synthesize(annotation: typing.Any, label: str) -> typing.Any:
     """Build a value satisfying ``annotation``, tagged with ``label``."""
     if annotation is inspect.Parameter.empty or annotation is typing.Any:
@@ -174,6 +185,14 @@ def _synthesize(annotation: typing.Any, label: str) -> typing.Any:
         return {"sentinel": label}
     if annotation is list:
         return [MagicMock(name=f"sentinel-{label}")]
+
+    if _is_declared_dict_shape(annotation):
+        # A declared dict shape is a config the SDK splats into a real
+        # constructor, so a dict of invented keys satisfies the annotation and
+        # then fails the call it feeds. Faithfully filling one means building
+        # whatever its fields reference, which is unbounded. Decline, so a
+        # union falls through to the member that can be built directly.
+        raise _Unsynthesizable(f"declared dict shape {annotation!r} for {label}")
 
     if isinstance(annotation, type):
         if issubclass(annotation, enum.Enum):

@@ -65,8 +65,17 @@ describe("template forwarding against the real Strands SDK", () => {
   it("forwards a field the Agent only keeps under an underscore name", () => {
     // Reading this under its public name yields undefined on a real Agent,
     // which is how it was being dropped while the suite stayed green.
-    const cfg = threadConfig(realTemplate());
-    expect(cfg.toolExecutor).toBe("sequential");
+    const template = realTemplate();
+    const cfg = threadConfig(template);
+
+    // Compared against whatever the Agent itself stored, not against the
+    // literal that was passed in: newer releases normalize this option into an
+    // executor instance, and pinning the literal would make the assertion
+    // about the SDK's representation rather than about the forwarding.
+    const stored = (template as unknown as Record<string, unknown>)
+      ._toolExecutor;
+    expect(stored).toBeDefined();
+    expect(cfg.toolExecutor).toBe(stored);
   });
 
   it("leaves structured output off the per-thread agent", () => {
