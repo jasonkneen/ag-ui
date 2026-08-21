@@ -130,14 +130,18 @@ jobs:
 
       - name: Install the newest published Strands SDK
         working-directory: integrations/aws-strands/typescript
-        # --no-save so neither package.json nor the lockfile is rewritten: this
-        # lane reports on a version the repository has not adopted, and a lane
-        # that edits tracked files to do its job cannot also assert they are
-        # unchanged.
+        # pnpm, not npm: this is a pnpm workspace and this package depends on
+        # its siblings through the `workspace:` protocol, which npm refuses
+        # with EUNSUPPORTEDPROTOCOL.
+        #
+        # This rewrites package.json and the lockfile. That is deliberate and
+        # confined to the runner: the whole point of the lane is to report on a
+        # version the repository has not adopted, so it does not also assert
+        # that those files are untouched afterwards. Nothing is committed.
         run: |
           set -euo pipefail
-          npm install --no-save --no-package-lock @strands-agents/sdk@latest
-          node -e "console.log('@strands-agents/sdk', require('@strands-agents/sdk/package.json').version)"
+          pnpm add -D "@strands-agents/sdk@latest"
+          pnpm list @strands-agents/sdk --depth 0
 
       - name: Typecheck against the newest release
         working-directory: integrations/aws-strands/typescript
@@ -146,7 +150,3 @@ jobs:
       - name: Run tests against the newest release
         working-directory: integrations/aws-strands/typescript
         run: pnpm exec vitest run
-
-      - name: Assert the newer SDK did not rewrite tracked files
-        if: ${{ !cancelled() }}
-        run: git diff --exit-code
