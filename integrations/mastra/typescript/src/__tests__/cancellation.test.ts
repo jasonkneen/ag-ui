@@ -459,6 +459,91 @@ describe("run() cancellation propagation (#2288)", () => {
       subscription.unsubscribe();
       await tick();
     });
+
+    // abortRun() has no subscription to close, so it has to settle the
+    // Observable itself. These two assert that without the second unsubscribe
+    // the tests above lean on — a caller that only calls abortRun() must not be
+    // left waiting on a run that never ends.
+    it("settles the run() Observable on its own, with no unsubscribe", async () => {
+      const gate = deferred();
+      const { stream } = countingStream(gate.promise);
+
+      const agent = wrap(
+        localFake({
+          async stream() {
+            return { fullStream: stream };
+          },
+        }),
+      );
+
+      const firstChunk = deferred();
+      const settled = deferred();
+      let outcome: "complete" | "error" | null = null;
+
+      agent.run(STREAM_INPUT).subscribe({
+        next: (event) => {
+          if (event.type === EventType.TEXT_MESSAGE_CHUNK) firstChunk.release();
+        },
+        error: () => {
+          outcome = "error";
+          settled.release();
+        },
+        complete: () => {
+          outcome = "complete";
+          settled.release();
+        },
+      });
+
+      await firstChunk.promise;
+      agent.abortRun();
+
+      await Promise.race([
+        settled.promise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error("run() never settled")), 1000),
+        ),
+      ]);
+
+      expect(outcome).toBe("complete");
+    });
+
+    it("settles runAgent() on its own, with no unsubscribe", async () => {
+      const gate = deferred();
+      const { stream } = countingStream(gate.promise);
+
+      const agent = wrap(
+        localFake({
+          async stream() {
+            return { fullStream: stream };
+          },
+        }),
+      );
+
+      const firstChunk = deferred();
+      const finished = agent.runAgent(
+        { forwardedProps: {} },
+        {
+          onTextMessageContentEvent: () => {
+            firstChunk.release();
+          },
+        },
+      );
+
+      await firstChunk.promise;
+      agent.abortRun();
+
+      await expect(
+        Promise.race([
+          finished,
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error("runAgent() never settled")),
+              1000,
+            ),
+          ),
+        ]),
+      ).resolves.toBeDefined();
+    });
   });
 
   // The teardown fires on normal completion too (RxJS closes the subscription
