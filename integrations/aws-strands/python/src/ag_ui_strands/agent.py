@@ -1051,7 +1051,8 @@ def _build_strands_history(
                 )
                 if has_media:
                     blocks = convert_agui_content_to_strands(
-                        content, url_fetch_policy, fetch_budget
+                        content, url_fetch_policy, fetch_budget,
+                        message_id=getattr(msg, "id", None),
                     )
                     if isinstance(blocks, list) and blocks:
                         out.append({"role": "user", "content": blocks})
@@ -2975,6 +2976,7 @@ class StrandsAgent:
                                     convert_agui_content_to_strands,
                                     msg.content,
                                     self.config.url_fetch_policy,
+                                    message_id=getattr(msg, "id", None),
                                 )
                                 if not user_message:
                                     # All content blocks failed conversion — fall back to text

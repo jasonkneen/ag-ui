@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _IMAGE_FORMATS: Set[str] = {"png", "jpeg", "gif", "webp"}
 _DOCUMENT_FORMATS: Set[str] = {"pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"}
 _VIDEO_FORMATS: Set[str] = {"flv", "mkv", "mov", "mpeg", "mpg", "mp4", "three_gp", "webm", "wmv"}
+_DOCUMENT_NAME_METADATA_KEYS = ("file_id", "fileId", "filename", "fileName")
 
 
 # Common MIME subtype aliases that don't directly match the allowed format strings.
@@ -535,10 +536,63 @@ def _resolve_source_bytes(
     return None
 
 
+def _document_name(
+    item: DocumentInputContent,
+    raw: bytes,
+    *,
+    message_id: Optional[str],
+    document_index: int,
+) -> str:
+    """Return a neutral, replay-stable Bedrock document name.
+
+    Bedrock requires document names to be unique across the complete request,
+    including messages replayed from earlier turns. The AG-UI message id scopes
+    the name to a stable conversation turn, while the document index separates
+    repeated copies of the same file within that message. A stable source
+    identity and optional metadata identity keep the fallback deterministic for
+    direct converter callers that do not have a message id.
+
+    User-controlled metadata is hashed rather than copied into ``name``. This
+    both satisfies Bedrock's restricted character set and keeps filenames or
+    other prompt-like metadata out of the model-visible document name.
+    """
+    stable_message_id = message_id if isinstance(message_id, str) and message_id else "direct"
+    metadata_identity = ""
+    metadata = item.metadata
+    if isinstance(metadata, dict):
+        for key in _DOCUMENT_NAME_METADATA_KEYS:
+            value = metadata.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                value_text = str(value).strip()
+                if value_text:
+                    metadata_identity = f"{key}:{value_text}"
+                    break
+
+    source_identity = (
+        f"url:{item.source.value}"
+        if isinstance(item.source, InputContentUrlSource)
+        else f"bytes:{hashlib.sha256(raw).hexdigest()}"
+    )
+    name_digest = hashlib.sha256()
+    for component in (
+        stable_message_id,
+        str(document_index),
+        source_identity,
+        metadata_identity,
+    ):
+        encoded = component.encode("utf-8")
+        name_digest.update(len(encoded).to_bytes(8, "big"))
+        name_digest.update(encoded)
+    digest = name_digest.hexdigest()
+    return f"document-{digest}"
+
+
 def convert_agui_content_to_strands(
     content: List[Any],
     policy: Optional[UrlFetchPolicy] = None,
     budget: Optional[_FetchBudget] = None,
+    *,
+    message_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Convert an AG-UI ``InputContent`` list to Strands ``ContentBlock`` dicts.
 
@@ -546,7 +600,8 @@ def convert_agui_content_to_strands(
 
     * :class:`TextInputContent` -> ``{"text": "..."}``
     * :class:`ImageInputContent` -> ``{"image": {"format": ..., "source": {"bytes": ...}}}``
-    * :class:`DocumentInputContent` -> ``{"document": {"format": ..., "name": "document", "source": {"bytes": ...}}}``
+    * :class:`DocumentInputContent` -> a document block with a neutral,
+      deterministic ``document-<digest>`` name.
     * :class:`VideoInputContent` -> ``{"video": {"format": ..., "source": {"bytes": ...}}}``
     * :class:`AudioInputContent` -- skipped with a warning (Strands has no audio support).
     * Unknown types -- skipped with a warning.
@@ -555,10 +610,15 @@ def convert_agui_content_to_strands(
     :data:`DEFAULT_URL_FETCH_POLICY`).  *budget* bounds what the whole run
     fetches; pass the same one to every call made for a single request so the
     ceilings apply across all of its attachments.
+
+    ``message_id`` should be the stable AG-UI message id when the content is
+    part of conversation history. Direct callers may omit it and receive a
+    deterministic source-based fallback.
     """
     blocks: List[Dict[str, Any]] = []
     if budget is None:
         budget = _FetchBudget(policy)
+    document_index = 0
 
     for item in content:
         if isinstance(item, TextInputContent):
@@ -579,6 +639,8 @@ def convert_agui_content_to_strands(
             })
 
         elif isinstance(item, DocumentInputContent):
+            current_document_index = document_index
+            document_index += 1
             raw = _resolve_source_bytes(item.source, policy, budget)
             if raw is None:
                 continue
@@ -588,7 +650,12 @@ def convert_agui_content_to_strands(
             blocks.append({
                 "document": {
                     "format": fmt,
-                    "name": "document",
+                    "name": _document_name(
+                        item,
+                        raw,
+                        message_id=message_id,
+                        document_index=current_document_index,
+                    ),
                     "source": {"bytes": raw},
                 }
             })
