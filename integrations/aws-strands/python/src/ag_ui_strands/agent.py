@@ -719,6 +719,72 @@ def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _extract_tool_result_data(result_content: Any) -> Any:
+    """Extract a meaningful value from Strands tool-result content.
+
+    Text blocks keep their established unwrapped representation and last-block
+    precedence. JSON blocks are unwrapped to match the TypeScript adapter. Media
+    blocks retain their wrapper (``image`` / ``document`` / ``video``) so the
+    payload type survives conversion to AG-UI's string-only result field.
+    """
+    if not isinstance(result_content, list):
+        return None
+
+    fallback = None
+    fallback_set = False
+    text_result = None
+    text_found = False
+    for content_item in result_content:
+        if not isinstance(content_item, dict):
+            continue
+
+        if "text" in content_item:
+            text_found = True
+            text_content = content_item["text"]
+            try:
+                text_result = json.loads(text_content)
+            except (json.JSONDecodeError, TypeError):
+                if isinstance(text_content, str):
+                    try:
+                        text_result = json.loads(text_content.replace("'", '"'))
+                    except (json.JSONDecodeError, TypeError):
+                        text_result = text_content
+                else:
+                    text_result = text_content
+            continue
+
+        if not fallback_set:
+            if "json" in content_item:
+                fallback = content_item["json"]
+            else:
+                # Strands media blocks are already JSON-shaped dicts. Unknown
+                # non-text blocks are kept too, for forward compatibility.
+                fallback = content_item
+            fallback_set = True
+
+    return text_result if text_found else fallback
+
+
+def _serialize_tool_result_data(result_data: Any) -> str:
+    """Serialize a tool result for the AG-UI string field.
+
+    Strands represents inline media bytes as ``bytes``. TypeScript's SDK
+    ``toJSON`` method base64-encodes them, so do the same here to keep both
+    adapters wire-compatible. ``None`` represents a genuinely empty result.
+    """
+    if result_data is None:
+        return ""
+
+    def encode_bytes(value: Any) -> str:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(value)).decode("ascii")
+        raise TypeError(
+            f"Object of type {type(value).__name__} is not JSON serializable"
+        )
+
+    return json.dumps(result_data, default=encode_bytes)
+
+
 async def _forward_inner_agent_events(
     inner_event: Any,
     parent_tool_use: Dict[str, Any],
@@ -2672,26 +2738,9 @@ class StrandsAgent:
                             result_tool_id = tool_result.get("toolUseId")
                             result_content = tool_result.get("content", [])
 
-                            result_data = None
-                            if result_content and isinstance(result_content, list):
-                                for content_item in result_content:
-                                    if (
-                                        isinstance(content_item, dict)
-                                        and "text" in content_item
-                                    ):
-                                        text_content = content_item["text"]
-                                        try:
-                                            result_data = json.loads(text_content)
-                                        except json.JSONDecodeError:
-                                            try:
-                                                json_text = text_content.replace(
-                                                    "'", '"'
-                                                )
-                                                result_data = json.loads(json_text)
-                                            except Exception:
-                                                result_data = text_content
+                            result_data = _extract_tool_result_data(result_content)
 
-                            if not result_tool_id or result_data is None:
+                            if not result_tool_id:
                                 continue
 
                             # Direct lookup works for backend tools (keyed by Strands ID).
@@ -2755,7 +2804,9 @@ class StrandsAgent:
                             # A fresh message ID is used so CopilotKit creates a proper standalone
                             # ToolMessage and closes the spinner correctly.
                             tool_result_message_id = str(uuid.uuid4())
-                            tool_result_content = json.dumps(result_data)
+                            tool_result_content = _serialize_tool_result_data(
+                                result_data
+                            )
                             yield ToolCallResultEvent(
                                 type=EventType.TOOL_CALL_RESULT,
                                 tool_call_id=result_tool_id,

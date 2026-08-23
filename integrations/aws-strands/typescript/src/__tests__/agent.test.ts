@@ -8,7 +8,14 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { ToolUseBlock, ToolResultBlock, TextBlock } from "@strands-agents/sdk";
+import {
+  DocumentBlock,
+  ImageBlock,
+  ToolUseBlock,
+  ToolResultBlock,
+  TextBlock,
+  VideoBlock,
+} from "@strands-agents/sdk";
 import type { AgentStreamEvent } from "@strands-agents/sdk";
 import { EventType } from "@ag-ui/core";
 import type { BaseEvent } from "@ag-ui/core";
@@ -292,6 +299,80 @@ describe("StrandsAgent.run — tool calls", () => {
     expect(result.toolCallId).toBe("backend-1");
     expect(JSON.parse(result.content)).toEqual({ ok: true });
   });
+
+  it.each([
+    [
+      "image",
+      new ImageBlock({
+        format: "png",
+        source: { bytes: new Uint8Array([0, 1]) },
+      }),
+      {
+        image: { format: "png", source: { bytes: "AAE=" } },
+      },
+    ],
+    [
+      "document",
+      new DocumentBlock({
+        name: "result.pdf",
+        format: "pdf",
+        source: { bytes: new Uint8Array([2, 3]) },
+      }),
+      {
+        document: {
+          name: "result.pdf",
+          format: "pdf",
+          source: { bytes: "AgM=" },
+        },
+      },
+    ],
+    [
+      "video",
+      new VideoBlock({
+        format: "mp4",
+        source: { bytes: new Uint8Array([4, 5]) },
+      }),
+      {
+        video: { format: "mp4", source: { bytes: "BAU=" } },
+      },
+    ],
+  ])(
+    "serializes %s-only backend tool results",
+    async (_kind, contentBlock, expected) => {
+      const toolUseId = `backend-${_kind}`;
+      const block = new ToolUseBlock({
+        name: "backend_tool",
+        toolUseId,
+        input: {},
+      });
+      const resultBlock = new ToolResultBlock({
+        toolUseId,
+        status: "success",
+        content: [contentBlock],
+      });
+      const agent = scriptedStrandsAgent([
+        block as unknown as AgentStreamEvent,
+        {
+          type: "afterToolCallEvent",
+          toolUse: {
+            toolUseId,
+            name: "backend_tool",
+            input: {},
+          },
+          tool: undefined,
+          result: resultBlock,
+        } as unknown as AgentStreamEvent,
+      ]);
+
+      const events = await collect(agent);
+      const result = events.find(
+        (event) => event.type === EventType.TOOL_CALL_RESULT,
+      ) as unknown as { content: string };
+
+      expect(result).toBeDefined();
+      expect(JSON.parse(result.content)).toEqual(expected);
+    },
+  );
 
   it("emits a PredictState CustomEvent when ToolBehavior.predictState is configured", async () => {
     const block = new ToolUseBlock({
