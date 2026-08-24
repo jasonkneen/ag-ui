@@ -130,17 +130,10 @@ def _agui_media_type_for_mime_type(mime_type: str) -> str:
          CDN URLs are the norm. So a URL-sourced non-image loses its modality, and
          this is the documented limit of this fix rather than something it covers.
       2. A data URL with no MIME type at all (``data:;base64,…``), where there is
-         nothing to read. The block stays an ``image``, which is what it already
-         was.
-
-         CAVEAT, measured 2026-08-25 on this file as it stands: the ``image/png``
-         default this paragraph used to claim does NOT apply in this runtime.
-         `convert_langchain_multimodal_to_agui` extracts ``""`` from
-         ``data:;base64,…`` and records ``mime_type=""`` on the source, where the
-         mirrored TypeScript adapter records ``image/png`` for the same input.
-         Both answer "image" for the MEDIA TYPE, so nothing is retyped, but the
-         recorded MIME type diverges. That is a code defect reported separately,
-         not something this docstring is describing.
+         nothing to read. The pre-existing ``image/png`` default applies — see the
+         ``or "image/png"`` in `convert_langchain_multimodal_to_agui`, which is
+         what the mirrored TypeScript adapter records for the same input. The
+         block stays an ``image``, which is what it already was.
 
     ``metadata.filename`` is lost on this path in both directions regardless — the
     ``image_url`` block has nowhere to carry it.
@@ -386,7 +379,23 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                     parts = url.split(",", 1)
                     header = parts[0]
                     data = parts[1] if len(parts) > 1 else ""
-                    mime_type = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
+                    # `or "image/png"`, not just the `":" in header` gate. A
+                    # `data:` URL ALWAYS has a colon, so the gate never falls
+                    # through for one — but the mediatype it then extracts is the
+                    # empty string for the `data:;base64,…` that a MIME-less
+                    # attachment produces. The gate therefore treated "present but
+                    # empty" as a value and wrote `mime_type=""` into the thread,
+                    # while the docstring on `_agui_media_type_for_mime_type`
+                    # claimed the `image/png` default applied to exactly this case.
+                    # Now it does, which is also what the mirrored TypeScript
+                    # adapter records for the same input. The MEDIA TYPE is
+                    # unaffected either way — `_agui_media_type_for_mime_type`
+                    # answers "image" for both "" and "image/png" — so this only
+                    # stops an unusable MIME type from being recorded, it does not
+                    # retype anything.
+                    mime_type = (
+                        header.split(":")[1].split(";")[0] if ":" in header else ""
+                    ) or "image/png"
 
                     # The MIME type this adapter put in the data URL on the way out
                     # is enough to recover the modality on the way back.

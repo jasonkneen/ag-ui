@@ -1111,6 +1111,47 @@ class TestModalitySurvivesImageUrlRoundTrip(unittest.TestCase):
 
         self.assertIsInstance(content, ImageInputContent)
 
+    def test_a_mime_less_data_url_reads_as_the_image_png_its_own_fallback_names(self):
+        """A ``data:`` URL always has a colon, so the ``":" in header`` gate never
+        fell through for one — it extracted the EMPTY STRING and recorded that as
+        the attachment's MIME type, while the docstring on
+        `_agui_media_type_for_mime_type` claimed the ``image/png`` default applied
+        to exactly this case. The mirrored TypeScript adapter already applies it.
+
+        The media type is unaffected either way — `_agui_media_type_for_mime_type`
+        answers ``image`` for both ``""`` and ``image/png`` — so this only stops an
+        unusable MIME type from being written into the thread.
+
+        Mirrors the TypeScript ``reads a MIME-less data URL as the image/png its
+        own fallback names``.
+        """
+        [content] = convert_langchain_multimodal_to_agui(
+            [{"type": "image_url", "image_url": {"url": "data:;base64,aGk="}}]
+        )
+
+        self.assertIsInstance(content, ImageInputContent)
+        self.assertEqual(content.source.type, "data")
+        self.assertEqual(content.source.value, "aGk=")
+        self.assertEqual(content.source.mime_type, "image/png")
+
+    def test_a_data_url_that_does_carry_a_mime_type_keeps_it(self):
+        """The guard for the default above: it must not overwrite a real MIME
+        type, and it must not disturb the modality recovery that reads it."""
+        cases = [
+            ("data:image/jpeg;base64,aGk=", ImageInputContent, "image/jpeg"),
+            ("data:video/mp4;base64,aGk=", VideoInputContent, "video/mp4"),
+            ("data:application/pdf;base64,aGk=", DocumentInputContent, "application/pdf"),
+        ]
+
+        for url, expected_class, expected_mime in cases:
+            with self.subTest(url):
+                [content] = convert_langchain_multimodal_to_agui(
+                    [{"type": "image_url", "image_url": {"url": url}}]
+                )
+
+                self.assertIsInstance(content, expected_class)
+                self.assertEqual(content.source.mime_type, expected_mime)
+
     def test_known_limit_a_url_sourced_video_comes_back_as_an_image(self):
         """Not an oversight — an `image_url` block carries ``{"url": …}`` and
         nothing else, so an https-hosted video arrives with no MIME type and no
