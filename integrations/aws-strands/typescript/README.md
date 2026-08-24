@@ -102,11 +102,13 @@ You can also use the helper functions `addStrandsExpressEndpoint` and `addPing` 
 
 ```ts
 import express from "express";
-import cors from "cors";
 import { addStrandsExpressEndpoint, addPing } from "@ag-ui/aws-strands/server";
 
 const app = express();
-app.use(cors());
+// No CORS middleware, so no page on a different origin can read this
+// endpoint's responses. Same-origin pages are unaffected: CORS governs
+// cross-origin requests only.
+// Add `cors` yourself only if a browser on another origin has to reach it.
 app.use(express.json({ limit: "50mb" }));
 addStrandsExpressEndpoint(app, aguiAgent, { path: "/invocations" });
 addPing(app, "/ping");
@@ -230,9 +232,14 @@ const model = new BedrockModel({
 
 ```bash
 pnpm add @ag-ui/aws-strands @strands-agents/sdk @ag-ui/core @ag-ui/encoder
-# Server-side helpers (createStrandsApp / addStrandsExpressEndpoint) require express + cors:
-pnpm add express cors
-pnpm add -D @types/express @types/cors
+# Server-side helpers (createStrandsApp / addStrandsExpressEndpoint) require express:
+pnpm add express
+pnpm add -D @types/express
+# `cors` is loaded only when `createStrandsApp` installs the middleware, which
+# needs a truthy `corsOrigin` that `corsEnabled: false` has not vetoed.
+# Skip the next two lines unless you opt into cross-origin access:
+pnpm add cors
+pnpm add -D @types/cors
 # @modelcontextprotocol/sdk is loaded unconditionally by @strands-agents/sdk
 # — required at runtime even for agents that don't use MCP:
 pnpm add @modelcontextprotocol/sdk
@@ -262,6 +269,351 @@ const aguiAgent = new StrandsAgent({
 const app = await createStrandsApp(aguiAgent, { path: "/invocations" });
 app.listen(8000);
 ```
+
+## Cross-Origin Access
+
+`createStrandsApp` does not allow cross-origin access unless you ask for it.
+Omit `corsOrigin` and no CORS middleware is installed: responses carry no
+`Access-Control-Allow-Origin` header, so a browser refuses to hand any response
+from this app to a page on a different origin. A page served from the same
+origin as the app reads it as usual, since CORS governs cross-origin requests
+only.
+
+That default matters because the agent route is unauthenticated unless you pass
+[`auth`](#authenticating-the-agent-route). An allowed origin can invoke the
+agent, trigger whatever side effects its tools have, and read the streamed
+response, so cross-origin access is a deliberate choice rather than a starting
+position.
+
+```ts
+// Default: no cross-origin access.
+const app = await createStrandsApp(aguiAgent, { path: "/invocations" });
+
+// Local development: literal `*`, emitted verbatim, never reflected.
+const dev = await createStrandsApp(aguiAgent, { corsOrigin: "*" });
+
+// Production: an exact-match allowlist.
+const prod = await createStrandsApp(aguiAgent, {
+  corsOrigin: ["https://app.example.com", "https://admin.example.com"],
+});
+```
+
+`corsOrigin` accepts:
+
+| Value               | Effect                                                                      |
+| ------------------- | --------------------------------------------------------------------------- |
+| omitted             | No CORS middleware; no CORS header on any response                          |
+| `"*"`               | Literal `Access-Control-Allow-Origin: *`, emitted verbatim, never reflected |
+| `"https://app.tld"` | That one origin, emitted verbatim whichever origin asked                    |
+| `["https://a.tld"]` | Exact-match allowlist; a miss withholds `Access-Control-Allow-Origin`       |
+| `[]`                | The allowlist path with nothing on the list, so every origin misses         |
+| `true`              | Reflects the calling origin back per request; see the warning below         |
+| `false`             | No CORS middleware; identical to omitting `corsOrigin`                      |
+| `""`                | Same as `false`                                                             |
+
+Only the bare string `"*"` is the wildcard. Inside an array it is a literal
+one-character origin string that no browser origin ever equals, so `["*"]`
+withholds `Access-Control-Allow-Origin` from every caller and denies everything.
+
+An allowlist miss, `[]` included, is not a silent no-op. Measured against
+`cors` 2.8.5 on Express 5, a preflight from a disallowed origin comes back
+`204` carrying `Access-Control-Allow-Credentials: true` and
+`Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE`; the only header
+withheld is `Access-Control-Allow-Origin`, and that omission is what makes the
+browser block the response. `false` and `""` behave differently again: the factory reads
+them as falsy and installs no middleware, so the preflight falls through to
+Express's own `OPTIONS` responder (`200`, `Allow: POST`) and no CORS header is
+emitted at all. The optional `cors` dependency is not even loaded for them.
+
+When it installs the middleware, `createStrandsApp` passes `credentials: true`,
+and `CreateStrandsAppOptions` offers no way to change that. So every response
+the middleware acts on carries `Access-Control-Allow-Credentials: true`,
+including the allowlist-miss and `[]` cases above.
+
+> **`corsOrigin: true` is the value to be careful with, not `"*"`.** `true`
+> reflects whatever `Origin` the request carried straight back in
+> `Access-Control-Allow-Origin`, per request, and that reflected origin arrives
+> paired with the `Access-Control-Allow-Credentials: true` above. Browsers
+> honour that pair for a credentialed request (`credentials: "include"`), so
+> `true` lets a page on any origin make a credentialed cross-origin call to the
+> agent route and read the streamed response. On a route with no `auth` guard,
+> that is every site the browser visits. Prefer an exact-match array.
+>
+> `"*"` fails in the safer direction. The CORS protocol tells browsers to
+> reject a literal wildcard combined with credentials, so
+> `Access-Control-Allow-Origin: *` alongside that credentials header only ever
+> serves requests that send no credentials; the `corsOrigin: "*"` suggested
+> above for local development cannot carry cookies. Name the origins
+> explicitly when the browser has to send them.
+
+The two adapters are strict in opposite places. Python's `create_strands_app`
+guards the credentials pairing directly, computing
+`allow_credentials=bool(origins) and not is_wildcard`, so it never pairs
+credentials with a wildcard; the TypeScript factory has no equivalent guard
+today. Python has no equivalent of the TypeScript default, though: it adds
+`CORSMiddleware` to every app and falls back to `allow_origins=["*"]` whenever
+`origins` is omitted or empty, with no switch for turning CORS off. So Python
+is open to every origin until you name one, while TypeScript grants no
+cross-origin access until you ask for it.
+
+> **Compatibility break.** Before this change the factory installed CORS
+> middleware unconditionally and defaulted to `corsOrigin: "*"`, so every
+> browser origin was allowed. Deployments that relied on that implicit default
+> now have to pass `corsOrigin` explicitly. Explicit values are unaffected.
+
+Cross-origin policy is only one of two defenses here. Requests without a JSON
+`Content-Type` are refused with HTTP 415 before the agent runs, which blocks the
+simple, non-preflighted variant of the same attack. Neither one is a substitute
+for authentication: pass [`auth`](#authenticating-the-agent-route) if the
+endpoint is reachable from an untrusted network.
+
+### Narrowing methods and headers
+
+`allowMethods` and `allowHeaders` are passed straight to `cors` as `methods` and
+`allowedHeaders`. Omit them and the `cors` defaults apply, measured against
+`cors` 2.8.5 on Express 5:
+
+- `Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE`.
+- `Access-Control-Allow-Headers` reflects the preflight's own
+  `Access-Control-Request-Headers` verbatim, and is absent entirely when the
+  preflight sends none.
+
+Narrowing either one replaces the corresponding default. Narrowing
+`allowHeaders` also pins the list regardless of what the preflight asked for, so
+`Access-Control-Allow-Headers: Content-Type` comes back even for a preflight
+that sent no `Access-Control-Request-Headers` at all:
+
+```ts
+const app = await createStrandsApp(aguiAgent, {
+  path: "/invocations",
+  corsOrigin: ["https://app.example.com"],
+  allowMethods: ["POST"],
+  allowHeaders: ["Content-Type"],
+});
+```
+
+Three details worth knowing:
+
+- Narrowing the method list does not make `cors` reject a preflight for a
+  method outside it. A `DELETE` preflight against `allowMethods: ["POST"]`
+  still answers `204` carrying `Access-Control-Allow-Methods: POST`, and the
+  browser is what enforces the narrowing.
+- **A narrowed `allowHeaders` has to include `Content-Type`.** The agent route
+  answers `415` to any request without a JSON `Content-Type` (measured: both an
+  absent `Content-Type` and `text/plain` come back
+  `415 {"error":"Unsupported Media Type: expected application/json"}`), and
+  `application/json` is not a CORS-safelisted request header value, so a browser
+  only sends it once a preflight has permitted `Content-Type`. Leave it off the
+  list and every cross-origin agent call is blocked, while the preflight still
+  answers `204` carrying the narrowed list: a healthy-looking response for a
+  route nothing can reach. Server-side callers (curl, another service) are
+  unaffected, since CORS never applies to them.
+- **`[]` is a deny-all, not a request for the default.** An empty array is
+  truthy, so it reaches `cors`, which withholds the corresponding header
+  entirely rather than sending it empty. Measured: `allowMethods: []` answers a
+  preflight `204` with no `Access-Control-Allow-Methods`, `allowHeaders: []`
+  with no `Access-Control-Allow-Headers`, and both leave
+  `Access-Control-Allow-Origin` intact. That mirrors how `corsOrigin: []` denies
+  every origin and is deliberate, but the only symptom is in the caller's
+  browser console, so `createStrandsApp` warns at startup when it installs a
+  policy carrying either empty list.
+
+Those defaults deliberately do not match the Python side, where
+`create_strands_app` passes `allow_methods=["*"]` and `allow_headers=["*"]`.
+The `cors` defaults are already narrower, neither option existed in the
+TypeScript adapter before, so there is no back-compatibility to preserve, and
+widening them to match would be a security regression rather than parity.
+
+Both options only mean something once the middleware is installed. Passing
+either with no `corsOrigin` policy throws at construction, naming the options
+passed and the fix, rather than silently doing nothing.
+
+#### What ends up in `Vary`
+
+`Vary` on the preflight is assembled from two halves with independent causes,
+which is why there is no single default to quote. Measured across every origin
+posture and every combination of narrowed, empty and omitted `allowMethods` /
+`allowHeaders`:
+
+| Half of `Vary`                   | Present when                                                   |
+| -------------------------------- | -------------------------------------------------------------- |
+| `Origin`                         | The origin policy is anything other than the bare string `"*"` |
+| `Access-Control-Request-Headers` | `allowHeaders` is omitted, whatever `allowMethods` says        |
+
+The `Origin` half is the cache-safety one: it is what stops a shared cache
+serving one origin's response to another, and it turns on and off with the
+origin form rather than with the narrowing options. A bare `"*"` sends the same
+`Access-Control-Allow-Origin` to every caller, so the response does not depend
+on who asked and `cors` correctly leaves `Origin` out. A single origin string, an
+array (matching or not), `[]` and `true` all emit it.
+
+The `Access-Control-Request-Headers` half is not about the caller's origin at
+all. It is present only while the answer depends on what the preflight asked
+for, which stops being true the moment `allowHeaders` fixes the set. Narrowing
+`allowMethods` moves neither half.
+
+The four combinations that follow, on a preflight:
+
+| Origin policy | `allowHeaders`   | `Vary`                                   |
+| ------------- | ---------------- | ---------------------------------------- |
+| `"*"`         | omitted          | `Access-Control-Request-Headers`         |
+| `"*"`         | narrowed or `[]` | absent entirely                          |
+| anything else | omitted          | `Origin, Access-Control-Request-Headers` |
+| anything else | narrowed or `[]` | `Origin`                                 |
+
+Non-preflight responses never carry the `Access-Control-Request-Headers` half.
+They carry `Vary: Origin` on every posture except the bare `"*"`, which carries
+no `Vary` at all, and neither narrowing option changes that.
+
+### One switch for turning CORS off
+
+`corsEnabled` is a veto over `corsOrigin`, for callers that compute the origin
+policy somewhere else (an env var, shared config) and want one independent
+switch:
+
+| `corsEnabled`         | `corsOrigin`        | Result                                                                                                      |
+| --------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `false`               | anything, or absent | No middleware. Also silences `allowMethods` / `allowHeaders` with no complaint; `cors` is never even loaded |
+| `undefined` (default) | truthy              | Middleware installed, exactly as without the option                                                         |
+| `undefined` (default) | falsy, or absent    | No middleware                                                                                               |
+| `true`                | truthy              | Middleware installed; redundant but accepted                                                                |
+| `true`                | falsy, or absent    | Throws at construction                                                                                      |
+
+`corsEnabled: false` is byte-identical on the wire to `corsOrigin: false`, so as
+a disable switch it is a second spelling. Its value is compositional: one place
+to turn cross-origin access off without reaching into wherever `corsOrigin` is
+computed.
+
+`corsEnabled: true` with no origin policy throws rather than installing
+anything, because the two alternatives are both wrong. Installing `cors()` with
+no `origin` would restore the wildcard by the back door, since `cors`'s own
+default `origin` is `'*'`. Installing nothing silently would leave a caller who
+explicitly asked for CORS to discover from a browser console that it is off.
+This option can never widen access on its own.
+
+### Cross-origin policy in the examples
+
+Both example servers are origin-restricted by default and read the same
+`CORS_ALLOW_ORIGINS` variable (comma-separated), parsed once in
+`examples/server/cors.ts`:
+
+| `CORS_ALLOW_ORIGINS`     | Policy                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| unset                    | `http://localhost:9999,http://localhost:3000`, the origins a locally run dojo is served from |
+| a comma-separated list   | That exact-match allowlist                                                                   |
+| contains `*`             | The bare wildcard, which is the development opt-in to any origin                             |
+| set but naming no origin | Denies every origin, and says so on startup                                                  |
+
+Two of those rows log a warning rather than applying quietly: `*` alongside
+named origins warns that the wildcard wins and the named entries are ignored,
+and a set-but-empty value warns that every cross-origin browser request is
+denied. A third warning is per entry rather than per row: `cors` compares
+allowlist entries to the request's `Origin` verbatim, so an entry that can never
+equal one, because it has no `scheme://` prefix, or carries a trailing slash,
+path, query or fragment, or uses uppercase letters a browser never sends, is
+named along with the reason instead of printing as though it were allowed. Each
+server also prints the policy it resolved as it starts listening.
+
+The dojo server (`examples/server/server.ts`) applies it with its own `cors`
+middleware; `examples/server/api/tool-based-generative-ui.ts` is the one
+standalone example that opts in, passing the parsed value as
+`createStrandsApp`'s `corsOrigin`. The other standalone examples pass no
+`corsOrigin` and stay closed. None of this is in the path for the dojo itself,
+which reaches the examples from its own server-side route handler, or for curl:
+it is for pointing a browser page straight at one of these servers.
+
+## Authenticating the Agent Route
+
+The agent route is unauthenticated by default. Pass `auth` to guard it, on
+either entry point:
+
+```ts
+import { createStrandsApp } from "@ag-ui/aws-strands/server";
+import type { StrandsAuthMiddleware } from "@ag-ui/aws-strands/server";
+
+const requireBearer: StrandsAuthMiddleware = (req, res, next) => {
+  const header = req.header("authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token || token !== process.env.AGENT_TOKEN) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+};
+
+const app = await createStrandsApp(aguiAgent, {
+  path: "/invocations",
+  auth: requireBearer,
+});
+```
+
+```ts
+// Same option on the low-level helper, for an app you build yourself.
+addStrandsExpressEndpoint(app, aguiAgent, {
+  path: "/invocations",
+  auth: requireBearer,
+});
+```
+
+It is plain Express middleware, `(req, res, next)`, which is what the ecosystem
+of guards you would actually reach for already is: `express-jwt`,
+`passport.authenticate(...)`, or a hand-written check like the one above. An
+existing Express `RequestHandler` assigns to `auth` with no cast. The return
+value is ignored, but a returned promise is awaited, so an `async` guard that
+rejects fails closed instead of hanging the request.
+
+The request has to be admitted explicitly by calling `next()`. A guard that
+returns without touching the response neither admits nor rejects, which is what
+lets an ordinary callback-style middleware call `next()` long after it returns.
+The 401 body is whatever your middleware writes; the adapter does not invent
+one.
+
+What the adapter guarantees around it:
+
+- **The agent never runs for a rejected request.** The guard is route
+  middleware registered ahead of the agent handler, so `next()` is the only
+  thing that advances to it. A middleware that answers the request and then
+  calls `next()` anyway does not advance either, which is what stops a
+  streaming agent writing into a response that is already finished.
+- **Failures fail closed and quietly.** A thrown error, a rejected promise, or
+  `next(error)` answers the error's own `status` or `statusCode` when that is a
+  usable HTTP error code, which is how `express-jwt` and `passport` report a
+  rejected credential, and `500` otherwise. The body is the generic reason
+  phrase for that status and never the error's own message, so no internal
+  detail and no stack frame reaches the client, and the error is logged
+  server-side through the adapter's logger. If the response head is already on
+  the wire there is no status left to set, so the connection is dropped; if the
+  response has already finished, it is left alone. `next("route")` and
+  `next("router")` are Express control-flow signals rather than failures and are
+  forwarded as such.
+- **`auth` runs before the request-boundary checks.** An unauthenticated
+  request with a non-JSON `Content-Type` gets `401`, not the `415` it would get
+  without a guard. Authenticating before telling an anonymous caller anything
+  about the request contract is the intended order; `415` and `400` still bite
+  behind a guard that passes.
+- **`/ping` and `/capabilities` stay open.** Health probes have to keep
+  working, and the capabilities document is a static matrix of what this
+  adapter supports rather than user data.
+
+### Relationship to the Python adapter
+
+None of `auth`, `corsEnabled`, `allowMethods` or `allowHeaders` has an
+equivalent in Python today. `create_strands_app` in
+`python/src/ag_ui_strands/utils.py` takes `(agent, path="/", ping_path="/ping",
+origins=None)` and nothing else: no guard hook, no off switch, no method or
+header narrowing. A Python pull request adding the matching options is open but
+unmerged, so this change is that pull request's TypeScript counterpart rather
+than a catch-up to something already shipped, and until it lands TypeScript is
+ahead of Python on this surface rather than level with it.
+
+One divergence is deliberate and stays whichever way that lands: TypeScript
+makes cross-origin access opt-in, while `create_strands_app` installs
+`CORSMiddleware` on every app and falls back to `allow_origins=["*"]` whenever
+`origins` is omitted or empty. TypeScript could flip the default outright rather
+than easing into it because it has a second boundary in front of the agent: the
+endpoint answers `415` to any request without a JSON `Content-Type` before
+dispatching, which already blocked the simple, non-preflighted form of the same
+cross-origin call.
 
 ## Configuration
 
@@ -304,15 +656,21 @@ using `createStrandsApp`:
 
 ```ts
 import express from "express";
-import cors from "cors";
 import { addStrandsExpressEndpoint, addPing } from "@ag-ui/aws-strands/server";
 
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 addStrandsExpressEndpoint(app, aguiAgent, { path: "/invocations" });
 addPing(app, "/ping");
 ```
+
+Mounting the endpoint yourself means you own the cross-origin policy too. Add
+`cors` middleware only if a browser on another origin has to reach the endpoint,
+and give it an explicit allowlist when you do.
+
+`addStrandsExpressEndpoint` takes the same
+[`auth`](#authenticating-the-agent-route) option as `createStrandsApp`, so the
+guard travels with the route rather than with the app you built around it.
 
 ## Development
 
