@@ -961,6 +961,34 @@ describe("Multimodal Message Conversion", () => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("Dropping file block"));
       warn.mockRestore();
     });
+
+    it("ignores a block whose type is an Object.prototype key", () => {
+      // `item.type` is not author-controlled: it rides in on content blocks the
+      // LangGraph server relays from model and tool output. A bare bracket
+      // lookup into an object literal answers "constructor" / "toString" with an
+      // INHERITED FUNCTION, which is truthy, so the media branch would be
+      // entered and that function written out as the AG-UI content type — a
+      // malformed item that fails schema validation downstream. A prototype key
+      // has to be exactly as unrecognized as any other unknown block type:
+      // skipped, leaving only the blocks this converter actually understands.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "prototype-typed",
+          type: "human",
+          content: [
+            { type: "text", text: "before" },
+            { type: "constructor", data: "JVBERi0xLjQK", mimeType: "application/pdf" },
+            { type: "toString", url: "https://example.com/doc.pdf" },
+            { type: "valueOf", base64: "JVBERi0xLjQK", mime_type: "audio/mpeg" },
+            { type: "hasOwnProperty", data: "JVBERi0xLjQK" },
+            { type: "isPrototypeOf", data: "JVBERi0xLjQK" },
+          ],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      const content = (agui[0] as UserMessage).content as Array<any>;
+      expect(content).toEqual([{ type: "text", text: "before" }]);
+    });
   });
 });
 

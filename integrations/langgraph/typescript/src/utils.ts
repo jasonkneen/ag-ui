@@ -100,13 +100,25 @@ function deriveFilename(mimeType: string | undefined): string {
   return subtype ? `attachment.${subtype}` : "attachment";
 }
 
-/** The return leg: which AG-UI media type a standard block becomes. */
-const AGUI_MEDIA_TYPES: Record<string, "audio" | "video" | "document" | "image"> = {
-  audio: "audio",
-  video: "video",
-  file: "document",
-  image: "image",
-};
+/**
+ * The return leg: which AG-UI media type a standard block becomes.
+ *
+ * A `Map` rather than an object literal, matching {@link MEDIA_CONTENT_TYPES},
+ * and for the same reason: the key is `item.type` off an inbound block, which is
+ * whatever the LangGraph server relayed from model or tool output and is not
+ * author-controlled. An object literal answers `["constructor"]` or
+ * `["toString"]` with an inherited `Object.prototype` member — truthy, and a
+ * function — so a block typed after a prototype key would pass the gate and be
+ * emitted with a FUNCTION as its AG-UI content type, failing schema validation
+ * downstream. A `Map` sees only what was put in it, and `get` returns the media
+ * type in the same lookup that decides the branch.
+ */
+const AGUI_MEDIA_TYPES = new Map<string, "audio" | "video" | "document" | "image">([
+  ["audio", "audio"],
+  ["video", "video"],
+  ["file", "document"],
+  ["image", "image"],
+]);
 
 /**
  * The media block this adapter emits: a LangChain `source_type` data block.
@@ -293,13 +305,17 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
   const aguiContent: InputContent[] = [];
 
   for (const item of content) {
+    // Resolved before the chain so the branch gate and the emitted content type
+    // are one lookup rather than two. `undefined` for every block kind this
+    // converter does not recognise, prototype key or not.
+    const type = AGUI_MEDIA_TYPES.get(item.type);
+
     if (item.type === "text" && item.text) {
       aguiContent.push({
         type: "text",
         text: item.text,
       });
-    } else if (AGUI_MEDIA_TYPES[item.type]) {
-      const type = AGUI_MEDIA_TYPES[item.type];
+    } else if (type) {
       const incoming = readIncomingMediaBlock(item);
 
       if (!incoming) {
