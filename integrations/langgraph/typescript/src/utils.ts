@@ -150,7 +150,45 @@ const AGUI_MEDIA_TYPES = new Map<string, "audio" | "video" | "document" | "image
  * path that actually runs, the non-deprecated shape is the one that silently
  * fails. Deprecated-and-translated beats current-and-forwarded-raw.
  *
- * Revisit when the JS default path translates native blocks without a marker.
+ * KNOWN LIMIT, measured and deliberately not addressed here: the Responses API.
+ * Everything above is Chat Completions, which is where the reported failure was.
+ * On `useResponsesApi: true` the same emitted block behaves differently, and no
+ * single shape fixes both — the JS-native shape is correct on Responses/v1 and
+ * forwarded raw on the Chat Completions default path, which is the bug this
+ * change exists to fix. Measured on `@langchain/openai@1.2.0`, before and after:
+ *
+ *   case                          before                     after
+ *   ----------------------------  -------------------------  ----------------------
+ *   audio, Responses, v1          input_image (wrong kind)   NO PART EMITTED
+ *   audio, Responses, default     input_image (wrong kind)   input_audio ✓
+ *   audio, Completions, either    input_image (wrong kind)   input_audio ✓
+ *   document, Responses, v1       input_image (wrong kind)   input_file ✓
+ *   document, Responses, default  input_image (wrong kind)   file.file_data
+ *                                                            (Chat Completions
+ *                                                            part shape; the
+ *                                                            Responses form is
+ *                                                            input_file)
+ *
+ * Five of the six rows go from a wrong-kind part to a right-kind one. Row 1 goes
+ * the other way, and it is the one to know about: the attachment stops being
+ * emitted at all, with no throw and no warning, so the model answers without ever
+ * seeing it. The cause is upstream and not reachable from here —
+ * `dist/converters/responses.js` handles the v1 block kinds in one chain and
+ * audio's branch is empty (`} else if (block.type === "audio") {}`), the only
+ * occurrence of "audio" in that converter, sitting between `file` and `image`
+ * branches that both resolve a real part.
+ *
+ * Note what row 1 is NOT: a working path that this change broke. Before, the
+ * audio went out labelled as an image, so the request carried a part the API
+ * does not accept for audio. The run failed then and produces a wrong answer now
+ * — worse to diagnose, but not a lost capability.
+ *
+ * This converter cannot tell the two transports apart. It receives messages and
+ * nothing else; the model is constructed inside the graph, on the far side of the
+ * LangGraph server call. Emitting per-transport is not possible from here.
+ *
+ * Revisit when the JS default path translates native blocks without a marker, or
+ * when the Responses v1 converter grows an audio branch.
  */
 interface StandardMediaBlock {
   type: "audio" | "file";
