@@ -807,5 +807,83 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertEqual(agui_content[1].source.value, "https://example.com/test.png")
 
 
+class TestCrossRuntimeWireShape(unittest.TestCase):
+    """The TYPESCRIPT adapter's emitted block, checked against PYTHON's converter.
+
+    These two adapters implement one protocol and can front the same LangGraph
+    server, so the block one emits has to be translatable by the runtime the
+    other one lives in. Nothing else in either test suite covers that seam, and
+    it is where this PR's first two rounds went wrong: each half was verified
+    against its own runtime only.
+
+    The literals below are the TS adapter's output verbatim (see
+    `integrations/langgraph/typescript/src/utils.ts`, `standardMediaBlock`). If
+    someone changes that emission, this fails here — in the other language —
+    which is the point.
+    """
+
+    def test_ts_emitted_document_block_converts_in_python(self):
+        from langchain_core.messages.block_translators.openai import (
+            convert_to_openai_data_block,
+        )
+
+        ts_emitted = {
+            "type": "file",
+            "source_type": "base64",
+            "data": "JVBERi0xLjQK",
+            "mime_type": "application/pdf",
+            "metadata": {"filename": "invoice-q2.pdf"},
+        }
+
+        self.assertEqual(
+            convert_to_openai_data_block(ts_emitted),
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "filename": "invoice-q2.pdf",
+                },
+            },
+        )
+
+    def test_ts_emitted_audio_block_converts_in_python(self):
+        from langchain_core.messages.block_translators.openai import (
+            convert_to_openai_data_block,
+        )
+
+        ts_emitted = {
+            "type": "audio",
+            "source_type": "base64",
+            "data": "SGVsbG8=",
+            "mime_type": "audio/wav",
+        }
+
+        self.assertEqual(
+            convert_to_openai_data_block(ts_emitted),
+            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+        )
+
+    def test_the_shape_python_cannot_translate(self):
+        """Why the TS adapter does not emit LangChain.js's native block shape.
+
+        It is not merely unconverted here — Python REJECTS it. Combined with the
+        JS side forwarding it raw on the default path, that shape has no runtime
+        where it reaches a provider correctly.
+        """
+        from langchain_core.messages.block_translators.openai import (
+            convert_to_openai_data_block,
+        )
+
+        js_native = {
+            "type": "file",
+            "data": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "metadata": {"filename": "invoice-q2.pdf"},
+        }
+
+        with self.assertRaises(ValueError):
+            convert_to_openai_data_block(js_native)
+
+
 if __name__ == "__main__":
     unittest.main()
