@@ -15,9 +15,10 @@ from ag_ui.core import (
     InputContentDataSource,
     InputContentUrlSource,
 )
-from langchain_core.messages import HumanMessage
-from langchain_core.messages.block_translators.openai import (
-    convert_to_openai_data_block,
+from langchain_core.messages import (
+    HumanMessage,
+    convert_to_openai_messages,
+    is_data_content_block,
 )
 
 from ag_ui_langgraph.utils import (
@@ -426,9 +427,17 @@ class TestMultimodalConversion(unittest.TestCase):
         lc_content = convert_agui_multimodal_to_langchain(content_list)
 
         self.assertEqual(lc_content[0]["filename"], "invoice-q2.pdf")
-        # The metadata OBJECT still must not ride along: a non-standard
-        # top-level `metadata` key makes strict providers 400 (issue #2100).
-        self.assertNotIn("metadata", lc_content[0])
+        # ENUMERATED, not negated. `assertNotIn("metadata", ...)` reads like a
+        # guard but cannot fail: nothing in `_standard_media_block` writes a
+        # `metadata` key, so it would pass for every input including a block
+        # that lost its filename. Pinning the whole key set constrains the
+        # output in both directions — a key gained (issue #2100's top-level
+        # `metadata` object, which makes strict providers 400) and a key lost.
+        # The TypeScript counterpart does the same with
+        # `expect(Object.keys(content[1].metadata)).toEqual(["filename"])`.
+        self.assertEqual(
+            sorted(lc_content[0]), ["base64", "filename", "mime_type", "type"]
+        )
 
     def test_document_survives_the_langchain_round_trip(self):
         """AG-UI -> LangChain -> AG-UI keeps the document a document.
@@ -850,13 +859,22 @@ class TestMultimodalConversion(unittest.TestCase):
 
 
 class TestProviderBoundary(unittest.TestCase):
-    """The EMITTED block, run through the real langchain-core OpenAI translator.
+    """The EMITTED block, run down the real path to the provider payload.
 
     The tests above assert the SHAPE this converter emits. On their own that is
     the trap that lets a wrong shape ship: a converter and its tests agreeing on
-    an invented schema look identical to a correct one. These hand the emitted
-    block to `convert_to_openai_data_block` and read what comes out — no network,
-    the translator is a pure function.
+    an invented schema look identical to a correct one. These take the emitted
+    block and read what a provider would actually receive — no network, the
+    conversion is a pure function.
+
+    They go through `convert_to_openai_messages`, not
+    `convert_to_openai_data_block`, ON PURPOSE. The real path gates translation
+    behind `is_data_content_block` and only calls the translator for blocks that
+    pass; a block that fails the gate is FORWARDED VERBATIM instead. Calling the
+    translator directly skips the gate, so a shape the real path would never
+    translate can still look translated in a test — see
+    `test_js_native_spelling_is_forwarded_unrecognized_not_rejected` for the
+    measurement that makes that concrete.
     """
 
     @staticmethod
@@ -864,6 +882,16 @@ class TestProviderBoundary(unittest.TestCase):
         """The block this converter actually puts on the wire for `item`."""
         blocks = convert_agui_multimodal_to_langchain([item])
         return blocks[0]
+
+    @staticmethod
+    def _provider_payload(block):
+        """What an OpenAI-compatible provider actually receives for `block`.
+
+        A block the gate rejects comes back out of here unchanged, so an
+        equality assertion against the translated form catches that too.
+        """
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(block)])])
+        return message["content"][0]
 
     def test_emitted_document_block_translates_for_openai(self):
         block = self._emit(
@@ -876,8 +904,9 @@ class TestProviderBoundary(unittest.TestCase):
             )
         )
 
+        self.assertTrue(is_data_content_block(block))
         self.assertEqual(
-            convert_to_openai_data_block(block),
+            self._provider_payload(block),
             {
                 "type": "file",
                 "file": {
@@ -905,7 +934,7 @@ class TestProviderBoundary(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            translated = convert_to_openai_data_block(block)
+            translated = self._provider_payload(block)
 
         self.assertEqual(
             translated,
@@ -917,9 +946,12 @@ class TestProviderBoundary(unittest.TestCase):
                 },
             },
         )
-        # And the translator's "you should have given me a filename" warning is
-        # NOT raised, because the converter gave it one.
-        self.assertEqual([w for w in caught if "filename" in str(w.message)], [])
+        # And langchain-core stays silent, because the converter supplied the
+        # name. Measured with langchain-core 1.2.13: a file block with NO
+        # filename warns ("OpenAI may require a filename for file uploads") and
+        # substitutes the literal `LC_AUTOGENERATED` — so this list is empty
+        # only while the derivation keeps working.
+        self.assertEqual([str(w.message) for w in caught], [])
 
     def test_emitted_audio_block_translates_for_openai(self):
         block = self._emit(
@@ -931,8 +963,9 @@ class TestProviderBoundary(unittest.TestCase):
             )
         )
 
+        self.assertTrue(is_data_content_block(block))
         self.assertEqual(
-            convert_to_openai_data_block(block),
+            self._provider_payload(block),
             {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
         )
 
@@ -946,8 +979,9 @@ class TestProviderBoundary(unittest.TestCase):
             )
         )
 
+        self.assertTrue(is_data_content_block(block))
         self.assertEqual(
-            convert_to_openai_data_block(block),
+            self._provider_payload(block),
             {
                 "type": "file",
                 "file": {
@@ -964,33 +998,69 @@ class TestProviderBoundary(unittest.TestCase):
             )
         )
 
+        self.assertTrue(is_data_content_block(block))
         self.assertEqual(
-            convert_to_openai_data_block(block),
+            self._provider_payload(block),
             {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
         )
 
-    def test_refused_combinations_raise_in_the_translator(self):
-        """The other half of the decision, pinned.
+    def test_refused_combinations_stay_off_the_standard_block_path(self):
+        """The other half of the decision, pinned to BOTH its halves.
 
-        Every combination this converter REFUSES to announce as a standard block,
-        with the exception that is the reason why. If one of these ever stops
-        raising, the corresponding row in `_STANDARD_BLOCK_TYPES` can be
-        revisited — but not before.
+        Each row is a combination this converter refuses to announce as a
+        standard block, paired with the exception that is the reason why. Two
+        assertions, because either one alone is weak:
+
+        1. the converter really does keep that combination on `image_url` — this
+           is what a well-meaning "finish the job" edit to `_STANDARD_BLOCK_TYPES`
+           breaks, and pinning only the library behaviour would not notice;
+        2. the standard block for it really does die, measured on the REAL path
+           (`convert_to_openai_messages`) rather than by calling the translator
+           past the `is_data_content_block` gate. All four of these DO pass that
+           gate, so the gate is not what saves them — the raise is.
+
+        If one of these ever stops raising, the corresponding row in
+        `_STANDARD_BLOCK_TYPES` can be revisited. Not before.
         """
         refused = {
             "audio by url": (
+                AudioInputContent(
+                    type="audio",
+                    source=InputContentUrlSource(
+                        type="url", value="https://example.com/a.wav"
+                    ),
+                ),
                 {"type": "audio", "url": "https://example.com/a.wav", "mime_type": "audio/wav"},
                 "Key base64 is required for audio blocks",
             ),
             "video by base64": (
+                VideoInputContent(
+                    type="video",
+                    source=InputContentDataSource(
+                        type="data", value="AAA=", mime_type="video/mp4"
+                    ),
+                ),
                 {"type": "video", "base64": "AAA=", "mime_type": "video/mp4"},
                 "Block of type video is not supported",
             ),
             "video by url": (
+                VideoInputContent(
+                    type="video",
+                    source=InputContentUrlSource(
+                        type="url", value="https://example.com/v.mp4"
+                    ),
+                ),
                 {"type": "video", "url": "https://example.com/v.mp4", "mime_type": "video/mp4"},
                 "Block of type video is not supported",
             ),
             "file by url": (
+                DocumentInputContent(
+                    type="document",
+                    source=InputContentUrlSource(
+                        type="url", value="https://example.com/d.pdf"
+                    ),
+                    metadata={"filename": "d.pdf"},
+                ),
                 {
                     "type": "file",
                     "url": "https://example.com/d.pdf",
@@ -1001,67 +1071,129 @@ class TestProviderBoundary(unittest.TestCase):
             ),
         }
 
-        for name, (block, message) in refused.items():
+        for name, (agui_item, standard_block, message) in refused.items():
             with self.subTest(name):
+                self.assertEqual(self._emit(agui_item)["type"], "image_url")
+
+                self.assertTrue(is_data_content_block(standard_block))
                 with self.assertRaisesRegex(ValueError, message):
-                    convert_to_openai_data_block(dict(block))
+                    self._provider_payload(standard_block)
+
+
+def _as_typescript_wire_block(block):
+    """Re-spell a block THIS package emits into the one the TypeScript adapter
+    puts on the wire for the same AG-UI item.
+
+    Both adapters emit the same block; they differ only in field NAMES. Python
+    uses langchain-core's spelling (`base64`, top-level `filename`); the
+    TypeScript half uses the `source_type` family (`source_type` + `data`,
+    `metadata.filename`) — see `standardMediaBlock` in
+    `integrations/langgraph/typescript/src/utils.ts`.
+
+    Only the names are rewritten here. Every VALUE comes from this package's own
+    converter, so the cross-runtime tests below are driven by what Python
+    actually emits today rather than by a literal someone typed once and that
+    silently stops matching. The remaining hand-maintained part is this mapping
+    itself, which is four lines and sits next to the file it mirrors.
+    """
+    wire = {
+        "type": block["type"],
+        "source_type": "base64",
+        "data": block["base64"],
+        "mime_type": block["mime_type"],
+    }
+    if "filename" in block:
+        wire["metadata"] = {"filename": block["filename"]}
+    return wire
 
 
 class TestCrossRuntimeWireShape(unittest.TestCase):
-    """The TYPESCRIPT adapter's emitted block, checked against PYTHON's converter.
+    """One AG-UI item, out through PYTHON and back in through the TYPESCRIPT
+    wire shape, using THIS package's converters on both legs.
 
     These two adapters implement one protocol and can front the same LangGraph
-    server, so the block one emits has to be translatable by the runtime the
-    other one lives in. Nothing else in either test suite covers that seam, and
-    it is where this PR's first two rounds went wrong: each half was verified
-    against its own runtime only.
+    server, so the block one emits has to be both translatable for the provider
+    AND readable by the other one's return leg. Nothing else in either test
+    suite covers that seam, and it is where this PR's first two rounds went
+    wrong: each half was verified against its own runtime only.
 
-    The literals below are the TS adapter's output verbatim (see
-    `integrations/langgraph/typescript/src/utils.ts`, `standardMediaBlock`). If
-    someone changes that emission, this fails here — in the other language —
-    which is the point.
+    Asserting a hand-copied TypeScript literal against `langchain_core` alone
+    would not cover it — that exercises the library, not this package. The round
+    trips below call `convert_agui_multimodal_to_langchain` on the way out and
+    `convert_langchain_multimodal_to_agui` on the way back, with
+    `_as_typescript_wire_block` standing in for the sibling runtime in between.
     """
 
-    def test_ts_emitted_document_block_converts_in_python(self):
-        from langchain_core.messages.block_translators.openai import (
-            convert_to_openai_data_block,
+    def test_document_survives_the_cross_runtime_round_trip(self):
+        """AG-UI -> Python outbound -> TS wire shape -> Python return leg.
+
+        The inbound half is the shape the sibling runtime actually produces
+        (`source_type` + `data` + `metadata.filename`), which Python's return leg
+        used to drop on the floor — an attachment that vanishes from a reopened
+        thread.
+        """
+        original = DocumentInputContent(
+            type="document",
+            source=InputContentDataSource(
+                type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+            ),
+            metadata={"filename": "invoice-q2.pdf"},
         )
 
-        ts_emitted = {
-            "type": "file",
-            "source_type": "base64",
-            "data": "JVBERi0xLjQK",
-            "mime_type": "application/pdf",
-            "metadata": {"filename": "invoice-q2.pdf"},
-        }
+        [emitted] = convert_agui_multimodal_to_langchain([original])
+        wire = _as_typescript_wire_block(emitted)
 
+        # The sibling runtime's spelling still reaches the provider correctly …
+        self.assertTrue(is_data_content_block(wire))
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(wire)])])
         self.assertEqual(
-            convert_to_openai_data_block(ts_emitted),
-            {
-                "type": "file",
-                "file": {
-                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
-                    "filename": "invoice-q2.pdf",
-                },
-            },
+            message["content"],
+            [
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                        "filename": "invoice-q2.pdf",
+                    },
+                }
+            ],
         )
 
-    def test_ts_emitted_audio_block_converts_in_python(self):
-        from langchain_core.messages.block_translators.openai import (
-            convert_to_openai_data_block,
+        # … and this package's return leg rebuilds the item it started as.
+        [returned] = convert_langchain_multimodal_to_agui([wire])
+        self.assertIsInstance(returned, DocumentInputContent)
+        self.assertIsInstance(returned.source, InputContentDataSource)
+        self.assertEqual(returned.source.value, original.source.value)
+        self.assertEqual(returned.source.mime_type, original.source.mime_type)
+        self.assertEqual(returned.metadata, {"filename": "invoice-q2.pdf"})
+
+    def test_audio_survives_the_cross_runtime_round_trip(self):
+        """Same seam, for inline audio — which translates to `input_audio`
+        rather than `file`, so it exercises a different translator branch."""
+        original = AudioInputContent(
+            type="audio",
+            source=InputContentDataSource(
+                type="data", value="SGVsbG8=", mime_type="audio/wav"
+            ),
+            metadata={"filename": "clip.wav"},
         )
 
-        ts_emitted = {
-            "type": "audio",
-            "source_type": "base64",
-            "data": "SGVsbG8=",
-            "mime_type": "audio/wav",
-        }
+        [emitted] = convert_agui_multimodal_to_langchain([original])
+        wire = _as_typescript_wire_block(emitted)
 
+        self.assertTrue(is_data_content_block(wire))
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(wire)])])
         self.assertEqual(
-            convert_to_openai_data_block(ts_emitted),
-            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+            message["content"],
+            [{"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}}],
         )
+
+        [returned] = convert_langchain_multimodal_to_agui([wire])
+        self.assertIsInstance(returned, AudioInputContent)
+        self.assertIsInstance(returned.source, InputContentDataSource)
+        self.assertEqual(returned.source.value, original.source.value)
+        self.assertEqual(returned.source.mime_type, original.source.mime_type)
+        self.assertEqual(returned.metadata, {"filename": "clip.wav"})
 
     # ── The return leg reads all three vocabularies ────────────────────
     #
@@ -1144,29 +1276,9 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
         self.assertEqual(agui_content[0].source.mime_type, "video/mp4")
         self.assertEqual(agui_content[0].metadata, {"filename": "demo.mp4"})
 
-    def test_ts_emitted_base64_block_is_read_back_into_agui(self):
-        """Shape 3, base64: the `source_type` family — verbatim TS adapter output.
-
-        This literal is the same block asserted by
-        `test_ts_emitted_document_block_converts_in_python`: what the TypeScript
-        adapter puts on the wire. Python used to return `[]` for it.
-        """
-        agui_content = convert_langchain_multimodal_to_agui([
-            {
-                "type": "file",
-                "source_type": "base64",
-                "data": "JVBERi0xLjQK",
-                "mime_type": "application/pdf",
-                "metadata": {"filename": "invoice-q2.pdf"},
-            },
-        ])
-
-        self.assertEqual(len(agui_content), 1)
-        self.assertIsInstance(agui_content[0], DocumentInputContent)
-        self.assertIsInstance(agui_content[0].source, InputContentDataSource)
-        self.assertEqual(agui_content[0].source.value, "JVBERi0xLjQK")
-        self.assertEqual(agui_content[0].source.mime_type, "application/pdf")
-        self.assertEqual(agui_content[0].metadata, {"filename": "invoice-q2.pdf"})
+    # Shape 3, base64 (the `source_type` family the TypeScript adapter emits) is
+    # covered by `test_document_survives_the_cross_runtime_round_trip` above,
+    # which builds it from this package's own outbound leg instead of a literal.
 
     def test_ts_emitted_url_block_is_read_back_into_agui(self):
         """Shape 3, url: the `source_type` family, URL variant."""
@@ -1233,26 +1345,66 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
 
         self.assertEqual(agui_content, [])
 
-    def test_the_shape_python_cannot_translate(self):
-        """Why the TS adapter does not emit LangChain.js's native block shape.
+    def test_js_native_spelling_is_forwarded_unrecognized_not_rejected(self):
+        """Why neither adapter emits LangChain.js's native field names.
 
-        It is not merely unconverted here — Python REJECTS it. Combined with the
-        JS side forwarding it raw on the default path, that shape has no runtime
-        where it reaches a provider correctly.
+        An earlier version of this test called `convert_to_openai_data_block`
+        directly, saw a `ValueError`, and concluded Python REJECTS that shape.
+        That verdict came from calling PAST the gate the real path uses, and it
+        is wrong for three of the four modalities. Measured with langchain-core
+        1.2.13 through `convert_to_openai_messages`, on
+        `{type, data, mimeType, metadata.filename}`:
+
+            file   is_data_content_block -> False, forwarded VERBATIM
+            audio  is_data_content_block -> False, forwarded VERBATIM
+            video  is_data_content_block -> False, forwarded VERBATIM
+            image  is_data_content_block -> False, raises ("Unrecognized
+                   content block … does not have a 'source' or 'image' key")
+
+        Silently forwarded is not better than rejected, it is worse: the run
+        does not die here with a stack trace naming the block, it dies at the
+        provider on a content block nobody in this repo emitted deliberately.
+        Which is the actual reason the spelling matters — not that Python
+        refuses it, but that Python does not RECOGNIZE it.
         """
-        from langchain_core.messages.block_translators.openai import (
-            convert_to_openai_data_block,
+        [emitted] = convert_agui_multimodal_to_langchain([
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                ),
+                metadata={"filename": "invoice-q2.pdf"},
+            )
+        ])
+
+        # The spelling this package emits is recognized, and translated.
+        self.assertTrue(is_data_content_block(emitted))
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(emitted)])])
+        self.assertEqual(
+            message["content"],
+            [
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                        "filename": "invoice-q2.pdf",
+                    },
+                }
+            ],
         )
 
+        # The SAME payload under LangChain.js's native names is not recognized,
+        # and goes to the provider untouched. Built from `emitted` so it tracks
+        # whatever this package emits rather than a frozen literal.
         js_native = {
-            "type": "file",
-            "data": "JVBERi0xLjQK",
-            "mimeType": "application/pdf",
-            "metadata": {"filename": "invoice-q2.pdf"},
+            "type": emitted["type"],
+            "data": emitted["base64"],
+            "mimeType": emitted["mime_type"],
+            "metadata": {"filename": emitted["filename"]},
         }
-
-        with self.assertRaises(ValueError):
-            convert_to_openai_data_block(js_native)
+        self.assertFalse(is_data_content_block(js_native))
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(js_native)])])
+        self.assertEqual(message["content"], [js_native])
 
 
 if __name__ == "__main__":
