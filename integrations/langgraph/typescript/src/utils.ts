@@ -49,20 +49,37 @@ const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
  * OpenAI SDK's own `ChatCompletionContentPartInputAudio.InputAudio` — and both
  * runtimes derive that string from the block's `mime_type`. So the constraint is
  * not "audio converts": it is "audio converts for two subtypes, spelled the way
- * the provider spells them". Measured on `@langchain/openai@1.2.0` and
- * `langchain-core@1.2.13`, emitting through this adapter's own converter:
+ * the provider spells them".
+ *
+ * READ THE TABLE AS "WITHOUT THIS MAP". It records what a RAW `audio` standard
+ * block carrying that MIME type does — which is the thing this map exists to
+ * prevent, NOT what this adapter emits today. Downstream of this map the only
+ * spellings that ever reach a translator are `audio/wav` and `audio/mp3`, so
+ * re-measuring means handing the raw block to the translator directly, not
+ * running an AG-UI item through this converter. Measured 2026-08-25 on
+ * `@langchain/openai@1.2.0` (which resolves `openai@6.10.0`) via `ChatOpenAI`
+ * with a stub `fetch`, and `langchain-core@1.2.13` via
+ * `convert_to_openai_messages`:
  *
  *   AG-UI mimeType     JS (@langchain/openai)     Python (langchain-core)
  *   -----------------  -------------------------  --------------------------
  *   audio/wav          format "wav" ✓             format "wav" ✓
  *   audio/mp3          format "mp3" ✓             format "mp3" ✓
- *   audio/mpeg         THREW                      format "mpeg" ✗ (API 400)
- *   audio/ogg          THREW                      format "ogg" ✗ (API 400)
- *   audio/aac          THREW                      format "aac" ✗ (API 400)
- *   audio/webm         THREW                      format "webm" ✗ (API 400)
- *   audio/x-wav        THREW                      format "x-wav" ✗ (API 400)
- *   AUDIO/WAV          THREW                      format "WAV" ✗ (API 400)
- *   audio/wav;codecs=1 format "wav" ✓             format "wav; codecs=1" ✗
+ *   audio/mpeg         THREW                      format "mpeg" ✗
+ *   audio/ogg          THREW                      format "ogg" ✗
+ *   audio/aac          THREW                      format "aac" ✗
+ *   audio/webm         THREW                      format "webm" ✗
+ *   audio/x-wav        THREW                      format "x-wav" ✗
+ *   AUDIO/WAV          THREW                      format "WAV" ✗
+ *   audio/wav;codecs=1 format "wav" ✓             format "wav;codecs=1" ✗
+ *
+ * The JS THREW cells are measured: the message is "Audio blocks with source_type
+ * base64 must have mime type of audio/wav or audio/mp3". The Python ✗ cells are
+ * measured only as far as the request body — that `format` string IS what
+ * langchain-core puts on the wire. The ✗ itself is an inference, not a live API
+ * call: `format` is a two-value enum in the OpenAI SDK (`format: 'wav' | 'mp3'`,
+ * read out of `openai@6.10.0`), so anything else is out-of-enum and the API
+ * rejects it. Nobody has re-run these against a live key from this repo.
  *
  * Two things fall out of that table, and this map exists for both.
  *
@@ -96,7 +113,9 @@ const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
  * Kept in lockstep with `_OPENAI_AUDIO_MIME_TYPES` in the Python adapter. A
  * divergence here is the class of bug this converter exists to fix.
  *
- * Revisit when `input_audio.format` grows a third value.
+ * Revisit when `input_audio.format` grows a third value. It has not: still
+ * `'wav' | 'mp3'` in `openai@6.10.0` (what `@langchain/openai@1.2.0` resolves)
+ * and in `openai@7.5.0`, checked 2026-08-25.
  */
 const OPENAI_AUDIO_MIME_TYPES = new Map<string, string>([
   ["audio/wav", "audio/wav"],
@@ -138,8 +157,12 @@ function normalizedAudioMimeType(mimeType: string | undefined): string | undefin
  * other combination exactly as it was: this change improves the paths it can
  * prove and regresses none.
  *
- * Measured against `@langchain/core@1.1.40` + `@langchain/openai@1.2.0` (JS) and
- * `langchain-core@1.2.13` (Python), through the real OpenAI translators:
+ * Measured 2026-08-25 against `@langchain/core@1.1.40` + `@langchain/openai@1.2.0`
+ * (JS, through `ChatOpenAI` with a stub `fetch`) and `langchain-core@1.2.13`
+ * (Python, through `convert_to_openai_messages`). Like the table on
+ * {@link OPENAI_AUDIO_MIME_TYPES}, the failing cells are what the STANDARD BLOCK
+ * would do if it were emitted — which is why this function refuses to emit one
+ * for those rows, so they are not reachable through this converter as it stands:
  *
  *   AG-UI item        JS (@langchain/openai)              Python
  *   ----------------  ----------------------------------  --------------------------------
@@ -171,8 +194,14 @@ function standardBlockTypeFor(
   mediaType: string,
   source: InputContentDataSource | InputContentUrlSource
 ): { type: "audio" | "file"; mimeType?: string } | null {
-  // Every URL-sourced media block throws in both runtimes; only inline data
-  // converts.
+  // Only inline data converts, for every modality this function would otherwise
+  // promote. Measured 2026-08-25: a `source_type: "url"` block throws in JS and
+  // raises in Python for audio, document and video alike.
+  //
+  // NOT true of a url-sourced `image` standard block, which both runtimes DO
+  // convert (to `image_url` / `image_url`, the same part the fallback below
+  // produces). That row is simply irrelevant here — images never take the
+  // standard-block path at all, they keep `image_url` unconditionally.
   if (source?.type !== "data") return null;
   if (mediaType === "audio") {
     const mimeType = normalizedAudioMimeType(source.mimeType);
@@ -181,8 +210,8 @@ function standardBlockTypeFor(
   if (mediaType === "document") {
     // A document with NO usable MIME type still has to name one, because the
     // translator interpolates whatever it is given straight into the data URL:
-    // measured on `@langchain/openai@1.2.0`, a `file` block with `mime_type`
-    // absent or empty reaches the provider as
+    // measured 2026-08-25 on `@langchain/openai@1.2.0`, a `file` block whose
+    // `mime_type` is absent, empty OR null reaches the provider as
     // `file.file_data: "data:;base64,<payload>"`. That is not a part with a
     // missing type, it is a part with the WRONG one — RFC 2397 §2 defines an
     // omitted mediatype as `text/plain;charset=US-ASCII`, so a PDF's bytes go
@@ -277,10 +306,22 @@ const PLAUSIBLE_EXTENSION = /^[a-z0-9]{1,8}$/;
  *
  * Not cosmetic. `@langchain/openai` THROWS on a file block with no filename
  * ("a filename or name or title is needed via meta-data for OpenAI when working
- * with multimodal blocks"), so the document path this converter claims to
- * support has to carry one or it is not actually supported. Python only warns
- * and omits the key, but both runtimes emit the same block, so both substitute
- * the same derived name.
+ * with multimodal blocks" — measured 2026-08-25 on `@langchain/openai@1.2.0`), so
+ * the document path this converter claims to support has to carry one or it is
+ * not actually supported.
+ *
+ * Python does not throw, and does not merely drop the key either: measured on
+ * `langchain-core@1.2.13`, a nameless file block warns ("OpenAI may require a
+ * filename for file uploads…") and the part goes out carrying the PLACEHOLDER
+ * `filename: "LC_AUTOGENERATED"` — i.e. the provider is told the user attached a
+ * file by that name. Substituting a derived name is an improvement on both.
+ *
+ * The two runtimes do NOT emit the same block: this one emits
+ * `source_type` / `data` / `mime_type` / `metadata.filename`, the Python adapter
+ * emits `base64` / `mime_type` / top-level `filename`. Both translate to the same
+ * provider part (verified through both real translators), and both run the same
+ * derivation — `_derive_filename` there is kept identical to this — so an
+ * attachment gets the same name whichever runtime sent it.
  *
  * THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough to look
  * like a rule — `application/pdf`, `text/csv` — and then does not:
@@ -409,43 +450,55 @@ function aguiMediaTypeForMimeType(mimeType: string): "audio" | "video" | "docume
  *
  * THIS IS THE ONLY REPRESENTATION THAT TRANSLATES IN BOTH RUNTIMES, and this
  * adapter needs both — it is a JavaScript package that talks to a LangGraph
- * server which is usually the Python one. Measured against the locked
- * dependencies (`@langchain/core@1.1.40` + `@langchain/openai@1.2.0`, and
- * `langchain-core` on the Python side):
+ * server which is usually the Python one. Measured 2026-08-25 against the locked
+ * dependencies — `@langchain/core@1.1.40` + `@langchain/openai@1.2.0` through
+ * `ChatOpenAI` with a stub `fetch`, and `langchain-core@1.2.13` through
+ * `convert_to_openai_messages` — reading the request body each one produced:
  *
  *   shape                                    JS default path      Python
- *   ---------------------------------------  -------------------  ------------
- *   source_type + data + mime_type           file.file_data ✓     same ✓
- *   Python native (base64/mime_type)         VERBATIM ✗           ✓
- *   JS native (data/mimeType/metadata)       VERBATIM ✗           ValueError ✗
+ *   ---------------------------------------  -------------------  ----------------
+ *   source_type + data + mime_type           file.file_data ✓     file.file_data ✓
+ *   Python native (base64/mime_type)         VERBATIM ✗           file.file_data ✓
+ *   JS native (data/mimeType/metadata)       VERBATIM ✗           VERBATIM ✗
  *
  * "VERBATIM" is the trap. The block is neither translated nor rejected: it is
  * forwarded to the provider exactly as written, so the request carries a content
- * part the API does not accept. On the JS side that happens because the default
- * conversion path gates translation behind `isDataContentBlock`, which tests for
- * `source_type` and nothing else; a block without it is not recognised as media
- * at all.
+ * part the API does not accept. It is the failure mode in BOTH runtimes for a
+ * shape that runtime does not recognise — the JS-native block came back out of
+ * `convert_to_openai_messages` as `{"type": "file", "data": …, "mimeType": …,
+ * "metadata": {…}}`, unchanged, with no exception and no warning. (An earlier
+ * revision of this table claimed Python raised a `ValueError` on that row. It
+ * does not, on 1.2.13 — silence is the actual behaviour, and it is worse.)
+ *
+ * On the JS side the cause is that the default conversion path gates translation
+ * behind `isDataContentBlock`, which requires a `source_type` of `"url"` /
+ * `"base64"` / `"text"` / `"id"`; a block without that key is not recognised as
+ * media at all.
  *
  * `@langchain/core` does mark this family `@deprecated` ("Use
- * ContentBlock.Multimodal.Data instead"), and the JS-native shape it points to
+ * {@link ContentBlock.Multimodal.Data} instead" — the literal JSDoc in
+ * `dist/messages/content/data.d.ts`), and the JS-native shape it points to
  * works — but ONLY on the v1 conversion path, which requires
  * `response_metadata.output_version === "v1"` on the message. This adapter does
  * not set that marker and cannot set it for a graph it does not own, so on the
  * path that actually runs, the non-deprecated shape is the one that silently
- * fails. Deprecated-and-translated beats current-and-forwarded-raw.
+ * fails. The deprecated family costs nothing for staying: measured, it translates
+ * to `file.file_data` on the v1 path too. Deprecated-and-translated beats
+ * current-and-forwarded-raw.
  *
  * KNOWN LIMIT, measured and deliberately not addressed here: the Responses API.
  * Everything above is Chat Completions, which is where the reported failure was.
  * On `useResponsesApi: true` the same emitted block behaves differently, and no
  * single shape fixes both — the JS-native shape is correct on Responses/v1 and
  * forwarded raw on the Chat Completions default path, which is the bug this
- * change exists to fix. Measured on `@langchain/openai@1.2.0`, before and after:
+ * change exists to fix. Measured 2026-08-25 on `@langchain/openai@1.2.0`, before
+ * and after, reading the request body off a stub `fetch`:
  *
  *   case                          before                     after
  *   ----------------------------  -------------------------  ----------------------
  *   audio, Responses, v1          input_image (wrong kind)   NO PART EMITTED
  *   audio, Responses, default     input_image (wrong kind)   input_audio ✓
- *   audio, Completions, either    input_image (wrong kind)   input_audio ✓
+ *   audio, Completions, either    image_url (wrong kind)     input_audio ✓
  *   document, Responses, v1       input_image (wrong kind)   input_file ✓
  *   document, Responses, default  input_image (wrong kind)   file.file_data
  *                                                            (Chat Completions
@@ -453,14 +506,19 @@ function aguiMediaTypeForMimeType(mimeType: string): "audio" | "video" | "docume
  *                                                            Responses form is
  *                                                            input_file)
  *
- * Five of the six rows go from a wrong-kind part to a right-kind one. Row 1 goes
- * the other way, and it is the one to know about: the attachment stops being
- * emitted at all, with no throw and no warning, so the model answers without ever
- * seeing it. The cause is upstream and not reachable from here —
- * `dist/converters/responses.js` handles the v1 block kinds in one chain and
- * audio's branch is empty (`} else if (block.type === "audio") {}`), the only
- * occurrence of "audio" in that converter, sitting between `file` and `image`
- * branches that both resolve a real part.
+ * Note row 3's "before": on Chat Completions the old `image_url` block stayed an
+ * `image_url` part. `input_image` is the RESPONSES spelling of the same mistake,
+ * so only the Responses rows show it.
+ *
+ * Row 3 is two cases (default and v1), so the table covers six. Five of them go
+ * from a wrong-kind part to a right-kind one. Row 1 goes the other way, and it is
+ * the one to know about: the attachment stops being emitted at all, with no throw
+ * and no warning, so the model answers without ever seeing it. The cause is
+ * upstream and not reachable from here — `dist/converters/responses.js` handles
+ * the v1 block kinds in one chain and audio's branch is empty
+ * (`} else if (block.type === "audio") {}`), the only occurrence of "audio"
+ * anywhere in that converter, sitting immediately before the `file`, `image` and
+ * `video` branches, each of which resolves a real part.
  *
  * Note what row 1 is NOT: a working path that this change broke. Before, the
  * audio went out labelled as an image, so the request carried a part the API
@@ -472,7 +530,10 @@ function aguiMediaTypeForMimeType(mimeType: string): "audio" | "video" | "docume
  * LangGraph server call. Emitting per-transport is not possible from here.
  *
  * Revisit when the JS default path translates native blocks without a marker, or
- * when the Responses v1 converter grows an audio branch.
+ * when the Responses v1 converter grows an audio branch. Neither has happened as
+ * of `@langchain/openai@1.2.0` / `@langchain/core@1.1.40`, re-checked 2026-08-25:
+ * a native block is still forwarded raw on the default path, and the audio branch
+ * in `dist/converters/responses.js` is still empty.
  */
 interface StandardMediaBlock {
   type: "audio" | "file";
@@ -632,7 +693,11 @@ interface IncomingMediaBlock {
  * representation" half of this converter:
  *
  *   1. native LangChain.js — `data` / `url` / `fileId`, `mimeType`,
- *      `metadata.filename`. What this adapter now emits.
+ *      `metadata.filename`: `@langchain/core`'s `ContentBlock.Multimodal.Data`.
+ *      NOT what this adapter emits — see {@link StandardMediaBlock}, which emits
+ *      shape (3) precisely BECAUSE this shape is forwarded raw on the JS default
+ *      conversion path. It is accepted here because a JS-side graph that builds
+ *      its own content can legitimately produce it.
  *   2. LangChain Python — `base64` / `url`, `mime_type`, `filename`. NOT
  *      hypothetical: this package drives a LangGraph server through
  *      `@langchain/langgraph-sdk`, and that server is usually the Python one, so
@@ -867,14 +932,18 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
  *     BadRequestError: 400 - Invalid MIME type. Only image types are supported.
  *     (code: invalid_image_format)
  *
- * — which killed the run rather than degrading it. Routing every modality through
+ * — which killed the run rather than degrading it. That error is quoted from the
+ * originating report: it comes from the live provider, so unlike everything else
+ * documented in this file it is NOT reproducible from the test suite, which stubs
+ * the transport. Routing every modality through
  * `image_url` was correct when this converter was written (#1457) and stopped
  * being correct once LangChain grew standard multimodal blocks.
  *
  * Everything else — images, video, any URL-sourced media, and audio in a format
  * outside {@link OPENAI_AUDIO_MIME_TYPES} — keeps `image_url`, because the
- * standard block for those combinations throws inside the translator (JS) or
- * forwards an invalid `format` enum to the API (Python). See
+ * standard block for those combinations throws inside the JS translator, and in
+ * Python either raises (video, and every URL-sourced block) or forwards an
+ * invalid `format` enum to the API (audio only). See
  * {@link standardBlockTypeFor} for the measured table.
  *
  * Audio MIME types are NORMALIZED, not merely filtered: `audio/mpeg` — the
