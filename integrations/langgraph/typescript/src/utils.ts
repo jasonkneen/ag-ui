@@ -178,7 +178,33 @@ function standardBlockTypeFor(
     const mimeType = normalizedAudioMimeType(source.mimeType);
     return mimeType ? { type: "audio", mimeType } : null;
   }
-  if (mediaType === "document") return { type: "file", mimeType: source.mimeType };
+  if (mediaType === "document") {
+    // A document with NO usable MIME type still has to name one, because the
+    // translator interpolates whatever it is given straight into the data URL:
+    // measured on `@langchain/openai@1.2.0`, a `file` block with `mime_type`
+    // absent or empty reaches the provider as
+    // `file.file_data: "data:;base64,<payload>"`. That is not a part with a
+    // missing type, it is a part with the WRONG one — RFC 2397 §2 defines an
+    // omitted mediatype as `text/plain;charset=US-ASCII`, so a PDF's bytes go
+    // out asserting they are ASCII text.
+    //
+    // `application/octet-stream` is this file's existing answer for unidentified
+    // bytes, and the two legs are inverses, so it applies here rather than
+    // merely being available: {@link convertLangchainMultimodalToAgui} already
+    // normalizes a MIME-less inbound base64 block to exactly this string, and
+    // {@link FILENAME_EXTENSIONS} already maps it to the `bin` that
+    // {@link deriveFilename} independently derives for a MIME-less document.
+    // Without it the same attachment is `application/octet-stream` inbound and
+    // `""` outbound; with it the round trip is exact and the emitted MIME type
+    // and the emitted filename finally agree about what the file is.
+    //
+    // NOT applied on the `image_url` fallback path below — see
+    // {@link mediaSourceToUrl}.
+    return {
+      type: "file",
+      mimeType: firstNonEmptyString(source.mimeType) ?? "application/octet-stream",
+    };
+  }
   return null;
 }
 
@@ -491,7 +517,23 @@ function mediaSourceToUrl(
   source: InputContentDataSource | InputContentUrlSource | null | undefined
 ): string | null {
   if (source?.type === "data") {
-    return `data:${source.mimeType};base64,${source.value}`;
+    // `mimeType` is declared required, but this source arrives off the wire and
+    // nothing validates it at this boundary, so it can be absent as easily as
+    // empty — and template interpolation renders an absent one as the literal
+    // text `undefined`, putting `data:undefined;base64,…` on the provider
+    // request and, on the return leg, the string `"undefined"` into the thread's
+    // `mimeType` PERMANENTLY. Both spellings of "no MIME type" collapse to the
+    // one the data URL grammar already has for it: an omitted mediatype.
+    //
+    // Deliberately NOT the `application/octet-stream` that
+    // {@link standardBlockTypeFor} substitutes for a document. This is the
+    // `image_url` fallback path, which carries every modality the standard-block
+    // path refuses, and {@link aguiMediaTypeForMimeType} reads the MIME type
+    // inside this very URL to recover that modality: `application/octet-stream`
+    // reads back as a DOCUMENT, so substituting it here would silently retype a
+    // MIME-less image as a document on the next MESSAGES_SNAPSHOT. An omitted
+    // mediatype reads back as an image, which is what the item already was.
+    return `data:${firstNonEmptyString(source.mimeType) ?? ""};base64,${source.value}`;
   } else if (source?.type === "url") {
     return source.value;
   }
@@ -623,14 +665,27 @@ function readIncomingMediaBlock(item: IncomingMediaBlock): {
     item.metadata?.title,
     item.filename
   );
-  const mimeType = item.mimeType ?? item.mime_type;
-  const inlineData = item.data ?? item.base64;
+  // Same scan, same reason. `??` stops on a present-but-empty `mimeType` and
+  // throws away the `mime_type` behind it — the Python-shaped key that a Python
+  // LangGraph server actually sends — so a block carrying BOTH keys would lose
+  // its real MIME type and arrive as `application/octet-stream`. Python's
+  // reader already scans for the first non-empty string here; this is the line
+  // that made the two runtimes disagree about the same inbound block.
+  const mimeType = firstNonEmptyString(item.mimeType, item.mime_type);
+  // And again for the payload: `data: ""` alongside a populated `base64` is the
+  // same cross-shape collision, and `??` would stop at the empty string, fall
+  // past both return branches below, and DROP THE WHOLE BLOCK. Python reads it
+  // with `or`, which falls through.
+  const inlineData = firstNonEmptyString(item.data, item.base64);
+  // `url` is read through the same helper rather than a `typeof` check, so the
+  // non-string case is rejected in the same place as the empty one.
+  const url = firstNonEmptyString(item.url);
 
-  if (typeof inlineData === "string" && inlineData) {
+  if (inlineData) {
     return { value: inlineData, isUrl: false, mimeType, filename };
   }
-  if (typeof item.url === "string" && item.url) {
-    return { value: item.url, isUrl: true, mimeType, filename };
+  if (url) {
+    return { value: url, isUrl: true, mimeType, filename };
   }
   // `fileId`-only blocks reference provider-side storage with no bytes and no
   // URL, and AG-UI's typed content classes have nowhere to put that.
@@ -756,9 +811,18 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
       if (imageUrl.startsWith("data:")) {
         // Format: data:mime_type;base64,data
         const [header, data] = imageUrl.split(",", 2);
-        const mimeType = header.includes(":")
-          ? header.split(":")[1].split(";")[0]
-          : "image/png";
+        // `|| "image/png"`, not just the `includes(":")` gate. A `data:` URL
+        // ALWAYS has a colon, so the gate never falls through for one — but the
+        // mediatype it then extracts is the empty string for the `data:;base64,…`
+        // that a MIME-less attachment produces. The gate therefore treated
+        // "present but empty" as a value and wrote `mimeType: ""` into the
+        // thread, while the comment on {@link aguiMediaTypeForMimeType} claimed
+        // the `image/png` default applied to exactly this case. Now it does.
+        // The MEDIA TYPE is unaffected either way — `aguiMediaTypeForMimeType`
+        // answers "image" for both `""` and `image/png` — so this only stops an
+        // unusable MIME type from being recorded, it does not retype anything.
+        const mimeType =
+          (header.includes(":") ? header.split(":")[1].split(";")[0] : "") || "image/png";
 
         aguiContent.push({
           // The MIME type this adapter put in the data URL on the way out is
@@ -872,7 +936,12 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // id-only, image and video items, and unsupported audio types, all keep the
       // historical `image_url` reference form because the standard block for
       // those throws inside the translator.
-      const mimeType = item.mimeType ?? "";
+      // Read through the same helper the rest of this file uses. `?? ""` would
+      // accept a NON-string `mimeType` — this is a legacy item straight off the
+      // wire — and the `.split(";")` on the next line would then throw out of
+      // the loop that converts the whole message list. An unusable MIME type is
+      // an absent one.
+      const mimeType = firstNonEmptyString(item.mimeType) ?? "";
       // Modality is read off a case-folded copy: MIME types are case-insensitive
       // (RFC 2045 §5.1), so `AUDIO/WAV` names the same modality as `audio/wav`
       // and must not be routed as a document. The ORIGINAL string is what gets
@@ -897,8 +966,12 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       if (item.url) {
         url = item.url;
       } else if (item.data) {
-        // Construct data URL from base64 data
-        url = `data:${item.mimeType};base64,${item.data}`;
+        // Construct data URL from base64 data. The NORMALIZED `mimeType`, not
+        // `item.mimeType`: the raw one is optional on a legacy binary item, and
+        // interpolating an absent one writes the literal text `undefined` into
+        // the data URL. Same collapse as {@link mediaSourceToUrl}, which is the
+        // typed path's version of this line.
+        url = `data:${mimeType};base64,${item.data}`;
       } else if (item.id) {
         // Use id as a reference
         url = item.id;

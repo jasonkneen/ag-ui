@@ -1482,6 +1482,142 @@ describe("Multimodal Message Conversion", () => {
       expect(parts[1]).toEqual(nativeJsShapeWithNoSourceType);
       expect(parts[1]).not.toHaveProperty("file");
     });
+
+    // ── A document with no usable MIME type ───────────────────────────────
+    //
+    // The translator does not supply a default: it interpolates whatever
+    // `mime_type` it is handed straight into the data URL, so a missing one
+    // reached the provider as `data:;base64,…` — an omitted mediatype, which
+    // RFC 2397 §2 DEFINES as `text/plain;charset=US-ASCII`. The part did not
+    // lack a type, it claimed the wrong one.
+    it.each([
+      ["empty-string MIME type", ""],
+      ["absent MIME type", undefined],
+    ])("names a document's bytes octet-stream at the provider when it has an %s", async (_name, mimeType) => {
+      const emitted = (
+        aguiMessagesToLangChain([
+          {
+            id: "boundary-no-mime",
+            role: "user",
+            content: [
+              {
+                type: "document",
+                source: { type: "data", value: "aGk=", ...(mimeType === undefined ? {} : { mimeType }) },
+              },
+            ],
+          } as unknown as UserMessage,
+        ])[0].content as any[]
+      ).filter((b) => b.type !== "text");
+
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "file",
+        file: {
+          // NOT `data:;base64,aGk=`.
+          file_data: "data:application/octet-stream;base64,aGk=",
+          // The MIME type and the derived filename agree about what the file
+          // is, which is the property that makes the round trip exact.
+          filename: "attachment.bin",
+        },
+      });
+    });
+
+    // The `image_url` fallback path takes the other answer, and the difference
+    // is deliberate: `application/octet-stream` reads back as a DOCUMENT
+    // through `aguiMediaTypeForMimeType`, so substituting it here would retype
+    // a MIME-less image. What must not survive either way is the literal text
+    // `undefined`, which is what template interpolation renders an absent
+    // `mimeType` as.
+    it.each([
+      ["typed image content", { type: "image", source: { type: "data", value: "aGk=" } }],
+      ["legacy binary content", { type: "binary", data: "aGk=" }],
+    ])("does not put the text `undefined` in the data URL for %s with no MIME type", async (_name, item) => {
+      const emitted = (
+        aguiMessagesToLangChain([
+          { id: "boundary-undefined-mime", role: "user", content: [item] } as unknown as UserMessage,
+        ])[0].content as any[]
+      ).filter((b) => b.type !== "text");
+
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({ type: "image_url", image_url: { url: "data:;base64,aGk=" } });
+    });
+  });
+
+  // ── An empty MIME type is an absent MIME type ────────────────────────────
+  //
+  // Same defect as the filename above it, on the line below it: `??` falls
+  // through on null/undefined only, so a present-but-empty key shadows the
+  // populated one behind it. Every key here arrives off the wire, and a
+  // LangGraph server that is the Python one sends the `mime_type` / `base64`
+  // spellings, so a block carrying both shapes is not hypothetical.
+  describe("an empty inbound value does not shadow the populated one behind it", () => {
+    function firstContentBlock(block: unknown) {
+      const agui = langchainMessagesToAgui([
+        { id: "shadowing", type: "human", content: [block] } as unknown as LangGraphMessage,
+      ]);
+      return ((agui[0] as UserMessage).content as Array<any>)[0];
+    }
+
+    it("keeps mime_type when mimeType is the empty string", () => {
+      expect(
+        firstContentBlock({
+          type: "file",
+          mimeType: "",
+          mime_type: "application/pdf",
+          base64: "JVBERi0xLjQK",
+        }),
+      ).toEqual({
+        type: "document",
+        // NOT `application/octet-stream`, which is what the `??` chain produced
+        // by discarding the real type and then falling into the data path's
+        // unknown-bytes fallback.
+        source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+      });
+    });
+
+    it("keeps base64 when data is the empty string", () => {
+      // `??` stopped at the empty `data`, fell past BOTH return branches and
+      // dropped the whole block — the attachment vanished from the snapshot.
+      expect(
+        firstContentBlock({
+          type: "file",
+          data: "",
+          base64: "JVBERi0xLjQK",
+          mime_type: "application/pdf",
+        }),
+      ).toEqual({
+        type: "document",
+        source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+      });
+    });
+
+    it("reads a MIME-less data URL as the image/png its own fallback names", () => {
+      // A `data:` URL always has a colon, so the `includes(":")` gate never
+      // fell through for one — it extracted the empty string and recorded THAT
+      // as the attachment's MIME type, while the comment on
+      // `aguiMediaTypeForMimeType` claimed the `image/png` default applied here.
+      expect(firstContentBlock({ type: "image_url", image_url: { url: "data:;base64,aGk=" } })).toEqual({
+        type: "image",
+        source: { type: "data", value: "aGk=", mimeType: "image/png" },
+      });
+    });
+
+    it("treats a non-string legacy mimeType as absent instead of throwing", () => {
+      // `item.mimeType ?? ""` accepted a non-string and `.split(";")` on it
+      // threw out of the loop that converts the WHOLE message list, taking
+      // every other message with it.
+      const lc = aguiMessagesToLangChain([
+        {
+          id: "non-string-mime",
+          role: "user",
+          content: [{ type: "binary", mimeType: 42, data: "aGk=" }],
+        } as unknown as UserMessage,
+      ]);
+
+      expect(lc[0].content).toEqual([{ type: "image_url", image_url: { url: "data:;base64,aGk=" } }]);
+    });
   });
 
   // ── Native LangChain.js blocks on the way back ───────────────────────────
