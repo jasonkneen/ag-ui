@@ -80,7 +80,17 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
                 var usage = Assert.Single(error.Usage!);
                 Assert.Equal("test-model", usage.Model);
                 Assert.Equal(7, usage.InputTokens);
+            },
+            u =>
+            {
+                var usage = Assert.IsType<UsageContent>(Assert.Single(u.Contents));
+                Assert.Equal("test-model", u.ModelId);
+                Assert.Equal(7, usage.Details.InputTokenCount);
+                Assert.IsType<RunErrorEvent>(u.RawRepresentation);
             });
+        var aggregatedUsage = updates.ToChatResponse().Usage;
+        Assert.NotNull(aggregatedUsage);
+        Assert.Equal(7, aggregatedUsage.InputTokenCount);
         Assert.DoesNotContain(updates, u => u.RawRepresentation is RunFinishedEvent);
     }
 
