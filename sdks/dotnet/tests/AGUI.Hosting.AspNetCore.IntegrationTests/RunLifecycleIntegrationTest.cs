@@ -45,15 +45,22 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
     }
 
     [Theory]
-    [InlineData(TransportFormat.Json, false)]
-    [InlineData(TransportFormat.Json, true)]
-    [InlineData(TransportFormat.Protobuf, false)]
-    [InlineData(TransportFormat.Protobuf, true)]
+    [InlineData(TransportFormat.Json, false, false)]
+    [InlineData(TransportFormat.Json, false, true)]
+    [InlineData(TransportFormat.Json, true, false)]
+    [InlineData(TransportFormat.Json, true, true)]
+    [InlineData(TransportFormat.Protobuf, false, false)]
+    [InlineData(TransportFormat.Protobuf, false, true)]
+    [InlineData(TransportFormat.Protobuf, true, false)]
+    [InlineData(TransportFormat.Protobuf, true, true)]
     public async Task PostRun_StreamThrowsAfterUpdate_EmitsSanitizedRunErrorWithoutRunFinished(
         TransportFormat format,
-        bool yieldThread)
+        bool yieldThread,
+        bool providerCancellation)
     {
-        var client = CreateClient((messages, options, ct) => EmitUpdateThenThrow(yieldThread, ct), format);
+        var client = CreateClient(
+            (messages, options, ct) => EmitUpdateThenThrow(yieldThread, providerCancellation, ct),
+            format);
 
         var updates = await CollectUpdates(client, [new ChatMessage(ChatRole.User, "Hi")]);
 
@@ -69,19 +76,33 @@ public sealed class RunLifecycleIntegrationTest : IntegrationTestBase
                 var content = Assert.IsType<ErrorContent>(Assert.Single(u.Contents));
                 Assert.Equal("StreamingError", content.ErrorCode);
                 Assert.Equal("An error occurred while streaming the agent response.", content.Message);
-                Assert.IsType<RunErrorEvent>(u.RawRepresentation);
+                var error = Assert.IsType<RunErrorEvent>(u.RawRepresentation);
+                var usage = Assert.Single(error.Usage!);
+                Assert.Equal("test-model", usage.Model);
+                Assert.Equal(7, usage.InputTokens);
             });
         Assert.DoesNotContain(updates, u => u.RawRepresentation is RunFinishedEvent);
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow(
         bool yieldThread,
+        bool providerCancellation,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        yield return new ChatResponseUpdate
+        {
+            ModelId = "test-model",
+            Contents = [new UsageContent(new UsageDetails { InputTokenCount = 7 })]
+        };
         if (yieldThread)
         {
             await Task.Yield();
+        }
+
+        if (providerCancellation)
+        {
+            throw new OperationCanceledException("provider timeout");
         }
 
         throw new InvalidOperationException("sensitive provider failure details");

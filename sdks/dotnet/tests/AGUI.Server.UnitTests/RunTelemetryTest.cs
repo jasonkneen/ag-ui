@@ -129,10 +129,93 @@ public sealed class RunTelemetryTest
         var error = Assert.IsType<RunErrorEvent>(events[^1]);
         Assert.Equal("StreamingError", error.Code);
         Assert.Equal("An error occurred while streaming the agent response.", error.Message);
+        var usage = Assert.Single(error.Usage!);
+        Assert.Equal("test-model", usage.Model);
+        Assert.Equal(7, usage.InputTokens);
         Assert.DoesNotContain(events, e => e is RunFinishedEvent);
         Assert.Equal("error", run.GetTagItem("agui.run.outcome"));
         Assert.Equal(typeof(InvalidOperationException).FullName, run.GetTagItem("error.type"));
         Assert.Equal(events.Count, run.GetTagItem("agui.events.count"));
+        Assert.Equal(ActivityStatusCode.Error, run.Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProviderOperationCanceledException_IsRecordedAsError(bool yieldThread)
+    {
+        using var capture = CaptureActivities(AGUIServerInstrumentation.ActivitySourceName);
+        var context = new RunAgentInput { ThreadId = _threadId, RunId = _runId }
+            .ToChatRequestContext(SerializerOptions);
+
+        var events = new List<BaseEvent>();
+        await foreach (var evt in ProviderCancellationUpdates(yieldThread)
+            .AsAGUIEventStreamAsync(context).ConfigureAwait(false))
+        {
+            events.Add(evt);
+        }
+
+        var run = SingleRun(capture);
+        Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
+        Assert.Equal("error", run.GetTagItem("agui.run.outcome"));
+        Assert.Equal(typeof(OperationCanceledException).FullName, run.GetTagItem("error.type"));
+        Assert.Equal(events.Count, run.GetTagItem("agui.events.count"));
+        Assert.Equal(ActivityStatusCode.Error, run.Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CallerCancellation_IsRecordedAsCancelledAndPropagates(bool yieldThread)
+    {
+        using var capture = CaptureActivities(AGUIServerInstrumentation.ActivitySourceName);
+        using var cts = new CancellationTokenSource();
+        var context = new RunAgentInput { ThreadId = _threadId, RunId = _runId }
+            .ToChatRequestContext(SerializerOptions);
+        var events = new List<BaseEvent>();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var evt in CallerCancellationUpdates(yieldThread, cts.Token)
+                .AsAGUIEventStreamAsync(context, cts.Token).ConfigureAwait(false))
+            {
+                events.Add(evt);
+                if (evt is TextMessageContentEvent)
+                {
+                    cts.Cancel();
+                }
+            }
+        });
+
+        var run = SingleRun(capture);
+        Assert.DoesNotContain(events, e => e is RunErrorEvent or RunFinishedEvent);
+        Assert.Equal("cancelled", run.GetTagItem("agui.run.outcome"));
+        Assert.Null(run.GetTagItem("error.type"));
+        Assert.Equal(events.Count, run.GetTagItem("agui.events.count"));
+        Assert.Equal(ActivityStatusCode.Unset, run.Status);
+    }
+
+    [Fact]
+    public async Task CancellationAfterRunError_DoesNotOverwriteErrorOutcome()
+    {
+        using var capture = CaptureActivities(AGUIServerInstrumentation.ActivitySourceName);
+        using var cts = new CancellationTokenSource();
+        var context = new RunAgentInput { ThreadId = _threadId, RunId = _runId }
+            .ToChatRequestContext(SerializerOptions);
+
+        await foreach (var evt in ThrowingUpdates(yieldThread: false)
+            .AsAGUIEventStreamAsync(context, cts.Token).ConfigureAwait(false))
+        {
+            if (evt is RunErrorEvent)
+            {
+                cts.Cancel();
+            }
+        }
+
+        var run = SingleRun(capture);
+        Assert.Equal("error", run.GetTagItem("agui.run.outcome"));
+        Assert.Equal(typeof(InvalidOperationException).FullName, run.GetTagItem("error.type"));
         Assert.Equal(ActivityStatusCode.Error, run.Status);
     }
 
@@ -190,12 +273,41 @@ public sealed class RunTelemetryTest
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        yield return new ChatResponseUpdate
+        {
+            ModelId = "test-model",
+            Contents = [new UsageContent(new UsageDetails { InputTokenCount = 7 })]
+        };
         if (yieldThread)
         {
             await Task.Yield();
         }
 
         throw new InvalidOperationException("boom");
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> ProviderCancellationUpdates(bool yieldThread)
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
+        throw new OperationCanceledException("provider timeout");
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> CallerCancellationUpdates(
+        bool yieldThread,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "provider ignored cancellation");
     }
 
     private sealed class ActivityCapture : IDisposable

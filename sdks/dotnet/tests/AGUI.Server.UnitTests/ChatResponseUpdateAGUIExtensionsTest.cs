@@ -55,7 +55,23 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
                 Assert.Equal("StreamingError", error.Code);
                 Assert.Equal("An error occurred while streaming the agent response.", error.Message);
                 Assert.DoesNotContain("sensitive", error.Message, StringComparison.OrdinalIgnoreCase);
+                var usage = Assert.Single(error.Usage!);
+                Assert.Equal("test-model", usage.Model);
+                Assert.Equal(7, usage.InputTokens);
             });
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProviderOperationCanceledException_EmitsSanitizedRunError(bool yieldThread)
+    {
+        var events = await CollectEvents(EmitUpdateThenProviderCancellation(yieldThread));
+
+        var error = Assert.IsType<RunErrorEvent>(events[^1]);
+        Assert.Equal("StreamingError", error.Code);
+        Assert.Equal("An error occurred while streaming the agent response.", error.Message);
         Assert.DoesNotContain(events, e => e is RunFinishedEvent);
     }
 
@@ -1244,6 +1260,81 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
         Assert.IsType<RunFinishedSuccessOutcome>(finishedEvents[0].Outcome);
     }
 
+    [Fact]
+    public async Task ContentMapper_RunErrorEvent_StopsStream()
+    {
+        var error = new RunErrorEvent { Message = "mapped error" };
+        var update = new ChatResponseUpdate
+        {
+            Role = ChatRole.Assistant,
+            Contents = [new DataContent("data:text/plain;base64,SGVsbG8=", "text/plain")]
+        };
+
+        var events = await CollectEvents(
+            ToAsyncEnumerable(update, new ChatResponseUpdate(ChatRole.Assistant, "not emitted")),
+            unmappedUpdateHandler: (_, _) =>
+            [
+                error,
+                new CustomEvent { Name = "after-error", Value = JsonDocument.Parse("true").RootElement.Clone() }
+            ]);
+
+        Assert.Collection(events,
+            e => Assert.IsType<RunStartedEvent>(e),
+            e => Assert.Same(error, e));
+    }
+
+    [Fact]
+    public async Task CallMapper_RunErrorEvent_StopsStream()
+    {
+        var error = new RunErrorEvent { Message = "mapped error" };
+        var options = new AGUIStreamOptions()
+            .MapCall("mapped_tool", _ =>
+            [
+                error,
+                new CustomEvent { Name = "after-error", Value = JsonDocument.Parse("true").RootElement.Clone() }
+            ]);
+        var update = new ChatResponseUpdate
+        {
+            Role = ChatRole.Assistant,
+            Contents = [new FunctionCallContent("call-1", "mapped_tool", new Dictionary<string, object?>())]
+        };
+
+        var events = await CollectEvents(ToAsyncEnumerable(update), options);
+
+        Assert.Same(error, events[^1]);
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
+        Assert.DoesNotContain(events, e => e is CustomEvent);
+    }
+
+    [Fact]
+    public async Task ResultMapper_RunErrorEvent_StopsStream()
+    {
+        var error = new RunErrorEvent { Message = "mapped error" };
+        var options = new AGUIStreamOptions()
+            .MapResult("mapped_tool", _ =>
+            [
+                error,
+                new CustomEvent { Name = "after-error", Value = JsonDocument.Parse("true").RootElement.Clone() }
+            ]);
+        var updates = ToAsyncEnumerable(
+            new ChatResponseUpdate
+            {
+                Role = ChatRole.Assistant,
+                Contents = [new FunctionCallContent("call-1", "mapped_tool", new Dictionary<string, object?>())]
+            },
+            new ChatResponseUpdate
+            {
+                Role = ChatRole.Tool,
+                Contents = [new FunctionResultContent("call-1", "result")]
+            });
+
+        var events = await CollectEvents(updates, options);
+
+        Assert.Same(error, events[^1]);
+        Assert.DoesNotContain(events, e => e is RunFinishedEvent);
+        Assert.DoesNotContain(events, e => e is CustomEvent);
+    }
+
     #endregion
 
     #region Interrupt Mapper
@@ -1933,6 +2024,19 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
 
     private static async Task<List<BaseEvent>> CollectEvents(
         IAsyncEnumerable<ChatResponseUpdate> updates,
+        AGUIStreamOptions options)
+    {
+        var events = new List<BaseEvent>();
+        await foreach (var evt in updates.AsAGUIEventStreamAsync(BuildContext(options)).ConfigureAwait(false))
+        {
+            events.Add(evt);
+        }
+
+        return events;
+    }
+
+    private static async Task<List<BaseEvent>> CollectEvents(
+        IAsyncEnumerable<ChatResponseUpdate> updates,
         ChatRequestContext context)
     {
         var events = new List<BaseEvent>();
@@ -2047,12 +2151,28 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
     private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenThrow(bool yieldThread)
     {
         yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        yield return new ChatResponseUpdate
+        {
+            ModelId = "test-model",
+            Contents = [new UsageContent(new UsageDetails { InputTokenCount = 7 })]
+        };
         if (yieldThread)
         {
             await Task.Yield();
         }
 
         throw new InvalidOperationException("sensitive provider failure details");
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenProviderCancellation(bool yieldThread)
+    {
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "partial");
+        if (yieldThread)
+        {
+            await Task.Yield();
+        }
+
+        throw new OperationCanceledException("provider timeout");
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> EmitUpdateThenCancel(
@@ -2065,7 +2185,7 @@ public sealed class ChatResponseUpdateAGUIExtensionsTest
             await Task.Yield();
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
+        yield return new ChatResponseUpdate(ChatRole.Assistant, "provider ignored cancellation");
     }
 
     private static async IAsyncEnumerable<ChatResponseUpdate> GenerateInfiniteUpdates(
