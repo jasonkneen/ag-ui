@@ -52,7 +52,7 @@ public static class ChatResponseUpdateAGUIExtensions
     private const string RunOutcomeSuccess = "success";
     private const string RunOutcomeInterrupt = "interrupt";
     private const string RunOutcomeError = "error";
-    private const string RunOutcomeCancelled = "cancelled";
+    private const string RunOutcomeCanceled = "canceled";
 
     private static async IAsyncEnumerable<BaseEvent> InstrumentedAsync(
         IAsyncEnumerable<ChatResponseUpdate> updates,
@@ -106,7 +106,7 @@ public static class ChatResponseUpdateAGUIExtensions
                 {
                     if (!terminalEventEmitted)
                     {
-                        outcome = RunOutcomeCancelled;
+                        outcome = RunOutcomeCanceled;
                     }
 
                     throw;
@@ -153,7 +153,7 @@ public static class ChatResponseUpdateAGUIExtensions
             {
                 if (!terminalEventEmitted && cancellationToken.IsCancellationRequested)
                 {
-                    outcome = RunOutcomeCancelled;
+                    outcome = RunOutcomeCanceled;
                 }
 
                 activity.SetTag("agui.run.outcome", outcome);

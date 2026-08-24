@@ -167,7 +167,7 @@ public sealed class RunTelemetryTest
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task CallerCancellation_IsRecordedAsCancelledAndPropagates(bool yieldThread)
+    public async Task CallerCancellation_IsRecordedAsCanceledAndPropagates(bool yieldThread)
     {
         using var capture = CaptureActivities(AGUIServerInstrumentation.ActivitySourceName);
         using var cts = new CancellationTokenSource();
@@ -190,7 +190,7 @@ public sealed class RunTelemetryTest
 
         var run = SingleRun(capture);
         Assert.DoesNotContain(events, e => e is RunErrorEvent or RunFinishedEvent);
-        Assert.Equal("cancelled", run.GetTagItem("agui.run.outcome"));
+        Assert.Equal("canceled", run.GetTagItem("agui.run.outcome"));
         Assert.Null(run.GetTagItem("error.type"));
         Assert.Equal(events.Count, run.GetTagItem("agui.events.count"));
         Assert.Equal(ActivityStatusCode.Unset, run.Status);
