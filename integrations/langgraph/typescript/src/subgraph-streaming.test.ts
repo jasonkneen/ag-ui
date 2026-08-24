@@ -37,7 +37,7 @@ function makeConfig(): LangGraphAgentConfig {
     deploymentUrl: "http://localhost:2024",
     graphId: "test-graph",
     client: {
-      threads: { getState: vi.fn() },
+      threads: { getState: vi.fn(), getHistory: vi.fn() },
       runs: { cancel: vi.fn() },
       assistants: {
         search: vi.fn().mockResolvedValue([]),
@@ -65,12 +65,15 @@ type SnapshotHarness = {
     threadId: string,
     orderedStateValues?: LangGraphThreadState<unknown>["values"],
     hasOrderedStateValues?: boolean,
+    boundaryCheckpointStep?: number,
   ) => Promise<LangGraphThreadState<unknown>["values"]>;
 };
 
 type LangGraphClient = NonNullable<LangGraphAgentConfig["client"]>;
 type GetState = LangGraphClient["threads"]["getState"];
 type GetStateMock = MockedFunction<GetState>;
+type GetHistory = LangGraphClient["threads"]["getHistory"];
+type GetHistoryMock = MockedFunction<GetHistory>;
 type MockThreadState = Pick<LangGraphThreadState<unknown>, "values"> &
   Partial<Omit<LangGraphThreadState<unknown>, "values">>;
 
@@ -78,11 +81,10 @@ function snapshotHarness(agent: LangGraphAgent): SnapshotHarness {
   return agent as unknown as SnapshotHarness;
 }
 
-function setMockGetState(
-  config: LangGraphAgentConfig,
+function makeMockThreadState(
   state: MockThreadState,
-): GetStateMock {
-  const threadState: LangGraphThreadState<unknown> = {
+): LangGraphThreadState<unknown> {
+  return {
     next: [],
     checkpoint: {
       thread_id: "thread-1",
@@ -96,9 +98,25 @@ function setMockGetState(
     tasks: [],
     ...state,
   };
+}
+
+function setMockGetState(
+  config: LangGraphAgentConfig,
+  state: MockThreadState,
+): GetStateMock {
+  const threadState = makeMockThreadState(state);
   const getState = vi.mocked(config.client!.threads.getState);
   getState.mockResolvedValue(threadState);
   return getState;
+}
+
+function setMockGetHistory(
+  config: LangGraphAgentConfig,
+  states: MockThreadState[],
+): GetHistoryMock {
+  const getHistory = vi.mocked(config.client!.threads.getHistory);
+  getHistory.mockResolvedValue(states.map(makeMockThreadState));
+  return getHistory;
 }
 
 function setupSnapshotHarness(state: MockThreadState) {
@@ -573,7 +591,7 @@ describe("subgraph change trigger", () => {
     );
   });
 
-  it("falls back after ordered root values are consumed by an earlier boundary", async () => {
+  it("uses the boundary checkpoint after ordered root values are consumed", async () => {
     const { agent, dispatched, config } = makeStreamingAgent();
     const user = msg("u1", "human", "AMS to SF");
     const rootAssistant = msg("r1", "ai", "Root has current route");
@@ -582,16 +600,35 @@ describe("subgraph change trigger", () => {
       "ai",
       "Subgraph committed a hotel",
     );
+    const futureAssistant = msg("future", "ai", "Future root response");
     const getState = setMockGetState(config, {
       values: {
-        messages: [user, rootAssistant, committedSubgraphAssistant],
+        messages: [
+          user,
+          rootAssistant,
+          committedSubgraphAssistant,
+          futureAssistant,
+        ],
         itinerary: {
           route: "root route",
           hotel: "Hotel Zoe",
         },
+        futureOnly: true,
       },
       metadata: { writes: {} },
     });
+    const getHistory = setMockGetHistory(config, [
+      {
+        values: {
+          messages: [user, rootAssistant, committedSubgraphAssistant],
+          itinerary: {
+            route: "root route",
+            hotel: "Hotel Zoe",
+          },
+        },
+        metadata: { step: 6, writes: {} },
+      },
+    ]);
     (agent as any).getStateSnapshot = vi
       .fn()
       .mockImplementation((state: LangGraphThreadState<unknown>) => state.values);
@@ -630,6 +667,7 @@ describe("subgraph change trigger", () => {
           metadata: {
             langgraph_node: "supervisor",
             langgraph_checkpoint_ns: "supervisor:def",
+            langgraph_step: 7,
           },
           data: { output: {} },
         },
@@ -639,7 +677,11 @@ describe("subgraph change trigger", () => {
 
     await driveAgent(agent, chunks, stopAfterExitBoundary);
 
-    expect(getState).toHaveBeenCalledTimes(1);
+    expect(getHistory).toHaveBeenCalledWith("thread-1", {
+      limit: 1,
+      metadata: { step: 6 },
+    });
+    expect(getState).not.toHaveBeenCalled();
     const stateSnapshots = dispatched.filter(
       (event): event is StateSnapshotEvent =>
         event?.type === EventType.STATE_SNAPSHOT,
@@ -651,6 +693,9 @@ describe("subgraph change trigger", () => {
         hotel: "Hotel Zoe",
       },
     });
+    for (const stateSnapshot of stateSnapshots) {
+      expect(stateSnapshot.snapshot).not.toHaveProperty("futureOnly");
+    }
 
     const messagesSnapshots = dispatched.filter(
       (event): event is MessagesSnapshotEvent =>
@@ -662,6 +707,9 @@ describe("subgraph change trigger", () => {
       "r1",
       "s1",
     ]);
+    expect(
+      messagesSnapshots[1].messages.map((message) => message.id),
+    ).not.toContain("future");
   });
 });
 

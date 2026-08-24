@@ -1021,10 +1021,16 @@ export class LangGraphAgent extends AbstractAgent {
 
         if (currentSubgraph !== this.currentSubgraph) {
           this.currentSubgraph = currentSubgraph;
+          const boundaryCheckpointStep =
+            currentSubgraph === ROOT_SUBGRAPH_NAME &&
+            typeof metadata.langgraph_step === "number"
+              ? metadata.langgraph_step - 1
+              : undefined;
           latestStateValues = await this.getStateAndMessagesSnapshots(
             threadId,
             latestRootStateValues,
             hasOrderedRootStateValues,
+            boundaryCheckpointStep,
           );
           // A root values snapshot describes the boundary that follows it. Do
           // not reuse it after crossing that boundary: a subgraph may commit
@@ -1225,10 +1231,25 @@ export class LangGraphAgent extends AbstractAgent {
     threadId: string,
     orderedStateValues?: ThreadState<State>["values"],
     hasOrderedStateValues = false,
+    boundaryCheckpointStep?: number,
   ): Promise<ThreadState<State>["values"]> {
-    const state: ThreadState<State> = hasOrderedStateValues
-      ? ({ values: orderedStateValues ?? {} } as ThreadState<State>)
-      : await this.client.threads.getState(threadId);
+    let state: ThreadState<State>;
+    if (hasOrderedStateValues) {
+      state = { values: orderedStateValues ?? {} } as ThreadState<State>;
+    } else if (boundaryCheckpointStep !== undefined) {
+      const [boundaryState] = await this.client.threads.getHistory(threadId, {
+        limit: 1,
+        metadata: { step: boundaryCheckpointStep },
+      });
+      if (!boundaryState) {
+        throw new Error(
+          `No LangGraph checkpoint found for boundary step ${boundaryCheckpointStep}`,
+        );
+      }
+      state = boundaryState;
+    } else {
+      state = await this.client.threads.getState(threadId);
+    }
     this.dispatchEvent({
       type: EventType.STATE_SNAPSHOT,
       snapshot: this.getStateSnapshot(state),
