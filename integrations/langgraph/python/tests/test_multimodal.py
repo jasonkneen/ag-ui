@@ -4,6 +4,7 @@ Tests for multimodal message conversion between AG-UI and LangChain formats.
 
 import unittest
 import warnings
+from datetime import datetime
 from ag_ui.core import (
     UserMessage,
     TextInputContent,
@@ -16,6 +17,7 @@ from ag_ui.core import (
     InputContentUrlSource,
 )
 from langchain_core.messages import (
+    AIMessage,
     HumanMessage,
     convert_to_openai_messages,
     is_data_content_block,
@@ -1624,6 +1626,207 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
         self.assertFalse(is_data_content_block(js_native))
         [message] = convert_to_openai_messages([HumanMessage(content=[dict(js_native)])])
         self.assertEqual(message["content"], [js_native])
+
+
+class TestMalformedGraphContentDegrades(unittest.TestCase):
+    """The return leg tolerates what the graph actually sends.
+
+    Everything here converts LangChain content that a graph produced back into
+    AG-UI. That direction has a property the outbound one does not: it builds the
+    user message INSIDE `MESSAGES_SNAPSHOT`, so an exception raised on one bad
+    block does not degrade that block — it escapes the whole conversion and the
+    client is handed no messages at all. One malformed value from the graph
+    loses the entire thread.
+
+    So every case below asserts the same two things: the conversion does not
+    raise, and the blocks around the bad one survive. The TypeScript adapter
+    already skips these; a divergence between the runtimes on the same wire input
+    is the class of bug this branch exists to close.
+    """
+
+    # ── the `image_url` payload ──────────────────────────────────────────
+
+    def test_null_image_url_payload_is_dropped_instead_of_raising(self):
+        """`{"image_url": null}` used to hit `None.startswith` and take the
+        entire message list down with it."""
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING") as logs:
+            agui_content = convert_langchain_multimodal_to_agui([
+                {"type": "image_url", "image_url": None},
+            ])
+
+        self.assertEqual(agui_content, [])
+        self.assertIn("Dropping image_url block", logs.output[0])
+
+    def test_non_string_non_dict_image_url_payload_is_dropped(self):
+        """A payload of the wrong TYPE carries no url either, and `startswith`
+        is just as absent from an int or a list as it is from None."""
+        for payload in (42, [], ["https://example.com/a.png"], True):
+            with self.subTest(payload=payload):
+                with self.assertLogs("ag_ui_langgraph.utils", level="WARNING"):
+                    self.assertEqual(
+                        convert_langchain_multimodal_to_agui([
+                            {"type": "image_url", "image_url": payload},
+                        ]),
+                        [],
+                    )
+
+    def test_payload_yielding_an_empty_url_is_dropped_not_emitted(self):
+        """The quiet half of the defect. These did not raise — they minted an
+        `ImageInputContent` whose url is `""`, i.e. an attachment pointing at
+        nothing, with no warning that anything was wrong."""
+        for payload in ({}, {"url": None}, {"url": ""}, {"url": 42}, ""):
+            with self.subTest(payload=payload):
+                with self.assertLogs("ag_ui_langgraph.utils", level="WARNING"):
+                    self.assertEqual(
+                        convert_langchain_multimodal_to_agui([
+                            {"type": "image_url", "image_url": payload},
+                        ]),
+                        [],
+                    )
+
+    def test_image_url_block_with_no_payload_at_all_is_dropped(self):
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING"):
+            self.assertEqual(
+                convert_langchain_multimodal_to_agui([{"type": "image_url"}]),
+                [],
+            )
+
+    def test_usable_image_url_payloads_still_convert(self):
+        """The other side of the guard: what IS usable must keep working — the
+        `{"url": …}` shape, the bare string both runtimes also accept, and the
+        data-URL parse underneath both."""
+        by_dict, bare_string, data_url = convert_langchain_multimodal_to_agui([
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "image_url", "image_url": "https://example.com/b.png"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo"}},
+        ])
+
+        self.assertEqual(by_dict.source.value, "https://example.com/a.png")
+        self.assertEqual(bare_string.source.value, "https://example.com/b.png")
+        self.assertEqual(data_url.source.value, "iVBORw0KGgo")
+        self.assertEqual(data_url.source.mime_type, "image/png")
+
+    def test_a_malformed_block_does_not_take_down_the_messages_around_it(self):
+        """The reason this matters at all.
+
+        `convert_langchain_multimodal_to_agui` is called from
+        `langchain_messages_to_agui`, which builds the whole `MESSAGES_SNAPSHOT`.
+        An exception on the middle message is not a lost attachment, it is a lost
+        conversation — so assert the neighbours survive, not merely that the bad
+        block is skipped.
+        """
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING"):
+            messages = langchain_messages_to_agui([
+                HumanMessage(id="m1", content="before"),
+                HumanMessage(
+                    id="m2",
+                    content=[
+                        {"type": "text", "text": "look at this"},
+                        {"type": "image_url", "image_url": None},
+                    ],
+                ),
+                HumanMessage(id="m3", content="after"),
+            ])
+
+        self.assertEqual([m.id for m in messages], ["m1", "m2", "m3"])
+        self.assertEqual(messages[0].content, "before")
+        self.assertEqual(messages[2].content, "after")
+        # The surviving text of the message that carried the bad block, too.
+        self.assertEqual([c.text for c in messages[1].content], ["look at this"])
+
+    # ── the same defect elsewhere on the return leg ──────────────────────
+
+    def test_non_string_text_block_is_dropped(self):
+        """`TextInputContent.text` is a `str`; a block whose `text` is not one
+        raised a ValidationError out of the whole list."""
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING") as logs:
+            agui_content = convert_langchain_multimodal_to_agui([
+                {"type": "text", "text": None},
+                {"type": "text", "text": {"nested": "block"}},
+                {"type": "text", "text": "survivor"},
+            ])
+
+        self.assertEqual([c.text for c in agui_content], ["survivor"])
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("Dropping text block", logs.output[0])
+
+    def test_non_string_mime_type_does_not_abort_the_conversion(self):
+        """A media block's MIME type is read off the wire the same way its
+        filename is, and a non-string one is treated as absent rather than
+        handed to a source class that requires `str | None`."""
+        by_url, by_data = convert_langchain_multimodal_to_agui([
+            {"type": "image", "url": "https://example.com/a.png", "mime_type": {"a": 1}},
+            {"type": "audio", "base64": "QUJD", "mime_type": 123},
+        ])
+
+        self.assertEqual(by_url.source.value, "https://example.com/a.png")
+        self.assertIsNone(by_url.source.mime_type)
+        # The documented fallback for a data block that arrives without a type.
+        self.assertEqual(by_data.source.mime_type, "application/octet-stream")
+        self.assertEqual(by_data.source.value, "QUJD")
+
+    def test_non_string_encrypted_reasoning_content_is_ignored(self):
+        """`ReasoningMessage.encrypted_value` is `str | None`. A provider block
+        carrying something else has nothing round-trippable in it, and must not
+        cost the snapshot the messages around it."""
+        messages = langchain_messages_to_agui([
+            AIMessage(
+                id="a1",
+                content=[
+                    {
+                        "type": "reasoning",
+                        "summary": [{"text": "because X"}],
+                        "encrypted_content": {"blob": "not-a-string"},
+                    }
+                ],
+            ),
+        ])
+
+        reasoning, assistant = messages
+        self.assertEqual(reasoning.content, "because X")
+        self.assertIsNone(reasoning.encrypted_value)
+        self.assertEqual(assistant.id, "a1")
+
+    def test_non_string_reasoning_summary_text_is_skipped(self):
+        """A summary part whose `text` is not text joined into a `TypeError`."""
+        messages = langchain_messages_to_agui([
+            AIMessage(
+                id="a1",
+                content=[
+                    {
+                        "type": "reasoning",
+                        "summary": [{"text": {"nested": 1}}, {"text": "readable"}],
+                    }
+                ],
+            ),
+        ])
+
+        self.assertEqual(messages[0].content, "readable")
+
+    def test_unserializable_tool_call_arguments_do_not_abort_the_snapshot(self):
+        """Tool-call `args` is `dict[str, Any]`, so a graph can put a datetime in
+        it; a bare `json.dumps` raised and lost every message in the snapshot
+        over one argument."""
+        messages = langchain_messages_to_agui([
+            HumanMessage(id="m1", content="before"),
+            AIMessage(
+                id="a1",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "tc1",
+                        "name": "book",
+                        "args": {"when": datetime(2026, 1, 2, 3, 4, 5)},
+                    }
+                ],
+            ),
+        ])
+
+        self.assertEqual([m.id for m in messages], ["m1", "a1"])
+        self.assertEqual(
+            messages[1].tool_calls[0].function.arguments,
+            '{"when": "2026-01-02T03:04:05"}',
+        )
 
 
 if __name__ == "__main__":

@@ -136,7 +136,17 @@ def _read_incoming_media_block(item: Dict[str, Any]) -> _IncomingMedia | None:
     this converter, three can arrive.
     """
     filename = _incoming_block_filename(item)
-    mime_type = item.get("mimeType") or item.get("mime_type")
+    # Read like the filename above: the MIME type is whatever the graph put on
+    # the block, and a non-string one is not a MIME type this converter can carry
+    # — AG-UI's source classes REQUIRE `str | None`, so handing one straight to
+    # them raises a ValidationError that takes the whole snapshot down with it.
+    # Treat it as absent instead; the data path already has a documented fallback
+    # (`application/octet-stream`) for a block that arrives without one.
+    mime_type = None
+    for candidate in (item.get("mimeType"), item.get("mime_type")):
+        if isinstance(candidate, str) and candidate:
+            mime_type = candidate
+            break
 
     inline_data = item.get("data") or item.get("base64")
     if isinstance(inline_data, str) and inline_data:
@@ -149,6 +159,33 @@ def _read_incoming_media_block(item: Dict[str, Any]) -> _IncomingMedia | None:
     # `file_id` / `fileId` / `id`-only blocks reference provider-side storage
     # with no bytes and no URL, and AG-UI's typed classes have nowhere to put
     # that.
+    return None
+
+
+def _incoming_image_url(payload: Any) -> str | None:
+    """The url carried by a legacy ``image_url`` block, or ``None`` if it has none.
+
+    The payload is whatever the graph put under the ``image_url`` key. Two shapes
+    carry a url: LangChain's own ``{"url": "…"}`` and the bare string both
+    runtimes also accept. EVERYTHING else — ``None``, a number, a list, a dict
+    with no ``url`` or an empty/non-string one — carries no url at all, and the
+    caller drops the block rather than deriving one.
+
+    Reading it defensively is the point. This converter builds the user message
+    inside MESSAGES_SNAPSHOT, so ``payload.startswith(...)`` on a null payload
+    does not lose one block, it raises out of the whole snapshot and loses the
+    ENTIRE thread. And a payload that yields ``""`` is no better for being
+    quiet: it mints an attachment pointing at nothing.
+
+    Mirrors the `item.image_url` read in the TypeScript adapter's
+    `convertLangchainMultimodalToAgui`, which skips the same blocks.
+    """
+    if isinstance(payload, str):
+        return payload or None
+    if isinstance(payload, dict):
+        url = payload.get("url")
+        if isinstance(url, str) and url:
+            return url
     return None
 
 
@@ -195,14 +232,29 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
 
     Those media blocks may arrive in any of three field vocabularies — see
     :func:`_read_incoming_media_block`.
+
+    A block this converter cannot make sense of is SKIPPED AND LOGGED, never
+    raised on. The caller (`langchain_messages_to_agui`) builds the whole
+    MESSAGES_SNAPSHOT, so an exception here does not degrade one attachment —
+    it escapes the conversion and costs the client every message in the thread.
     """
     agui_content: List[AGUIContentItem] = []
     for item in content:
         if isinstance(item, dict):
             if item.get("type") == "text":
+                text = item.get("text", "")
+                # `TextInputContent.text` is a `str`; a block whose `text` is
+                # anything else raises a ValidationError that aborts the whole
+                # message list rather than the one bad block.
+                if not isinstance(text, str):
+                    logger.warning(
+                        "Dropping text block: text is %s, not a string",
+                        type(text).__name__,
+                    )
+                    continue
                 agui_content.append(TextInputContent(
                     type="text",
-                    text=item.get("text", "")
+                    text=text
                 ))
             elif item.get("type") in _AGUI_MEDIA_CLASSES:
                 media = _agui_media_from_standard_block(item)
@@ -214,8 +266,13 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                         item.get("type"),
                     )
             elif item.get("type") == "image_url":
-                image_url_data = item.get("image_url", {})
-                url = image_url_data.get("url", "") if isinstance(image_url_data, dict) else image_url_data
+                url = _incoming_image_url(item.get("image_url"))
+                if not url:
+                    logger.warning(
+                        "Dropping image_url block: no usable url in its %s payload",
+                        type(item.get("image_url")).__name__,
+                    )
+                    continue
 
                 # Parse data URLs to extract base64 data
                 if url.startswith("data:"):
@@ -249,10 +306,14 @@ def _reasoning_block_summary_text(block: Dict[str, Any]) -> str:
     content block (OpenAI Responses ``responses/v1`` shape)."""
     summary = block.get("summary")
     if isinstance(summary, list):
+        # `isinstance(..., str)` and not merely truthy: a summary part whose
+        # `text` is a dict or a number joins into a `TypeError` that aborts the
+        # whole snapshot, so a part that is not text is skipped like one that is
+        # empty.
         parts = [
-            s.get("text", "")
+            s["text"]
             for s in summary
-            if isinstance(s, dict) and s.get("text")
+            if isinstance(s, dict) and isinstance(s.get("text"), str) and s["text"]
         ]
         if parts:
             # Join multi-part summaries with a newline so the parts stay
@@ -278,7 +339,12 @@ def _reasoning_block_to_agui_message(
     is nothing the client could render or round-trip.
     """
     text = _reasoning_block_summary_text(block)
+    # `ReasoningMessage.encrypted_value` is `str | None`; a block whose
+    # `encrypted_content` is anything else has nothing round-trippable in it and
+    # would raise a ValidationError that costs the whole snapshot, not one block.
     encrypted = block.get("encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted:
+        encrypted = None
     block_id = block.get("id")
     # The provider id (e.g. OpenAI ``rs_…``) is the round-trip handle: under
     # ``store=True`` the summary/encrypted content are empty and the id alone is
@@ -355,7 +421,14 @@ def langchain_messages_to_agui(messages: List[BaseMessage]) -> List[AGUIMessage]
                         type="function",
                         function=AGUIFunctionCall(
                             name=tc["name"],
-                            arguments=json.dumps(tc.get("args", {})),
+                            # `args` is `dict[str, Any]`, so a graph can put a
+                            # datetime (or any object) in it and a bare
+                            # `json.dumps` raises — aborting every message in the
+                            # snapshot over one argument. Degrade that argument
+                            # instead, with the encoder this module already owns.
+                            arguments=json.dumps(
+                                tc.get("args", {}), default=json_safe_stringify
+                            ),
                         ),
                     )
                     for tc in message.tool_calls
