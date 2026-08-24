@@ -103,9 +103,53 @@ describe("Multimodal Message Conversion", () => {
       );
     });
 
-    it("should convert AudioInputContent to LangChain", () => {
+    it("should convert AudioInputContent with inline data to an audio block", () => {
       const aguiMessage: UserMessage = {
-        id: "test-audio",
+        id: "test-audio-data",
+        role: "user",
+        content: [
+          { type: "text", text: "Transcribe this audio" },
+          {
+            type: "audio",
+            source: {
+              type: "data",
+              value: "SGVsbG8=",
+              mimeType: "audio/wav",
+            },
+          } as AudioInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      const content = lcMessages[0].content as Array<any>;
+      expect(content).toHaveLength(2);
+      // An `audio` block, NOT `image_url`: providers validate the block kind, so
+      // audio announced as an image is rejected outright. Base64 audio is one of
+      // the two combinations both translators accept — see the boundary test
+      // "carries an emitted audio block to OpenAI as an input_audio part".
+      expect(content[1]).toEqual({
+        type: "audio",
+        source_type: "base64",
+        data: "SGVsbG8=",
+        mime_type: "audio/wav",
+      });
+    });
+
+    // ── Combinations deliberately LEFT on the legacy `image_url` path ────────
+    //
+    // These are pinned decisions, not aspirations. For each one, the standard
+    // media block THROWS inside the translator, so emitting it would convert the
+    // pre-existing degraded request into a dead run. They stay on `image_url`
+    // until the translators accept them. Do not "finish the job" by flipping one
+    // of these without re-measuring the boundary first.
+
+    it("keeps audio by URL on the legacy image_url path", () => {
+      // JS: "URL audio blocks with source_type url must be formatted as a data
+      // URL for ChatOpenAI". Python: ValueError "Key base64 is required for audio
+      // blocks".
+      const aguiMessage: UserMessage = {
+        id: "test-audio-url",
         role: "user",
         content: [
           { type: "text", text: "Transcribe this audio" },
@@ -123,21 +167,20 @@ describe("Multimodal Message Conversion", () => {
 
       const content = lcMessages[0].content as Array<any>;
       expect(content).toHaveLength(2);
-      // An `audio` block, NOT `image_url`: providers validate the block kind, so
-      // audio announced as an image is rejected outright.
       expect(content[1]).toEqual({
-        type: "audio",
-        source_type: "url",
-        url: "https://example.com/audio.mp3",
+        type: "image_url",
+        image_url: { url: "https://example.com/audio.mp3" },
       });
     });
 
-    it("should convert VideoInputContent to LangChain", () => {
+    it("keeps video on the legacy image_url path, whatever the source", () => {
+      // JS: "Unable to convert content block type 'video' to provider-specific
+      // format: not recognized." Python: ValueError "Block of type video is not
+      // supported." Neither source type changes that.
       const aguiMessage: UserMessage = {
         id: "test-video",
         role: "user",
         content: [
-          { type: "text", text: "Describe this video" },
           {
             type: "video",
             source: {
@@ -146,22 +189,30 @@ describe("Multimodal Message Conversion", () => {
               mimeType: "video/mp4",
             },
           } as VideoInputContent,
+          {
+            type: "video",
+            source: {
+              type: "url",
+              value: "https://example.com/clip.mp4",
+            },
+          } as VideoInputContent,
         ],
       };
 
       const lcMessages = aguiMessagesToLangChain([aguiMessage]);
 
       const content = lcMessages[0].content as Array<any>;
-      expect(content).toHaveLength(2);
-      expect(content[1]).toEqual({
-        type: "video",
-        source_type: "base64",
-        data: "dmlkZW9kYXRh",
-        mime_type: "video/mp4",
-      });
+      expect(content).toEqual([
+        { type: "image_url", image_url: { url: "data:video/mp4;base64,dmlkZW9kYXRh" } },
+        { type: "image_url", image_url: { url: "https://example.com/clip.mp4" } },
+      ]);
     });
 
-    it("should convert DocumentInputContent to LangChain", () => {
+    it("keeps documents by URL on the legacy image_url path", () => {
+      // JS: "URL file blocks with source_type url must be formatted as a data URL
+      // for ChatOpenAI". Python: ValueError "OpenAI Chat Completions does not
+      // support file URLs." Fetching the bytes on the caller's behalf is not this
+      // adapter's job, so the URL keeps going out as it always did.
       const aguiMessage: UserMessage = {
         id: "test-doc",
         role: "user",
@@ -173,6 +224,7 @@ describe("Multimodal Message Conversion", () => {
               type: "url",
               value: "https://example.com/doc.pdf",
             },
+            metadata: { filename: "doc.pdf" },
           } as DocumentInputContent,
         ],
       };
@@ -182,10 +234,32 @@ describe("Multimodal Message Conversion", () => {
       const content = lcMessages[0].content as Array<any>;
       expect(content).toHaveLength(2);
       expect(content[1]).toEqual({
-        type: "file",
-        source_type: "url",
-        url: "https://example.com/doc.pdf",
+        type: "image_url",
+        image_url: { url: "https://example.com/doc.pdf" },
       });
+    });
+
+    it("keeps a legacy binary by URL on the legacy image_url path", () => {
+      // Same rule as the typed items above: only inline data converts.
+      const aguiMessage: UserMessage = {
+        id: "test-binary-pdf-url",
+        role: "user",
+        content: [
+          {
+            type: "binary",
+            mimeType: "application/pdf",
+            url: "https://example.com/legacy.pdf",
+            filename: "legacy.pdf",
+          } as BinaryInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      const content = lcMessages[0].content as Array<any>;
+      expect(content).toEqual([
+        { type: "image_url", image_url: { url: "https://example.com/legacy.pdf" } },
+      ]);
     });
 
     it("should send an attached PDF as a file block, not an image", () => {
@@ -226,8 +300,8 @@ describe("Multimodal Message Conversion", () => {
         // gates translation behind `isDataContentBlock`, which tests for exactly
         // that field. `filename` sits under `metadata` because that is where
         // BOTH runtimes look (JS `getRequiredFilenameFromMetadata`, Python
-        // `convert_to_openai_data_block`); without it the JS translator
-        // substitutes the placeholder `LC_AUTOGENERATED`.
+        // `convert_to_openai_data_block`'s backward-compat branch); without it
+        // the JS translator THROWS.
         metadata: { filename: "invoice-q2.pdf" },
       });
       // Issue #2100 restated rather than dropped. The block DOES carry a
@@ -235,6 +309,37 @@ describe("Multimodal Message Conversion", () => {
       // but only `filename`, never AG-UI's metadata object wholesale, which is
       // what made strict providers 400.
       expect(Object.keys(content[1].metadata)).toEqual(["filename"]);
+    });
+
+    it("derives a filename for a document that arrived without one", () => {
+      // NOT cosmetic. `@langchain/openai` throws on a file block with no filename
+      // ("a filename or name or title is needed via meta-data for OpenAI when
+      // working with multimodal blocks"), so a document without one would land on
+      // the very failure this narrowing exists to avoid. The substitute comes
+      // from the MIME subtype and is applied in both runtimes so they agree.
+      const aguiMessage: UserMessage = {
+        id: "test-doc-no-filename",
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              type: "data",
+              value: "JVBERi0xLjQK",
+              mimeType: "application/pdf",
+            },
+          } as DocumentInputContent,
+        ],
+      };
+
+      const content = aguiMessagesToLangChain([aguiMessage])[0].content as Array<any>;
+      expect(content[0]).toEqual({
+        type: "file",
+        source_type: "base64",
+        data: "JVBERi0xLjQK",
+        mime_type: "application/pdf",
+        metadata: { filename: "attachment.pdf" },
+      });
     });
 
     it("should keep a document a document across the LangChain round trip", () => {
@@ -615,6 +720,127 @@ describe("Multimodal Message Conversion", () => {
         type: "input_audio",
         input_audio: { data: "SGVsbG8=", format: "wav" },
       });
+    });
+
+    it("carries an emitted filename-less PDF to OpenAI with the derived name", async () => {
+      // The document path claims to work. It only does because the converter
+      // substitutes a filename: without one this exact call throws inside
+      // `@langchain/openai` before a request is ever built.
+      const aguiMessage: UserMessage = {
+        id: "boundary-pdf-no-filename",
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+          } as DocumentInputContent,
+        ],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "file",
+        file: {
+          file_data: "data:application/pdf;base64,JVBERi0xLjQK",
+          filename: "attachment.pdf",
+        },
+      });
+    });
+
+    it("carries an emitted legacy-binary PDF to OpenAI as a file part", async () => {
+      const aguiMessage: UserMessage = {
+        id: "boundary-legacy-pdf",
+        role: "user",
+        content: [
+          {
+            type: "binary",
+            mimeType: "application/pdf",
+            data: "JVBERi0xLjQK",
+            filename: "legacy-invoice.pdf",
+          } as BinaryInputContent,
+        ],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "file",
+        file: {
+          file_data: "data:application/pdf;base64,JVBERi0xLjQK",
+          filename: "legacy-invoice.pdf",
+        },
+      });
+    });
+
+    it("carries an emitted legacy-binary audio clip to OpenAI as an input_audio part", async () => {
+      const aguiMessage: UserMessage = {
+        id: "boundary-legacy-audio",
+        role: "user",
+        content: [
+          {
+            type: "binary",
+            mimeType: "audio/wav",
+            data: "SGVsbG8=",
+          } as BinaryInputContent,
+        ],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "input_audio",
+        input_audio: { data: "SGVsbG8=", format: "wav" },
+      });
+    });
+
+    // The other half of the decision: the combinations this converter REFUSES to
+    // announce as standard blocks, and the throw that is the reason why. If one
+    // of these ever stops throwing, the corresponding row in
+    // `standardBlockTypeFor` can be revisited — but not before.
+    it.each([
+      [
+        "audio by url",
+        { type: "audio", source_type: "url", url: "https://example.com/a.wav", mime_type: "audio/wav" },
+        /must be formatted as a data URL/,
+      ],
+      [
+        "video by base64",
+        { type: "video", source_type: "base64", data: "AAA=", mime_type: "video/mp4" },
+        /'video'.*not recognized/,
+      ],
+      [
+        "video by url",
+        { type: "video", source_type: "url", url: "https://example.com/v.mp4", mime_type: "video/mp4" },
+        /'video'.*not recognized/,
+      ],
+      [
+        "file by url",
+        {
+          type: "file",
+          source_type: "url",
+          url: "https://example.com/d.pdf",
+          mime_type: "application/pdf",
+          metadata: { filename: "d.pdf" },
+        },
+        /must be formatted as a data URL/,
+      ],
+      [
+        "file by base64 with no filename",
+        { type: "file", source_type: "base64", data: "JVBERi0xLjQK", mime_type: "application/pdf" },
+        /a filename or name or title is needed/,
+      ],
+    ])("would throw at the provider for %s — hence the image_url fallback", async (_name, block, message) => {
+      await expect(partsOnTheWire([block])).rejects.toThrow(message);
     });
 
     it("forwards a block with no source_type RAW — the regression this guards", async () => {

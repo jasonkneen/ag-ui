@@ -42,22 +42,65 @@ export function getStreamPayloadInput({
 const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
 
 /**
- * Which LangChain standard content block each AG-UI media type becomes.
+ * Which LangChain standard content block an AG-UI media item becomes, or `null`
+ * to keep the pre-existing `image_url` block.
  *
- * `image` is absent on purpose: it keeps the legacy `image_url` shape, because it
- * is the one media path that already worked end to end and changing a working
- * payload is not part of fixing the broken ones. Everything else maps to the
- * standard block for its modality (`@langchain/core` >= 1), which is what
- * providers validate — an audio clip announced as an image is rejected on the
- * block kind no matter what its data URL says.
+ * THE ALLOW-LIST IS NARROW ON PURPOSE. A standard block is only an improvement
+ * where the translator downstream can actually accept it. Where it cannot, the
+ * block is REJECTED INSIDE THE TRANSLATOR and the run dies — strictly worse than
+ * the degraded-but-alive `image_url` payload that shipped before this change,
+ * because it turns a bad request into a dead run. So this converter emits a
+ * standard block only for combinations measured to convert, and leaves every
+ * other combination exactly as it was: this change improves the paths it can
+ * prove and regresses none.
+ *
+ * Measured against `@langchain/core@1.1.40` + `@langchain/openai@1.2.0` (JS) and
+ * `langchain-core@1.2.13` (Python), through the real OpenAI translators:
+ *
+ *   AG-UI item        JS (@langchain/openai)              Python
+ *   ----------------  ----------------------------------  --------------------------------
+ *   audio, data       input_audio ✓                       input_audio ✓
+ *   audio, url        throws ("must be formatted as a     throws ("Key base64 is required
+ *                     data URL")                          for audio blocks")
+ *   video, any        throws ("Unable to convert content  throws ("Block of type video is
+ *                     block type 'video' ... not          not supported")
+ *                     recognized")
+ *   document, data    file.file_data ✓ — but ONLY with a  file.file_data ✓
+ *                     filename; see {@link deriveFilename}
+ *   document, url     throws (JS: needs a data URL)       throws ("does not support file
+ *                                                         URLs")
+ *   image, any        already worked as `image_url`, and is left alone
+ *
+ * Revisit a row when its translator grows support for that combination.
  */
-const STANDARD_BLOCK_TYPES: Record<string, "audio" | "video" | "file"> = {
-  audio: "audio",
-  video: "video",
-  document: "file",
-};
+function standardBlockTypeFor(
+  mediaType: string,
+  source: InputContentDataSource | InputContentUrlSource
+): "audio" | "file" | null {
+  // Every URL-sourced media block throws in both runtimes; only inline data
+  // converts.
+  if (source?.type !== "data") return null;
+  if (mediaType === "audio") return "audio";
+  if (mediaType === "document") return "file";
+  return null;
+}
 
-/** The return leg of {@link STANDARD_BLOCK_TYPES}. */
+/**
+ * A filename for a `file` block whose AG-UI item did not carry one.
+ *
+ * Not cosmetic. `@langchain/openai` THROWS on a file block with no filename
+ * ("a filename or name or title is needed via meta-data for OpenAI when working
+ * with multimodal blocks"), so the document path this converter claims to
+ * support has to carry one or it is not actually supported. Python only warns
+ * and omits the key, but both runtimes emit the same block, so both substitute
+ * the same derived name.
+ */
+function deriveFilename(mimeType: string | undefined): string {
+  const subtype = (mimeType ?? "").split("/")[1]?.split(";")[0]?.split("+")[0]?.trim();
+  return subtype ? `attachment.${subtype}` : "attachment";
+}
+
+/** The return leg: which AG-UI media type a standard block becomes. */
 const AGUI_MEDIA_TYPES: Record<string, "audio" | "video" | "document" | "image"> = {
   audio: "audio",
   video: "video",
@@ -98,19 +141,21 @@ const AGUI_MEDIA_TYPES: Record<string, "audio" | "video" | "document" | "image">
  * Revisit when the JS default path translates native blocks without a marker.
  */
 interface StandardMediaBlock {
-  type: "image" | "audio" | "video" | "file";
-  /** Which of the payload fields below carries the data. The recognition key. */
-  source_type: "base64" | "url";
-  /** Base64 payload, when `source_type` is `"base64"`. */
-  data?: string;
-  /** Location, when `source_type` is `"url"`. */
-  url?: string;
+  type: "audio" | "file";
+  /**
+   * The recognition key. `@langchain/core`'s `isDataContentBlock` gate tests for
+   * `source_type` and nothing else, so a block without it is not seen as media.
+   */
+  source_type: "base64";
+  /** Base64 payload. */
+  data: string;
   mime_type?: string;
   /**
    * `filename` lives under `metadata` rather than at the top level, because that
    * is where both runtimes look — JS via `getRequiredFilenameFromMetadata`,
-   * Python via `convert_to_openai_data_block`. Without it the JS translator warns
-   * and substitutes the placeholder `LC_AUTOGENERATED`.
+   * Python via `convert_to_openai_data_block`'s backward-compat branch. JS THROWS
+   * when it cannot find one on a file block, which is why the document path never
+   * emits without it (see {@link deriveFilename}).
    */
   metadata?: { filename?: string };
 }
@@ -148,27 +193,25 @@ function filenameFromMetadata(metadata: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Build the standard media block for an inline-data source.
+ *
+ * Only reached for combinations {@link standardBlockTypeFor} vouched for, so it
+ * takes a data source and always succeeds.
+ */
 function standardMediaBlock(
   type: StandardMediaBlock["type"],
-  source: InputContentDataSource | InputContentUrlSource,
+  source: InputContentDataSource,
   filename?: string
-): StandardMediaBlock | null {
-  let block: StandardMediaBlock;
-  if (source.type === "data") {
-    block = { type, source_type: "base64", data: source.value, mime_type: source.mimeType };
-  } else if (source.type === "url") {
-    // NOTE for `file` blocks specifically: ChatOpenAI requires a URL file block
-    // to already be a data URL and throws otherwise ("URL file blocks with
-    // source_type url must be formatted as a data URL"). Passing the URL through
-    // is deliberate — a loud provider error is a better answer than either
-    // silently dropping the attachment or having this adapter fetch remote bytes
-    // on the caller's behalf.
-    block = { type, source_type: "url", url: source.value };
-    if (source.mimeType) block.mime_type = source.mimeType;
-  } else {
-    return null;
-  }
-  if (filename) block.metadata = { filename };
+): StandardMediaBlock {
+  const block: StandardMediaBlock = {
+    type,
+    source_type: "base64",
+    data: source.value,
+    mime_type: source.mimeType,
+  };
+  const name = filename ?? (type === "file" ? deriveFilename(source.mimeType) : undefined);
+  if (name) block.metadata = { filename: name };
   return block;
 }
 
@@ -340,10 +383,10 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
  * VideoInputContent, DocumentInputContent) as well as legacy BinaryInputContent
  * for backwards compatibility.
  *
- * Images use LangChain's `image_url` block. Audio, video and documents use the
- * standard block for their modality (`audio`, `video`, `file`), because the block
- * KIND is what providers validate: a PDF sent as `image_url` carries its real MIME
- * type inside the data URL and is still rejected —
+ * Inline audio and inline documents use the standard block for their modality
+ * (`audio`, `file`), because the block KIND is what providers validate: a PDF
+ * sent as `image_url` carries its real MIME type inside the data URL and is
+ * still rejected —
  *
  *     BadRequestError: 400 - Invalid MIME type. Only image types are supported.
  *     (code: invalid_image_format)
@@ -351,6 +394,10 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
  * — which killed the run rather than degrading it. Routing every modality through
  * `image_url` was correct when this converter was written (#1457) and stopped
  * being correct once LangChain grew standard multimodal blocks.
+ *
+ * Everything else — images, video, and any URL-sourced media — keeps `image_url`,
+ * because the standard block for those combinations throws inside the translator.
+ * See {@link standardBlockTypeFor} for the measured table.
  */
 function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainContentBlock[] {
   const langchainContent: LangchainContentBlock[] = [];
@@ -364,19 +411,16 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
     } else if (MEDIA_CONTENT_TYPES.has(item.type)) {
       // ImageInputContent, AudioInputContent, VideoInputContent, DocumentInputContent
       const mediaItem = item as ImageInputContent | AudioInputContent | VideoInputContent | DocumentInputContent;
-      const blockType = STANDARD_BLOCK_TYPES[item.type];
+      const blockType = standardBlockTypeFor(item.type, mediaItem.source);
 
       if (blockType) {
-        const block = standardMediaBlock(
-          blockType,
-          mediaItem.source,
-          filenameFromMetadata((mediaItem as { metadata?: unknown }).metadata)
+        langchainContent.push(
+          standardMediaBlock(
+            blockType,
+            mediaItem.source as InputContentDataSource,
+            filenameFromMetadata((mediaItem as { metadata?: unknown }).metadata)
+          )
         );
-        if (block) {
-          langchainContent.push(block);
-        } else {
-          console.warn(`[convertAguiMultimodalToLangchain] Dropping ${item.type} content: unrecognized source type`);
-        }
         continue;
       }
 
@@ -393,23 +437,18 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // Legacy BinaryInputContent — backwards compatibility.
       //
       // Split on the MIME type, which is the only modality signal a legacy item
-      // carries (the typed classes above announce their own). An `id`-only item
-      // cannot be classified at all, so it keeps the historical `image_url`
-      // reference form.
+      // carries (the typed classes above announce their own), and only for inline
+      // data with a declared MIME type. That is the same narrow allow-list the
+      // typed path uses, for the same reason: url-only, id-only, image and video
+      // items keep the historical `image_url` reference form because the standard
+      // block for those throws inside the translator.
       const mimeType = item.mimeType ?? "";
 
-      if (!mimeType.startsWith("image/") && (item.url || item.data)) {
-        const blockType = mimeType.startsWith("audio/")
-          ? "audio"
-          : mimeType.startsWith("video/")
-            ? "video"
-            : "file";
-        const source: InputContentDataSource | InputContentUrlSource = item.url
-          ? { type: "url", value: item.url, ...(item.mimeType ? { mimeType: item.mimeType } : {}) }
-          : { type: "data", value: item.data!, mimeType };
-
-        const block = standardMediaBlock(blockType, source, item.filename);
-        if (block) langchainContent.push(block);
+      if (item.data && !item.url && mimeType && !mimeType.startsWith("image/") && !mimeType.startsWith("video/")) {
+        const blockType = mimeType.startsWith("audio/") ? "audio" : "file";
+        langchainContent.push(
+          standardMediaBlock(blockType, { type: "data", value: item.data, mimeType }, item.filename)
+        );
         continue;
       }
 

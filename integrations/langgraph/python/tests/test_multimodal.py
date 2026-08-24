@@ -3,6 +3,7 @@ Tests for multimodal message conversion between AG-UI and LangChain formats.
 """
 
 import unittest
+import warnings
 from ag_ui.core import (
     UserMessage,
     TextInputContent,
@@ -15,6 +16,9 @@ from ag_ui.core import (
     InputContentUrlSource,
 )
 from langchain_core.messages import HumanMessage
+from langchain_core.messages.block_translators.openai import (
+    convert_to_openai_data_block,
+)
 
 from ag_ui_langgraph.utils import (
     agui_messages_to_langchain,
@@ -213,28 +217,6 @@ class TestMultimodalConversion(unittest.TestCase):
 
     # ── AudioInputContent ───────────────────────────────────────────────
 
-    def test_agui_audio_url_source_to_langchain(self):
-        """Test converting AudioInputContent with URL source to LangChain."""
-        content_list = [
-            AudioInputContent(
-                type="audio",
-                source=InputContentUrlSource(
-                    type="url",
-                    value="https://example.com/audio.mp3",
-                ),
-            ),
-        ]
-
-        lc_content = convert_agui_multimodal_to_langchain(content_list)
-
-        # An `audio` block, NOT `image_url`: providers validate the block kind,
-        # so audio announced as an image is rejected outright.
-        self.assertEqual(len(lc_content), 1)
-        self.assertEqual(
-            lc_content[0],
-            {"type": "audio", "url": "https://example.com/audio.mp3"},
-        )
-
     def test_agui_audio_data_source_to_langchain(self):
         """Test converting AudioInputContent with data source to LangChain."""
         content_list = [
@@ -250,6 +232,10 @@ class TestMultimodalConversion(unittest.TestCase):
 
         lc_content = convert_agui_multimodal_to_langchain(content_list)
 
+        # An `audio` block, NOT `image_url`: providers validate the block kind,
+        # so audio announced as an image is rejected outright. Base64 audio is
+        # one of the two combinations the translator accepts — see
+        # `test_emitted_audio_block_translates_for_openai`.
         self.assertEqual(len(lc_content), 1)
         self.assertEqual(
             lc_content[0],
@@ -260,10 +246,40 @@ class TestMultimodalConversion(unittest.TestCase):
             },
         )
 
+    # ── Combinations deliberately LEFT on the legacy `image_url` path ────
+    #
+    # These are pinned decisions, not aspirations. For each one the standard
+    # media block RAISES inside `convert_to_openai_data_block` (and throws in the
+    # mirrored TypeScript adapter), so emitting it would turn the pre-existing
+    # degraded request into a dead run. They stay on `image_url` until the
+    # translators accept them — see
+    # `test_refused_combinations_raise_in_the_translator`, which pins the throws.
+    # Do not "finish the job" by flipping one of these without re-measuring.
+
+    def test_agui_audio_url_source_stays_on_image_url(self):
+        """Audio by URL keeps the legacy `image_url` block."""
+        content_list = [
+            AudioInputContent(
+                type="audio",
+                source=InputContentUrlSource(
+                    type="url",
+                    value="https://example.com/audio.mp3",
+                ),
+            ),
+        ]
+
+        lc_content = convert_agui_multimodal_to_langchain(content_list)
+
+        self.assertEqual(len(lc_content), 1)
+        self.assertEqual(
+            lc_content[0],
+            {"type": "image_url", "image_url": {"url": "https://example.com/audio.mp3"}},
+        )
+
     # ── VideoInputContent ───────────────────────────────────────────────
 
-    def test_agui_video_url_source_to_langchain(self):
-        """Test converting VideoInputContent with URL source to LangChain."""
+    def test_agui_video_url_source_stays_on_image_url(self):
+        """Video by URL keeps the legacy `image_url` block."""
         content_list = [
             VideoInputContent(
                 type="video",
@@ -279,11 +295,11 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertEqual(len(lc_content), 1)
         self.assertEqual(
             lc_content[0],
-            {"type": "video", "url": "https://example.com/video.mp4"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/video.mp4"}},
         )
 
-    def test_agui_video_data_source_to_langchain(self):
-        """Test converting VideoInputContent with data source to LangChain."""
+    def test_agui_video_data_source_stays_on_image_url(self):
+        """Video by inline data keeps the legacy `image_url` block."""
         content_list = [
             VideoInputContent(
                 type="video",
@@ -300,13 +316,17 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertEqual(len(lc_content), 1)
         self.assertEqual(
             lc_content[0],
-            {"type": "video", "base64": "AAAA", "mime_type": "video/mp4"},
+            {"type": "image_url", "image_url": {"url": "data:video/mp4;base64,AAAA"}},
         )
 
     # ── DocumentInputContent ────────────────────────────────────────────
 
-    def test_agui_document_url_source_to_langchain(self):
-        """Test converting DocumentInputContent with URL source to LangChain."""
+    def test_agui_document_url_source_stays_on_image_url(self):
+        """Documents by URL keep the legacy `image_url` block.
+
+        Fetching the bytes on the caller's behalf is not this adapter's job, so
+        the URL keeps going out exactly as it always did.
+        """
         content_list = [
             DocumentInputContent(
                 type="document",
@@ -314,6 +334,7 @@ class TestMultimodalConversion(unittest.TestCase):
                     type="url",
                     value="https://example.com/doc.pdf",
                 ),
+                metadata={"filename": "doc.pdf"},
             ),
         ]
 
@@ -322,7 +343,25 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertEqual(len(lc_content), 1)
         self.assertEqual(
             lc_content[0],
-            {"type": "file", "url": "https://example.com/doc.pdf"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/doc.pdf"}},
+        )
+
+    def test_agui_legacy_binary_url_stays_on_image_url(self):
+        """A legacy binary by URL keeps the legacy `image_url` block too."""
+        content_list = [
+            BinaryInputContent(
+                type="binary",
+                mime_type="application/pdf",
+                url="https://example.com/legacy.pdf",
+                filename="legacy.pdf",
+            ),
+        ]
+
+        lc_content = convert_agui_multimodal_to_langchain(content_list)
+
+        self.assertEqual(
+            lc_content,
+            [{"type": "image_url", "image_url": {"url": "https://example.com/legacy.pdf"}}],
         )
 
     def test_agui_document_data_source_to_langchain(self):
@@ -348,6 +387,10 @@ class TestMultimodalConversion(unittest.TestCase):
         #     are supported. (code: invalid_image_format)
         #
         # and the exception kills the run rather than degrading it.
+        #
+        # The filename is DERIVED from the MIME subtype because the item carried
+        # none: langchain-core only warns about that, but the mirrored TypeScript
+        # adapter's translator throws, so both runtimes substitute the same name.
         self.assertEqual(len(lc_content), 1)
         self.assertEqual(
             lc_content[0],
@@ -355,15 +398,16 @@ class TestMultimodalConversion(unittest.TestCase):
                 "type": "file",
                 "base64": "JVBERi0xLjQK",
                 "mime_type": "application/pdf",
+                "filename": "attachment.pdf",
             },
         )
 
     def test_agui_document_filename_reaches_the_file_block(self):
         """A document's `metadata.filename` lands on the file block.
 
-        langchain-core's OpenAI translator warns and substitutes a placeholder
-        (`LC_AUTOGENERATED`) when a file block carries no filename, and
-        `metadata: {filename}` is where AG-UI puts it — the client's own
+        A file block without a filename is degraded in both runtimes —
+        langchain-core warns and drops the key, `@langchain/openai` throws — and
+        `metadata: {filename}` is where AG-UI puts it: the client's own
         `backward-compatibility-0-0-47` middleware migrates the legacy
         `BinaryInputContent.filename` into exactly that shape.
         """
@@ -417,19 +461,18 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertEqual(round_tripped[1].source.mime_type, "application/pdf")
         self.assertEqual(round_tripped[1].metadata, {"filename": "invoice-q2.pdf"})
 
-    def test_audio_and_video_survive_the_langchain_round_trip(self):
-        """Same guard as the document round trip, for the other two modalities."""
+    def test_audio_survives_the_langchain_round_trip(self):
+        """Same guard as the document round trip, for inline audio.
+
+        Video is absent on purpose: it is not emitted as a standard block, so it
+        round-trips through `image_url` and comes back as an image. That is the
+        pre-existing behaviour, and it is a live run rather than a dead one.
+        """
         original = [
             AudioInputContent(
                 type="audio",
                 source=InputContentDataSource(
                     type="data", value="SGVsbG8=", mime_type="audio/mp3"
-                ),
-            ),
-            VideoInputContent(
-                type="video",
-                source=InputContentUrlSource(
-                    type="url", value="https://example.com/video.mp4"
                 ),
             ),
         ]
@@ -440,8 +483,7 @@ class TestMultimodalConversion(unittest.TestCase):
 
         self.assertIsInstance(round_tripped[0], AudioInputContent)
         self.assertEqual(round_tripped[0].source.mime_type, "audio/mp3")
-        self.assertIsInstance(round_tripped[1], VideoInputContent)
-        self.assertEqual(round_tripped[1].source.value, "https://example.com/video.mp4")
+        self.assertEqual(round_tripped[0].source.value, "SGVsbG8=")
 
     # ── LangChain to AG-UI (new types) ─────────────────────────────────
 
@@ -805,6 +847,164 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertIsInstance(agui_content[1], ImageInputContent)
         self.assertIsInstance(agui_content[1].source, InputContentUrlSource)
         self.assertEqual(agui_content[1].source.value, "https://example.com/test.png")
+
+
+class TestProviderBoundary(unittest.TestCase):
+    """The EMITTED block, run through the real langchain-core OpenAI translator.
+
+    The tests above assert the SHAPE this converter emits. On their own that is
+    the trap that lets a wrong shape ship: a converter and its tests agreeing on
+    an invented schema look identical to a correct one. These hand the emitted
+    block to `convert_to_openai_data_block` and read what comes out — no network,
+    the translator is a pure function.
+    """
+
+    @staticmethod
+    def _emit(item):
+        """The block this converter actually puts on the wire for `item`."""
+        blocks = convert_agui_multimodal_to_langchain([item])
+        return blocks[0]
+
+    def test_emitted_document_block_translates_for_openai(self):
+        block = self._emit(
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                ),
+                metadata={"filename": "invoice-q2.pdf"},
+            )
+        )
+
+        self.assertEqual(
+            convert_to_openai_data_block(block),
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "filename": "invoice-q2.pdf",
+                },
+            },
+        )
+
+    def test_emitted_filename_less_document_carries_the_derived_name(self):
+        """The derived filename is why this path can claim to work.
+
+        langchain-core only warns when a file block has no filename, but the
+        mirrored TypeScript adapter's translator THROWS. Both runtimes emit the
+        same block, so both substitute the same name.
+        """
+        block = self._emit(
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                ),
+            )
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            translated = convert_to_openai_data_block(block)
+
+        self.assertEqual(
+            translated,
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "filename": "attachment.pdf",
+                },
+            },
+        )
+        # And the translator's "you should have given me a filename" warning is
+        # NOT raised, because the converter gave it one.
+        self.assertEqual([w for w in caught if "filename" in str(w.message)], [])
+
+    def test_emitted_audio_block_translates_for_openai(self):
+        block = self._emit(
+            AudioInputContent(
+                type="audio",
+                source=InputContentDataSource(
+                    type="data", value="SGVsbG8=", mime_type="audio/wav"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            convert_to_openai_data_block(block),
+            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+        )
+
+    def test_emitted_legacy_binary_document_translates_for_openai(self):
+        block = self._emit(
+            BinaryInputContent(
+                type="binary",
+                mime_type="application/pdf",
+                data="JVBERi0xLjQK",
+                filename="legacy-invoice.pdf",
+            )
+        )
+
+        self.assertEqual(
+            convert_to_openai_data_block(block),
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "filename": "legacy-invoice.pdf",
+                },
+            },
+        )
+
+    def test_emitted_legacy_binary_audio_translates_for_openai(self):
+        block = self._emit(
+            BinaryInputContent(
+                type="binary", mime_type="audio/wav", data="SGVsbG8="
+            )
+        )
+
+        self.assertEqual(
+            convert_to_openai_data_block(block),
+            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+        )
+
+    def test_refused_combinations_raise_in_the_translator(self):
+        """The other half of the decision, pinned.
+
+        Every combination this converter REFUSES to announce as a standard block,
+        with the exception that is the reason why. If one of these ever stops
+        raising, the corresponding row in `_STANDARD_BLOCK_TYPES` can be
+        revisited — but not before.
+        """
+        refused = {
+            "audio by url": (
+                {"type": "audio", "url": "https://example.com/a.wav", "mime_type": "audio/wav"},
+                "Key base64 is required for audio blocks",
+            ),
+            "video by base64": (
+                {"type": "video", "base64": "AAA=", "mime_type": "video/mp4"},
+                "Block of type video is not supported",
+            ),
+            "video by url": (
+                {"type": "video", "url": "https://example.com/v.mp4", "mime_type": "video/mp4"},
+                "Block of type video is not supported",
+            ),
+            "file by url": (
+                {
+                    "type": "file",
+                    "url": "https://example.com/d.pdf",
+                    "mime_type": "application/pdf",
+                    "filename": "d.pdf",
+                },
+                "does not support file URLs",
+            ),
+        }
+
+        for name, (block, message) in refused.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, message):
+                    convert_to_openai_data_block(dict(block))
 
 
 class TestCrossRuntimeWireShape(unittest.TestCase):
