@@ -618,6 +618,177 @@ describe("Multimodal Message Conversion", () => {
     });
   });
 
+  // ── Malformed input from the wire ────────────────────────────────────────
+  //
+  // Every value these converters read arrives over a wire: AG-UI content from a
+  // client's JSON, LangChain content from whatever the LangGraph server relayed
+  // out of model or tool output. Neither side is validated at this boundary in
+  // TypeScript (Python's Pydantic models reject most of it before it reaches the
+  // converter), so a missing key here is a `TypeError` thrown from INSIDE the
+  // loop that converts a whole message list — which discards every other message
+  // and every other block along with the bad one.
+  //
+  // The rule these tests pin: a malformed ITEM is dropped with a warning; it
+  // never takes down its neighbours, its message, or the conversion.
+  describe("malformed input is dropped, not thrown on", () => {
+    it("drops a media item with no source instead of throwing", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const aguiMessage: UserMessage = {
+        id: "test-no-source",
+        role: "user",
+        content: [
+          { type: "text", text: "Hello" },
+          // `source` absent entirely — the shape `standardBlockTypeFor` already
+          // guards with `source?.type` but `mediaSourceToUrl` did not.
+          { type: "image" } as unknown as ImageInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      expect(lcMessages).toHaveLength(1);
+      const content = lcMessages[0].content as Array<any>;
+      expect(content).toEqual([{ type: "text", text: "Hello" }]);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping image content: source could not be converted to URL")
+      );
+      warn.mockRestore();
+    });
+
+    it("keeps the surrounding content when one media item has no source", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const aguiMessage: UserMessage = {
+        id: "test-bad-item-neighbours",
+        role: "user",
+        content: [
+          { type: "text", text: "look at these" },
+          { type: "audio", source: null } as unknown as AudioInputContent,
+          {
+            type: "image",
+            source: { type: "url", value: "https://example.com/photo.jpg" },
+          } as ImageInputContent,
+        ],
+      };
+
+      const lcMessages = aguiMessagesToLangChain([aguiMessage]);
+
+      expect(lcMessages).toHaveLength(1);
+      const content = lcMessages[0].content as Array<any>;
+      // The text and the good image both survive; only the bad item is gone.
+      expect(content).toEqual([
+        { type: "text", text: "look at these" },
+        { type: "image_url", image_url: { url: "https://example.com/photo.jpg" } },
+      ]);
+      warn.mockRestore();
+    });
+
+    it("does not let one bad media item abort a whole multi-message conversion", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const lcMessages = aguiMessagesToLangChain([
+        { id: "m1", role: "user", content: "first" } as UserMessage,
+        {
+          id: "m2",
+          role: "user",
+          content: [{ type: "document" } as unknown as DocumentInputContent],
+        } as UserMessage,
+        { id: "m3", role: "user", content: "third" } as UserMessage,
+      ]);
+
+      // The messages either side of the bad one are still there.
+      expect(lcMessages.map((m) => m.id)).toEqual(["m1", "m2", "m3"]);
+      expect(lcMessages[2].content).toBe("third");
+      warn.mockRestore();
+    });
+
+    it("drops a null entry in an AG-UI content array", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const aguiMessage: UserMessage = {
+        id: "test-null-agui-item",
+        role: "user",
+        content: [
+          { type: "text", text: "before" },
+          null as unknown as TextInputContent,
+          { type: "text", text: "after" },
+        ],
+      };
+
+      const content = aguiMessagesToLangChain([aguiMessage])[0].content as Array<any>;
+      expect(content).toEqual([
+        { type: "text", text: "before" },
+        { type: "text", text: "after" },
+      ]);
+      warn.mockRestore();
+    });
+
+    it("drops a null entry in an inbound LangChain content array", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const agui = langchainMessagesToAgui([
+        {
+          id: "null-inbound-block",
+          type: "human",
+          content: [
+            { type: "text", text: "before" },
+            null,
+            { type: "text", text: "after" },
+          ],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      const content = (agui[0] as UserMessage).content as Array<any>;
+      expect(content).toEqual([
+        { type: "text", text: "before" },
+        { type: "text", text: "after" },
+      ]);
+      warn.mockRestore();
+    });
+
+    it("tolerates a null block when resolving a message's text content", () => {
+      // `resolveMessageContent` runs `content.find(c => c.type === "text")` over
+      // an array the graph handed back; a null entry there killed the whole
+      // conversion before the text block after it was ever looked at.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "null-block-system",
+          type: "system",
+          content: [null, { type: "text", text: "you are helpful" }],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      expect(agui).toHaveLength(1);
+      expect(agui[0].content).toBe("you are helpful");
+    });
+
+    it("drops a tool call with no function instead of aborting the conversion", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const lcMessages = aguiMessagesToLangChain([
+        {
+          id: "assistant-bad-tc",
+          role: "assistant",
+          content: "calling",
+          toolCalls: [
+            { id: "tc-broken", type: "function" },
+            {
+              id: "tc-good",
+              type: "function",
+              function: { name: "get_weather", arguments: '{"city":"Paris"}' },
+            },
+          ],
+        } as unknown as Message,
+        { id: "after", role: "user", content: "and then" } as UserMessage,
+      ]);
+
+      // The conversion completed, and the message after the bad tool call is
+      // still present.
+      expect(lcMessages.map((m) => m.id)).toEqual(["assistant-bad-tc", "after"]);
+      const toolCalls = (lcMessages[0] as any).tool_calls;
+      expect(toolCalls).toEqual([
+        { id: "tc-good", name: "get_weather", args: { city: "Paris" }, type: "tool_call" },
+      ]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Dropping tool call"));
+      warn.mockRestore();
+    });
+  });
+
   // ── Provider boundary ────────────────────────────────────────────────────
   //
   // The tests above assert the SHAPE this adapter emits. On their own that is

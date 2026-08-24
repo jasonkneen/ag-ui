@@ -313,10 +313,25 @@ type LangchainContentBlock =
   | { type: "image_url"; image_url: { url: string } }
   | StandardMediaBlock;
 
-function mediaSourceToUrl(source: InputContentDataSource | InputContentUrlSource): string | null {
-  if (source.type === "data") {
+/**
+ * The `image_url` URL for an AG-UI media source, or `null` if there isn't one.
+ *
+ * `source` is typed as required but arrives off the wire, so it is read
+ * OPTIONALLY. A media item with no source at all is not a type error the caller
+ * can rule out — {@link standardBlockTypeFor} already reads the same field as
+ * `source?.type`, and the two paths must not disagree about whether it can be
+ * absent. More importantly, this runs inside the loop that converts a whole
+ * message list: a throw here discards every other block and every other message,
+ * where the Python adapter's `isinstance` chain simply returns `None` and lets
+ * the caller warn and drop the one bad item. Returning `null` is what keeps the
+ * two runtimes degrading the same way.
+ */
+function mediaSourceToUrl(
+  source: InputContentDataSource | InputContentUrlSource | null | undefined
+): string | null {
+  if (source?.type === "data") {
     return `data:${source.mimeType};base64,${source.value}`;
-  } else if (source.type === "url") {
+  } else if (source?.type === "url") {
     return source.value;
   }
   return null;
@@ -443,6 +458,15 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
   const aguiContent: InputContent[] = [];
 
   for (const item of content) {
+    // A content array relayed by the LangGraph server can carry a JSON `null`
+    // (or a bare string) where a block is expected, and `item.type` on one of
+    // those aborts the conversion of every OTHER block and every other message.
+    // One unusable block is dropped like any other unusable block.
+    if (!item || typeof item !== "object") {
+      console.warn("[convertLangchainMultimodalToAgui] Dropping content block: not an object");
+      continue;
+    }
+
     // Resolved before the chain so the branch gate and the emitted content type
     // are one lookup rather than two. `undefined` for every block kind this
     // converter does not recognise, prototype key or not.
@@ -564,6 +588,14 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
   const langchainContent: LangchainContentBlock[] = [];
 
   for (const item of content) {
+    // Same reason as the inbound converter: this array is client JSON, nothing
+    // validates it at this boundary in TypeScript, and `item.type` on a `null`
+    // entry throws from inside the loop that converts the whole message list.
+    if (!item || typeof item !== "object") {
+      console.warn("[convertAguiMultimodalToLangchain] Dropping content item: not an object");
+      continue;
+    }
+
     if (item.type === "text") {
       langchainContent.push({
         type: "text",
@@ -895,14 +927,29 @@ export function aguiMessagesToLangChain(messages: Message[]): LangGraphMessage[]
           type: "ai",
           role: message.role,
           content,
-          tool_calls: (message.toolCalls ?? []).map((tc: ToolCall) => ({
-            id: tc.id,
-            name: tc.function.name,
-            // Guard empty/absent arguments (parity with the Python side):
-            // JSON.parse("") throws and would abort the whole conversion.
-            args: tc.function.arguments ? JSON.parse(tc.function.arguments) : {},
-            type: "tool_call",
-          })),
+          tool_calls: (message.toolCalls ?? [])
+            // Same reason the `arguments` read below is guarded: a tool call
+            // missing its `function` is client JSON, not a shape the type can
+            // rule out, and `tc.function.name` on one throws from inside the
+            // loop that converts the whole message list. Python never reaches
+            // this because Pydantic rejects the payload at parse time; here the
+            // one unusable call is dropped (it has no name, so there is nothing
+            // to invoke) and the rest of the conversion survives.
+            .filter((tc: ToolCall) => {
+              if (tc?.function) return true;
+              console.warn(
+                "[aguiMessagesToLangChain] Dropping tool call: no function name or arguments"
+              );
+              return false;
+            })
+            .map((tc: ToolCall) => ({
+              id: tc.id,
+              name: tc.function.name,
+              // Guard empty/absent arguments (parity with the Python side):
+              // JSON.parse("") throws and would abort the whole conversion.
+              args: tc.function.arguments ? JSON.parse(tc.function.arguments) : {},
+              type: "tool_call",
+            })),
         } as LangGraphMessage);
         break;
       }
@@ -1065,7 +1112,11 @@ export function resolveMessageContent(content?: LangGraphMessage['content']): st
   }
 
   if (Array.isArray(content) && content.length) {
-    const contentText = content.find(c => c.type === 'text')?.text
+    // `c?.type`, not `c.type`: this array is whatever the graph put on the
+    // message, and a `null` entry in it would throw out of `find` — aborting
+    // the conversion of the whole message list rather than skipping the entry
+    // and finding the text block that follows it.
+    const contentText = content.find(c => c?.type === 'text')?.text
     return contentText ?? null;
   }
 
