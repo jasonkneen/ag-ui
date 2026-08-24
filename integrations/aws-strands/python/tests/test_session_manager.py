@@ -63,7 +63,7 @@ async def _empty_async_gen():
     yield  # pragma: no cover — makes this an async generator
 
 
-def _make_base_agent(session_manager_provider=None) -> StrandsAgent:
+def _make_base_agent(session_manager_provider=None, **config_kwargs) -> StrandsAgent:
     """Create a StrandsAgent with a mocked underlying Strands agent."""
     mock_core = MagicMock()
     mock_core.model = MagicMock()
@@ -72,7 +72,9 @@ def _make_base_agent(session_manager_provider=None) -> StrandsAgent:
     mock_core.tool_registry.registry = {}
     mock_core.record_direct_tool_call = True
 
-    config = StrandsAgentConfig(session_manager_provider=session_manager_provider)
+    config = StrandsAgentConfig(
+        session_manager_provider=session_manager_provider, **config_kwargs
+    )
     return StrandsAgent(agent=mock_core, name="test_agent", config=config)
 
 
@@ -402,6 +404,102 @@ class TestFrontendToolContinuation:
         assert "Hello" not in instance.stream_prompts
 
 
+    @pytest.mark.asyncio
+    async def test_delta_only_continuation_resolves_name_through_wire_map(self):
+        """A frontend tool is emitted under a FRESH wire id, so the native
+        history that carries its name is keyed by the native ``toolUseId``.
+        The durable wire->native map is the only bridge between them; without
+        consulting it the derivation misses and the model is handed an empty
+        prompt, then re-fires the same tool (issue #2376)."""
+        mock_session_manager = _mock_session_manager()
+        provider = MagicMock(return_value=mock_session_manager)
+        agent = _make_base_agent(session_manager_provider=provider)
+
+        tools = [_frontend_tool("setBackground"), _frontend_tool("setForeground")]
+        input_data = RunAgentInput(
+            thread_id="thread-delta",
+            run_id="run-2",
+            state={},
+            messages=[
+                ToolMessage(
+                    id="t1",
+                    role="tool",
+                    content='{"approved": true}',
+                    tool_call_id="wire-1",
+                ),
+            ],
+            tools=tools,
+            context=[],
+            forwarded_props={},
+        )
+
+        # Native history knows the call under the native id only.
+        session_history = [
+            {"role": "user", "content": [{"text": "make it blue"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "native-1",
+                            "name": "setBackground",
+                            "input": {"color": "blue"},
+                        }
+                    }
+                ],
+            },
+        ]
+        instance = _MockSessionAgentWithHistory(
+            mock_session_manager, messages=session_history
+        )
+        instance.state.set(AG_UI_WIRE_MAP_STATE_KEY, {"wire-1": "native-1"})
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
+            MockCore.return_value = instance
+            await _collect_events(agent, input_data)
+
+        assert instance.stream_prompts == [
+            'setBackground returned: {"approved": true}'
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delta_only_continuation_keeps_degrading_when_wire_map_misses(self):
+        """The wire map is a fallback, not a guess: an id it does not hold is
+        still skipped rather than matched to some other recorded call."""
+        mock_session_manager = _mock_session_manager()
+        provider = MagicMock(return_value=mock_session_manager)
+        agent = _make_base_agent(session_manager_provider=provider)
+
+        tools = [_frontend_tool("setBackground"), _frontend_tool("setForeground")]
+        input_data = _delta_continuation_input(tools)
+
+        session_history = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "native-1",
+                            "name": "setBackground",
+                            "input": {},
+                        }
+                    }
+                ],
+            },
+        ]
+        instance = _MockSessionAgentWithHistory(
+            mock_session_manager, messages=session_history
+        )
+        # The map holds a different call; ``call-xyz`` from the payload is absent.
+        instance.state.set(AG_UI_WIRE_MAP_STATE_KEY, {"wire-other": "native-1"})
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
+            MockCore.return_value = instance
+            await _collect_events(agent, input_data)
+
+        assert instance.stream_prompts == [""]
+
+
 class _MockSessionAgentReal:
     """Session-manager-backed mock exposing a real ``session_manager`` (public
     attribute, like ``StrandsAgentCore``) plus an ``agent_id`` and native
@@ -490,11 +588,15 @@ def _result_content(sm, agent_id, index):
     return persisted[index].message["content"]
 
 
-async def _run_session_continuation(sm, agent_id, messages, tools, wire_map, store):
+async def _run_session_continuation(
+    sm, agent_id, messages, tools, wire_map, store, config_kwargs=None
+):
     """Drive run() for a continuation and return the mock agent instance."""
     _seed_session(sm, agent_id, store)
     provider = MagicMock(return_value=sm)
-    agent = _make_base_agent(session_manager_provider=provider)
+    agent = _make_base_agent(
+        session_manager_provider=provider, **(config_kwargs or {})
+    )
     input_data = RunAgentInput(
         thread_id=sm.session_id,
         run_id="run-2",
@@ -627,6 +729,31 @@ class TestSessionFrontendToolReconciliation:
         assert _result_content(sm, "default", 1)[0]["toolResult"]["content"] == [
             {"text": '{"approved": false}'}
         ]
+
+    @pytest.mark.asyncio
+    async def test_legacy_continuation_names_the_tool_when_replay_is_disabled(
+        self, tmp_path
+    ):
+        """The configuration from issue #2376: the same delta-only continuation
+        with ``replay_history_into_strands=False``. The reconcile branch is
+        gated on that flag and the replay branch is off whenever a session
+        manager exists, so ``stream_async(user_message)`` is the only channel
+        left. Naming the tool there requires translating the wire id through
+        the map; without it the model is prompted with ``""`` and re-fires the
+        same call."""
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(session_id="thread-noreplay", storage_dir=str(tmp_path))
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[_payload_tool("wire-1", '{"approved": false}')],
+            tools=[_frontend_tool("approve")],
+            wire_map={"wire-1": "native-1"},
+            store=[_store_tool_use("native-1", "approve"), _store_placeholder("native-1")],
+            config_kwargs={"replay_history_into_strands": False},
+        )
+        assert instance.stream_prompts == ['approve returned: {"approved": false}']
 
     @pytest.mark.parametrize(
         "content", ["tool failed: invalid id", ""], ids=["with-text", "empty"]

@@ -1887,6 +1887,22 @@ class StrandsAgent:
                     last_msg_had_tool_calls = False
                     strands_messages.append(strands_msg)
 
+            # The durable wire->native map recorded at emission, read back from
+            # session state (restored from the store on a fresh process). Read
+            # here rather than at the reconciliation block below because the
+            # continuation-message derivation needs it too: on a delta-only
+            # payload the tool result arrives under the wire id, while the tool
+            # name is only known under the native one.
+            wire_to_native: Dict[str, str] = {}
+            reconciliation_setup_error: Exception | None = None
+            if session_manager is not None:
+                try:
+                    wire_to_native = (
+                        strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
+                    )
+                except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
+                    reconciliation_setup_error = e
+
             # Build a lookup of tool_call_id -> tool_name from the input messages
             # directly (the assistant message in Run 2 already carries the name).
             _tool_call_id_to_name: dict = {}
@@ -1930,6 +1946,18 @@ class StrandsAgent:
                 for msg in reversed(input_data.messages):
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
+                        if tool_name is None:
+                            # A frontend tool is emitted under a fresh wire id, so
+                            # the name recovered from native session history above is
+                            # keyed by the native ``toolUseId`` instead. Translate
+                            # through the durable map and retry. Kept as a fallback
+                            # rather than translating up front: when the assistant
+                            # message IS in the payload the lookup is already keyed
+                            # by the wire id, and a backend tool has no wire entry at
+                            # all because its wire id is the native id.
+                            _native_id = wire_to_native.get(msg.tool_call_id)
+                            if _native_id:
+                                tool_name = _tool_call_id_to_name.get(_native_id)
                         if tool_name and tool_name in frontend_tool_names:
                             # Forward the ACTUAL result so the model can act on the
                             # human's decision (e.g. an approval resolving to
@@ -2055,18 +2083,6 @@ class StrandsAgent:
             # result when its tool name is client-declared, or (for delta-only
             # payloads that omit the assistant message) when its wire id was
             # recorded in the wire->native map when the call was emitted.
-            # The durable wire->native map recorded at emission, read back from
-            # session state (restored from the store on a fresh process).
-            wire_to_native: Dict[str, str] = {}
-            reconciliation_setup_error: Exception | None = None
-            if session_manager is not None:
-                try:
-                    wire_to_native = (
-                        strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-                    )
-                except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
-                    reconciliation_setup_error = e
-
             # The durable per-``toolUseId`` call metadata map recorded at
             # emission (see the ``current_tool_use`` handler). On a RESUME
             # run this is the ONLY source of ``{name, args, input,
