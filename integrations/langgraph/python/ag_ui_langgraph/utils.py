@@ -412,7 +412,12 @@ _MEDIA_CONTENT_TYPES = (ImageInputContent, AudioInputContent, VideoInputContent,
 #
 #   AG-UI item        Python                              JS
 #   ----------------  ----------------------------------  -----------------------------
-#   audio, data       input_audio ✓                       input_audio ✓
+#   audio, data,      input_audio ✓                       input_audio ✓
+#   wav/mp3 spelling  — after `_OPENAI_AUDIO_MIME_TYPES` normalizes the spelling.
+#                     The RAW MIME type does not necessarily convert; see below.
+#   audio, data,      forwards an invalid `format` enum   throws ("must have mime type
+#   any other type    to the API → 400                     of audio/wav or audio/mp3")
+#                     — so these keep `image_url`; see `_OPENAI_AUDIO_MIME_TYPES`
 #   audio, url        ValueError "Key base64 is required  throws ("must be formatted as
 #                     for audio blocks"                    a data URL")
 #   video, any        ValueError "Block of type video is  throws ("... 'video' ... not
@@ -424,11 +429,116 @@ _MEDIA_CONTENT_TYPES = (ImageInputContent, AudioInputContent, VideoInputContent,
 #                     URLs"
 #   image, any        already worked as `image_url`, and is left alone
 #
+# Note what the audio rows do NOT say: they do not say "audio, data converts".
+# That claim held only for the `audio/wav` it was first measured on. The document
+# rows are unqualified because `file.file_data` carries the MIME type inside a
+# data URL rather than through an enum, so no subtype is special.
+#
 # Revisit a row when its translator grows support for that combination.
 _STANDARD_BLOCK_TYPES = {
     AudioInputContent: "audio",
     DocumentInputContent: "file",
 }
+
+# The audio MIME types an `input_audio` part can actually carry, mapped to the
+# ONE spelling the provider accepts for each.
+#
+# `input_audio.format` is an enum of exactly two values — `"wav" | "mp3"` in the
+# OpenAI SDK's own `ChatCompletionContentPartInputAudio.InputAudio` — and both
+# runtimes derive that string from the block's `mime_type`. So the constraint is
+# not "audio converts": it is "audio converts for two subtypes, spelled the way
+# the provider spells them". Measured on langchain-core 1.2.13 and
+# `@langchain/openai` 1.2.0, emitting through this adapter's own converter:
+#
+#   AG-UI mime_type    Python (langchain-core)     JS (@langchain/openai)
+#   -----------------  --------------------------  ------------------------
+#   audio/wav          format "wav" ✓              format "wav" ✓
+#   audio/mp3          format "mp3" ✓              format "mp3" ✓
+#   audio/mpeg         format "mpeg" ✗ (API 400)   THREW
+#   audio/ogg          format "ogg" ✗ (API 400)    THREW
+#   audio/aac          format "aac" ✗ (API 400)    THREW
+#   audio/webm         format "webm" ✗ (API 400)   THREW
+#   audio/x-wav        format "x-wav" ✗ (API 400)  THREW
+#   AUDIO/WAV          format "WAV" ✗ (API 400)    THREW
+#   audio/wav;codecs=1 format "wav; codecs=1" ✗    format "wav" ✓
+#
+# Two things fall out of that table, and this map exists for both.
+#
+# FIRST: `audio/mpeg` is the IANA-registered MIME type for MP3, and it is what
+# browsers, OS file pickers and `file(1)` report for a `.mp3`. It is therefore the
+# single most common audio attachment on the web, and it is NOT on the provider's
+# allow-list — `audio/mp3` is, which is the non-standard spelling. Refusing
+# `audio/mpeg` would leave the common case permanently on `image_url` (a
+# guaranteed provider 400 for a non-image part); passing it through unchanged
+# sends an invalid enum value here and kills the run inside the translator in the
+# TypeScript adapter. Rewriting the spelling is the only outcome where an MP3
+# actually reaches the model, so this map normalizes rather than merely narrows.
+#
+# SECOND: this runtime's failure mode is WORSE than the TypeScript one and is
+# entirely silent. `convert_to_openai_data_block` takes `mime_type.split("/")[-1]`
+# verbatim, so `audio/ogg` becomes `format: "ogg"` and goes out over the wire —
+# no local error, just a 400 from the API with nothing pointing back here. A case
+# difference or a `;codecs=` parameter is enough to produce that on a type BOTH
+# runtimes could otherwise have handled. Normalizing to a canonical spelling
+# before emitting removes the divergence at the source: after this map, the only
+# `mime_type` either runtime ever puts on an audio block is `audio/wav` or
+# `audio/mp3`, which this naive split and the TypeScript parser both reduce to the
+# same accepted enum value.
+#
+# Keys are the case-folded MIME type with any parameters stripped (MIME types are
+# case-insensitive per RFC 2045 §5.1, so `AUDIO/WAV` is a legal spelling of a
+# supported type and must not be treated as an unsupported one). The WAV aliases
+# are the registered and de-facto spellings of the same RIFF/WAVE container; they
+# name a format the provider accepts and differ only in how they are written,
+# which is the same defect as `audio/mpeg`.
+#
+# Kept in lockstep with `OPENAI_AUDIO_MIME_TYPES` in the TypeScript adapter. A
+# divergence here is the class of bug this converter exists to fix.
+#
+# Revisit when `input_audio.format` grows a third value.
+_OPENAI_AUDIO_MIME_TYPES = {
+    "audio/wav": "audio/wav",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/mp3": "audio/mp3",
+    "audio/mpeg": "audio/mp3",
+}
+
+
+def _normalized_audio_mime_type(mime_type: str | None) -> str | None:
+    """The provider-accepted spelling for an audio MIME type.
+
+    Returns ``None`` when the provider cannot carry that audio format at all, in
+    which case the caller keeps the pre-existing ``image_url`` block. See
+    `_OPENAI_AUDIO_MIME_TYPES`.
+    """
+    # Parameters (`;codecs=…`, `;charset=…`) are part of a legal MIME type but not
+    # part of its identity, and this runtime's translator would forward them into
+    # the `format` enum verbatim.
+    base = (mime_type or "").split(";")[0].strip().lower()
+    return _OPENAI_AUDIO_MIME_TYPES.get(base)
+
+
+def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[str, str | None] | None:
+    """Which standard block to emit and with WHICH MIME type, or ``None``.
+
+    ``None`` means the combination has no standard block that survives the
+    translator, so the caller keeps the pre-existing ``image_url`` form.
+
+    Audio is the only modality whose MIME type is rewritten: the type that goes on
+    the wire is the normalized spelling, not the one the client sent. Documents
+    pass theirs through untouched, because `file.file_data` carries it inside a
+    data URL where no enum constrains it.
+
+    Mirrors `standardBlockTypeFor` in the TypeScript adapter.
+    """
+    if block_type is None:
+        return None
+    if block_type == "audio":
+        normalized = _normalized_audio_mime_type(mime_type)
+        return ("audio", normalized) if normalized else None
+    return (block_type, mime_type)
 
 
 def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSource]) -> str | None:
@@ -481,20 +591,24 @@ def _derive_filename(mime_type: str | None) -> str:
 
 def _standard_media_block(
     block_type: str,
-    source: InputContentDataSource,
+    data: str,
+    mime_type: str | None,
     filename: str | None = None,
 ) -> Dict[str, Any]:
-    """Build a LangChain standard media block from an inline-data source.
+    """Build a LangChain standard media block from inline base64 data.
 
-    Only reached for the combinations `_STANDARD_BLOCK_TYPES` vouches for, which
-    are all base64, so this always succeeds.
+    Only reached for the combinations `_standard_block_for` vouches for, which are
+    all base64, so this always succeeds. Takes ``mime_type`` separately rather
+    than reading it off the source, because for audio the type that goes on the
+    wire is the normalized spelling `_standard_block_for` resolved, not the one
+    the client sent.
     """
     block: Dict[str, Any] = {
         "type": block_type,
-        "base64": source.value,
-        "mime_type": source.mime_type,
+        "base64": data,
+        "mime_type": mime_type,
     }
-    name = filename or (_derive_filename(source.mime_type) if block_type == "file" else None)
+    name = filename or (_derive_filename(mime_type) if block_type == "file" else None)
     if name:
         block["filename"] = name
     return block
@@ -507,10 +621,10 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
     VideoInputContent, DocumentInputContent) as well as legacy BinaryInputContent
     for backwards compatibility.
 
-    Inline audio and inline documents use the standard block for their modality
-    (`audio`, `file`), because the block KIND is what providers validate: a PDF
-    sent as `image_url` carries its real MIME type inside the data URL and is
-    still rejected —
+    Inline documents, and inline audio IN A FORMAT THE PROVIDER CAN CARRY, use the
+    standard block for their modality (`audio`, `file`), because the block KIND is
+    what providers validate: a PDF sent as `image_url` carries its real MIME type
+    inside the data URL and is still rejected —
 
         openai.BadRequestError: 400 - Invalid MIME type. Only image types are
         supported. (code: invalid_image_format)
@@ -520,9 +634,16 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
     stopped being correct once langchain-core grew standard multimodal blocks;
     the effective floor here is langchain-core 1.2.10, via `langchain>=1.2.0`.
 
-    Everything else — images, video, and any URL-sourced media — keeps
-    `image_url`, because the standard block for those combinations raises inside
-    the translator. See `_STANDARD_BLOCK_TYPES` for the measured table.
+    Everything else — images, video, any URL-sourced media, and audio in a format
+    outside `_OPENAI_AUDIO_MIME_TYPES` — keeps `image_url`, because the standard
+    block for those combinations raises inside the translator (TypeScript) or
+    forwards an invalid `format` enum to the API (here). See
+    `_STANDARD_BLOCK_TYPES` for the measured table.
+
+    Audio MIME types are NORMALIZED, not merely filtered: `audio/mpeg` — the
+    standard type for MP3 and the commonest audio attachment there is — is emitted
+    as the `audio/mp3` spelling the provider's enum actually lists. See
+    `_OPENAI_AUDIO_MIME_TYPES`.
 
     Apart from `metadata.filename`, which is a documented field of the file
     block, AG-UI ``InputContent.metadata`` is intentionally NOT copied onto the
@@ -541,16 +662,21 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
         elif isinstance(item, _MEDIA_CONTENT_TYPES):
             block_type = _STANDARD_BLOCK_TYPES.get(type(item))
             # Only inline data converts; every URL-sourced media block raises in
-            # both runtimes, so those fall through to `image_url` below.
+            # both runtimes, so those fall through to `image_url` below. Audio in
+            # a format the provider's `input_audio.format` enum cannot name falls
+            # through too — `_standard_block_for` returns None for it.
             if block_type and isinstance(item.source, InputContentDataSource):
-                langchain_content.append(
-                    _standard_media_block(
-                        block_type,
-                        item.source,
-                        _filename_from_metadata(item.metadata),
+                standard = _standard_block_for(block_type, item.source.mime_type)
+                if standard:
+                    langchain_content.append(
+                        _standard_media_block(
+                            standard[0],
+                            item.source.value,
+                            standard[1],
+                            _filename_from_metadata(item.metadata),
+                        )
                     )
-                )
-                continue
+                    continue
             url = _media_source_to_url(item.source)
             if url:
                 langchain_content.append({
@@ -564,30 +690,36 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             #
             # Split on the MIME type, which is the only modality signal a legacy
             # item carries (the typed classes above announce their own), and only
-            # for inline data with a declared MIME type. That is the same narrow
-            # allow-list the typed path uses, for the same reason: url-only,
-            # id-only, image and video items keep the historical `image_url`
-            # reference form because the standard block for those raises inside
-            # the translator.
+            # for inline data with a declared MIME type. The decision then goes
+            # through the SAME `_standard_block_for` the typed path uses, so an
+            # audio type the provider cannot carry is refused identically on both
+            # paths — url-only, id-only, image and video items, and unsupported
+            # audio types, all keep the historical `image_url` reference form
+            # because the standard block for those raises inside the translator or
+            # sends an invalid `format` enum.
             mime_type = item.mime_type or ""
+            # Modality is read off a case-folded copy: MIME types are
+            # case-insensitive (RFC 2045 §5.1), so `AUDIO/WAV` names the same
+            # modality as `audio/wav` and must not be routed as a document. The
+            # ORIGINAL string is what gets emitted for documents, where it is
+            # carried inside a data URL rather than matched against an enum.
+            modality = mime_type.split(";")[0].strip().lower()
             if (
                 item.data
                 and not item.url
                 and mime_type
-                and not mime_type.startswith("image/")
-                and not mime_type.startswith("video/")
+                and not modality.startswith("image/")
+                and not modality.startswith("video/")
             ):
-                block_type = "audio" if mime_type.startswith("audio/") else "file"
-                langchain_content.append(
-                    _standard_media_block(
-                        block_type,
-                        InputContentDataSource(
-                            type="data", value=item.data, mime_type=mime_type
-                        ),
-                        item.filename,
+                block_type = "audio" if modality.startswith("audio/") else "file"
+                standard = _standard_block_for(block_type, mime_type)
+                if standard:
+                    langchain_content.append(
+                        _standard_media_block(
+                            standard[0], item.data, standard[1], item.filename
+                        )
                     )
-                )
-                continue
+                    continue
 
             content_dict: Dict[str, Any] = {"type": "image_url"}
 

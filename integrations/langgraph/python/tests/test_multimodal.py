@@ -1004,6 +1004,185 @@ class TestProviderBoundary(unittest.TestCase):
             {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
         )
 
+    # ── Audio MIME types ────────────────────────────────────────────────
+    #
+    # `input_audio.format` is an enum of exactly two values (`"wav" | "mp3"` in
+    # the OpenAI SDK's own `ChatCompletionContentPartInputAudio.InputAudio`), and
+    # this runtime derives it from `mime_type.split("/")[-1]`. So "audio, data
+    # converts" was never true as stated — it was true of the `audio/wav` it was
+    # measured on. These pin the real constraint, per spelling.
+
+    def test_admitted_audio_mime_types_reach_the_provider(self):
+        """Every audio spelling this converter ADMITS, and the part it produces.
+
+        `audio/mpeg` is the load-bearing row: it is the IANA-registered type for
+        MP3 and what a browser reports for a `.mp3`, and it is NOT what the
+        provider's enum lists — so it only works because the converter rewrites
+        the spelling to `audio/mp3` before emitting.
+
+        The last three rows are the same defect in a different disguise: a MIME
+        type is case-insensitive (RFC 2045 §5.1) and may carry parameters, and
+        neither makes a supported format unsupported.
+        """
+        admitted = {
+            "audio/wav": "wav",
+            "audio/mp3": "mp3",
+            "audio/mpeg": "mp3",
+            "audio/x-wav": "wav",
+            "audio/wave": "wav",
+            "audio/vnd.wave": "wav",
+            "AUDIO/MPEG": "mp3",
+            "audio/WAV": "wav",
+            "audio/mpeg; charset=binary": "mp3",
+            "audio/wav; codecs=1": "wav",
+        }
+
+        for mime_type, expected_format in admitted.items():
+            with self.subTest(mime_type):
+                block = self._emit(
+                    AudioInputContent(
+                        type="audio",
+                        source=InputContentDataSource(
+                            type="data", value="SGVsbG8=", mime_type=mime_type
+                        ),
+                    )
+                )
+
+                self.assertTrue(is_data_content_block(block))
+                self.assertEqual(
+                    self._provider_payload(block),
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "SGVsbG8=", "format": expected_format},
+                    },
+                )
+
+    def test_admitted_legacy_binary_audio_mime_types_reach_the_provider(self):
+        """The legacy `binary` path routes through the SAME gate.
+
+        A divergence between the two paths would put the same clip on the wire
+        two different ways depending on which client sent it.
+        """
+        admitted = {"audio/mpeg": "mp3", "audio/x-wav": "wav", "AUDIO/MPEG": "mp3"}
+
+        for mime_type, expected_format in admitted.items():
+            with self.subTest(mime_type):
+                block = self._emit(
+                    BinaryInputContent(
+                        type="binary", mime_type=mime_type, data="SGVsbG8="
+                    )
+                )
+
+                self.assertEqual(
+                    self._provider_payload(block),
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "SGVsbG8=", "format": expected_format},
+                    },
+                )
+
+    def test_raw_audio_mpeg_would_send_an_invalid_format_enum(self):
+        """Why the rewrite is not cosmetic, and why THIS runtime is the worse one.
+
+        Hand the translator the type a client ACTUALLY sends for an MP3 and it
+        does not raise — it takes the subtype verbatim and puts `"mpeg"` in a
+        field whose only legal values are `"wav"` and `"mp3"`. The request leaves
+        the process and the API rejects it, with nothing pointing back to this
+        converter. The mirrored TypeScript adapter throws locally on the same
+        block; a divergence like that is the class of bug this converter exists
+        to fix, and normalizing the spelling before emitting removes it at the
+        source.
+        """
+        raw = {"type": "audio", "base64": "SGVsbG8=", "mime_type": "audio/mpeg"}
+
+        self.assertTrue(is_data_content_block(raw))
+        self.assertEqual(
+            self._provider_payload(raw),
+            # No exception. That is the finding.
+            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "mpeg"}},
+        )
+
+    def test_unsupported_audio_mime_types_stay_on_the_image_url_path(self):
+        """Formats the provider's enum cannot name at all.
+
+        Two assertions per row, and neither is enough alone: the converter really
+        does keep these on `image_url`, and the standard block it declined to
+        emit really would have carried a `format` the API rejects.
+        """
+        for mime_type in ("audio/ogg", "audio/aac", "audio/webm", "audio/flac", "audio/mp4"):
+            with self.subTest(mime_type):
+                emitted = self._emit(
+                    AudioInputContent(
+                        type="audio",
+                        source=InputContentDataSource(
+                            type="data", value="SGVsbG8=", mime_type=mime_type
+                        ),
+                    )
+                )
+                self.assertEqual(
+                    emitted,
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,SGVsbG8="},
+                    },
+                )
+                # Degraded but ALIVE: the fallback reaches the wire without
+                # raising, which is the whole premise of the narrow gate.
+                self.assertEqual(self._provider_payload(emitted), emitted)
+
+                # And the block NOT emitted would have sent an unusable enum.
+                declined = {
+                    "type": "audio",
+                    "base64": "SGVsbG8=",
+                    "mime_type": mime_type,
+                }
+                self.assertEqual(
+                    self._provider_payload(declined)["input_audio"]["format"],
+                    mime_type.split("/")[-1],
+                )
+
+    def test_unsupported_legacy_binary_audio_stays_on_the_image_url_path(self):
+        for mime_type in ("audio/ogg", "audio/webm"):
+            with self.subTest(mime_type):
+                emitted = self._emit(
+                    BinaryInputContent(
+                        type="binary", mime_type=mime_type, data="SGVsbG8="
+                    )
+                )
+                self.assertEqual(
+                    emitted,
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,SGVsbG8="},
+                    },
+                )
+
+    def test_document_mime_type_is_not_rewritten(self):
+        """The normalization is audio-only.
+
+        A document carries its MIME type inside a `file_data` data URL, where no
+        enum constrains it, so rewriting one there would corrupt a working path.
+        """
+        block = self._emit(
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/vnd.ms-excel"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            self._provider_payload(block),
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/vnd.ms-excel;base64,JVBERi0xLjQK",
+                    "filename": "attachment.vnd.ms-excel",
+                },
+            },
+        )
+
     def test_refused_combinations_stay_off_the_standard_block_path(self):
         """The other half of the decision, pinned to BOTH its halves.
 
@@ -1194,6 +1373,46 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
         self.assertEqual(returned.source.value, original.source.value)
         self.assertEqual(returned.source.mime_type, original.source.mime_type)
         self.assertEqual(returned.metadata, {"filename": "clip.wav"})
+
+    def test_mpeg_audio_survives_the_cross_runtime_round_trip_as_mp3(self):
+        """The normalized spelling is what crosses the seam — in BOTH directions.
+
+        An MP3 arrives as `audio/mpeg`, which neither runtime can put on the wire
+        under that name. The converter rewrites it to `audio/mp3` once, on the way
+        out, so the sibling runtime's translator accepts it (it throws on
+        `audio/mpeg`) and this runtime's produces the same `format` value rather
+        than an invalid one.
+
+        The visible consequence, pinned here rather than left to be discovered: a
+        round trip through MESSAGES_SNAPSHOT reports the attachment as
+        `audio/mp3`, not the `audio/mpeg` the client sent. The rewrite is between
+        two spellings of one format, so the bytes and the format are unchanged —
+        only the name is, and only to the one the provider recognises.
+        """
+        original = AudioInputContent(
+            type="audio",
+            source=InputContentDataSource(
+                type="data", value="SGVsbG8=", mime_type="audio/mpeg"
+            ),
+            metadata={"filename": "podcast.mp3"},
+        )
+
+        [emitted] = convert_agui_multimodal_to_langchain([original])
+        self.assertEqual(emitted["mime_type"], "audio/mp3")
+
+        wire = _as_typescript_wire_block(emitted)
+        self.assertTrue(is_data_content_block(wire))
+        [message] = convert_to_openai_messages([HumanMessage(content=[dict(wire)])])
+        self.assertEqual(
+            message["content"],
+            [{"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "mp3"}}],
+        )
+
+        [returned] = convert_langchain_multimodal_to_agui([wire])
+        self.assertIsInstance(returned, AudioInputContent)
+        self.assertEqual(returned.source.value, original.source.value)
+        self.assertEqual(returned.source.mime_type, "audio/mp3")
+        self.assertEqual(returned.metadata, {"filename": "podcast.mp3"})
 
     # ── The return leg reads all three vocabularies ────────────────────
     #

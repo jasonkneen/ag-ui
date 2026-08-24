@@ -803,6 +803,170 @@ describe("Multimodal Message Conversion", () => {
       });
     });
 
+    // ── Audio MIME types ────────────────────────────────────────────────
+    //
+    // `input_audio.format` is an enum of exactly two values, and both runtimes
+    // derive it from the block's `mime_type`. So "audio, data converts" was never
+    // true as stated — it was true of the `audio/wav` it was measured on. These
+    // cases pin the real constraint at the provider boundary, per spelling.
+
+    // Everything the converter ADMITS, with the exact part that lands on the
+    // wire. `audio/mpeg` is the load-bearing row: it is the IANA type for MP3 and
+    // what a browser reports for a `.mp3`, and it is NOT what the provider's enum
+    // lists — so it only works because the converter rewrites the spelling.
+    it.each([
+      ["audio/wav", "wav"],
+      ["audio/mp3", "mp3"],
+      ["audio/mpeg", "mp3"],
+      ["audio/x-wav", "wav"],
+      ["audio/wave", "wav"],
+      ["audio/vnd.wave", "wav"],
+      // MIME types are case-insensitive (RFC 2045 §5.1) and may carry parameters;
+      // neither makes a supported format unsupported.
+      ["AUDIO/MPEG", "mp3"],
+      ["audio/WAV", "wav"],
+      ["audio/mpeg; charset=binary", "mp3"],
+      ["audio/wav; codecs=1", "wav"],
+    ])("carries %s to OpenAI as input_audio format %s", async (mimeType, format) => {
+      const aguiMessage: UserMessage = {
+        id: "boundary-audio-mime",
+        role: "user",
+        content: [
+          {
+            type: "audio",
+            source: { type: "data", value: "SGVsbG8=", mimeType },
+          } as AudioInputContent,
+        ],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "input_audio",
+        input_audio: { data: "SGVsbG8=", format },
+      });
+    });
+
+    // The legacy `binary` path routes through the SAME gate, so it admits and
+    // normalizes identically. A divergence between the two paths would put the
+    // same clip on the wire two different ways depending on which client sent it.
+    it.each([
+      ["audio/mpeg", "mp3"],
+      ["audio/x-wav", "wav"],
+      ["AUDIO/MPEG", "mp3"],
+    ])("carries legacy-binary %s to OpenAI as input_audio format %s", async (mimeType, format) => {
+      const aguiMessage: UserMessage = {
+        id: "boundary-legacy-audio-mime",
+        role: "user",
+        content: [{ type: "binary", mimeType, data: "SGVsbG8=" } as BinaryInputContent],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "input_audio",
+        input_audio: { data: "SGVsbG8=", format },
+      });
+    });
+
+    // Why the rewrite is not cosmetic: hand the provider the type the client
+    // ACTUALLY sent for an MP3 and the run dies inside the translator, before a
+    // request is built. This is the throw the normalization step exists to avoid,
+    // pinned so it cannot be quietly reintroduced by widening the gate instead.
+    it("would throw at the provider for a raw audio/mpeg block — hence the rewrite", async () => {
+      await expect(
+        partsOnTheWire([
+          { type: "audio", source_type: "base64", data: "SGVsbG8=", mime_type: "audio/mpeg" },
+        ]),
+      ).rejects.toThrow(/must have mime type of audio\/wav or audio\/mp3/);
+    });
+
+    // Everything the converter REFUSES. Two claims per row, and both matter: the
+    // block stays on the pre-existing `image_url` path (so this change regresses
+    // nothing), and that path reaches the wire WITHOUT throwing — degraded but
+    // alive, which is the whole premise of the narrow gate.
+    it.each(["audio/ogg", "audio/aac", "audio/webm", "audio/flac", "audio/mp4"])(
+      "keeps %s on the image_url path, which does not throw",
+      async (mimeType) => {
+        const aguiMessage: UserMessage = {
+          id: "boundary-audio-unsupported",
+          role: "user",
+          content: [
+            {
+              type: "audio",
+              source: { type: "data", value: "SGVsbG8=", mimeType },
+            } as AudioInputContent,
+          ],
+        };
+
+        const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+          (b) => b.type !== "text",
+        );
+        expect(emitted).toEqual([
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,SGVsbG8=` } },
+        ]);
+
+        const parts = await partsOnTheWire(emitted);
+        expect(parts[1]).toEqual({
+          type: "image_url",
+          image_url: { url: `data:${mimeType};base64,SGVsbG8=` },
+        });
+      },
+    );
+
+    it.each(["audio/ogg", "audio/webm"])(
+      "keeps legacy-binary %s on the image_url path",
+      async (mimeType) => {
+        const aguiMessage: UserMessage = {
+          id: "boundary-legacy-audio-unsupported",
+          role: "user",
+          content: [{ type: "binary", mimeType, data: "SGVsbG8=" } as BinaryInputContent],
+        };
+
+        const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+          (b) => b.type !== "text",
+        );
+        expect(emitted).toEqual([
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,SGVsbG8=` } },
+        ]);
+      },
+    );
+
+    // The normalization is audio-only. Documents carry their MIME type inside a
+    // `file_data` data URL where no enum constrains it, so rewriting one there
+    // would corrupt a working path.
+    it("does not rewrite a document MIME type", async () => {
+      const aguiMessage: UserMessage = {
+        id: "boundary-doc-mime-untouched",
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/vnd.ms-excel" },
+          } as DocumentInputContent,
+        ],
+      };
+
+      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
+        (b) => b.type !== "text",
+      );
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1]).toEqual({
+        type: "file",
+        file: {
+          file_data: "data:application/vnd.ms-excel;base64,JVBERi0xLjQK",
+          filename: "attachment.vnd.ms-excel",
+        },
+      });
+    });
+
     // The other half of the decision: the combinations this converter REFUSES to
     // announce as standard blocks, and the throw that is the reason why. If one
     // of these ever stops throwing, the corresponding row in
