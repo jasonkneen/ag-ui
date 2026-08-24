@@ -218,7 +218,7 @@ public static class AGUIChatMessageExtensions
             AGUIInputContentDataSource dataSource =>
                 new DataContent(Convert.FromBase64String(dataSource.Value), dataSource.MimeType),
             AGUIInputContentUrlSource urlSource =>
-                new UriContent(new Uri(urlSource.Value, UriKind.RelativeOrAbsolute), urlSource.MimeType),
+                CreateUriContent(mediaInput, urlSource),
             _ => throw new NotSupportedException(
                 $"Input content source type '{mediaInput.Source?.Type ?? "<null>"}' is not supported.")
         };
@@ -248,13 +248,59 @@ public static class AGUIChatMessageExtensions
         }
     }
 
+    private static UriContent CreateUriContent(
+        AGUIMediaInputContent mediaInput,
+        AGUIInputContentUrlSource urlSource)
+    {
+        var content = new UriContent(new Uri(urlSource.Value, UriKind.RelativeOrAbsolute), urlSource.MimeType);
+        if (urlSource.MimeType is null &&
+            string.Equals(content.MediaType, "application/octet-stream", StringComparison.OrdinalIgnoreCase))
+        {
+            content.MediaType = mediaInput switch
+            {
+                AGUIImageInputContent => "image/*",
+                AGUIAudioInputContent => "audio/*",
+                AGUIVideoInputContent => "video/*",
+                _ => content.MediaType
+            };
+        }
+
+        return content;
+    }
+
     /// <summary>
     /// Converts a sequence of <see cref="ChatMessage"/> instances to <see cref="AGUIMessage"/> instances.
     /// </summary>
     /// <param name="chatMessages">The chat messages to convert.</param>
     /// <returns>A sequence of <see cref="AGUIMessage"/> instances.</returns>
-    public static IEnumerable<AGUIMessage> AsAGUIMessages(this IEnumerable<ChatMessage> chatMessages)
+    public static IEnumerable<AGUIMessage> AsAGUIMessages(this IEnumerable<ChatMessage> chatMessages) =>
+        AsAGUIMessages(chatMessages, AGUIJsonSerializerContext.Default.Options);
+
+    /// <summary>
+    /// Converts a sequence of <see cref="ChatMessage"/> instances to <see cref="AGUIMessage"/> instances.
+    /// </summary>
+    /// <param name="chatMessages">The chat messages to convert.</param>
+    /// <param name="jsonSerializerOptions">The options used to serialize message content.</param>
+    /// <returns>A sequence of <see cref="AGUIMessage"/> instances.</returns>
+    public static IEnumerable<AGUIMessage> AsAGUIMessages(
+        this IEnumerable<ChatMessage> chatMessages,
+        JsonSerializerOptions jsonSerializerOptions)
     {
+#if NET7_0_OR_GREATER
+        ArgumentNullException.ThrowIfNull(chatMessages);
+        ArgumentNullException.ThrowIfNull(jsonSerializerOptions);
+#else
+        if (chatMessages is null)
+        {
+            throw new ArgumentNullException(nameof(chatMessages));
+        }
+
+        if (jsonSerializerOptions is null)
+        {
+            throw new ArgumentNullException(nameof(jsonSerializerOptions));
+        }
+#endif
+
         foreach (var message in chatMessages)
         {
             AGUIMessage aguiMessage;
@@ -278,6 +324,7 @@ public static class AGUIChatMessageExtensions
                                     MimeType = dataContent.MediaType ?? string.Empty
                                 },
                                 dataContent.AdditionalProperties,
+                                jsonSerializerOptions,
                                 dataContent.Name));
                             break;
                         case UriContent uriContent:
@@ -288,7 +335,8 @@ public static class AGUIChatMessageExtensions
                                     Value = uriContent.Uri?.ToString() ?? string.Empty,
                                     MimeType = uriContent.MediaType
                                 },
-                                uriContent.AdditionalProperties));
+                                uriContent.AdditionalProperties,
+                                jsonSerializerOptions));
                             break;
                         default:
                             parts.Add(new AGUITextInputContent { Text = content.ToString() ?? string.Empty });
@@ -321,7 +369,7 @@ public static class AGUIChatMessageExtensions
                                 Arguments = fc.Arguments is not null
                                     ? JsonSerializer.Serialize(
                                         fc.Arguments,
-                                        AGUIJsonSerializerContext.Default.GetTypeInfo(typeof(IDictionary<string, object?>))!)
+                                        jsonSerializerOptions.GetTypeInfo(typeof(IDictionary<string, object?>)))
                                     : string.Empty
                             }
                         });
@@ -352,7 +400,7 @@ public static class AGUIChatMessageExtensions
                     {
                         Id = functionResult.CallId,
                         ToolCallId = functionResult.CallId,
-                        Content = SerializeFunctionResult(functionResult, message.Text),
+                        Content = SerializeFunctionResult(functionResult, message.Text, jsonSerializerOptions),
                         // Restored here as well as at the end of the loop: this branch
                         // yields directly (one message per result) and so never reaches
                         // the shared Id/SubagentRunId assignment below.
@@ -391,6 +439,7 @@ public static class AGUIChatMessageExtensions
         string? mediaType,
         AGUIInputContentSource source,
         AdditionalPropertiesDictionary? additionalProperties,
+        JsonSerializerOptions jsonSerializerOptions,
         string? filename = null)
     {
         AGUIMediaInputContent content = GetMediaTypeKind(mediaType) switch
@@ -402,7 +451,10 @@ public static class AGUIChatMessageExtensions
         };
 
         content.Source = source;
-        content.Metadata = ConvertAdditionalProperties(additionalProperties, filename);
+        content.Metadata = ConvertAdditionalProperties(
+            additionalProperties,
+            filename,
+            jsonSerializerOptions);
         return content;
     }
 
@@ -439,7 +491,8 @@ public static class AGUIChatMessageExtensions
 
     private static JsonElement? ConvertAdditionalProperties(
         AdditionalPropertiesDictionary? additionalProperties,
-        string? filename)
+        string? filename,
+        JsonSerializerOptions jsonSerializerOptions)
     {
         if ((additionalProperties is null || additionalProperties.Count == 0) &&
             string.IsNullOrEmpty(filename))
@@ -450,7 +503,23 @@ public static class AGUIChatMessageExtensions
         if (additionalProperties?.Count == 1 &&
             additionalProperties.TryGetValue("metadata", out JsonElement preservedMetadata))
         {
-            return preservedMetadata.Clone();
+            if (string.IsNullOrEmpty(filename) ||
+                preservedMetadata.ValueKind != JsonValueKind.Object ||
+                preservedMetadata.TryGetProperty("filename", out _))
+            {
+                return preservedMetadata.Clone();
+            }
+
+            IDictionary<string, object?> mergedMetadata = new Dictionary<string, object?>();
+            foreach (var property in preservedMetadata.EnumerateObject())
+            {
+                mergedMetadata[property.Name] = property.Value.Clone();
+            }
+
+            mergedMetadata["filename"] = filename;
+            return JsonSerializer.SerializeToElement(
+                mergedMetadata,
+                jsonSerializerOptions.GetTypeInfo(typeof(IDictionary<string, object?>)));
         }
 
         IDictionary<string, object?> metadata = new Dictionary<string, object?>();
@@ -469,7 +538,7 @@ public static class AGUIChatMessageExtensions
 
         return JsonSerializer.SerializeToElement(
             metadata,
-            AGUIJsonSerializerContext.Default.GetTypeInfo(typeof(IDictionary<string, object?>))!);
+            jsonSerializerOptions.GetTypeInfo(typeof(IDictionary<string, object?>)));
     }
 
     private enum MediaTypeKind
@@ -493,7 +562,10 @@ public static class AGUIChatMessageExtensions
         string.Equals(role, AGUIRoles.Tool, StringComparison.OrdinalIgnoreCase) ? ChatRole.Tool :
         throw new InvalidOperationException($"Unknown chat role: {role}");
 
-    private static string SerializeFunctionResult(FunctionResultContent functionResult, string? fallbackText)
+    private static string SerializeFunctionResult(
+        FunctionResultContent functionResult,
+        string? fallbackText,
+        JsonSerializerOptions jsonSerializerOptions)
     {
         switch (functionResult.Result)
         {
@@ -504,9 +576,9 @@ public static class AGUIChatMessageExtensions
             case IDictionary<string, object?>:
                 return JsonSerializer.Serialize(
                     functionResult.Result,
-                    AGUIJsonSerializerContext.Default.GetTypeInfo(typeof(IDictionary<string, object?>))!);
+                    jsonSerializerOptions.GetTypeInfo(typeof(IDictionary<string, object?>)));
             case not null:
-                var resultTypeInfo = AGUIJsonSerializerContext.Default.GetTypeInfo(functionResult.Result.GetType());
+                var resultTypeInfo = jsonSerializerOptions.GetTypeInfo(functionResult.Result.GetType());
                 return resultTypeInfo is not null
                     ? JsonSerializer.Serialize(functionResult.Result, resultTypeInfo)
                     : functionResult.Result.ToString() ?? string.Empty;

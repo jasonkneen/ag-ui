@@ -166,6 +166,32 @@ public sealed class AGUIChatClientTest
         Assert.Equal("high", image.Metadata?.GetProperty("detail").GetString());
     }
 
+    [Fact]
+    public async Task GetStreamingResponse_MultimodalContent_UsesConfiguredSerializerOptionsForMetadata()
+    {
+        var transport = new CapturingTransport();
+        using var client = new AGUIChatClient(new()
+        {
+            Transport = transport,
+            JsonSerializerOptions = AGUIChatClientTestJsonSerializerContext.Default.Options
+        });
+        var dataContent = new DataContent(new byte[] { 1, 2, 3, 4 }, "image/png")
+        {
+            AdditionalProperties = new AdditionalPropertiesDictionary
+            {
+                ["provider"] = new CustomMetadata { QualityLevel = "high" }
+            }
+        };
+
+        await DrainAsync(client.GetStreamingResponseAsync(
+            [new ChatMessage(ChatRole.User, [dataContent])],
+            new ChatOptions()));
+
+        var userMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(transport.LastInput!.Messages));
+        var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(userMessage.Content));
+        Assert.Equal("high", image.Metadata?.GetProperty("provider").GetProperty("quality_level").GetString());
+    }
+
     // https://github.com/ag-ui-protocol/ag-ui/issues/2151
     // A caller-supplied RunAgentInput (via RawRepresentationFactory) must forward
     // Context and ForwardedProperties onto the request actually sent, alongside

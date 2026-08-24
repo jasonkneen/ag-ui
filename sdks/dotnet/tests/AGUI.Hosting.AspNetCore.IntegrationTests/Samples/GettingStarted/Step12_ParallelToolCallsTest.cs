@@ -23,7 +23,7 @@ namespace AGUI.Server.IntegrationTests.Samples.GettingStarted;
 ///
 /// Beyond the standard layer-2 baseline capture, this test validates the parallel-tool-result
 /// conversion contract in BOTH directions:
-///   * Outbound (<see cref="AGUIChatMessageExtensions.AsAGUIMessages"/>): a tool
+///   * Outbound (<see cref="AGUIChatMessageExtensions.AsAGUIMessages(IEnumerable{ChatMessage})"/>): a tool
 ///     <see cref="ChatMessage"/> carrying multiple <see cref="FunctionResultContent"/>s must
 ///     emit one <see cref="AGUIToolMessage"/> per result, each keyed on its call id.
 ///   * Inbound (<see cref="AGUIChatMessageExtensions.AsChatMessages"/>): consecutive AG-UI tool

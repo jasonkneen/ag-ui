@@ -130,7 +130,9 @@ var image = new AGUIImageInputContent
 When a server adapts an AG-UI request to Microsoft.Extensions.AI,
 `AGUIChatMessageExtensions.AsChatMessages()` maps data sources to `DataContent`
 and URL sources to `UriContent`. The source MIME type is preserved; when a URL
-source omits `mimeType`, `UriContent` infers it from the URL.
+source omits `mimeType`, `UriContent` infers it from the URL. If the URL does
+not have a recognized extension, the canonical discriminator supplies
+`image/*`, `audio/*`, or `video/*` so the modality is not lost.
 
 The complete `metadata` value is preserved under the MEAI content's
 `AdditionalProperties["metadata"]` key, including object-shaped values. For

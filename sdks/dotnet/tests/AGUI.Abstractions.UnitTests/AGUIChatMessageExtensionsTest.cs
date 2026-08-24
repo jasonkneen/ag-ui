@@ -635,6 +635,31 @@ public sealed class AGUIChatMessageExtensionsTest
         }
     }
 
+    [Theory]
+    [InlineData("image", "image/*")]
+    [InlineData("audio", "audio/*")]
+    [InlineData("video", "video/*")]
+    [InlineData("document", "application/octet-stream")]
+    public void AsChatMessages_CanonicalUrlWithoutMimeTypeOrExtension_PreservesModality(
+        string mediaType,
+        string expectedMimeType)
+    {
+        var message = new AGUIUserMessage
+        {
+            Content =
+            [
+                CreateMediaInputContent(
+                    mediaType,
+                    new AGUIInputContentUrlSource { Value = "https://example.com/content" })
+            ]
+        };
+
+        var chatMessage = Assert.Single(new[] { message }.AsChatMessages());
+        var content = Assert.IsType<UriContent>(Assert.Single(chatMessage.Contents));
+
+        Assert.Equal(expectedMimeType, content.MediaType);
+    }
+
     [Fact]
     public void AsChatMessages_CanonicalMediaWithNonObjectMetadata_PreservesMetadataValue()
     {
@@ -692,6 +717,46 @@ public sealed class AGUIChatMessageExtensionsTest
         Assert.Equal("high", media.Metadata?.GetProperty("providerHint").GetString());
         Assert.Equal("original", media.Metadata?.GetProperty("nested").GetProperty("quality").GetString());
         Assert.Equal("content.bin", media.Metadata?.GetProperty("filename").GetString());
+    }
+
+    [Fact]
+    public void AsAGUIMessages_DataContentWithPreservedMetadata_MergesNameAsFilename()
+    {
+        var content = new DataContent(System.Convert.FromBase64String("AQIDBA=="), "image/png")
+        {
+            Name = "content.png",
+            AdditionalProperties = new AdditionalPropertiesDictionary
+            {
+                ["metadata"] = JsonSerializer.SerializeToElement(new { detail = "high" })
+            }
+        };
+        var message = new ChatMessage(ChatRole.User, [content]);
+
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(aguiMessage.Content));
+
+        Assert.Equal("high", image.Metadata?.GetProperty("detail").GetString());
+        Assert.Equal("content.png", image.Metadata?.GetProperty("filename").GetString());
+        Assert.False(image.Metadata?.TryGetProperty("metadata", out _) ?? true);
+    }
+
+    [Fact]
+    public void AsAGUIMessages_DataContentWithPreservedFilename_DoesNotOverwriteFilename()
+    {
+        var content = new DataContent(System.Convert.FromBase64String("AQIDBA=="), "image/png")
+        {
+            Name = "content.png",
+            AdditionalProperties = new AdditionalPropertiesDictionary
+            {
+                ["metadata"] = JsonSerializer.SerializeToElement(new { filename = "original.png" })
+            }
+        };
+        var message = new ChatMessage(ChatRole.User, [content]);
+
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(aguiMessage.Content));
+
+        Assert.Equal("original.png", image.Metadata?.GetProperty("filename").GetString());
     }
 
     [Fact]
