@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+extract-changelog-entry.py
+
+Extracts one version's entry from a package's CHANGELOG.md, for the publish
+workflow to place into the GitHub Release body. The CHANGELOG files are the
+human-approved source of truth written on the release PR (see
+generate-changelog-entries.ts); this script only reads what was merged.
+
+Usage:
+  ./extract-changelog-entry.py <package-name> <version> [--demote N]
+
+The package's directory is resolved from scripts/release/release.config.json
+by exact package name. The entry is the block starting at the line
+`## <version>` (an em-dash date suffix is allowed) up to the next `## `
+heading or end of file, without the heading line itself.
+
+--demote N prefixes N extra '#' to every Markdown heading in the body
+(outside fenced code blocks), so the entry nests correctly under the release
+body's own headings.
+
+Exit codes (see the EXIT_* constants below):
+  0 - entry printed to stdout
+  1 - bad invocation (wrong argument count, non-integer --demote) or an
+      operational failure such as an unreadable config or an undecodable
+      changelog. Callers MUST NOT treat this as an absent entry: it means the
+      notes could not be read, not that none were approved.
+  3 - no entry (unknown package, missing CHANGELOG.md, or version absent);
+      nothing printed. Callers treat this as "no approved notes".
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# AGUI_RELEASE_REPO_ROOT exists for tests, which point it at a fixture tree
+# carrying its own scripts/release/release.config.json.
+REPO_ROOT = Path(
+    os.environ.get(
+        "AGUI_RELEASE_REPO_ROOT",
+        Path(__file__).resolve().parent.parent.parent,
+    )
+)
+CONFIG_PATH = REPO_ROOT / "scripts" / "release" / "release.config.json"
+
+# Callers (create-or-update-release.sh, reconcile-release.sh) branch on these,
+# so they are part of this script's contract rather than incidental numbers.
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NO_ENTRY = 3
+
+
+def resolve_package_path(name: str) -> Path | None:
+    with CONFIG_PATH.open("rb") as f:
+        config = json.load(f)
+    for scope_data in config["scopes"].values():
+        for pkg in scope_data["packages"]:
+            if pkg["name"] == name:
+                return REPO_ROOT / pkg["path"]
+    return None
+
+
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _scan_lines(content: str) -> list[tuple[str, bool]]:
+    """Yield (line, is_heading) with fence awareness across the WHOLE file:
+    a `## ` line inside a fenced code block (``` or ~~~; a fence closes only
+    on its own marker) is content, not a heading. Tracking must start at line
+    one — a `## <version>` inside a fenced example ABOVE the real entry must
+    not be mistaken for it."""
+    out: list[tuple[str, bool]] = []
+    open_fence: str | None = None
+    for line in content.split("\n"):
+        fence = _FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)
+            if open_fence is None:
+                open_fence = marker
+            elif open_fence == marker:
+                open_fence = None
+        is_heading = open_fence is None and not fence and line.startswith("## ")
+        out.append((line, is_heading))
+    return out
+
+
+def extract_entry(content: str, version: str) -> str | None:
+    """The heading may be either this pipeline's `## 0.7.0 — date` or the
+    Keep-a-Changelog `## [0.7.0] - date` that some hand-maintained files use."""
+    escaped = re.escape(version)
+    heading = re.compile(rf"^## \[?{escaped}\]?(?:\s|$)")
+    body: list[str] = []
+    in_entry = False
+    for line, is_heading in _scan_lines(content):
+        if not in_entry:
+            if is_heading and heading.match(line):
+                in_entry = True
+            continue
+        if is_heading:
+            break
+        body.append(line)
+    if not in_entry:
+        return None
+    return "\n".join(body).strip()
+
+
+def demote_headings(body: str, levels: int) -> str:
+    out: list[str] = []
+    open_fence: str | None = None
+    for line in body.split("\n"):
+        fence = _FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)
+            if open_fence is None:
+                open_fence = marker
+            elif open_fence == marker:
+                open_fence = None
+            out.append(line)
+            continue
+        if open_fence is None and re.match(r"^#{1,6} ", line):
+            out.append("#" * levels + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def main() -> int:
+    args = list(sys.argv[1:])
+    demote = 0
+    if "--demote" in args:
+        i = args.index("--demote")
+        try:
+            demote = int(args[i + 1])
+        except (IndexError, ValueError):
+            print("ERROR: --demote requires an integer", file=sys.stderr)
+            return EXIT_USAGE
+        del args[i : i + 2]
+    if len(args) != 2:
+        print(
+            f"Usage: {sys.argv[0]} <package-name> <version> [--demote N]",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    name, version = args
+    # An unreadable or malformed config is a fault, and it reaches an operator
+    # through a workflow annotation — so report it in one line rather than as
+    # an uncaught traceback.
+    try:
+        pkg_path = resolve_package_path(name)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: cannot read {CONFIG_PATH}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if pkg_path is None:
+        print(f"package '{name}' not found in release.config.json", file=sys.stderr)
+        return EXIT_NO_ENTRY
+
+    changelog = pkg_path / "CHANGELOG.md"
+    if not changelog.is_file():
+        print(f"no CHANGELOG.md at {changelog}", file=sys.stderr)
+        return EXIT_NO_ENTRY
+
+    # A changelog that exists but cannot be decoded is a FAULT, not an absent
+    # entry: exiting 3 here would tell the caller "no notes were approved" and
+    # publish that as fact.
+    try:
+        content = changelog.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"ERROR: cannot read {changelog}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    entry = extract_entry(content, version)
+    if entry is None:
+        print(f"no entry for {name} {version} in {changelog}", file=sys.stderr)
+        return EXIT_NO_ENTRY
+
+    if demote:
+        entry = demote_headings(entry, demote)
+    print(entry)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
