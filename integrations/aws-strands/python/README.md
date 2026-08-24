@@ -96,7 +96,9 @@ app = create_strands_app(
 )
 ```
 
-The same `auth` argument is accepted by `add_strands_fastapi_endpoint`. The ping endpoint is left unauthenticated so load balancer and AgentCore health probes keep working.
+The same `auth` argument is accepted by `add_strands_fastapi_endpoint` and is
+evaluated before JSON decoding or model validation. The ping endpoint is left
+unauthenticated so load balancer and AgentCore health probes keep working.
 
 Agent POST requests must send a JSON-compatible `Content-Type`: either
 `application/json` or an `application/*+json` media type. Requests with a

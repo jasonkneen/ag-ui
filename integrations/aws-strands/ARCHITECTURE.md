@@ -134,6 +134,7 @@ The transport layer is intentionally lightweight:
 
 - `add_strands_fastapi_endpoint(app, agent, path, auth=None)` registers a POST route that:
   - Accepts a `RunAgentInput` body.
+  - Evaluates the optional authentication dependency before parsing and validating that body.
   - Instantiates `EventEncoder` using the requester's `Accept` header to choose between SSE (`text/event-stream`) and newline-delimited JSON.
   - Streams whatever `StrandsAgent.run` yields, automatically encoding every AG-UI event.
   - Sends a `RunErrorEvent` with `code="ENCODING_ERROR"` if serialization fails mid-stream.

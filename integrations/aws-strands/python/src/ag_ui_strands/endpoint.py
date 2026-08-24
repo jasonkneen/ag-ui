@@ -1,11 +1,16 @@
 """FastAPI endpoint utilities for AWS Strands integration."""
 
+import json
 from typing import Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
+
 from ag_ui.core import RunAgentInput
 from ag_ui.encoder import EventEncoder
+
 from .agent import StrandsAgent
 
 
@@ -25,12 +30,46 @@ async def _require_json_content_type(request: Request) -> None:
         )
 
 
+async def _parse_run_agent_input(request: Request) -> RunAgentInput:
+    """Parse and validate the request body after route dependencies run."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body", exc.pos),
+                    "msg": "JSON decode error",
+                    "input": {},
+                    "ctx": {"error": exc.msg},
+                }
+            ],
+            body=exc.doc,
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="There was an error parsing the body",
+        ) from exc
+
+    try:
+        return RunAgentInput.model_validate(body)
+    except ValidationError as exc:
+        errors = []
+        for error in exc.errors():
+            request_error = dict(error)
+            request_error["loc"] = ("body", *error["loc"])
+            errors.append(request_error)
+        raise RequestValidationError(errors, body=body) from exc
+
+
 def add_strands_fastapi_endpoint(
     app: FastAPI,
     agent: StrandsAgent,
     path: str,
+    *,
     auth: Optional[Callable[..., Any]] = None,
-    **kwargs
 ) -> None:
     """Add a Strands agent endpoint to FastAPI app.
 
@@ -40,16 +79,32 @@ def add_strands_fastapi_endpoint(
         path: Path for the agent endpoint
         auth: Optional FastAPI dependency callable used to authenticate requests.
             It should raise ``fastapi.HTTPException`` to reject a request. The
-            endpoint is unauthenticated when this is ``None``.
+            endpoint is unauthenticated when this is ``None``. Authentication
+            runs before the request body is parsed and validated.
     """
 
-    dependencies = [Depends(_require_json_content_type)]
+    dependencies = []
     if auth is not None:
         dependencies.append(Depends(auth))
+    dependencies.append(Depends(_require_json_content_type))
 
-    @app.post(path, dependencies=dependencies)
-    async def strands_endpoint(input_data: RunAgentInput, request: Request):
+    @app.post(
+        path,
+        dependencies=dependencies,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": RunAgentInput.model_json_schema(by_alias=True)
+                    }
+                },
+            }
+        },
+    )
+    async def strands_endpoint(request: Request):
         """AWS Strands agent endpoint."""
+        input_data = await _parse_run_agent_input(request)
         accept_header = request.headers.get("accept")
         encoder = EventEncoder(accept=accept_header)
         

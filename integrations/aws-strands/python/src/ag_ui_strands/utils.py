@@ -284,10 +284,11 @@ def create_strands_app(
                 app = create_strands_app(agent, auth=require_token)
 
             The ping endpoint stays unauthenticated so health probes keep working.
-        allow_methods: CORS methods to allow (default: ``["*"]`` for backward
-            compatibility).
-        allow_headers: CORS request headers to allow (default: ``["*"]`` for
-            backward compatibility).
+        allow_methods: CORS methods to allow. ``None`` defaults to ``["*"]``
+            for backward compatibility; ``[]`` allows none.
+        allow_headers: CORS request headers to allow. ``None`` defaults to
+            ``["*"]`` for backward compatibility; ``[]`` allows none beyond
+            CORS-safelisted request headers.
         cors_enabled: Explicit CORS switch. Pass ``False`` to add no CORS
             middleware, even if *origins* is supplied. Pass ``True`` to retain
             CORS explicitly; when *origins* is empty, this uses ``["*"]`` without
@@ -318,8 +319,8 @@ def create_strands_app(
             CORSMiddleware,
             allow_origins=cors_origins,
             allow_credentials=bool(origins) and not is_wildcard,
-            allow_methods=allow_methods or ["*"],
-            allow_headers=allow_headers or ["*"],
+            allow_methods=allow_methods if allow_methods is not None else ["*"],
+            allow_headers=allow_headers if allow_headers is not None else ["*"],
         )
 
     # Add the agent endpoint
