@@ -1213,6 +1213,89 @@ class TestProviderBoundary(unittest.TestCase):
         # only while the derivation keeps working.
         self.assertEqual([str(w.message) for w in caught], [])
 
+    def test_mime_less_document_names_its_bytes_octet_stream(self):
+        """A document with no usable MIME type still has to name one.
+
+        The translator supplies no default: it interpolates whatever `mime_type`
+        it is handed straight into the data URL, so an empty one reached the
+        provider as `data:;base64,…` — an omitted mediatype, which RFC 2397 §2
+        DEFINES as `text/plain;charset=US-ASCII`. The part did not lack a type,
+        it claimed the wrong one, and a PDF's bytes went out asserting they were
+        ASCII text.
+
+        Mirrors the TypeScript `names a document's bytes octet-stream at the
+        provider when it has an %s`. That adapter parametrizes an ABSENT
+        `mimeType` alongside the empty one; there is no absent case to
+        parametrize here, because `InputContentDataSource.mime_type` is a
+        required `str` that pydantic validates at this boundary — so the empty
+        string is the only spelling of "no MIME type" that can reach this
+        converter through the public API.
+        """
+        block = self._emit(
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(type="data", value="aGk=", mime_type=""),
+            )
+        )
+
+        self.assertEqual(
+            self._provider_payload(block),
+            {
+                "type": "file",
+                "file": {
+                    # NOT `data:;base64,aGk=`.
+                    "file_data": "data:application/octet-stream;base64,aGk=",
+                    # The MIME type and the derived filename now agree about what
+                    # the file is, which is the property that makes the round trip
+                    # exact.
+                    "filename": "attachment.bin",
+                },
+            },
+        )
+
+    def test_mime_less_image_is_not_retyped_as_a_document(self):
+        """The `image_url` fallback path takes the OTHER answer, deliberately.
+
+        `application/octet-stream` reads back as a DOCUMENT through
+        `_agui_media_type_for_mime_type`, so substituting it on this path would
+        silently retype a MIME-less image as a document on the next
+        MESSAGES_SNAPSHOT. An omitted mediatype reads back as an image, which is
+        what the item already was.
+
+        Mirrors the TypeScript ``does not put the text `undefined` in the data
+        URL for %s with no MIME type``.
+        """
+        cases = [
+            (
+                "typed image content",
+                ImageInputContent(
+                    type="image",
+                    source=InputContentDataSource(
+                        type="data", value="aGk=", mime_type=""
+                    ),
+                ),
+            ),
+            (
+                "legacy binary content",
+                BinaryInputContent(type="binary", mime_type="", data="aGk="),
+            ),
+        ]
+
+        for name, item in cases:
+            with self.subTest(name):
+                block = self._emit(item)
+
+                self.assertEqual(
+                    self._provider_payload(block),
+                    {"type": "image_url", "image_url": {"url": "data:;base64,aGk="}},
+                )
+
+                # And the round trip keeps it an IMAGE rather than promoting it
+                # to the document the octet-stream substitution would have made
+                # of it.
+                [returned] = convert_langchain_multimodal_to_agui([block])
+                self.assertIsInstance(returned, ImageInputContent)
+
     def test_every_filename_situation_reaches_the_provider(self):
         """The four filename situations an attachment can be in, each carried all
         the way to the payload.

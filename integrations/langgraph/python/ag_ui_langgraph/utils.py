@@ -725,9 +725,28 @@ def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[
     translator, so the caller keeps the pre-existing ``image_url`` form.
 
     Audio is the only modality whose MIME type is rewritten: the type that goes on
-    the wire is the normalized spelling, not the one the client sent. Documents
-    pass theirs through untouched, because `file.file_data` carries it inside a
-    data URL where no enum constrains it.
+    the wire is the normalized spelling, not the one the client sent. A document
+    passes its own through untouched, because `file.file_data` carries it inside a
+    data URL where no enum constrains it — but a document with NO usable MIME type
+    still has to name one, because the translator interpolates whatever it is
+    given straight into that URL: measured on langchain-core 1.2.13, a `file`
+    block whose `mime_type` is absent or empty reaches the provider as
+    `file.file_data: "data:;base64,<payload>"`. That is not a part with a missing
+    type, it is a part with the WRONG one — RFC 2397 §2 defines an omitted
+    mediatype as `text/plain;charset=US-ASCII`, so a PDF's bytes go out asserting
+    they are ASCII text.
+
+    `application/octet-stream` is this file's existing answer for unidentified
+    bytes, and the two legs are inverses, so it applies here rather than merely
+    being available: `_agui_media_from_standard_block` already normalizes a
+    MIME-less inbound base64 block to exactly this string, and
+    `_FILENAME_EXTENSIONS` already maps it to the `bin` that `_derive_filename`
+    independently derives for a MIME-less document. Without it the same attachment
+    is `application/octet-stream` inbound and `""` outbound; with it the round trip
+    is exact and the emitted MIME type and the emitted filename finally agree about
+    what the file is.
+
+    NOT applied on the `image_url` fallback path — see `_media_source_to_url`.
 
     Mirrors `standardBlockTypeFor` in the TypeScript adapter.
     """
@@ -736,7 +755,7 @@ def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[
     if block_type == "audio":
         normalized = _normalized_audio_mime_type(mime_type)
         return ("audio", normalized) if normalized else None
-    return (block_type, mime_type)
+    return (block_type, mime_type or "application/octet-stream")
 
 
 def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSource]) -> str | None:
@@ -744,6 +763,16 @@ def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSo
 
     For data sources, constructs a ``data:<mime>;base64,<value>`` URL.
     For URL sources, returns the URL directly.
+
+    A MIME-less data source becomes ``data:;base64,…`` — an omitted mediatype —
+    and deliberately NOT the ``application/octet-stream`` that
+    `_standard_block_for` substitutes for a document. This is the ``image_url``
+    fallback path, which carries every modality the standard-block path refuses,
+    and `_agui_media_type_for_mime_type` reads the MIME type back out of this very
+    URL to recover that modality: ``application/octet-stream`` reads back as a
+    DOCUMENT, so substituting it here would silently retype a MIME-less image as a
+    document on the next MESSAGES_SNAPSHOT. An omitted mediatype reads back as an
+    image, which is what the item already was.
     """
     if isinstance(source, InputContentDataSource):
         return f"data:{source.mime_type};base64,{source.value}"
