@@ -183,6 +183,70 @@ function standardBlockTypeFor(
 }
 
 /**
+ * The file extension for a MIME type whose SUBTYPE IS NOT ITS EXTENSION.
+ *
+ * Only these need an entry. A subtype that already is the extension —
+ * `application/pdf`, `text/csv`, `application/json`, `text/html`,
+ * `application/zip`, `image/png` — falls through to the derivation in
+ * {@link deriveFilename} and comes out right without being listed here, so
+ * listing it would only be a second place to keep correct.
+ *
+ * Scope is "what an attachment realistically arrives as": office documents,
+ * the plain-text family, and the audio/image/video types whose subtype is a
+ * famous mismatch (`audio/mpeg` is mp3, `image/jpeg` is jpg). Deliberately NOT
+ * covered, because the generic fallback already answers them or because no
+ * answer is better than a guessed one: archive and compression formats beyond
+ * their own subtype, `application/x-*` experimental types, and unregistered
+ * vendor types outside the office suites.
+ *
+ * A `Map` rather than an object literal, for the reason spelled out on
+ * {@link AGUI_MEDIA_TYPES}: the key is a client-supplied MIME string, and an
+ * object literal answers `"constructor"` with an inherited function.
+ */
+const FILENAME_EXTENSIONS = new Map<string, string>([
+  // Text
+  ["text/plain", "txt"],
+  ["text/markdown", "md"],
+  ["text/x-markdown", "md"],
+  ["text/rtf", "rtf"],
+  ["application/rtf", "rtf"],
+  ["text/xml", "xml"],
+  ["application/xml", "xml"],
+  // Office
+  ["application/msword", "doc"],
+  ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"],
+  ["application/vnd.ms-excel", "xls"],
+  ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"],
+  ["application/vnd.ms-powerpoint", "ppt"],
+  ["application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"],
+  ["application/vnd.oasis.opendocument.text", "odt"],
+  ["application/vnd.oasis.opendocument.spreadsheet", "ods"],
+  ["application/vnd.oasis.opendocument.presentation", "odp"],
+  // The canonical "unknown bytes" type, and the generic fallback's answer too.
+  ["application/octet-stream", "bin"],
+  // Audio. Reachable here only via a document item carrying an audio MIME type
+  // — the audio path emits an `audio` block, which needs no filename — but the
+  // two derivations must not disagree about what `audio/mpeg` is called.
+  ["audio/mpeg", "mp3"],
+  ["audio/x-wav", "wav"],
+  ["audio/wave", "wav"],
+  ["audio/vnd.wave", "wav"],
+  ["audio/mp4", "m4a"],
+  ["audio/x-m4a", "m4a"],
+  // Image / video, same "mislabelled document" reachability.
+  ["image/jpeg", "jpg"],
+  ["image/svg+xml", "svg"],
+  ["image/x-icon", "ico"],
+  ["image/vnd.microsoft.icon", "ico"],
+  ["video/quicktime", "mov"],
+  ["video/x-msvideo", "avi"],
+  ["video/x-matroska", "mkv"],
+]);
+
+/** An extension a filename can plausibly end in: short and alphanumeric. */
+const PLAUSIBLE_EXTENSION = /^[a-z0-9]{1,8}$/;
+
+/**
  * A filename for a `file` block whose AG-UI item did not carry one.
  *
  * Not cosmetic. `@langchain/openai` THROWS on a file block with no filename
@@ -191,10 +255,47 @@ function standardBlockTypeFor(
  * support has to carry one or it is not actually supported. Python only warns
  * and omits the key, but both runtimes emit the same block, so both substitute
  * the same derived name.
+ *
+ * THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough to look
+ * like a rule — `application/pdf`, `text/csv` — and then does not:
+ * `text/plain` is not `.plain`, `audio/mpeg` is not `.mpeg`, and
+ * `application/vnd.api+json` is not `.vnd.api`. So the subtype is a LAST resort
+ * here, taken only when it survives being checked:
+ *
+ *   1. {@link FILENAME_EXTENSIONS} answers the types whose subtype is wrong.
+ *   2. A structured-syntax suffix (RFC 6838 §4.2.8) names the underlying
+ *      format, so `+json` / `+xml` wins over the vendor tree in front of it.
+ *   3. Otherwise the registration-tree prefix (`vnd.`, `prs.`, `x-`, `x.`) is
+ *      stripped, because it is a namespace and not part of any extension.
+ *   4. What is left has to LOOK like an extension. `ms-excel` and
+ *      `openxmlformats-officedocument.wordprocessingml.document` do not, and a
+ *      dot inside the "extension" turns `attachment.vnd.ms-excel` into a file
+ *      apparently named `attachment.vnd`. Anything implausible becomes `.bin`,
+ *      which is what an unidentified byte stream is called.
+ *
+ * MIME types are case-insensitive (RFC 2045 §5.1), so the lookup is case-folded.
  */
 function deriveFilename(mimeType: string | undefined): string {
-  const subtype = (mimeType ?? "").split("/")[1]?.split(";")[0]?.split("+")[0]?.trim();
-  return subtype ? `attachment.${subtype}` : "attachment";
+  const base = (mimeType ?? "").split(";")[0].trim().toLowerCase();
+
+  let extension = FILENAME_EXTENSIONS.get(base);
+  if (!extension) {
+    // Everything after the FIRST slash, not `split("/")[1]`. A malformed
+    // `a/b/c` has no subtype, and taking the middle segment would invent one —
+    // and invent a different one than Python's `partition("/")`, which is the
+    // divergence this file exists to avoid.
+    const slash = base.indexOf("/");
+    let subtype = slash < 0 ? "" : base.slice(slash + 1);
+    const plus = subtype.lastIndexOf("+");
+    if (plus >= 0) {
+      subtype = subtype.slice(plus + 1);
+    } else {
+      subtype = subtype.replace(/^(?:vnd\.|prs\.|x-|x\.)/, "");
+    }
+    extension = PLAUSIBLE_EXTENSION.test(subtype) ? subtype : "bin";
+  }
+
+  return `attachment.${extension}`;
 }
 
 /**
@@ -409,8 +510,24 @@ function mediaSourceToUrl(
  */
 function filenameFromMetadata(metadata: unknown): string | undefined {
   if (metadata && typeof metadata === "object") {
-    const filename = (metadata as { filename?: unknown }).filename;
-    if (typeof filename === "string" && filename) return filename;
+    return firstNonEmptyString((metadata as { filename?: unknown }).filename);
+  }
+  return undefined;
+}
+
+/**
+ * The first candidate that is a usable filename, or `undefined`.
+ *
+ * "Usable" excludes the EMPTY STRING as well as null/undefined and non-strings.
+ * A supplied-but-empty filename is not a name the client chose, it is a name the
+ * client failed to send, and treating it as a value is what makes a `??` chain
+ * shadow the fallback behind it — the divergence from Python this consolidates
+ * away. Every caller reads keys that arrive off the wire, so the type check is
+ * not redundant with the declared types.
+ */
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate) return candidate;
   }
   return undefined;
 }
@@ -435,7 +552,12 @@ function standardMediaBlock(
     data,
     mime_type: mimeType,
   };
-  const name = filename ?? (type === "file" ? deriveFilename(mimeType) : undefined);
+  // `||`, not `??`. A supplied filename arrives off the wire and can be the
+  // EMPTY STRING; `??` would accept it, skip the fallback, and then fail the
+  // `if (name)` below — emitting a file block with no filename at all, which is
+  // the one thing `@langchain/openai` throws on. An empty name is an absent
+  // name. Python's `_standard_media_block` reads it the same way.
+  const name = filename || (type === "file" ? deriveFilename(mimeType) : undefined);
   if (name) block.metadata = { filename: name };
   return block;
 }
@@ -489,7 +611,18 @@ function readIncomingMediaBlock(item: IncomingMediaBlock): {
   mimeType?: string;
   filename?: string;
 } | null {
-  const filename = item.metadata?.filename ?? item.metadata?.name ?? item.metadata?.title ?? item.filename;
+  // A SCAN FOR THE FIRST NON-EMPTY STRING, not a `??` chain. `??` falls through
+  // on null/undefined only, so `metadata: { filename: "", name: "report.pdf" }`
+  // would stop at the empty string and throw away the name `metadata.name` was
+  // carrying. Every one of these keys arrives off the wire, so a non-string is
+  // possible too and is no more usable than an empty one. Mirrors Python's
+  // `_incoming_block_filename`, which already read it this way.
+  const filename = firstNonEmptyString(
+    item.metadata?.filename,
+    item.metadata?.name,
+    item.metadata?.title,
+    item.filename
+  );
   const mimeType = item.mimeType ?? item.mime_type;
   const inlineData = item.data ?? item.base64;
 
@@ -502,6 +635,38 @@ function readIncomingMediaBlock(item: IncomingMediaBlock): {
   // `fileId`-only blocks reference provider-side storage with no bytes and no
   // URL, and AG-UI's typed content classes have nowhere to put that.
   return null;
+}
+
+/**
+ * An inbound filename, unless this adapter is the one that made it up.
+ *
+ * {@link deriveFilename} fabricates a name for every filename-less document on
+ * the way out, because the provider translator throws without one. That name
+ * comes back on the return leg, and writing it into AG-UI `metadata.filename`
+ * would make an invented name INDISTINGUISHABLE from one the user typed — the
+ * thread would then assert, permanently, that the user attached a file called
+ * `attachment.pdf`. It also freezes the guess: a supplied name always wins over
+ * derivation, so once the fabricated one is in the thread, every later send
+ * keeps it even after the derivation is corrected.
+ *
+ * There is no marker to test, and a marker on the wire would be a marker in the
+ * provider request. What there is instead is determinism: the fabricated name is
+ * exactly `deriveFilename(mime_type)` and nothing else ever is, so recomputing it
+ * identifies it. A user who genuinely named their PDF `attachment.pdf` loses
+ * nothing that reaches a provider — the outbound leg derives that same string
+ * back for them on the next send.
+ *
+ * Only `file` blocks are checked, because only `file` blocks are ever given a
+ * derived name.
+ */
+function suppliedFilename(
+  blockType: string,
+  filename: string | undefined,
+  mimeType: string | undefined
+): string | undefined {
+  if (!filename) return undefined;
+  if (blockType === "file" && filename === deriveFilename(mimeType)) return undefined;
+  return filename;
 }
 
 /**
@@ -550,7 +715,8 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
         continue;
       }
 
-      const metadata = incoming.filename ? { filename: incoming.filename } : undefined;
+      const filename = suppliedFilename(item.type, incoming.filename, incoming.mimeType);
+      const metadata = filename ? { filename } : undefined;
 
       if (incoming.isUrl) {
         aguiContent.push({

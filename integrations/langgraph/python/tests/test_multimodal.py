@@ -405,6 +405,135 @@ class TestMultimodalConversion(unittest.TestCase):
             },
         )
 
+    def test_derived_filename_extensions(self):
+        """THE SUBTYPE IS NOT THE EXTENSION.
+
+        It coincides with one often enough that `mime.split("/")[1]` looks like a
+        rule, and the rows below are where that rule was wrong: `text/plain` is
+        not `.plain`, `audio/mpeg` is not `.mpeg`, `application/vnd.api+json` is
+        not `.vnd.api`. The passthrough rows are here so the fix cannot be a
+        lookup table that forgot the common case.
+
+        Every row is duplicated in the TypeScript suite (`derives %s as %s`). A
+        row that disagrees across the two is an attachment that reaches the
+        provider under a different name depending on which runtime sent it — the
+        class of bug this branch closes.
+        """
+        cases = [
+            # Corrected by the extension map.
+            ("text/plain", "attachment.txt"),
+            ("text/markdown", "attachment.md"),
+            ("audio/mpeg", "attachment.mp3"),
+            ("application/msword", "attachment.doc"),
+            ("application/vnd.ms-excel", "attachment.xls"),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "attachment.docx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "attachment.xlsx",
+            ),
+            ("image/jpeg", "attachment.jpg"),
+            # Structured-syntax suffix: the format is what follows the `+`.
+            ("application/vnd.api+json", "attachment.json"),
+            ("application/ld+json", "attachment.json"),
+            # Already right from the subtype, and must stay right.
+            ("application/pdf", "attachment.pdf"),
+            ("text/csv", "attachment.csv"),
+            ("application/json", "attachment.json"),
+            ("text/html", "attachment.html"),
+            ("application/zip", "attachment.zip"),
+            # Nothing plausible to extract: an unidentified byte stream is `.bin`.
+            ("application/octet-stream", "attachment.bin"),
+            ("application/x-weird-thing", "attachment.bin"),
+            ("application/vnd.acme.internal-thing", "attachment.bin"),
+            # Malformed. `a/b/c` has no subtype, and the middle segment is not
+            # one — the two runtimes must not disagree about that.
+            ("application/pdf/extra", "attachment.bin"),
+            ("notamimetype", "attachment.bin"),
+            # MIME types are case-insensitive (RFC 2045 §5.1), and parameters
+            # are not part of the type's identity.
+            ("TEXT/PLAIN", "attachment.txt"),
+            ("text/plain; charset=utf-8", "attachment.txt"),
+        ]
+
+        for mime_type, expected in cases:
+            with self.subTest(mime_type=mime_type):
+                [block] = convert_agui_multimodal_to_langchain([
+                    DocumentInputContent(
+                        type="document",
+                        source=InputContentDataSource(
+                            type="data", value="JVBERi0xLjQK", mime_type=mime_type
+                        ),
+                    )
+                ])
+                self.assertEqual(block["filename"], expected)
+
+    def test_empty_supplied_filename_is_treated_as_absent(self):
+        """`""` is not a name the client chose, it is one it failed to send.
+
+        Reading it as a value skips the derivation and emits a file block with NO
+        filename — the one shape `@langchain/openai` throws on, which is why the
+        mirrored TypeScript adapter had a dead run here. Both entry points are
+        pinned: the typed `metadata.filename` and the legacy item's top-level
+        `filename`.
+        """
+        typed, legacy = convert_agui_multimodal_to_langchain([
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                ),
+                metadata={"filename": ""},
+            ),
+            BinaryInputContent(
+                type="binary",
+                mime_type="application/pdf",
+                data="JVBERi0xLjQK",
+                filename="",
+            ),
+        ])
+
+        self.assertEqual(typed["filename"], "attachment.pdf")
+        self.assertEqual(legacy["filename"], "attachment.pdf")
+
+    def test_derived_filename_does_not_come_back_as_user_supplied(self):
+        """The outbound leg INVENTS a name for every filename-less document,
+        because the provider translator needs one.
+
+        If the return leg writes that name into AG-UI `metadata.filename`, the
+        thread now asserts the user attached a file called `attachment.txt` — and
+        because a supplied name always beats derivation, the invention is frozen
+        into every later send. The invented name is exactly
+        `_derive_filename(mime_type)`, so recomputing it identifies it. A REAL
+        name is untouched, which is the other half.
+        """
+        emitted = convert_agui_multimodal_to_langchain([
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="aGk=", mime_type="text/plain"
+                ),
+            ),
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="aGk=", mime_type="text/plain"
+                ),
+                metadata={"filename": "notes.txt"},
+            ),
+        ])
+
+        # Pinned: what goes OUT still carries the derived name, because dropping
+        # it there is the failure this whole path exists to avoid.
+        self.assertEqual(emitted[0]["filename"], "attachment.txt")
+
+        derived, supplied = convert_langchain_multimodal_to_agui(emitted)
+        self.assertIsNone(derived.metadata)
+        self.assertEqual(derived.source.value, "aGk=")
+        self.assertEqual(supplied.metadata, {"filename": "notes.txt"})
+
     def test_agui_document_filename_reaches_the_file_block(self):
         """A document's `metadata.filename` lands on the file block.
 
@@ -1084,6 +1213,74 @@ class TestProviderBoundary(unittest.TestCase):
         # only while the derivation keeps working.
         self.assertEqual([str(w.message) for w in caught], [])
 
+    def test_every_filename_situation_reaches_the_provider(self):
+        """The four filename situations an attachment can be in, each carried all
+        the way to the payload.
+
+        langchain-core only WARNS about a nameless file block, so the assertion
+        here is on the name that lands — but the mirrored TypeScript translator
+        THROWS on the same block, which is what makes this load-bearing rather
+        than cosmetic. Mirrored by the TypeScript
+        `reaches OpenAI with a usable filename when it is %s`.
+        """
+        cases = [
+            (
+                "supplied",
+                DocumentInputContent(
+                    type="document",
+                    source=InputContentDataSource(
+                        type="data", value="aGk=", mime_type="application/pdf"
+                    ),
+                    metadata={"filename": "real.pdf"},
+                ),
+                "real.pdf",
+            ),
+            (
+                "empty-string supplied, typed",
+                DocumentInputContent(
+                    type="document",
+                    source=InputContentDataSource(
+                        type="data", value="aGk=", mime_type="application/pdf"
+                    ),
+                    metadata={"filename": ""},
+                ),
+                "attachment.pdf",
+            ),
+            (
+                "empty-string supplied, legacy binary",
+                BinaryInputContent(
+                    type="binary", mime_type="application/pdf", data="aGk=", filename=""
+                ),
+                "attachment.pdf",
+            ),
+            (
+                "absent with a known MIME type",
+                DocumentInputContent(
+                    type="document",
+                    source=InputContentDataSource(
+                        type="data", value="aGk=", mime_type="text/plain"
+                    ),
+                ),
+                "attachment.txt",
+            ),
+            (
+                "absent with an unknown MIME type",
+                DocumentInputContent(
+                    type="document",
+                    source=InputContentDataSource(
+                        type="data", value="aGk=", mime_type="application/x-weird-thing"
+                    ),
+                ),
+                "attachment.bin",
+            ),
+        ]
+
+        for name, item, filename in cases:
+            with self.subTest(situation=name):
+                payload = self._provider_payload(self._emit(item))
+                self.assertEqual(payload["type"], "file")
+                self.assertEqual(payload["file"]["filename"], filename)
+
     def test_emitted_audio_block_translates_for_openai(self):
         block = self._emit(
             AudioInputContent(
@@ -1309,7 +1506,12 @@ class TestProviderBoundary(unittest.TestCase):
                 "type": "file",
                 "file": {
                     "file_data": "data:application/vnd.ms-excel;base64,JVBERi0xLjQK",
-                    "filename": "attachment.vnd.ms-excel",
+                    # The MIME TYPE is untouched — `application/vnd.ms-excel`,
+                    # verbatim, inside the data URL. The FILENAME is a separate
+                    # decision: `.xls` is this type's extension, and
+                    # `attachment.vnd.ms-excel` named a file `attachment` with
+                    # an extension `.vnd`.
+                    "filename": "attachment.xls",
                 },
             },
         )
@@ -1673,6 +1875,35 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
 
         self.assertEqual(by_name.metadata, {"filename": "named.pdf"})
         self.assertEqual(by_title.metadata, {"filename": "titled.pdf"})
+
+    def test_empty_filename_falls_through_to_name_and_title(self):
+        """An EMPTY `metadata.filename` must not shadow the spellings behind it.
+
+        This reader always scanned for the first non-empty string; the mirrored
+        TypeScript adapter used a `??` chain, which falls through on
+        null/undefined only, so an empty `filename` stopped it dead and threw
+        away the name `metadata.name` was carrying. Pinned on both sides so they
+        cannot drift apart again.
+        """
+        by_name, by_title = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "source_type": "base64",
+                "data": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "metadata": {"filename": "", "name": "report.pdf", "title": "Q2"},
+            },
+            {
+                "type": "file",
+                "source_type": "base64",
+                "data": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "metadata": {"filename": "", "name": "", "title": "from-title.pdf"},
+            },
+        ])
+
+        self.assertEqual(by_name.metadata, {"filename": "report.pdf"})
+        self.assertEqual(by_title.metadata, {"filename": "from-title.pdf"})
 
     def test_base64_block_without_mime_type_is_not_dropped(self):
         """AG-UI's data source REQUIRES a MIME type; a malformed block degrades

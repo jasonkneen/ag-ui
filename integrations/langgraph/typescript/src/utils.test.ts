@@ -342,6 +342,97 @@ describe("Multimodal Message Conversion", () => {
       });
     });
 
+    // THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough that
+    // `mime.split("/")[1]` looks like a rule, and the rows below are where that
+    // rule was wrong: `text/plain` is not `.plain`, `audio/mpeg` is not `.mpeg`,
+    // `application/vnd.api+json` is not `.vnd.api`. The passthrough rows are
+    // here so the fix cannot be a lookup table that forgot the common case.
+    //
+    // Every row is duplicated in the Python suite
+    // (`test_derived_filename_extensions`). A row that disagrees across the two
+    // is an attachment that reaches the provider under a different name
+    // depending on which runtime sent it — the class of bug this branch closes.
+    it.each([
+      // Corrected by the extension map.
+      ["text/plain", "attachment.txt"],
+      ["text/markdown", "attachment.md"],
+      ["audio/mpeg", "attachment.mp3"],
+      ["application/msword", "attachment.doc"],
+      ["application/vnd.ms-excel", "attachment.xls"],
+      [
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "attachment.docx",
+      ],
+      ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "attachment.xlsx"],
+      ["image/jpeg", "attachment.jpg"],
+      // Structured-syntax suffix: the format is what follows the `+`.
+      ["application/vnd.api+json", "attachment.json"],
+      ["application/ld+json", "attachment.json"],
+      // Already right from the subtype, and must stay right.
+      ["application/pdf", "attachment.pdf"],
+      ["text/csv", "attachment.csv"],
+      ["application/json", "attachment.json"],
+      ["text/html", "attachment.html"],
+      ["application/zip", "attachment.zip"],
+      // Nothing plausible to extract: an unidentified byte stream is `.bin`.
+      ["application/octet-stream", "attachment.bin"],
+      ["application/x-weird-thing", "attachment.bin"],
+      ["application/vnd.acme.internal-thing", "attachment.bin"],
+      // Malformed. `a/b/c` has no subtype, and the middle segment is not one —
+      // the two runtimes must not disagree about that.
+      ["application/pdf/extra", "attachment.bin"],
+      ["notamimetype", "attachment.bin"],
+      // MIME types are case-insensitive (RFC 2045 §5.1), and parameters are not
+      // part of the type's identity.
+      ["TEXT/PLAIN", "attachment.txt"],
+      ["text/plain; charset=utf-8", "attachment.txt"],
+    ])("derives %s as %s", (mimeType, expected) => {
+      const content = aguiMessagesToLangChain([
+        {
+          id: "test-derive",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "JVBERi0xLjQK", mimeType },
+            } as DocumentInputContent,
+          ],
+        } as UserMessage,
+      ])[0].content as Array<any>;
+
+      expect(content[0].metadata).toEqual({ filename: expected });
+    });
+
+    it("treats an empty supplied filename as absent, not as a name", () => {
+      // `""` is not a name the client chose, it is a name the client failed to
+      // send. Reading it with `??` accepts it, skips the derivation, and emits a
+      // file block with NO filename — which is the one shape
+      // `@langchain/openai` throws on. Both entry points are pinned: the typed
+      // `metadata.filename` and the legacy item's top-level `filename`.
+      const content = aguiMessagesToLangChain([
+        {
+          id: "test-empty-filename",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+              metadata: { filename: "" },
+            } as DocumentInputContent,
+            {
+              type: "binary",
+              mimeType: "application/pdf",
+              data: "JVBERi0xLjQK",
+              filename: "",
+            } as BinaryInputContent,
+          ],
+        } as UserMessage,
+      ])[0].content as Array<any>;
+
+      expect(content[0].metadata).toEqual({ filename: "attachment.pdf" });
+      expect(content[1].metadata).toEqual({ filename: "attachment.pdf" });
+    });
+
     it("should keep a document a document across the LangChain round trip", () => {
       // This is the MESSAGES_SNAPSHOT path. A block kind the return leg does not
       // understand is an attachment that disappears from the thread on the next
@@ -1064,6 +1155,52 @@ describe("Multimodal Message Conversion", () => {
       });
     });
 
+    // The four filename situations an attachment can be in, each one carried all
+    // the way to the wire. This is the evidence that the value is load-bearing:
+    // the translator THROWS on a file part it cannot find a name for, so a row
+    // that reaches `parts` at all is a row that does not kill the run. Mirrored
+    // in Python by `test_every_filename_situation_reaches_the_provider`.
+    it.each([
+      [
+        "supplied",
+        { type: "document", source: { type: "data", value: "aGk=", mimeType: "application/pdf" }, metadata: { filename: "real.pdf" } },
+        "real.pdf",
+      ],
+      [
+        // The empty string used to survive the `??` chain, produce a block with
+        // NO filename, and throw right here.
+        "empty-string supplied, typed",
+        { type: "document", source: { type: "data", value: "aGk=", mimeType: "application/pdf" }, metadata: { filename: "" } },
+        "attachment.pdf",
+      ],
+      [
+        "empty-string supplied, legacy binary",
+        { type: "binary", mimeType: "application/pdf", data: "aGk=", filename: "" },
+        "attachment.pdf",
+      ],
+      [
+        "absent with a known MIME type",
+        { type: "document", source: { type: "data", value: "aGk=", mimeType: "text/plain" } },
+        "attachment.txt",
+      ],
+      [
+        "absent with an unknown MIME type",
+        { type: "document", source: { type: "data", value: "aGk=", mimeType: "application/x-weird-thing" } },
+        "attachment.bin",
+      ],
+    ])("reaches OpenAI with a usable filename when it is %s", async (_name, item, filename) => {
+      const emitted = (
+        aguiMessagesToLangChain([
+          { id: "filename-situation", role: "user", content: [item] } as unknown as UserMessage,
+        ])[0].content as any[]
+      ).filter((b) => b.type !== "text");
+
+      const parts = await partsOnTheWire(emitted);
+
+      expect(parts[1].type).toBe("file");
+      expect(parts[1].file.filename).toBe(filename);
+    });
+
     it("carries an emitted legacy-binary PDF to OpenAI as a file part", async () => {
       const aguiMessage: UserMessage = {
         id: "boundary-legacy-pdf",
@@ -1275,7 +1412,11 @@ describe("Multimodal Message Conversion", () => {
         type: "file",
         file: {
           file_data: "data:application/vnd.ms-excel;base64,JVBERi0xLjQK",
-          filename: "attachment.vnd.ms-excel",
+          // The MIME TYPE is untouched — `application/vnd.ms-excel`, verbatim,
+          // inside the data URL. The FILENAME is a separate decision: `.xls` is
+          // this type's extension, and `attachment.vnd.ms-excel` named a file
+          // `attachment` with an extension `.vnd`.
+          filename: "attachment.xls",
         },
       });
     });
@@ -1465,6 +1606,85 @@ describe("Multimodal Message Conversion", () => {
 
       const content = (agui[0] as UserMessage).content as Array<any>;
       expect(content).toEqual([{ type: "text", text: "before" }]);
+    });
+
+    it("falls through an empty metadata.filename to metadata.name", () => {
+      // The lookup used to be a `??` chain, and `??` falls through on
+      // null/undefined ONLY — so an empty `metadata.filename` stopped it dead
+      // and threw away the name `metadata.name` was carrying. Python's
+      // `_incoming_block_filename` always scanned for the first NON-EMPTY
+      // string; this is the divergence closed.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "empty-then-name",
+          type: "human",
+          content: [
+            {
+              type: "file",
+              source_type: "base64",
+              data: "JVBERi0xLjQK",
+              mime_type: "application/pdf",
+              metadata: { filename: "", name: "report.pdf", title: "Q2" },
+            },
+            {
+              type: "file",
+              source_type: "base64",
+              data: "JVBERi0xLjQK",
+              mime_type: "application/pdf",
+              metadata: { filename: "", name: "", title: "from-title.pdf" },
+            },
+          ],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      const content = (agui[0] as UserMessage).content as Array<any>;
+      expect(content[0].metadata).toEqual({ filename: "report.pdf" });
+      expect(content[1].metadata).toEqual({ filename: "from-title.pdf" });
+    });
+
+    it("does not let a derived filename come back as a user-supplied one", () => {
+      // The outbound leg INVENTS a name for every filename-less document,
+      // because the provider translator needs one. If the return leg writes that
+      // name into AG-UI `metadata.filename`, the thread now asserts the user
+      // attached a file called `attachment.txt` — and because a supplied name
+      // always beats derivation, the invention is frozen into every later send.
+      //
+      // The invented name is exactly `deriveFilename(mime_type)`, so recomputing
+      // it identifies it. A REAL name is untouched, which is the other half.
+      const emitted = aguiMessagesToLangChain([
+        {
+          id: "derived-out",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "aGk=", mimeType: "text/plain" },
+            } as DocumentInputContent,
+            {
+              type: "document",
+              source: { type: "data", value: "aGk=", mimeType: "text/plain" },
+              metadata: { filename: "notes.txt" },
+            } as DocumentInputContent,
+          ],
+        } as UserMessage,
+      ])[0].content as Array<any>;
+
+      // Pinned: what goes OUT still carries the derived name, because dropping
+      // it there is the throw this whole path exists to avoid.
+      expect(emitted[0].metadata).toEqual({ filename: "attachment.txt" });
+
+      const back = (
+        langchainMessagesToAgui([
+          { id: "derived-out", type: "human", content: emitted } as unknown as LangGraphMessage,
+        ])[0] as UserMessage
+      ).content as Array<any>;
+
+      expect(back[0]).toEqual({
+        type: "document",
+        source: { type: "data", value: "aGk=", mimeType: "text/plain" },
+      });
+      expect(back[0].metadata).toBeUndefined();
+      expect(back[1].metadata).toEqual({ filename: "notes.txt" });
     });
   });
 });

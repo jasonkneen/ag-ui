@@ -250,6 +250,37 @@ def _incoming_image_url(payload: Any) -> str | None:
     return None
 
 
+def _supplied_filename(
+    block_type: str, filename: str | None, mime_type: str | None
+) -> str | None:
+    """An inbound filename, unless this adapter is the one that made it up.
+
+    `_derive_filename` fabricates a name for every filename-less document on the
+    way out, because the provider translator needs one. That name comes back on
+    the return leg, and writing it into AG-UI ``metadata.filename`` would make an
+    invented name INDISTINGUISHABLE from one the user typed — the thread would
+    then assert, permanently, that the user attached a file called
+    ``attachment.pdf``. It also freezes the guess: a supplied name always wins
+    over derivation, so once the fabricated one is in the thread, every later
+    send keeps it even after the derivation is corrected.
+
+    There is no marker to test, and a marker on the wire would be a marker in the
+    provider request. What there is instead is determinism: the fabricated name
+    is exactly ``_derive_filename(mime_type)`` and nothing else ever is, so
+    recomputing it identifies it. A user who genuinely named their PDF
+    ``attachment.pdf`` loses nothing that reaches a provider — the outbound leg
+    derives that same string back for them on the next send.
+
+    Only ``file`` blocks are checked, because only ``file`` blocks are ever given
+    a derived name. Mirrors `suppliedFilename` in the TypeScript adapter.
+    """
+    if not filename:
+        return None
+    if block_type == "file" and filename == _derive_filename(mime_type):
+        return None
+    return filename
+
+
 def _agui_media_from_standard_block(item: Dict[str, Any]):
     """Rebuild an AG-UI media content item from a LangChain standard block."""
     agui_class = _AGUI_MEDIA_CLASSES[item["type"]]
@@ -257,7 +288,8 @@ def _agui_media_from_standard_block(item: Dict[str, Any]):
     if incoming is None:
         return None
 
-    metadata = {"filename": incoming.filename} if incoming.filename else None
+    filename = _supplied_filename(item["type"], incoming.filename, incoming.mime_type)
+    metadata = {"filename": filename} if filename else None
 
     if incoming.is_url:
         return agui_class(
@@ -718,6 +750,74 @@ def _filename_from_metadata(metadata: Any) -> str | None:
     return None
 
 
+# The file extension for a MIME type whose SUBTYPE IS NOT ITS EXTENSION.
+#
+# Only these need an entry. A subtype that already is the extension —
+# `application/pdf`, `text/csv`, `application/json`, `text/html`,
+# `application/zip`, `image/png` — falls through to the derivation in
+# `_derive_filename` and comes out right without being listed, so listing it
+# would only be a second place to keep correct.
+#
+# Scope is "what an attachment realistically arrives as": office documents, the
+# plain-text family, and the audio/image/video types whose subtype is a famous
+# mismatch (`audio/mpeg` is mp3, `image/jpeg` is jpg). Deliberately NOT covered,
+# because the generic fallback already answers them or because no answer is
+# better than a guessed one: archive and compression formats beyond their own
+# subtype, `application/x-*` experimental types, and unregistered vendor types
+# outside the office suites.
+#
+# KEPT IN LOCKSTEP with `FILENAME_EXTENSIONS` in the TypeScript adapter's
+# `utils.ts`. A row here that is missing there is an attachment that reaches the
+# provider under two different names depending on which runtime sent it.
+_FILENAME_EXTENSIONS = {
+    # Text
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/x-markdown": "md",
+    "text/rtf": "rtf",
+    "application/rtf": "rtf",
+    "text/xml": "xml",
+    "application/xml": "xml",
+    # Office
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.oasis.opendocument.text": "odt",
+    "application/vnd.oasis.opendocument.spreadsheet": "ods",
+    "application/vnd.oasis.opendocument.presentation": "odp",
+    # The canonical "unknown bytes" type, and the generic fallback's answer too.
+    "application/octet-stream": "bin",
+    # Audio. Reachable here only via a document item carrying an audio MIME type
+    # — the audio path emits an `audio` block, which needs no filename — but the
+    # two derivations must not disagree about what `audio/mpeg` is called.
+    "audio/mpeg": "mp3",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/vnd.wave": "wav",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    # Image / video, same "mislabelled document" reachability.
+    "image/jpeg": "jpg",
+    "image/svg+xml": "svg",
+    "image/x-icon": "ico",
+    "image/vnd.microsoft.icon": "ico",
+    "video/quicktime": "mov",
+    "video/x-msvideo": "avi",
+    "video/x-matroska": "mkv",
+}
+
+# An extension a filename can plausibly end in: short and alphanumeric.
+# `fullmatch`, not `match`: Python's `$` also matches before a trailing newline,
+# which JavaScript's does not, and the two runtimes must agree on every input.
+_PLAUSIBLE_EXTENSION = re.compile(r"[a-z0-9]{1,8}")
+
+# A MIME registration tree is a namespace, not part of any extension.
+_REGISTRATION_TREE = re.compile(r"^(?:vnd\.|prs\.|x-|x\.)")
+
+
 def _derive_filename(mime_type: str | None) -> str:
     """A filename for a `file` block whose AG-UI item did not carry one.
 
@@ -726,10 +826,38 @@ def _derive_filename(mime_type: str | None) -> str:
     with multimodal blocks"), so the document path has to carry one for the
     claimed support to be real. langchain-core only warns and omits the key, but
     both runtimes emit the same block, so both substitute the same derived name.
+
+    THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough to look
+    like a rule — ``application/pdf``, ``text/csv`` — and then does not:
+    ``text/plain`` is not ``.plain``, ``audio/mpeg`` is not ``.mpeg``, and
+    ``application/vnd.api+json`` is not ``.vnd.api``. So the subtype is a LAST
+    resort here, taken only when it survives being checked:
+
+      1. `_FILENAME_EXTENSIONS` answers the types whose subtype is wrong.
+      2. A structured-syntax suffix (RFC 6838 §4.2.8) names the underlying
+         format, so ``+json`` / ``+xml`` wins over the vendor tree in front of it.
+      3. Otherwise the registration-tree prefix (``vnd.``, ``prs.``, ``x-``,
+         ``x.``) is stripped, because it is a namespace, not an extension.
+      4. What is left has to LOOK like an extension. ``ms-excel`` and
+         ``openxmlformats-officedocument.wordprocessingml.document`` do not, and
+         a dot inside the "extension" turns ``attachment.vnd.ms-excel`` into a
+         file apparently named ``attachment.vnd``. Anything implausible becomes
+         ``.bin``, which is what an unidentified byte stream is called.
+
+    MIME types are case-insensitive (RFC 2045 §5.1), so the lookup is case-folded.
     """
-    subtype = (mime_type or "").split("/")[1:2]
-    subtype = subtype[0].split(";")[0].split("+")[0].strip() if subtype else ""
-    return f"attachment.{subtype}" if subtype else "attachment"
+    base = (mime_type or "").split(";")[0].strip().lower()
+
+    extension = _FILENAME_EXTENSIONS.get(base)
+    if not extension:
+        _, _, subtype = base.partition("/")
+        if "+" in subtype:
+            subtype = subtype.rpartition("+")[2]
+        else:
+            subtype = _REGISTRATION_TREE.sub("", subtype)
+        extension = subtype if _PLAUSIBLE_EXTENSION.fullmatch(subtype) else "bin"
+
+    return f"attachment.{extension}"
 
 
 def _standard_media_block(
