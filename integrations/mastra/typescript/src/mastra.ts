@@ -681,6 +681,7 @@ export class MastraAgent extends AbstractAgent {
       const abortController = new AbortController();
       this.abortControllers.add(abortController);
 
+
       // Settle the Observable on cancellation. abortRun() has no subscription
       // to close, and the consumption loops only notice the signal when the
       // producer yields again — a gated or already-drained stream never does,
@@ -700,6 +701,32 @@ export class MastraAgent extends AbstractAgent {
         },
         { once: true },
       );
+
+      // A caller-supplied `ClientOptions.abortSignal` (an outer request
+      // disconnect or timeout) has to cancel this run too. Chaining it into the
+      // run's controller keeps ONE cancellation channel, so both sources take
+      // the identical path: the per-run client stops the producer, the listener
+      // above settles the Observable, and neither onError nor RUN_FINISHED
+      // fires. Cloning the caller's signal into the per-run client instead
+      // would leave the two unlinked, and the outer one would abort a fetch
+      // nothing here was watching.
+      //
+      // Registered after the settle listener so an ALREADY-aborted caller
+      // signal still completes the subscriber rather than aborting into a
+      // listener that does not exist yet.
+      //
+      // The chain listener is scoped to this run's own signal, so it is removed
+      // when the run ends: a long-lived caller signal does not accumulate one
+      // listener per run.
+      const callerSignal = this.remoteClient?.options?.abortSignal;
+      if (callerSignal?.aborted) {
+        abortController.abort();
+      } else if (callerSignal) {
+        callerSignal.addEventListener("abort", () => abortController.abort(), {
+          once: true,
+          signal: abortController.signal,
+        });
+      }
 
       const run = async () => {
         const runStartedEvent: RunStartedEvent = {
@@ -1077,6 +1104,11 @@ export class MastraAgent extends AbstractAgent {
    * through `getRemoteAgents`) cannot produce a working per-run client, and the
    * caller-supplied handle is the one that must keep being used. Remote
    * cancellation stays best-effort in those cases rather than failing the run.
+   *
+   * `abortSignal` replaces any `ClientOptions.abortSignal` on the clone, which
+   * is safe because `run` chains a caller-supplied one into this run's
+   * controller: the signal passed here already fires whenever the caller's
+   * does, so the outer disconnect or timeout keeps being honoured.
    */
   private remoteAgentForRun(abortSignal?: AbortSignal): RemoteMastraAgent {
     const shared = this.agent as RemoteMastraAgent;
@@ -2459,13 +2491,16 @@ export class MastraAgent extends AbstractAgent {
           // @mastra/core emits a first-class `abort` chunk (payload `{}`) when
           // a run is cancelled via abortSignal, and closes the stream straight
           // after. Recognized here purely so a cancelled run stops tripping the
-          // unknown-chunk warning below; the loop then exits on stream end and
-          // the normal flush path runs.
+          // unknown-chunk warning below.
           //
-          // Deliberately NOT `return true`: the stopped-early path has no
-          // caller that completes the subscriber, so short-circuiting here
-          // leaves the run() Observable hanging forever. Suppressing the
-          // trailing RUN_FINISHED on a cancelled run belongs to #2417.
+          // `break` rather than a short-circuit: the caller distinguishes the
+          // outcomes, and this chunk alone does not say which one applies. When
+          // the run's own signal fired, the loop's cancellation check returns
+          // "cancelled" on the next turn and the abort listener in run()
+          // settles the Observable, with no flush and no RUN_FINISHED. When the
+          // abort came from Mastra's side with our signal untouched, the stream
+          // simply ends and the normal flush + RUN_FINISHED path runs, which is
+          // the case #2417 still covers.
           break;
         }
         default: {

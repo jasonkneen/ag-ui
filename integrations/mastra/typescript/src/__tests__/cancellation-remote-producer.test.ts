@@ -92,14 +92,46 @@ afterEach(() => {
 });
 
 describe("remote run cancellation reaches the producer (#2288)", () => {
-  function remoteAgent() {
-    const client = new MastraClient({ baseUrl: "http://localhost:4111" });
+  function remoteAgent(callerSignal?: AbortSignal) {
+    const client = new MastraClient({
+      baseUrl: "http://localhost:4111",
+      ...(callerSignal ? { abortSignal: callerSignal } : {}),
+    } as any);
     return new MastraAgent({
       agentId: "test-agent",
       agent: client.getAgent("test-agent") as any,
       resourceId: "resource-1",
       remoteClient: client as any,
     });
+  }
+
+  /** Subscribes, waits for the first chunk, and reports how the run settled. */
+  function subscribeAndTrack(agent: InstanceType<typeof MastraAgent>) {
+    let outcome: "complete" | "error" | null = null;
+    const firstChunk = { release: () => {} } as { release: () => void };
+    const gotFirst = new Promise<void>((resolve) => {
+      firstChunk.release = resolve;
+    });
+    const settled = { release: () => {} } as { release: () => void };
+    const done = new Promise<void>((resolve) => {
+      settled.release = resolve;
+    });
+
+    const subscription = agent.run(STREAM_INPUT).subscribe({
+      next: (event: BaseEvent) => {
+        if (event.type === EventType.TEXT_MESSAGE_CHUNK) firstChunk.release();
+      },
+      error: () => {
+        outcome = "error";
+        settled.release();
+      },
+      complete: () => {
+        outcome = "complete";
+        settled.release();
+      },
+    });
+
+    return { subscription, gotFirst, done, outcome: () => outcome };
   }
 
   it("binds the run's abort signal to a per-run client", async () => {
@@ -161,6 +193,76 @@ describe("remote run cancellation reaches the producer (#2288)", () => {
     // chunks were delivered (and billed) with only our consumption silenced.
     expect(producer.stoppedEarly).toBe(true);
     expect(producer.delivered).toBeLessThan(12);
+  });
+
+  // A caller can hand the client its own ClientOptions.abortSignal for an outer
+  // request disconnect or timeout. The per-run clone replaces that field, so
+  // the two signals have to be linked or the outer one stops being honoured.
+  // Either source must take the same path: stop the producer, settle the
+  // Observable, no onError.
+  describe("a caller-supplied ClientOptions.abortSignal", () => {
+    it("still cancels the run when the caller's controller aborts", async () => {
+      const outer = new AbortController();
+      const agent = remoteAgent(outer.signal);
+      const { gotFirst, done, outcome } = subscribeAndTrack(agent);
+
+      await gotFirst;
+      outer.abort();
+
+      await Promise.race([
+        done,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error("run() never settled")), 1000),
+        ),
+      ]);
+
+      expect(producer.stoppedEarly).toBe(true);
+      expect(producer.delivered).toBeLessThan(12);
+      expect(outcome()).toBe("complete");
+    });
+
+    it("is not clobbered by the per-run signal, and vice versa", async () => {
+      const outer = new AbortController();
+      const agent = remoteAgent(outer.signal);
+      const { subscription, gotFirst, outcome } = subscribeAndTrack(agent);
+
+      await gotFirst;
+
+      // The clone carries a signal distinct from the caller's, and aborting the
+      // run must not require the caller's to fire.
+      const perRun = constructorOptions.filter(
+        (o) => o.abortSignal && o.abortSignal !== outer.signal,
+      );
+      expect(perRun).toHaveLength(1);
+
+      // Unsubscribing closes the subscription without invoking complete, so
+      // there is nothing to await here beyond the abort propagating.
+      subscription.unsubscribe();
+      await tick();
+
+      expect(producer.stoppedEarly).toBe(true);
+      expect(outcome()).not.toBe("error");
+      // The caller's own signal is untouched by the run ending, so it stays
+      // usable for whatever else it governs.
+      expect(outer.signal.aborted).toBe(false);
+    });
+
+    it("cancels immediately when the caller's signal is already aborted", async () => {
+      const outer = new AbortController();
+      outer.abort();
+      const agent = remoteAgent(outer.signal);
+      const { done, outcome } = subscribeAndTrack(agent);
+
+      await Promise.race([
+        done,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error("run() never settled")), 1000),
+        ),
+      ]);
+
+      expect(outcome()).toBe("complete");
+      expect(producer.delivered).toBeLessThan(12);
+    });
   });
 
   it("settles the Observable on abortRun() without an unsubscribe", async () => {
