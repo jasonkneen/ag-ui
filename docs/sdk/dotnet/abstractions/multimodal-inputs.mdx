@@ -139,7 +139,8 @@ The complete `metadata` value is preserved under the MEAI content's
 inline data, a string `metadata.filename` property is also assigned to
 `DataContent.Name` so file-capable providers receive the filename.
 
-In the client direction, `AsAGUIMessages()` maps `DataContent` and `UriContent`
+In the client direction, `AsAGUIMessages(jsonSerializerOptions)` maps
+`DataContent` and `UriContent`
 to canonical media parts based on their MIME type and serializes their
 `AdditionalProperties` as the part's `metadata`. `DataContent.Name` is included
 as `metadata.filename` when that property is not already present.

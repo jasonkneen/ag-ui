@@ -24,7 +24,6 @@ AGUI.Abstractions.InterruptResponseContent.Metadata.set -> void
 AGUI.Abstractions.InterruptResponseContent.Payload.get -> System.Text.Json.JsonElement?
 AGUI.Abstractions.InterruptResponseContent.Payload.set -> void
 static AGUI.Abstractions.AGUIChatMessageExtensions.AsChatMessages(this System.Collections.Generic.IEnumerable<AGUI.Abstractions.AGUIMessage!>! aguiMessages) -> System.Collections.Generic.IEnumerable<Microsoft.Extensions.AI.ChatMessage!>!
-static AGUI.Abstractions.AGUIChatMessageExtensions.AsAGUIMessages(this System.Collections.Generic.IEnumerable<Microsoft.Extensions.AI.ChatMessage!>! chatMessages) -> System.Collections.Generic.IEnumerable<AGUI.Abstractions.AGUIMessage!>!
 static AGUI.Abstractions.AGUIChatMessageExtensions.AsAGUIMessages(this System.Collections.Generic.IEnumerable<Microsoft.Extensions.AI.ChatMessage!>! chatMessages, System.Text.Json.JsonSerializerOptions! jsonSerializerOptions) -> System.Collections.Generic.IEnumerable<AGUI.Abstractions.AGUIMessage!>!
 static AGUI.Abstractions.AGUIChatMessageExtensions.MapChatRole(string! role) -> Microsoft.Extensions.AI.ChatRole
 static AGUI.Abstractions.AGUIToolExtensions.AsAGUITools(this System.Collections.Generic.IEnumerable<Microsoft.Extensions.AI.AITool!>! tools) -> System.Collections.Generic.IEnumerable<AGUI.Abstractions.AGUITool!>!

@@ -9,6 +9,9 @@ namespace AGUI.Abstractions.UnitTests;
 
 public sealed class AGUIChatMessageExtensionsTest
 {
+    private static readonly JsonSerializerOptions s_jsonSerializerOptions =
+        AGUIJsonSerializerContext.Default.Options;
+
     [Fact]
     public void AsChatMessages_UserMessageWithName_SetsAuthorName()
     {
@@ -55,7 +58,7 @@ public sealed class AGUIChatMessageExtensionsTest
             new ChatMessage(ChatRole.User, "Hello") { AuthorName = "Bob" }
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).ToList();
 
         Assert.Single(aguiMessages);
         var userMsg = Assert.IsType<AGUIUserMessage>(aguiMessages[0]);
@@ -70,7 +73,7 @@ public sealed class AGUIChatMessageExtensionsTest
             new ChatMessage(ChatRole.User, "Hello")
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).ToList();
 
         Assert.Single(aguiMessages);
         var userMsg = Assert.IsType<AGUIUserMessage>(aguiMessages[0]);
@@ -82,7 +85,7 @@ public sealed class AGUIChatMessageExtensionsTest
     {
         var original = new ChatMessage(ChatRole.User, "Hello") { AuthorName = "Charlie", MessageId = "msg-1" };
 
-        var aguiMessages = new[] { original }.AsAGUIMessages().ToList();
+        var aguiMessages = new[] { original }.AsAGUIMessages(s_jsonSerializerOptions).ToList();
         var roundTripped = aguiMessages.AsChatMessages().ToList();
 
         Assert.Single(roundTripped);
@@ -123,7 +126,7 @@ public sealed class AGUIChatMessageExtensionsTest
             }
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).ToList();
 
         Assert.Single(aguiMessages);
         var toolMsg = Assert.IsType<AGUIToolMessage>(aguiMessages[0]);
@@ -153,7 +156,7 @@ public sealed class AGUIChatMessageExtensionsTest
             }
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().OfType<AGUIToolMessage>().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).OfType<AGUIToolMessage>().ToList();
 
         Assert.Equal(2, aguiMessages.Count);
 
@@ -205,7 +208,7 @@ public sealed class AGUIChatMessageExtensionsTest
             ])
         };
 
-        var roundTripped = chatMessages.AsAGUIMessages().AsChatMessages().ToList();
+        var roundTripped = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).AsChatMessages().ToList();
 
         var callIds = roundTripped
             .SelectMany(m => m.Contents.OfType<FunctionResultContent>())
@@ -224,7 +227,7 @@ public sealed class AGUIChatMessageExtensionsTest
             new ChatMessage(ChatRole.Tool, [new FunctionResultContent("tc_1", resultObject)])
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).ToList();
 
         var toolMsg = Assert.IsType<AGUIToolMessage>(aguiMessages[0]);
         Assert.Equal("tc_1", toolMsg.ToolCallId);
@@ -283,7 +286,7 @@ public sealed class AGUIChatMessageExtensionsTest
             ])
         };
 
-        var aguiMessages = chatMessages.AsAGUIMessages().ToList();
+        var aguiMessages = chatMessages.AsAGUIMessages(s_jsonSerializerOptions).ToList();
 
         var assistantMsg = Assert.IsType<AGUIAssistantMessage>(aguiMessages[0]);
         Assert.NotNull(assistantMsg.ToolCalls);
@@ -313,7 +316,7 @@ public sealed class AGUIChatMessageExtensionsTest
             new ChatMessage(ChatRole.Assistant, "The weather in NYC is 72°F and sunny!") { MessageId = "msg-4" }
         };
 
-        var aguiMessages = original.AsAGUIMessages().ToList();
+        var aguiMessages = original.AsAGUIMessages(s_jsonSerializerOptions).ToList();
         var roundTripped = aguiMessages.AsChatMessages().ToList();
 
         Assert.Equal(4, roundTripped.Count);
@@ -580,7 +583,7 @@ public sealed class AGUIChatMessageExtensionsTest
             });
 
         var roundTripped = Assert.IsType<AGUIUserMessage>(
-            Assert.Single(new[] { chatMessage }.AsAGUIMessages()));
+            Assert.Single(new[] { chatMessage }.AsAGUIMessages(s_jsonSerializerOptions)));
         var roundTrippedImage = Assert.IsType<AGUIImageInputContent>(roundTripped.Content[1]);
         Assert.Equal("high", roundTrippedImage.Metadata?.GetProperty("detail").GetString());
         var roundTrippedDocument = Assert.IsType<AGUIDocumentInputContent>(roundTripped.Content[4]);
@@ -707,7 +710,8 @@ public sealed class AGUIChatMessageExtensionsTest
         };
         var message = new ChatMessage(ChatRole.User, [content]);
 
-        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(
+            Assert.Single(new[] { message }.AsAGUIMessages(s_jsonSerializerOptions)));
         var media = Assert.IsAssignableFrom<AGUIMediaInputContent>(Assert.Single(aguiMessage.Content));
 
         Assert.IsType(expectedContentType, media);
@@ -732,7 +736,8 @@ public sealed class AGUIChatMessageExtensionsTest
         };
         var message = new ChatMessage(ChatRole.User, [content]);
 
-        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(
+            Assert.Single(new[] { message }.AsAGUIMessages(s_jsonSerializerOptions)));
         var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(aguiMessage.Content));
 
         Assert.Equal("high", image.Metadata?.GetProperty("detail").GetString());
@@ -753,7 +758,8 @@ public sealed class AGUIChatMessageExtensionsTest
         };
         var message = new ChatMessage(ChatRole.User, [content]);
 
-        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(
+            Assert.Single(new[] { message }.AsAGUIMessages(s_jsonSerializerOptions)));
         var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(aguiMessage.Content));
 
         Assert.Equal("original.png", image.Metadata?.GetProperty("filename").GetString());
@@ -771,7 +777,8 @@ public sealed class AGUIChatMessageExtensionsTest
         };
         var message = new ChatMessage(ChatRole.User, [content]);
 
-        var aguiMessage = Assert.IsType<AGUIUserMessage>(Assert.Single(new[] { message }.AsAGUIMessages()));
+        var aguiMessage = Assert.IsType<AGUIUserMessage>(
+            Assert.Single(new[] { message }.AsAGUIMessages(s_jsonSerializerOptions)));
         var image = Assert.IsType<AGUIImageInputContent>(Assert.Single(aguiMessage.Content));
         var source = Assert.IsType<AGUIInputContentUrlSource>(image.Source);
 
@@ -822,7 +829,7 @@ public sealed class AGUIChatMessageExtensionsTest
         var developerRole = new ChatRole("developer");
         var chatMessage = new ChatMessage(developerRole, "follow the rules") { MessageId = "dev-1" };
 
-        var aguiMessage = Assert.Single(new[] { chatMessage }.AsAGUIMessages());
+        var aguiMessage = Assert.Single(new[] { chatMessage }.AsAGUIMessages(s_jsonSerializerOptions));
         var developer = Assert.IsType<AGUIDeveloperMessage>(aguiMessage);
         Assert.Equal("dev-1", developer.Id);
         Assert.Equal("follow the rules", developer.Content);

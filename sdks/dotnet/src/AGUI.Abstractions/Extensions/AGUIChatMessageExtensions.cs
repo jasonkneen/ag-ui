@@ -272,14 +272,6 @@ public static class AGUIChatMessageExtensions
     /// Converts a sequence of <see cref="ChatMessage"/> instances to <see cref="AGUIMessage"/> instances.
     /// </summary>
     /// <param name="chatMessages">The chat messages to convert.</param>
-    /// <returns>A sequence of <see cref="AGUIMessage"/> instances.</returns>
-    public static IEnumerable<AGUIMessage> AsAGUIMessages(this IEnumerable<ChatMessage> chatMessages) =>
-        AsAGUIMessages(chatMessages, AGUIJsonSerializerContext.Default.Options);
-
-    /// <summary>
-    /// Converts a sequence of <see cref="ChatMessage"/> instances to <see cref="AGUIMessage"/> instances.
-    /// </summary>
-    /// <param name="chatMessages">The chat messages to convert.</param>
     /// <param name="jsonSerializerOptions">The options used to serialize message content.</param>
     /// <returns>A sequence of <see cref="AGUIMessage"/> instances.</returns>
     public static IEnumerable<AGUIMessage> AsAGUIMessages(
