@@ -132,8 +132,16 @@ function eventTypes(dispatched: any[]): string[] {
   return dispatched.map((e) => e?.type).filter(Boolean);
 }
 
-function msg(id: string, role: "human" | "ai", content: string): LangGraphMessage {
-  return { id, type: role === "human" ? "human" : "ai", content } as LangGraphMessage;
+function msg(
+  id: string,
+  role: "human" | "ai",
+  content: string,
+): LangGraphMessage {
+  return {
+    id,
+    type: role === "human" ? "human" : "ai",
+    content,
+  } as LangGraphMessage;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +150,14 @@ function msg(id: string, role: "human" | "ai", content: string): LangGraphMessag
 
 describe("nsRoot extraction", () => {
   it("empty ns → empty string", () => expect(nsRoot("")).toBe(""));
-  it("root supervisor → supervisor", () => expect(nsRoot("supervisor:cf4865ae")).toBe("supervisor"));
-  it("subgraph boundary → subgraph name", () => expect(nsRoot("flights_agent:17b1922c")).toBe("flights_agent"));
+  it("root supervisor → supervisor", () =>
+    expect(nsRoot("supervisor:cf4865ae")).toBe("supervisor"));
+  it("subgraph boundary → subgraph name", () =>
+    expect(nsRoot("flights_agent:17b1922c")).toBe("flights_agent"));
   it("inside subgraph (|) → first segment", () =>
-    expect(nsRoot("flights_agent:17b1922c|flights_agent_chat_node:0a492c87")).toBe("flights_agent"));
+    expect(
+      nsRoot("flights_agent:17b1922c|flights_agent_chat_node:0a492c87"),
+    ).toBe("flights_agent"));
   it("deeply nested → outermost", () =>
     expect(nsRoot("outer:aaa|inner:bbb|deepest:ccc")).toBe("outer"));
 });
@@ -234,7 +246,9 @@ describe("getStateAndMessagesSnapshots", () => {
 
     await (agent as any).getStateAndMessagesSnapshots("thread-1");
 
-    const snap = dispatched.find((e) => e?.type === EventType.MESSAGES_SNAPSHOT);
+    const snap = dispatched.find(
+      (e) => e?.type === EventType.MESSAGES_SNAPSHOT,
+    );
     expect(snap).toBeDefined();
     const ids = snap.messages.map((m: any) => m.id);
     expect(ids).toContain("h1");
@@ -370,9 +384,9 @@ describe("subgraph change trigger", () => {
       next: [],
       metadata: { writes: {} },
     });
-    (config.client as any).assistants.search = vi.fn().mockResolvedValue([
-      { assistant_id: "asst-1", graph_id: "test-graph" },
-    ]);
+    (config.client as any).assistants.search = vi
+      .fn()
+      .mockResolvedValue([{ assistant_id: "asst-1", graph_id: "test-graph" }]);
     (config.client as any).assistants.getGraph = vi.fn().mockResolvedValue({
       nodes: [{ id: "supervisor" }, { id: "hotels_agent" }],
       edges: [],
@@ -380,7 +394,10 @@ describe("subgraph change trigger", () => {
 
     const { agent, dispatched } = makeAgent(config);
     agent.threadId = "thread-1";
-    (agent as any).assistant = { assistant_id: "asst-1", graph_id: "test-graph" };
+    (agent as any).assistant = {
+      assistant_id: "asst-1",
+      graph_id: "test-graph",
+    };
     (agent as any).activeRun = {
       id: "run-1",
       nodeName: null,
@@ -442,7 +459,8 @@ describe("subgraph change trigger", () => {
           event: "on_chain_start",
           metadata: {
             langgraph_node: "hotels_agent",
-            langgraph_checkpoint_ns: "hotels_agent:abc|hotels_agent_chat_node:xyz",
+            langgraph_checkpoint_ns:
+              "hotels_agent:abc|hotels_agent_chat_node:xyz",
           },
         },
       },
@@ -462,7 +480,7 @@ describe("subgraph change trigger", () => {
     await driveAgent(agent, chunks);
 
     const snapCount = eventTypes(dispatched).filter(
-      (t) => t === EventType.MESSAGES_SNAPSHOT
+      (t) => t === EventType.MESSAGES_SNAPSHOT,
     ).length;
     expect(snapCount).toBeGreaterThanOrEqual(1);
   });
@@ -477,7 +495,8 @@ describe("subgraph change trigger", () => {
           event: "on_chain_start",
           metadata: {
             langgraph_node: "hotels_agent",
-            langgraph_checkpoint_ns: "hotels_agent:abc|hotels_agent_chat_node:xyz",
+            langgraph_checkpoint_ns:
+              "hotels_agent:abc|hotels_agent_chat_node:xyz",
           },
         },
       },
@@ -496,7 +515,9 @@ describe("subgraph change trigger", () => {
 
     await driveAgent(agent, chunks);
 
-    const snapshots = dispatched.filter((e) => e?.type === EventType.MESSAGES_SNAPSHOT);
+    const snapshots = dispatched.filter(
+      (e) => e?.type === EventType.MESSAGES_SNAPSHOT,
+    );
     expect(snapshots.length).toBeGreaterThanOrEqual(1);
 
     const first = snapshots[0];
@@ -512,7 +533,9 @@ describe("subgraph change trigger", () => {
     const getState = vi.mocked(config.client!.threads.getState);
     (agent as any).getStateSnapshot = vi
       .fn()
-      .mockImplementation((state: LangGraphThreadState<unknown>) => state.values);
+      .mockImplementation(
+        (state: LangGraphThreadState<unknown>) => state.values,
+      );
 
     const user = msg("u1", "human", "AMS to SF");
     const rootAssistant = msg("r1", "ai", "Root has current route");
@@ -631,9 +654,13 @@ describe("subgraph change trigger", () => {
     ]);
     (agent as any).getStateSnapshot = vi
       .fn()
-      .mockImplementation((state: LangGraphThreadState<unknown>) => state.values);
+      .mockImplementation(
+        (state: LangGraphThreadState<unknown>) => state.values,
+      );
 
-    const stopAfterExitBoundary = new Error("stop after exit boundary snapshot");
+    const stopAfterExitBoundary = new Error(
+      "stop after exit boundary snapshot",
+    );
     const chunks = [
       {
         event: "values",
@@ -729,7 +756,7 @@ describe("getState error propagation", () => {
     (agent as any).getStateSnapshot = vi.fn().mockReturnValue({});
 
     await expect(
-      (agent as any).getStateAndMessagesSnapshots("thread-1")
+      (agent as any).getStateAndMessagesSnapshots("thread-1"),
     ).rejects.toThrow("checkpoint unavailable");
   });
 });
