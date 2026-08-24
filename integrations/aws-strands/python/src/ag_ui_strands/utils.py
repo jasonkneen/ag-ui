@@ -1,12 +1,15 @@
 """Utility functions for AWS Strands integration."""
 
 import base64
+import hashlib
+import http.client
 import ipaddress
 import logging
 import re
 import socket
 import urllib.request
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -137,8 +140,11 @@ def _resolved_addresses(host: str, port: Optional[int]) -> List["ipaddress._Base
     return addresses
 
 
-def _validate_fetch_url(url: str, policy: Optional[UrlFetchPolicy] = None) -> None:
-    """Validate *url* against *policy*; raise :class:`UrlFetchPolicyError` if refused."""
+def _validate_and_resolve_fetch_url(
+    url: str,
+    policy: Optional[UrlFetchPolicy] = None,
+) -> List["ipaddress._BaseAddress"]:
+    """Validate *url* and return the exact addresses approved by *policy*."""
     policy = policy or DEFAULT_URL_FETCH_POLICY
     parts = urlsplit(url)
     scheme = (parts.scheme or "").lower()
@@ -147,20 +153,127 @@ def _validate_fetch_url(url: str, policy: Optional[UrlFetchPolicy] = None) -> No
             f"URL scheme '{scheme}' is not allowed "
             f"(allowed: {sorted(policy.allowed_schemes)})"
         )
+    if parts.username is not None or parts.password is not None:
+        raise UrlFetchPolicyError("URL userinfo credentials are not supported")
     host = parts.hostname
     if not host:
         # Explicitly allowed non-network schemes (for example ``data``) have no
         # host. Requiring both scheme and private-network opt-ins preserves that
         # escape hatch without weakening the default policy.
         if policy.allow_private_networks:
-            return
-        raise UrlFetchPolicyError(f"URL has no host: {url}")
-    for ip in _resolved_addresses(host, parts.port):
+            return []
+        raise UrlFetchPolicyError("URL has no host")
+    addresses = _resolved_addresses(host, parts.port)
+    for ip in addresses:
         if _is_blocked_address(ip, policy.allow_private_networks):
             raise UrlFetchPolicyError(
                 f"URL host '{host}' resolves to non-public address {ip}, "
                 "which is blocked by the URL fetch policy"
             )
+    return addresses
+
+
+def _validate_fetch_url(url: str, policy: Optional[UrlFetchPolicy] = None) -> None:
+    """Validate *url* against *policy*; raise :class:`UrlFetchPolicyError` if refused."""
+    _validate_and_resolve_fetch_url(url, policy)
+
+
+def _connect_to_validated_addresses(
+    addresses: List["ipaddress._BaseAddress"],
+    port: int,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+):
+    """Connect directly to validated IP literals without another DNS lookup."""
+    last_error = None
+    for ip in addresses:
+        family = socket.AF_INET6 if isinstance(ip, ipaddress.IPv6Address) else socket.AF_INET
+        sock = None
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            destination = (str(ip), port, 0, 0) if family == socket.AF_INET6 else (str(ip), port)
+            sock.connect(destination)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("No validated address is available for the connection")
+
+
+class _PinnedConnectionMixin:
+    """Route an HTTP client's socket to its pre-validated address set."""
+
+    def _pin_addresses(self, addresses: List["ipaddress._BaseAddress"]) -> None:
+        self._validated_addresses = addresses
+        self._create_connection = self._create_pinned_connection
+
+    def _create_pinned_connection(
+        self,
+        address,
+        timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address=None,
+    ):
+        return _connect_to_validated_addresses(
+            self._validated_addresses,
+            address[1],
+            timeout,
+            source_address,
+        )
+
+
+class _PinnedHTTPConnection(_PinnedConnectionMixin, http.client.HTTPConnection):
+    """HTTP connection whose transport is pinned to validated IP addresses."""
+
+    def __init__(self, host, *, validated_addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._pin_addresses(validated_addresses)
+
+
+class _PinnedHTTPSConnection(_PinnedConnectionMixin, http.client.HTTPSConnection):
+    """HTTPS connection pinned by IP while retaining the hostname for TLS."""
+
+    def __init__(self, host, *, validated_addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._pin_addresses(validated_addresses)
+
+
+class _PolicyHTTPHandler(urllib.request.HTTPHandler):
+    """Validate and pin an HTTP request immediately before connecting."""
+
+    def __init__(self, policy: UrlFetchPolicy):
+        super().__init__()
+        self._policy = policy
+
+    def http_open(self, req):
+        addresses = _validate_and_resolve_fetch_url(req.full_url, self._policy)
+        connection = partial(
+            _PinnedHTTPConnection,
+            validated_addresses=addresses,
+        )
+        return self.do_open(connection, req)
+
+
+class _PolicyHTTPSHandler(urllib.request.HTTPSHandler):
+    """Validate and pin an HTTPS request immediately before connecting."""
+
+    def __init__(self, policy: UrlFetchPolicy):
+        super().__init__()
+        self._policy = policy
+
+    def https_open(self, req):
+        addresses = _validate_and_resolve_fetch_url(req.full_url, self._policy)
+        connection = partial(
+            _PinnedHTTPSConnection,
+            validated_addresses=addresses,
+        )
+        return self.do_open(connection, req, context=self._context)
 
 
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -175,8 +288,13 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _open_url(url: str, timeout: float, policy: UrlFetchPolicy):
-    """Open *url* with a redirect handler that re-validates every hop."""
-    opener = urllib.request.build_opener(_PolicyRedirectHandler(policy))
+    """Open *url* with policy checks and address pinning on every hop."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _PolicyHTTPHandler(policy),
+        _PolicyHTTPSHandler(policy),
+        _PolicyRedirectHandler(policy),
+    )
     return opener.open(url, timeout=timeout)
 
 
@@ -196,6 +314,7 @@ def _fetch_url_bytes(url: str, policy: Optional[UrlFetchPolicy] = None) -> Optio
     timeout, oversized body); the reason is logged.
     """
     policy = policy or DEFAULT_URL_FETCH_POLICY
+    url_id = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
     try:
         _validate_fetch_url(url, policy)
         parts = urlsplit(url)
@@ -221,17 +340,21 @@ def _fetch_url_bytes(url: str, policy: Optional[UrlFetchPolicy] = None) -> Optio
             data = resp.read(policy.max_bytes + 1)
         if len(data) > policy.max_bytes:
             logger.error(
-                "Refusing to fetch URL %s: response exceeds the %d byte limit",
-                url,
+                "Refusing to fetch URL (url_id=%s): response exceeds the %d byte limit",
+                url_id,
                 policy.max_bytes,
             )
             return None
         return data
     except UrlFetchPolicyError as exc:
-        logger.error("Refusing to fetch URL %s: %s", url, exc)
+        logger.error("Refusing to fetch URL (url_id=%s): %s", url_id, exc)
         return None
     except Exception as exc:
-        logger.warning("Failed to fetch URL %s: %s", url, exc)
+        logger.warning(
+            "Failed to fetch URL (url_id=%s): %s",
+            url_id,
+            type(exc).__name__,
+        )
         return None
 
 
