@@ -456,6 +456,148 @@ describe("Multimodal Message Conversion", () => {
     });
   });
 
+  // ── Modality survives the `image_url` round trip ──────────────────────────
+  //
+  // `image_url` is the fallback block for every modality the outbound leg cannot
+  // send as a standard block — video always, audio outside the provider's format
+  // enum, and every URL-sourced item — so reading the block kind literally on the
+  // way back rewrote the thread: the user attached a video and MESSAGES_SNAPSHOT
+  // came back holding an image, permanently, for every later read.
+  //
+  // The MIME type inside the data URL is the recovery signal, and these tests
+  // pin BOTH halves: the type that comes back, and the fact that the block going
+  // out is byte-for-byte what it was (the outbound shape is provider-measured and
+  // must not move).
+  describe("modality survives the image_url round trip", () => {
+    const roundTrip = (item: any) => {
+      const lc = aguiMessagesToLangChain([
+        { id: "rt", role: "user", content: [item] } as UserMessage,
+      ]);
+      const agui = langchainMessagesToAgui(lc);
+      return {
+        wire: (lc[0].content as Array<any>)[0],
+        content: ((agui[0] as UserMessage).content as Array<any>)[0],
+      };
+    };
+
+    it("keeps a video a video across the round trip", () => {
+      const { wire, content } = roundTrip({
+        type: "video",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "video/mp4" },
+        metadata: { filename: "clip.mp4" },
+      } as VideoInputContent);
+
+      // Unchanged on the wire: video still has no standard block that any
+      // translator accepts, so it stays on `image_url` deliberately.
+      expect(wire).toEqual({
+        type: "image_url",
+        image_url: { url: "data:video/mp4;base64,SGVsbG8=" },
+      });
+      expect(content).toEqual({
+        type: "video",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "video/mp4" },
+      });
+    });
+
+    it("keeps audio the provider cannot carry an audio across the round trip", () => {
+      // `audio/ogg` is outside `input_audio.format`, so it rides `image_url` too.
+      const { wire, content } = roundTrip({
+        type: "audio",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "audio/ogg" },
+      } as AudioInputContent);
+
+      expect(wire).toEqual({
+        type: "image_url",
+        image_url: { url: "data:audio/ogg;base64,SGVsbG8=" },
+      });
+      expect(content).toEqual({
+        type: "audio",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "audio/ogg" },
+      });
+    });
+
+    it("keeps a legacy binary video a video across the round trip", () => {
+      const { wire, content } = roundTrip({
+        type: "binary",
+        mimeType: "video/mp4",
+        data: "SGVsbG8=",
+      } as BinaryInputContent);
+
+      expect(wire).toEqual({
+        type: "image_url",
+        image_url: { url: "data:video/mp4;base64,SGVsbG8=" },
+      });
+      expect(content).toEqual({
+        type: "video",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "video/mp4" },
+      });
+    });
+
+    it("still brings a genuine image back as an image", () => {
+      const { content } = roundTrip({
+        type: "image",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "image/png" },
+      } as ImageInputContent);
+
+      expect(content).toEqual({
+        type: "image",
+        source: { type: "data", value: "SGVsbG8=", mimeType: "image/png" },
+      });
+    });
+
+    it("reads a non-media MIME type on the image_url path as a document", () => {
+      // Nothing in this adapter emits a document as an `image_url` data URL, but a
+      // graph relaying its own content can, and `document` is what the legacy
+      // binary OUTBOUND leg calls the same MIME type. Symmetry, not guesswork.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "doc-data-url",
+          type: "human",
+          content: [
+            { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=" } },
+          ],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      expect(((agui[0] as UserMessage).content as Array<any>)[0]).toEqual({
+        type: "document",
+        source: { type: "data", value: "JVBERi0=", mimeType: "application/pdf" },
+      });
+    });
+
+    it("leaves a data URL with no MIME type an image", () => {
+      // Nothing to read, so the pre-existing default stands rather than a guess.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "no-mime",
+          type: "human",
+          content: [{ type: "image_url", image_url: { url: "data:;base64,SGVsbG8=" } }],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      expect(((agui[0] as UserMessage).content as Array<any>)[0].type).toBe("image");
+    });
+
+    it("KNOWN LIMIT: a URL-sourced video comes back as an image", () => {
+      // Not an oversight — an `image_url` block carries `{ url }` and nothing
+      // else, so an https-hosted video arrives with no MIME type and no other
+      // modality signal. Adding a key to the block is what issue #2100 was about
+      // (providers 400 on unexpected keys inside a content block), and a file
+      // extension is not a signal on signed or extensionless CDN URLs. This test
+      // exists so the limit is visible and a future fix has to change it
+      // deliberately.
+      const { content } = roundTrip({
+        type: "video",
+        source: { type: "url", value: "https://example.com/clip.mp4", mimeType: "video/mp4" },
+      } as VideoInputContent);
+
+      expect(content).toEqual({
+        type: "image",
+        source: { type: "url", value: "https://example.com/clip.mp4" },
+      });
+    });
+  });
+
   describe("langchainMessagesToAgui", () => {
     it("should convert text-only LangChain message to AG-UI", () => {
       const lcMessage: LangGraphMessage = {

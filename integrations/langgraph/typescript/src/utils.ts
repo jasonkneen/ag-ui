@@ -218,6 +218,66 @@ const AGUI_MEDIA_TYPES = new Map<string, "audio" | "video" | "document" | "image
 ]);
 
 /**
+ * The AG-UI media type named by a MIME type's MAJOR part.
+ *
+ * Used only on the `image_url` return leg, where the block kind says "image" for
+ * every modality and the MIME type inside the data URL is the one remaining
+ * modality signal. A `Map` for the same reason as {@link AGUI_MEDIA_TYPES}: the
+ * key comes off the wire.
+ *
+ * Kept in lockstep with `_MEDIA_TYPES_BY_MIME_MAJOR` in the Python adapter.
+ */
+const MEDIA_TYPES_BY_MIME_MAJOR = new Map<string, "audio" | "video" | "image">([
+  ["image", "image"],
+  ["audio", "audio"],
+  ["video", "video"],
+]);
+
+/**
+ * Recover the AG-UI media type of an `image_url` block from the MIME type in its
+ * data URL.
+ *
+ * WHY THIS EXISTS. `image_url` is not the image path — it is the fallback path
+ * for every modality {@link standardBlockTypeFor} refuses, which is video (no
+ * standard block converts, in either runtime), audio outside
+ * {@link OPENAI_AUDIO_MIME_TYPES}, and every URL-sourced item. Reading the block
+ * kind literally therefore turned an attached video into an `ImageInputContent`
+ * in MESSAGES_SNAPSHOT, permanently: the thread was rewritten, and every later
+ * read of it saw an image. The outbound leg is deliberately unchanged — see
+ * {@link convertAguiMultimodalToLangchain} — so the fix belongs here.
+ *
+ * The MIME type inside `data:<mime>;base64,…` is the original one this adapter
+ * put there, so on the DATA path the modality is fully recoverable. The mapping
+ * mirrors how the legacy `binary` OUTBOUND leg classifies the same string:
+ * image/video/audio by major type, everything else a document. Symmetric by
+ * construction, which is the property that keeps a round trip stable.
+ *
+ * Two cases are NOT recoverable and stay images, which is what they already were:
+ *
+ *   1. URL-sourced media. `image_url` carries `{ url }` and nothing else, so a
+ *      video at an https URL arrives with no MIME type and no other signal. AG-UI
+ *      lets a url source declare `mimeType`, but this adapter cannot put it on
+ *      the wire: extra keys inside a content block are what issue #2100 was about
+ *      (strict OpenAI-compatible providers 400 on "Unexpected keys in a message
+ *      content image dict"), and the outbound shape here is load-bearing. Guessing
+ *      from a file extension is not a signal — signed and extensionless CDN URLs
+ *      are the norm. So a URL-sourced non-image loses its modality, and this is
+ *      the documented limit of this fix rather than something it covers.
+ *   2. A data URL with no MIME type at all (`data:;base64,…`), where there is
+ *      nothing to read. The pre-existing `image/png` default applies.
+ *
+ * `metadata.filename` is lost on this path in both directions regardless — the
+ * `image_url` block has nowhere to carry it.
+ */
+function aguiMediaTypeForMimeType(mimeType: string): "audio" | "video" | "document" | "image" {
+  const [major, subtype] = mimeType.split("/");
+  // A string that is not `major/subtype` carries no modality; keep the historical
+  // answer rather than inventing a new wrong one.
+  if (!major || !subtype) return "image";
+  return MEDIA_TYPES_BY_MIME_MAJOR.get(major.trim().toLowerCase()) ?? "document";
+}
+
+/**
  * The media block this adapter emits: a LangChain `source_type` data block.
  *
  * THIS IS THE ONLY REPRESENTATION THAT TRANSLATES IN BOTH RUNTIMES, and this
@@ -447,8 +507,11 @@ function readIncomingMediaBlock(item: IncomingMediaBlock): {
 /**
  * Convert LangChain's multimodal content to AG-UI format.
  *
- * `image_url` blocks are converted to `ImageInputContent` with the appropriate
- * source type (data or URL). LangChain's standard media blocks (`image` /
+ * `image_url` blocks are converted with the appropriate source type (data or URL)
+ * and to the media type their MIME type names — `image_url` is the fallback block
+ * for every modality the outbound leg cannot send as a standard block, so it is
+ * NOT evidence of an image. See {@link aguiMediaTypeForMimeType}. LangChain's
+ * standard media blocks (`image` /
  * `audio` / `video` / `file`) are converted back to the matching AG-UI content
  * type, which is what keeps a non-image attachment in the thread across a
  * MESSAGES_SNAPSHOT — a block kind missing here is an attachment that vanishes
@@ -514,8 +577,9 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
         } as InputContent);
       }
     } else if (item.type === "image_url") {
-      // LangChain only uses `image_url` blocks for all media, so we always
-      // produce ImageInputContent here. The true media type is not recoverable.
+      // `image_url` is the fallback block for EVERY modality this adapter cannot
+      // send as a standard block, not just images, so the block kind is not the
+      // media type. See {@link aguiMediaTypeForMimeType}.
       const imageUrl = typeof item.image_url === "string"
         ? item.image_url
         : item.image_url?.url;
@@ -531,15 +595,19 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
           : "image/png";
 
         aguiContent.push({
-          type: "image",
+          // The MIME type this adapter put in the data URL on the way out is
+          // enough to recover the modality on the way back.
+          type: aguiMediaTypeForMimeType(mimeType),
           source: {
             type: "data",
             value: data || "",
             mimeType,
           },
-        });
+        } as InputContent);
       } else {
-        // Regular URL
+        // Regular URL. Nothing here names a modality — this is the first of the
+        // two unrecoverable cases in {@link aguiMediaTypeForMimeType} — so it
+        // stays an image.
         aguiContent.push({
           type: "image",
           source: {

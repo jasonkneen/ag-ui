@@ -475,9 +475,9 @@ class TestMultimodalConversion(unittest.TestCase):
     def test_audio_survives_the_langchain_round_trip(self):
         """Same guard as the document round trip, for inline audio.
 
-        Video is absent on purpose: it is not emitted as a standard block, so it
-        round-trips through `image_url` and comes back as an image. That is the
-        pre-existing behaviour, and it is a live run rather than a dead one.
+        This is the STANDARD BLOCK path. The modalities that ride `image_url`
+        instead — video, and audio the provider's format enum cannot name — are
+        covered by `TestModalitySurvivesImageUrlRoundTrip`.
         """
         original = [
             AudioInputContent(
@@ -858,6 +858,135 @@ class TestMultimodalConversion(unittest.TestCase):
         self.assertIsInstance(agui_content[1], ImageInputContent)
         self.assertIsInstance(agui_content[1].source, InputContentUrlSource)
         self.assertEqual(agui_content[1].source.value, "https://example.com/test.png")
+
+
+class TestModalitySurvivesImageUrlRoundTrip(unittest.TestCase):
+    """Modality survives the `image_url` round trip.
+
+    `image_url` is the fallback block for every modality the outbound leg cannot
+    send as a standard block — video always, audio outside the provider's format
+    enum, and every URL-sourced item — so reading the block kind literally on the
+    way back rewrote the thread: the user attached a video and MESSAGES_SNAPSHOT
+    came back holding an image, permanently, for every later read.
+
+    The MIME type inside the data URL is the recovery signal, and these tests pin
+    BOTH halves: the type that comes back, and the fact that the block going out
+    is byte-for-byte what it was (the outbound shape is provider-measured and must
+    not move).
+
+    Mirrors "modality survives the image_url round trip" in the TypeScript
+    adapter's `utils.test.ts`. A divergence between the two is the class of bug
+    this converter exists to fix.
+    """
+
+    def _round_trip(self, item):
+        wire = convert_agui_multimodal_to_langchain([item])
+        return wire[0], convert_langchain_multimodal_to_agui(wire)[0]
+
+    def test_video_stays_a_video_across_the_round_trip(self):
+        wire, content = self._round_trip(
+            VideoInputContent(
+                type="video",
+                source=InputContentDataSource(
+                    type="data", value="SGVsbG8=", mime_type="video/mp4"
+                ),
+                metadata={"filename": "clip.mp4"},
+            )
+        )
+
+        # Unchanged on the wire: video still has no standard block that any
+        # translator accepts, so it stays on `image_url` deliberately.
+        self.assertEqual(
+            wire,
+            {"type": "image_url", "image_url": {"url": "data:video/mp4;base64,SGVsbG8="}},
+        )
+        self.assertIsInstance(content, VideoInputContent)
+        self.assertEqual(content.source.value, "SGVsbG8=")
+        self.assertEqual(content.source.mime_type, "video/mp4")
+
+    def test_audio_the_provider_cannot_carry_stays_audio(self):
+        # `audio/ogg` is outside `input_audio.format`, so it rides `image_url` too.
+        wire, content = self._round_trip(
+            AudioInputContent(
+                type="audio",
+                source=InputContentDataSource(
+                    type="data", value="SGVsbG8=", mime_type="audio/ogg"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            wire,
+            {"type": "image_url", "image_url": {"url": "data:audio/ogg;base64,SGVsbG8="}},
+        )
+        self.assertIsInstance(content, AudioInputContent)
+        self.assertEqual(content.source.mime_type, "audio/ogg")
+
+    def test_legacy_binary_video_stays_a_video(self):
+        wire, content = self._round_trip(
+            BinaryInputContent(type="binary", mime_type="video/mp4", data="SGVsbG8=")
+        )
+
+        self.assertEqual(
+            wire,
+            {"type": "image_url", "image_url": {"url": "data:video/mp4;base64,SGVsbG8="}},
+        )
+        self.assertIsInstance(content, VideoInputContent)
+        self.assertEqual(content.source.mime_type, "video/mp4")
+
+    def test_a_genuine_image_still_comes_back_an_image(self):
+        _, content = self._round_trip(
+            ImageInputContent(
+                type="image",
+                source=InputContentDataSource(
+                    type="data", value="SGVsbG8=", mime_type="image/png"
+                ),
+            )
+        )
+
+        self.assertIsInstance(content, ImageInputContent)
+        self.assertEqual(content.source.mime_type, "image/png")
+
+    def test_a_non_media_mime_type_reads_as_a_document(self):
+        """Nothing in this adapter emits a document as an `image_url` data URL,
+        but a graph relaying its own content can, and `document` is what the
+        legacy binary OUTBOUND leg calls the same MIME type. Symmetry, not
+        guesswork."""
+        content = convert_langchain_multimodal_to_agui(
+            [{"type": "image_url", "image_url": {"url": "data:application/pdf;base64,JVBERi0="}}]
+        )[0]
+
+        self.assertIsInstance(content, DocumentInputContent)
+        self.assertEqual(content.source.value, "JVBERi0=")
+        self.assertEqual(content.source.mime_type, "application/pdf")
+
+    def test_a_data_url_with_no_mime_type_stays_an_image(self):
+        """Nothing to read, so the pre-existing default stands rather than a guess."""
+        content = convert_langchain_multimodal_to_agui(
+            [{"type": "image_url", "image_url": {"url": "data:;base64,SGVsbG8="}}]
+        )[0]
+
+        self.assertIsInstance(content, ImageInputContent)
+
+    def test_known_limit_a_url_sourced_video_comes_back_as_an_image(self):
+        """Not an oversight — an `image_url` block carries ``{"url": …}`` and
+        nothing else, so an https-hosted video arrives with no MIME type and no
+        other modality signal. Adding a key to the block is what issue #2100 was
+        about (providers 400 on unexpected keys inside a content block), and a
+        file extension is not a signal on signed or extensionless CDN URLs. This
+        test exists so the limit is visible and a future fix has to change it
+        deliberately."""
+        _, content = self._round_trip(
+            VideoInputContent(
+                type="video",
+                source=InputContentUrlSource(
+                    type="url", value="https://example.com/clip.mp4", mime_type="video/mp4"
+                ),
+            )
+        )
+
+        self.assertIsInstance(content, ImageInputContent)
+        self.assertEqual(content.source.value, "https://example.com/clip.mp4")
 
 
 class TestProviderBoundary(unittest.TestCase):
