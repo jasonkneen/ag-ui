@@ -368,6 +368,16 @@ describe("Multimodal Message Conversion", () => {
       // Structured-syntax suffix: the format is what follows the `+`.
       ["application/vnd.api+json", "attachment.json"],
       ["application/ld+json", "attachment.json"],
+      // Registration tree stripped: `vnd.` / `prs.` / `x-` / `x.` are
+      // NAMESPACES, and leaving one on turns a perfectly good extension into an
+      // implausible one that falls back to `.bin`. These rows are the only ones
+      // where the strip changes the answer — `application/x-weird-thing` below
+      // is `.bin` with or without it — so without them the strip is deletable
+      // with both suites green.
+      ["application/x-tar", "attachment.tar"],
+      ["application/vnd.rar", "attachment.rar"],
+      ["application/prs.foo", "attachment.foo"],
+      ["application/x.custom", "attachment.custom"],
       // Already right from the subtype, and must stay right.
       ["application/pdf", "attachment.pdf"],
       ["text/csv", "attachment.csv"],
@@ -809,6 +819,11 @@ describe("Multimodal Message Conversion", () => {
     });
 
     it("should skip media content with unknown source type", () => {
+      // The drop is announced, and the announcement is STUBBED: left live it
+      // writes to the suite's stderr on every run, which trains everyone
+      // reading CI output to ignore a line the converter emits precisely so a
+      // vanished attachment is traceable.
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const aguiMessage: UserMessage = {
         id: "test-unknown-source",
         role: "user",
@@ -825,9 +840,14 @@ describe("Multimodal Message Conversion", () => {
       // Only text should remain, image with unknown source should be dropped
       expect(content).toHaveLength(1);
       expect(content[0].type).toBe("text");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping image content: source could not be converted to URL"),
+      );
+      warn.mockRestore();
     });
 
     it("should skip binary content without any source", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const aguiMessage: UserMessage = {
         id: "test-9",
         role: "user",
@@ -848,6 +868,10 @@ describe("Multimodal Message Conversion", () => {
       // Binary content should be skipped, only text remains
       expect(content).toHaveLength(1);
       expect(content[0].type).toBe("text");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping BinaryInputContent: no url, data, or id provided"),
+      );
+      warn.mockRestore();
     });
   });
 
@@ -1071,6 +1095,19 @@ describe("Multimodal Message Conversion", () => {
       return body.messages[0].content;
     }
 
+    /**
+     * The LangChain blocks this adapter emits for one AG-UI message.
+     *
+     * There is deliberately no `.filter((b) => b.type !== "text")` here, and
+     * there never should have been one: every AG-UI message in this block
+     * carries its attachment and nothing else, so that filter removed nothing
+     * while reading as though it removed something. The text part these tests
+     * index past is the one `partsOnTheWire` adds on the way to the provider.
+     */
+    function emittedBlocks(message: unknown): any[] {
+      return aguiMessagesToLangChain([message as UserMessage])[0].content as any[];
+    }
+
     it("carries an emitted PDF block to OpenAI as a file part", async () => {
       const aguiMessage: UserMessage = {
         id: "boundary-pdf",
@@ -1084,9 +1121,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts).toEqual([
@@ -1115,9 +1150,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1141,9 +1174,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1189,11 +1220,9 @@ describe("Multimodal Message Conversion", () => {
         "attachment.bin",
       ],
     ])("reaches OpenAI with a usable filename when it is %s", async (_name, item, filename) => {
-      const emitted = (
-        aguiMessagesToLangChain([
+      const emitted = emittedBlocks(
           { id: "filename-situation", role: "user", content: [item] } as unknown as UserMessage,
-        ])[0].content as any[]
-      ).filter((b) => b.type !== "text");
+      );
 
       const parts = await partsOnTheWire(emitted);
 
@@ -1215,9 +1244,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1242,9 +1269,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1289,9 +1314,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1314,9 +1337,7 @@ describe("Multimodal Message Conversion", () => {
         content: [{ type: "binary", mimeType, data: "SGVsbG8=" } as BinaryInputContent],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1330,11 +1351,30 @@ describe("Multimodal Message Conversion", () => {
     // request is built. This is the throw the normalization step exists to avoid,
     // pinned so it cannot be quietly reintroduced by widening the gate instead.
     it("would throw at the provider for a raw audio/mpeg block — hence the rewrite", async () => {
-      await expect(
-        partsOnTheWire([
-          { type: "audio", source_type: "base64", data: "SGVsbG8=", mime_type: "audio/mpeg" },
-        ]),
-      ).rejects.toThrow(/must have mime type of audio\/wav or audio\/mp3/);
+      const raw = {
+        type: "audio",
+        source_type: "base64",
+        data: "SGVsbG8=",
+        mime_type: "audio/mpeg",
+      };
+
+      await expect(partsOnTheWire([raw])).rejects.toThrow(
+        /must have mime type of audio\/wav or audio\/mp3/,
+      );
+
+      // And the converter does not emit that block. Asserting only the throw
+      // documents `@langchain/openai` and pins nothing here — the assertion
+      // holds with this module deleted. The row is a claim about a CHOICE this
+      // adapter makes, so the choice is what it has to read.
+      expect(
+        emittedBlocks({
+          id: "raw-mpeg",
+          role: "user",
+          content: [
+            { type: "audio", source: { type: "data", value: "SGVsbG8=", mimeType: "audio/mpeg" } },
+          ],
+        }),
+      ).toEqual([{ ...raw, mime_type: "audio/mp3" }]);
     });
 
     // Everything the converter REFUSES. Two claims per row, and both matter: the
@@ -1355,9 +1395,7 @@ describe("Multimodal Message Conversion", () => {
           ],
         };
 
-        const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-          (b) => b.type !== "text",
-        );
+        const emitted = emittedBlocks(aguiMessage);
         expect(emitted).toEqual([
           { type: "image_url", image_url: { url: `data:${mimeType};base64,SGVsbG8=` } },
         ]);
@@ -1379,9 +1417,7 @@ describe("Multimodal Message Conversion", () => {
           content: [{ type: "binary", mimeType, data: "SGVsbG8=" } as BinaryInputContent],
         };
 
-        const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-          (b) => b.type !== "text",
-        );
+        const emitted = emittedBlocks(aguiMessage);
         expect(emitted).toEqual([
           { type: "image_url", image_url: { url: `data:${mimeType};base64,SGVsbG8=` } },
         ]);
@@ -1403,9 +1439,7 @@ describe("Multimodal Message Conversion", () => {
         ],
       };
 
-      const emitted = (aguiMessagesToLangChain([aguiMessage])[0].content as any[]).filter(
-        (b) => b.type !== "text",
-      );
+      const emitted = emittedBlocks(aguiMessage);
       const parts = await partsOnTheWire(emitted);
 
       expect(parts[1]).toEqual({
@@ -1425,24 +1459,41 @@ describe("Multimodal Message Conversion", () => {
     // announce as standard blocks, and the throw that is the reason why. If one
     // of these ever stops throwing, the corresponding row in
     // `standardBlockTypeFor` can be revisited — but not before.
+    //
+    // Each row carries BOTH halves, and it has to. A row that only asserted the
+    // throw would document `@langchain/openai` and pin nothing here: it passes
+    // with this module gutted, while its own name makes a claim about what the
+    // adapter does instead. So every row also drives the equivalent AG-UI item
+    // through the converter and reads the block it actually emits.
     it.each([
       [
         "audio by url",
+        { type: "audio", source: { type: "url", value: "https://example.com/a.wav", mimeType: "audio/wav" } },
         { type: "audio", source_type: "url", url: "https://example.com/a.wav", mime_type: "audio/wav" },
+        { type: "image_url", image_url: { url: "https://example.com/a.wav" } },
         /must be formatted as a data URL/,
       ],
       [
         "video by base64",
+        { type: "video", source: { type: "data", value: "AAA=", mimeType: "video/mp4" } },
         { type: "video", source_type: "base64", data: "AAA=", mime_type: "video/mp4" },
+        { type: "image_url", image_url: { url: "data:video/mp4;base64,AAA=" } },
         /'video'.*not recognized/,
       ],
       [
         "video by url",
+        { type: "video", source: { type: "url", value: "https://example.com/v.mp4", mimeType: "video/mp4" } },
         { type: "video", source_type: "url", url: "https://example.com/v.mp4", mime_type: "video/mp4" },
+        { type: "image_url", image_url: { url: "https://example.com/v.mp4" } },
         /'video'.*not recognized/,
       ],
       [
         "file by url",
+        {
+          type: "document",
+          source: { type: "url", value: "https://example.com/d.pdf", mimeType: "application/pdf" },
+          metadata: { filename: "d.pdf" },
+        },
         {
           type: "file",
           source_type: "url",
@@ -1450,15 +1501,48 @@ describe("Multimodal Message Conversion", () => {
           mime_type: "application/pdf",
           metadata: { filename: "d.pdf" },
         },
+        { type: "image_url", image_url: { url: "https://example.com/d.pdf" } },
         /must be formatted as a data URL/,
       ],
-      [
-        "file by base64 with no filename",
-        { type: "file", source_type: "base64", data: "JVBERi0xLjQK", mime_type: "application/pdf" },
+    ])(
+      "would throw at the provider for %s — hence the image_url fallback",
+      async (_name, aguiItem, refusedBlock, fallback, message) => {
+        await expect(partsOnTheWire([refusedBlock])).rejects.toThrow(message);
+
+        expect(
+          emittedBlocks({ id: "refused", role: "user", content: [aguiItem] }),
+        ).toEqual([fallback]);
+      },
+    );
+
+    // Not an `image_url` fallback, which is why this row is not in the table
+    // above: the converter DOES emit a file block for a filename-less document.
+    // What it does not do is emit it nameless, and this is the throw that is the
+    // reason why.
+    it("would throw at the provider for a nameless file block — hence the derived name", async () => {
+      const nameless = {
+        type: "file",
+        source_type: "base64",
+        data: "JVBERi0xLjQK",
+        mime_type: "application/pdf",
+      };
+
+      await expect(partsOnTheWire([nameless])).rejects.toThrow(
         /a filename or name or title is needed/,
-      ],
-    ])("would throw at the provider for %s — hence the image_url fallback", async (_name, block, message) => {
-      await expect(partsOnTheWire([block])).rejects.toThrow(message);
+      );
+
+      expect(
+        emittedBlocks({
+          id: "nameless-file",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+            },
+          ],
+        }),
+      ).toEqual([{ ...nameless, metadata: { filename: "attachment.pdf" } }]);
     });
 
     it("forwards a block with no source_type RAW — the regression this guards", async () => {
@@ -1481,6 +1565,23 @@ describe("Multimodal Message Conversion", () => {
 
       expect(parts[1]).toEqual(nativeJsShapeWithNoSourceType);
       expect(parts[1]).not.toHaveProperty("file");
+
+      // Which is only a reason to guard something if this adapter is the thing
+      // guarded. Without this line the test above holds with the converter
+      // deleted — it would be a fact about `@langchain/openai` and nothing else.
+      expect(
+        emittedBlocks({
+          id: "has-source-type",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+              metadata: { filename: "invoice-q2.pdf" },
+            },
+          ],
+        })[0],
+      ).toHaveProperty("source_type", "base64");
     });
 
     // ── A document with no usable MIME type ───────────────────────────────
@@ -1494,8 +1595,7 @@ describe("Multimodal Message Conversion", () => {
       ["empty-string MIME type", ""],
       ["absent MIME type", undefined],
     ])("names a document's bytes octet-stream at the provider when it has an %s", async (_name, mimeType) => {
-      const emitted = (
-        aguiMessagesToLangChain([
+      const emitted = emittedBlocks(
           {
             id: "boundary-no-mime",
             role: "user",
@@ -1506,8 +1606,7 @@ describe("Multimodal Message Conversion", () => {
               },
             ],
           } as unknown as UserMessage,
-        ])[0].content as any[]
-      ).filter((b) => b.type !== "text");
+      );
 
       const parts = await partsOnTheWire(emitted);
 
@@ -1533,11 +1632,9 @@ describe("Multimodal Message Conversion", () => {
       ["typed image content", { type: "image", source: { type: "data", value: "aGk=" } }],
       ["legacy binary content", { type: "binary", data: "aGk=" }],
     ])("does not put the text `undefined` in the data URL for %s with no MIME type", async (_name, item) => {
-      const emitted = (
-        aguiMessagesToLangChain([
+      const emitted = emittedBlocks(
           { id: "boundary-undefined-mime", role: "user", content: [item] } as unknown as UserMessage,
-        ])[0].content as any[]
-      ).filter((b) => b.type !== "text");
+      );
 
       const parts = await partsOnTheWire(emitted);
 
@@ -1622,6 +1719,70 @@ describe("Multimodal Message Conversion", () => {
 
   // ── Native LangChain.js blocks on the way back ───────────────────────────
   describe("langchainMessagesToAgui with native LangChain.js blocks", () => {
+    // EVERY standard block kind the return leg claims to understand, not just
+    // `file`. The map behind this is what keeps a non-image attachment in a
+    // reopened thread: a kind missing from it matches no branch of the
+    // converter at all, so the block is not converted, not warned about and not
+    // dropped loudly — it is simply absent from the next MESSAGES_SNAPSHOT,
+    // which is what the thread permanently becomes. Testing only the `file` row
+    // left the audio and video rows deletable with the suite green.
+    //
+    // Mirrored in Python by
+    // `test_every_standard_block_kind_comes_back_as_its_own_media_type`.
+    it.each([
+      ["audio", "audio/wav", "audio"],
+      ["video", "video/mp4", "video"],
+      ["image", "image/png", "image"],
+      ["file", "application/pdf", "document"],
+    ])("brings a standard %s block back as AG-UI %s content", (blockType, mimeType, aguiType) => {
+      const agui = langchainMessagesToAgui([
+        {
+          id: `return-leg-${blockType}`,
+          type: "human",
+          content: [
+            { type: blockType, source_type: "base64", data: "QUJD", mime_type: mimeType },
+          ],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      const content = (agui[0] as UserMessage).content as Array<any>;
+      expect(content).toEqual([
+        { type: aguiType, source: { type: "data", value: "QUJD", mimeType } },
+      ]);
+    });
+
+    it("names a MIME-less inbound base64 block's bytes octet-stream", () => {
+      // A base64 block with no MIME type is malformed rather than merely terse,
+      // but an AG-UI data source REQUIRES one, so the attachment is kept under
+      // the canonical name for unidentified bytes instead of being dropped.
+      //
+      // It has to be THAT string and not merely some placeholder: the outbound
+      // leg emits exactly `application/octet-stream` for a MIME-less document,
+      // and `FILENAME_EXTENSIONS` maps it to the same `.bin` the generic
+      // derivation independently produces. The two legs are inverses only while
+      // both spell it the same way. Mirrored in Python by
+      // `test_base64_block_without_mime_type_is_not_dropped`.
+      const agui = langchainMessagesToAgui([
+        {
+          id: "inbound-no-mime",
+          type: "human",
+          content: [{ type: "file", source_type: "base64", data: "JVBERi0xLjQK" }],
+        } as unknown as LangGraphMessage,
+      ]);
+
+      const content = (agui[0] as UserMessage).content as Array<any>;
+      expect(content).toEqual([
+        {
+          type: "document",
+          source: {
+            type: "data",
+            value: "JVBERi0xLjQK",
+            mimeType: "application/octet-stream",
+          },
+        },
+      ]);
+    });
+
     it("accepts a native JS file block", () => {
       const agui = langchainMessagesToAgui([
         {
