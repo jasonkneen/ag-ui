@@ -38,8 +38,15 @@ internal sealed class ToolCallBuilder
                 $"Cannot send 'TOOL_CALL_START' event: A tool call with ID '{evt.ToolCallId}' is already in progress. Complete it with 'TOOL_CALL_END' first.");
         }
 
-        _activeToolCalls[evt.ToolCallId] = new ToolCallState(evt.ToolCallName, evt.ParentMessageId);
-        _mintedMessageIds[evt.ToolCallId] = evt.ParentMessageId ?? evt.ToolCallId;
+        // string.IsNullOrEmpty, not ??: the TypeScript reducer's fallback is a
+        // TRUTHINESS check (`if (parentMessageId)`), so an empty-string parent —
+        // which this SDK's own server emits for unset optionals on some paths —
+        // mints the toolCallId there. Keeping "" here put an empty messageId on
+        // the update and split the coalesced message (caught by the hosting
+        // baseline snapshots).
+        var mintedParent = string.IsNullOrEmpty(evt.ParentMessageId) ? null : evt.ParentMessageId;
+        _activeToolCalls[evt.ToolCallId] = new ToolCallState(evt.ToolCallName, mintedParent);
+        _mintedMessageIds[evt.ToolCallId] = mintedParent ?? evt.ToolCallId;
     }
 
     public void AppendArgs(ToolCallArgsEvent evt)

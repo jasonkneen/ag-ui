@@ -1720,6 +1720,29 @@ public sealed class ProtocolRuleTest
     }
 
     [Fact]
+    public async Task EmptyStringParentMessageId_MintsTheToolCallId()
+    {
+        // The TypeScript reducer's parent fallback is a TRUTHINESS check, so an
+        // empty-string parentMessageId — which this SDK's own server emits for
+        // unset optionals on some paths — mints the toolCallId there. Keeping ""
+        // here put an empty messageId on the update and split the coalesced
+        // message (caught by the hosting baseline snapshots).
+        var events = new BaseEvent[]
+        {
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1" },
+            new ToolCallStartEvent { ToolCallId = "tc1", ToolCallName = "search", ParentMessageId = "" },
+            new ToolCallArgsEvent { ToolCallId = "tc1", Delta = "{}" },
+            new ToolCallEndEvent { ToolCallId = "tc1" },
+            new ToolCallResultEvent { MessageId = "tc1", ToolCallId = "tc1", Content = "done" },
+            new RunFinishedEvent { ThreadId = "t1", RunId = "r1" }
+        };
+
+        var updates = await ProcessEventsAsync(events);
+        var callUpdate = Assert.Single(updates, u => u.Contents.OfType<FunctionCallContent>().Any());
+        Assert.Equal("tc1", callUpdate.MessageId);
+    }
+
+    [Fact]
     public async Task Subagent_EncryptedOnlyReasoning_SurvivesCoalescing()
     {
         // Same coalescer rule as the attribution-only case above: an encrypted
