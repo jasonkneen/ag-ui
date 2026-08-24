@@ -863,6 +863,176 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
             {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
         )
 
+    # ── The return leg reads all three vocabularies ────────────────────
+    #
+    # `convert_langchain_multimodal_to_agui` builds the user message inside
+    # MESSAGES_SNAPSHOT. A vocabulary it cannot read is an attachment that
+    # vanishes from a reopened thread — the file was sent, the model read it,
+    # and the thread shows a bare line of text. It used to read only shape 2
+    # (LangChain Python), so every base64 media block the TypeScript adapter
+    # sends was dropped outright.
+
+    def test_js_native_base64_block_is_read(self):
+        """Shape 1, base64: native LangChain.js — `data` + `mimeType`."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "data": "JVBERi0xLjQK",
+                "mimeType": "application/pdf",
+                "metadata": {"filename": "invoice-q2.pdf"},
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], DocumentInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentDataSource)
+        self.assertEqual(agui_content[0].source.value, "JVBERi0xLjQK")
+        self.assertEqual(agui_content[0].source.mime_type, "application/pdf")
+        self.assertEqual(agui_content[0].metadata, {"filename": "invoice-q2.pdf"})
+
+    def test_js_native_url_block_is_read(self):
+        """Shape 1, url: native LangChain.js — `url` + `mimeType`."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "audio",
+                "url": "https://example.com/clip.wav",
+                "mimeType": "audio/wav",
+                "metadata": {"filename": "clip.wav"},
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], AudioInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentUrlSource)
+        self.assertEqual(agui_content[0].source.value, "https://example.com/clip.wav")
+        self.assertEqual(agui_content[0].source.mime_type, "audio/wav")
+        self.assertEqual(agui_content[0].metadata, {"filename": "clip.wav"})
+
+    def test_python_native_base64_block_is_read(self):
+        """Shape 2, base64: LangChain Python — `base64` + top-level `filename`."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "base64": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "filename": "invoice-q2.pdf",
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], DocumentInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentDataSource)
+        self.assertEqual(agui_content[0].source.value, "JVBERi0xLjQK")
+        self.assertEqual(agui_content[0].source.mime_type, "application/pdf")
+        self.assertEqual(agui_content[0].metadata, {"filename": "invoice-q2.pdf"})
+
+    def test_python_native_url_block_is_read(self):
+        """Shape 2, url: LangChain Python — `url` + `mime_type`."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "video",
+                "url": "https://example.com/demo.mp4",
+                "mime_type": "video/mp4",
+                "filename": "demo.mp4",
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], VideoInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentUrlSource)
+        self.assertEqual(agui_content[0].source.value, "https://example.com/demo.mp4")
+        self.assertEqual(agui_content[0].source.mime_type, "video/mp4")
+        self.assertEqual(agui_content[0].metadata, {"filename": "demo.mp4"})
+
+    def test_ts_emitted_base64_block_is_read_back_into_agui(self):
+        """Shape 3, base64: the `source_type` family — verbatim TS adapter output.
+
+        This literal is the same block asserted by
+        `test_ts_emitted_document_block_converts_in_python`: what the TypeScript
+        adapter puts on the wire. Python used to return `[]` for it.
+        """
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "source_type": "base64",
+                "data": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "metadata": {"filename": "invoice-q2.pdf"},
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], DocumentInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentDataSource)
+        self.assertEqual(agui_content[0].source.value, "JVBERi0xLjQK")
+        self.assertEqual(agui_content[0].source.mime_type, "application/pdf")
+        self.assertEqual(agui_content[0].metadata, {"filename": "invoice-q2.pdf"})
+
+    def test_ts_emitted_url_block_is_read_back_into_agui(self):
+        """Shape 3, url: the `source_type` family, URL variant."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "source_type": "url",
+                "url": "https://example.com/invoice-q2.pdf",
+                "mime_type": "application/pdf",
+                "metadata": {"filename": "invoice-q2.pdf"},
+            },
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0], DocumentInputContent)
+        self.assertIsInstance(agui_content[0].source, InputContentUrlSource)
+        self.assertEqual(
+            agui_content[0].source.value, "https://example.com/invoice-q2.pdf"
+        )
+        self.assertEqual(agui_content[0].source.mime_type, "application/pdf")
+        self.assertEqual(agui_content[0].metadata, {"filename": "invoice-q2.pdf"})
+
+    def test_filename_falls_back_to_metadata_name_and_title(self):
+        """`metadata.name` / `metadata.title` are the other spellings the
+        provider translators read, so the return leg must not lose them."""
+        by_name, by_title = convert_langchain_multimodal_to_agui([
+            {
+                "type": "file",
+                "source_type": "base64",
+                "data": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "metadata": {"name": "named.pdf"},
+            },
+            {
+                "type": "file",
+                "source_type": "base64",
+                "data": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "metadata": {"title": "titled.pdf"},
+            },
+        ])
+
+        self.assertEqual(by_name.metadata, {"filename": "named.pdf"})
+        self.assertEqual(by_title.metadata, {"filename": "titled.pdf"})
+
+    def test_base64_block_without_mime_type_is_not_dropped(self):
+        """AG-UI's data source REQUIRES a MIME type; a malformed block degrades
+        to the least wrong one rather than losing the attachment."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "file", "source_type": "base64", "data": "JVBERi0xLjQK"},
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertEqual(agui_content[0].source.mime_type, "application/octet-stream")
+        self.assertIsNone(agui_content[0].metadata)
+
+    def test_reference_only_block_is_still_dropped(self):
+        """A block that names provider-side storage carries no bytes and no URL,
+        and AG-UI's typed classes have nowhere to put that."""
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "file", "source_type": "id", "id": "file-abc123"},
+            {"type": "file", "fileId": "file-abc123"},
+        ])
+
+        self.assertEqual(agui_content, [])
+
     def test_the_shape_python_cannot_translate(self):
         """Why the TS adapter does not emit LangChain.js's native block shape.
 
