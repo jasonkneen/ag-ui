@@ -1692,6 +1692,30 @@ class StrandsAgent:
                     core_kwargs = dict(self._agent_kwargs)
                     if self._hooks:
                         core_kwargs["hooks"] = list(self._hooks)
+                    # The caller's per-thread kwargs go on last, so they can
+                    # supply what the template cannot carry and override what
+                    # it can. See StrandsAgentConfig.thread_agent_kwargs.
+                    if self.config.thread_agent_kwargs is not None:
+                        try:
+                            extra = self.config.thread_agent_kwargs(input_data)
+                        except Exception as e:  # noqa: BLE001 - surfaced as RUN_ERROR
+                            logger.error(
+                                "thread_agent_kwargs failed: %s", e, exc_info=True
+                            )
+                            yield RunErrorEvent(
+                                type=EventType.RUN_ERROR,
+                                message=(
+                                    "Failed to build per-thread agent kwargs: "
+                                    f"{e}"
+                                ),
+                                code="THREAD_AGENT_KWARGS_ERROR",
+                            )
+                            return
+                        core_kwargs.update(dict(extra or {}))
+                    # Re-asserted after the caller: these keep threads apart
+                    # and a run coherent, so they stay the adapter's to set.
+                    for owned in ("model", "system_prompt", "tools", "session_manager"):
+                        core_kwargs.pop(owned, None)
                     self._agents_by_thread[thread_id] = StrandsAgentCore(
                         model=self._model,
                         system_prompt=self._system_prompt,

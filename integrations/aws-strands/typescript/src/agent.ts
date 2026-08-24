@@ -940,17 +940,21 @@ export class StrandsAgent {
       this._log.debug(
         `${LOG_PREFIX} not shared with per-thread agents: ` +
           `${extracted.ignored.join(", ")}. Each is wired to the Agent that owns ` +
-          "it, so one instance cannot serve every thread.",
+          "it, so one instance cannot serve every thread. Supply them per " +
+          "thread with StrandsAgentConfig.threadAgentConfig.",
       );
     }
-    if (extracted.unsupported.length > 0) {
-      // Warn, not debug: reaching this means the caller set a value that is
-      // readable, so it is not an SDK default, and it will not reach any
-      // per-thread agent.
+    // Only fields whose value could actually be read are named here. Strands
+    // consumes others into internal state during construction and keeps
+    // nothing the adapter can find, so for those "was it set?" has no answer
+    // from the outside and a guess would fire at callers who set nothing.
+    // Those are documented on threadAgentConfig, which is the route that
+    // carries them.
+    if (extracted.unsupported.length > 0 && !this.config.threadAgentConfig) {
       this._log.warn(
-        `${LOG_PREFIX} these template settings are not carried to per-thread ` +
-          `agents and have no effect: ${extracted.unsupported.join(", ")}. ` +
-          "Set them on the Strands Agent this adapter builds per thread instead.",
+        `${LOG_PREFIX} these settings are on the template but are not carried ` +
+          `to per-thread agents: ${extracted.unsupported.join(", ")}. Supply ` +
+          "them per thread with StrandsAgentConfig.threadAgentConfig.",
       );
     }
 
@@ -1051,9 +1055,30 @@ export class StrandsAgent {
           );
         }
       }
+      let callerConfig: Partial<AgentConfig> | undefined;
+      if (this.config.threadAgentConfig) {
+        try {
+          callerConfig = await maybeAwait(
+            this.config.threadAgentConfig(inputData),
+          );
+        } catch (e) {
+          const msg = _errorMessage(e);
+          this._log.error(`${LOG_PREFIX} threadAgentConfig failed: ${msg}`, e);
+          return {
+            error: _runError(
+              `Failed to build per-thread agent config: ${msg}`,
+              "THREAD_AGENT_CONFIG_ERROR",
+            ),
+          };
+        }
+      }
       const effectiveSeed = sessionManager ? undefined : seedMessages;
       strandsAgent = new StrandsAgentCore(
-        this._buildThreadAgentConfig(sessionManager ?? undefined, effectiveSeed),
+        this._buildThreadAgentConfig(
+          sessionManager ?? undefined,
+          effectiveSeed,
+          callerConfig,
+        ),
       );
       // Register interruptOnCall hooks on the per-thread agent.
       const behaviors = this.config.toolBehaviors;
@@ -3172,6 +3197,7 @@ export class StrandsAgent {
   private _buildThreadAgentConfig(
     sessionManager?: SessionManager,
     seedMessages?: AgentConfig["messages"],
+    callerConfig?: Partial<AgentConfig>,
   ): AgentConfig {
     const t = this._templateFields;
     // Every "copy" field the template carried, without naming them one by one:
@@ -3180,11 +3206,19 @@ export class StrandsAgent {
     const cfg: AgentConfig = {
       ...t,
       tools: t.tools.slice(),
-      printer: false,
     };
     // Always set a stable id so SessionManager can locate snapshots after
     // the in-memory agent cache is cleared (stateless resume / restart).
     cfg.id = t.id ?? this.name;
+
+    // The caller's per-thread config goes on last of the template-derived
+    // values, so it can supply what the template cannot carry and override
+    // what it can. See StrandsAgentConfig.threadAgentConfig.
+    if (callerConfig) Object.assign(cfg, callerConfig);
+
+    // Re-asserted after the caller: these are what keeps threads apart and a
+    // run coherent, so they stay the adapter's to set.
+    cfg.printer = false;
     if (sessionManager) cfg.sessionManager = sessionManager;
     if (seedMessages && seedMessages.length > 0) cfg.messages = seedMessages;
     // Only forward plugins when the caller supplied them explicitly. Passing
