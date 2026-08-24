@@ -1988,6 +1988,173 @@ class TestCrossRuntimeWireShape(unittest.TestCase):
         self.assertEqual(message["content"], [js_native])
 
 
+class TestOutboundDispatchAdmitsAndResolvesByTheSameRule(unittest.TestCase):
+    """What the outbound loop LETS IN and what it then DOES with it have to be
+    decided by one rule.
+
+    The media branch is entered by `isinstance`, which is subclass-tolerant by
+    definition. If the modality is then resolved by exact class identity, the two
+    halves disagree for exactly the inputs `isinstance` was chosen to accept: a
+    subclass passes the gate, misses the lookup, and silently falls through to
+    the legacy `image_url` form — which for a document is the provider 400
+    ("Invalid MIME type. Only image types are supported") this whole path exists
+    to avoid. Subclassing a pydantic content model is ordinary: it is how an
+    application attaches its own fields to an attachment.
+    """
+
+    def _emit(self, item):
+        [block] = convert_agui_multimodal_to_langchain([item])
+        return block
+
+    def test_subclassed_media_item_keeps_its_own_modality(self):
+        """A subclass gets the block its BASE class would have got."""
+
+        class TenantAudioInputContent(AudioInputContent):
+            pass
+
+        class TenantDocumentInputContent(DocumentInputContent):
+            pass
+
+        audio = self._emit(
+            TenantAudioInputContent(
+                source=InputContentDataSource(
+                    type="data", value="SGVsbG8=", mime_type="audio/wav"
+                ),
+            )
+        )
+        self.assertEqual(
+            audio,
+            {"type": "audio", "base64": "SGVsbG8=", "mime_type": "audio/wav"},
+        )
+        self.assertTrue(is_data_content_block(audio))
+
+        document = self._emit(
+            TenantDocumentInputContent(
+                source=InputContentDataSource(
+                    type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                ),
+                metadata={"filename": "report.pdf"},
+            )
+        )
+        self.assertEqual(
+            document,
+            {
+                "type": "file",
+                "base64": "JVBERi0xLjQK",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+            },
+        )
+        self.assertTrue(is_data_content_block(document))
+
+    def test_subclassed_media_item_the_converter_refuses_still_falls_back(self):
+        """Subclass tolerance is not a licence to emit a standard block for a
+        combination the translator rejects.
+
+        Image and video have no row in `_STANDARD_BLOCK_TYPES`, so a subclass of
+        either must land on `image_url` exactly as its base class does — the
+        subclass fix must not turn "no row" into "some row".
+        """
+
+        class TenantImageInputContent(ImageInputContent):
+            pass
+
+        class TenantVideoInputContent(VideoInputContent):
+            pass
+
+        self.assertEqual(
+            self._emit(
+                TenantImageInputContent(
+                    source=InputContentDataSource(
+                        type="data", value="iVBOR", mime_type="image/png"
+                    ),
+                )
+            ),
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}},
+        )
+        self.assertEqual(
+            self._emit(
+                TenantVideoInputContent(
+                    source=InputContentDataSource(
+                        type="data", value="AAA=", mime_type="video/mp4"
+                    ),
+                )
+            ),
+            {"type": "image_url", "image_url": {"url": "data:video/mp4;base64,AAA="}},
+        )
+
+    def test_subclassed_audio_the_provider_cannot_carry_falls_back(self):
+        """The MIME gate applies to a subclass too: `audio/ogg` has no `format`
+        enum value, so it keeps `image_url` rather than killing the run."""
+
+        class TenantAudioInputContent(AudioInputContent):
+            pass
+
+        self.assertEqual(
+            self._emit(
+                TenantAudioInputContent(
+                    source=InputContentDataSource(
+                        type="data", value="T2dn", mime_type="audio/ogg"
+                    ),
+                )
+            ),
+            {"type": "image_url", "image_url": {"url": "data:audio/ogg;base64,T2dn"}},
+        )
+
+    def test_flattened_subclassed_media_keeps_its_modality_label(self):
+        """`flatten_user_content` had the SAME split rule — `isinstance` gate,
+        `type(item)` label lookup — so a subclassed attachment flattened to the
+        generic `[Media: …]` instead of `[Audio: …]`.
+
+        This is the text a model sees when the graph cannot take multimodal
+        content, so the label is the only description of the attachment it gets.
+        """
+
+        class TenantAudioInputContent(AudioInputContent):
+            pass
+
+        class TenantDocumentInputContent(DocumentInputContent):
+            pass
+
+        source = InputContentDataSource(
+            type="data", value="SGVsbG8=", mime_type="audio/wav"
+        )
+        self.assertEqual(
+            flatten_user_content([TenantAudioInputContent(source=source)]),
+            flatten_user_content([AudioInputContent(source=source)]),
+        )
+        self.assertEqual(
+            flatten_user_content([TenantAudioInputContent(source=source)]),
+            "[Audio: audio/wav]",
+        )
+
+        pdf = InputContentUrlSource(type="url", value="https://example.com/d.pdf")
+        self.assertEqual(
+            flatten_user_content([TenantDocumentInputContent(source=pdf)]),
+            "[Document: https://example.com/d.pdf]",
+        )
+
+    def test_unrecognized_content_item_is_dropped_with_a_warning(self):
+        """An item matching no branch fell out of the loop with no trace at all.
+
+        Its neighbours in the same loop already log `Dropping ...` when they
+        cannot convert something, so the one case that drops the item ENTIRELY
+        was the only one that left the operator nothing to search for.
+        """
+
+        class SomeFutureContent:
+            pass
+
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING") as captured:
+            emitted = convert_agui_multimodal_to_langchain(
+                [TextInputContent(text="hello"), SomeFutureContent()]
+            )
+
+        self.assertEqual(emitted, [{"type": "text", "text": "hello"}])
+        self.assertIn("Dropping", captured.output[0])
+        self.assertIn("SomeFutureContent", captured.output[0])
+
+
 class TestMalformedGraphContentDegrades(unittest.TestCase):
     """The return leg tolerates what the graph actually sends.
 

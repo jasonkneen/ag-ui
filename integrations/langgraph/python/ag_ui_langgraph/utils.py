@@ -615,6 +615,29 @@ _STANDARD_BLOCK_TYPES = {
     DocumentInputContent: "file",
 }
 
+
+def _by_content_class(table: Dict[Any, Any], item: Any, default: Any = None) -> Any:
+    """Look a content item up in a per-class table BY `isinstance`.
+
+    Every one of these tables sits behind an `isinstance` gate — the media branch
+    of the two loops below is entered with `isinstance(item, _MEDIA_CONTENT_TYPES)`
+    — so resolving the row with `table[type(item)]` asks the same question by a
+    STRICTER rule, and the two answers diverge for exactly the inputs the gate was
+    written to accept. An application that subclasses `DocumentInputContent` to
+    hang its own fields off an attachment passed the gate, missed the exact-class
+    lookup, and had its PDF emitted as `image_url` — the provider 400 ("Invalid
+    MIME type. Only image types are supported") this whole path exists to avoid.
+
+    Admission and resolution now use one rule, so a subclass is routed as
+    whatever it IS. Rows are tried in insertion order; the content classes are
+    siblings, so at most one can ever match.
+    """
+    for content_class, value in table.items():
+        if isinstance(item, content_class):
+            return value
+    return default
+
+
 # The audio MIME types an `input_audio` part can actually carry, mapped to the
 # ONE spelling the provider accepts for each.
 #
@@ -931,7 +954,7 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 "text": item.text
             })
         elif isinstance(item, _MEDIA_CONTENT_TYPES):
-            block_type = _STANDARD_BLOCK_TYPES.get(type(item))
+            block_type = _by_content_class(_STANDARD_BLOCK_TYPES, item)
             # Only inline data converts; every URL-sourced media block raises in
             # both runtimes, so those fall through to `image_url` below. Audio in
             # a format the provider's `input_audio.format` enum cannot name falls
@@ -1010,6 +1033,17 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 continue
 
             langchain_content.append(content_dict)
+        else:
+            # An item matching NO branch used to fall out of the loop leaving
+            # nothing behind — no block and no log — while every other drop in
+            # this same loop says so. That is the drop most worth announcing:
+            # the others lost one field of a recognized item, this one loses the
+            # attachment whole, and an operator watching a file vanish from a
+            # thread had no string to search for. A new content type added to the
+            # AG-UI union lands here.
+            logger.warning(
+                "Dropping unsupported content item of type %s", type(item).__name__
+            )
 
     return langchain_content
 
@@ -1299,7 +1333,7 @@ def flatten_user_content(content: Any) -> str:
                 if item.text:
                     parts.append(item.text)
             elif isinstance(item, _MEDIA_CONTENT_TYPES):
-                label = _MEDIA_LABEL_MAP.get(type(item), "Media")
+                label = _by_content_class(_MEDIA_LABEL_MAP, item, "Media")
                 parts.append(_flatten_media_content(item, label))
             elif isinstance(item, BinaryInputContent):
                 # Legacy BinaryInputContent — backwards compatibility
