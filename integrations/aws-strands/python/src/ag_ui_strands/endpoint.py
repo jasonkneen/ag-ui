@@ -74,10 +74,20 @@ async def _settle_and_close(iterator, step) -> None:
     """Close an agent left running after its consumer was cancelled.
 
     Runs detached from the cancelled scope, so the agent's own teardown can
-    await without being cut short. The in-flight step is settled first:
-    closing an async generator while another task is inside `__anext__` is an
-    error, not merely a race.
+    await without being cut short.
+
+    The in-flight step has to settle before the close: closing an async
+    generator while another task sits inside `__anext__` is an error, not
+    merely a race. It also has to be cancelled to settle at all, because a
+    step waiting on something that never arrives, a model call that hangs,
+    would otherwise hold the agent open for as long as it stayed blocked.
+
+    Cancelling it here rather than letting the request's cancellation reach it
+    is the whole point: this task is not itself being cancelled, so the
+    CancelledError lands once and the agent's teardown can await afterwards.
     """
+    if not step.done():
+        step.cancel()
     try:
         await step
     except BaseException:

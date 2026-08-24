@@ -98,6 +98,60 @@ class AwaitingTeardownAgent:
             self.cleanup_completed.set()
 
 
+class BlockedStepAgent:
+    """Streams one frame, then blocks forever waiting for something.
+
+    A long model call that never returns looks exactly like this. The step
+    the endpoint is waiting on never settles, so anything that waits for it
+    before closing the agent waits forever, and the run leaks.
+    """
+
+    name = "blocked-step"
+
+    def __init__(self) -> None:
+        self.blocked = threading.Event()
+        self.cleanup_entered = threading.Event()
+        self.cleanup_completed = threading.Event()
+
+    async def run(self, input_data: Any) -> AsyncIterator[BaseEvent]:
+        try:
+            yield run_started()
+            self.blocked.set()
+            await asyncio.Event().wait()
+        finally:
+            self.cleanup_entered.set()
+            await asyncio.sleep(0.05)
+            self.cleanup_completed.set()
+
+
+@pytest.fixture
+def blocked_step_server() -> Iterator[tuple[BlockedStepAgent, str]]:
+    yield from _serve(BlockedStepAgent())
+
+
+def test_a_blocked_step_does_not_keep_the_agent_open_after_a_disconnect(
+    blocked_step_server,
+) -> None:
+    """Waiting for a step that never settles never gets to the close.
+
+    The agent has to be cancelled for its teardown to start at all, and that
+    cancellation has to come from outside the request's own scope so the
+    teardown can still await.
+    """
+    agent, url = blocked_step_server
+
+    _abandon_stream_after_first_frame(url)
+    assert agent.blocked.wait(CLEANUP_TIMEOUT_SECONDS), "agent never reached its block"
+
+    assert agent.cleanup_entered.wait(CLEANUP_TIMEOUT_SECONDS), (
+        "the agent was never closed, so its teardown never started and the run "
+        "leaked for as long as the step stayed blocked"
+    )
+    assert agent.cleanup_completed.wait(CLEANUP_TIMEOUT_SECONDS), (
+        "the teardown started but could not finish awaiting"
+    )
+
+
 def _serve(agent: Any) -> Iterator[tuple[Any, str]]:
     app = FastAPI()
     add_strands_fastapi_endpoint(app, agent, "/")
