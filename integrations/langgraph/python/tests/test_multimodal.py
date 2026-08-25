@@ -3498,6 +3498,111 @@ class TestMalformedInputContract(unittest.TestCase):
                     ["Dropping BinaryInputContent item: no url, data, or id provided"],
                 )
 
+    def test_an_absent_legacy_mime_type_reads_like_a_null_one(self):
+        """``mime_type`` is the ONE field on ``BinaryInputContent`` with no
+        default, so it is the one that can be ABSENT rather than null:
+        ``model_construct`` fills ``id`` / ``url`` / ``data`` / ``filename`` in
+        from their defaults and has nothing to fill in here, and pydantic's
+        ``__getattr__`` raises ``AttributeError`` for a field never set.
+
+        The branch read it as a plain attribute BEFORE the guard that collapses a
+        bad value, so the read raised out of the whole message-list conversion —
+        rule 1 — while the very same item carrying ``mime_type=None`` was already
+        handled. Absent and null must be one behaviour, and the null one is
+        already pinned: ``data:;base64,…``, the same string
+        ``_media_source_to_url`` builds for a source with no MIME type."""
+        absent = BinaryInputContent.model_construct(type="binary", data="QUJD")
+        self.assertFalse(hasattr(absent, "mime_type"))
+
+        outcome = self._outbound([absent])
+
+        self.assertEqual(
+            outcome.content,
+            [{"type": "image_url", "image_url": {"url": "data:;base64,QUJD"}}],
+        )
+        self.assertEqual(outcome.warnings, [])
+        # Not merely "some sensible output" — the SAME output as the null and the
+        # non-string spellings of "no MIME type", which is the property that makes
+        # this a collapse rather than a third behaviour.
+        for label, mime_type in [("null", None), ("non-string", 42)]:
+            with self.subTest(spelling=label):
+                self.assertEqual(
+                    self._outbound([
+                        BinaryInputContent.model_construct(
+                            type="binary", mime_type=mime_type, data="QUJD"
+                        )
+                    ]).content,
+                    outcome.content,
+                )
+
+    def test_an_absent_legacy_mime_type_with_no_payload_is_dropped_and_logged_once(self):
+        """The half of the same defect that was a REGRESSION, not a pre-existing
+        hole. This branch reads the MIME type early, for the modality split, and
+        that read sits in front of the ``no url, data, or id`` guard — so an item
+        with nothing to send raised here where it used to fall straight into the
+        guard and be dropped. One warning, no raise, nothing emitted."""
+        item = BinaryInputContent.model_construct(type="binary")
+        self.assertFalse(hasattr(item, "mime_type"))
+
+        outcome = self._outbound([item])
+
+        self.assertEqual(outcome.content, [])
+        self.assertEqual(
+            outcome.warnings,
+            ["Dropping BinaryInputContent item: no url, data, or id provided"],
+        )
+
+    def test_items_and_messages_around_a_legacy_item_with_no_mime_type_survive(self):
+        """Rule 3 for the absent MIME type specifically: an ``AttributeError``
+        raised from the middle of this loop is not a degraded attachment, it is a
+        thread with no messages in it. The text on either side, the good
+        attachment beside it, and the messages before and after.
+
+        The CARRYING message is built with ``model_construct`` too, and has to be:
+        ``UserMessage`` re-runs ``BinaryInputContent``'s ``validate_source`` over
+        the content list, so a validated message could not hold this item. That is
+        the same bypass family the contract already declares in scope, applied one
+        level up."""
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING") as logs:
+            messages = agui_messages_to_langchain([
+                UserMessage(id="m1", role="user", content="before message"),
+                UserMessage.model_construct(
+                    id="m2",
+                    role="user",
+                    content=[
+                        TextInputContent(type="text", text="before"),
+                        BinaryInputContent.model_construct(type="binary"),
+                        BinaryInputContent(
+                            type="binary", mime_type="application/pdf", data="aGk="
+                        ),
+                        TextInputContent(type="text", text="after"),
+                    ],
+                ),
+                UserMessage(id="m3", role="user", content="after message"),
+            ])
+
+        self.assertEqual([m.id for m in messages], ["m1", "m2", "m3"])
+        self.assertEqual(messages[0].content, "before message")
+        self.assertEqual(messages[2].content, "after message")
+        self.assertEqual(
+            messages[1].content,
+            [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "file",
+                    "base64": "aGk=",
+                    "mime_type": "application/pdf",
+                    "filename": "attachment.pdf",
+                },
+                {"type": "text", "text": "after"},
+            ],
+        )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            "Dropping BinaryInputContent item: no url, data, or id provided",
+            logs.output[0],
+        )
+
     def test_an_unusable_legacy_url_does_not_shadow_a_usable_data_payload(self):
         """An unusable payload is an ABSENT payload — the rule this file already
         applies to a MIME type and to a filename. ``url`` outranks ``data`` only

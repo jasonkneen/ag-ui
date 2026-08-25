@@ -1494,7 +1494,22 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # a NON-string `mime_type` — this is a legacy item and nothing
             # guarantees it was validated — and the `.split` on the next line then
             # raised out of the loop that converts the whole message list.
-            declared_mime_type = _first_non_empty_string(item.mime_type) or ""
+            #
+            # Fetched with `getattr`, not read as an attribute, because that guard
+            # only ever sees a VALUE. `mime_type` is the one field on
+            # `BinaryInputContent` with no default, so it is the one that can be
+            # ABSENT: `model_construct` fills a default in for `id` / `url` /
+            # `data` / `filename` and has nothing to fill in here, and pydantic's
+            # `__getattr__` raises `AttributeError` for a field that was never
+            # set. That raise happened BEFORE the guard below could collapse the
+            # value, so an item built by any of the validation-bypassing routes
+            # THE MALFORMED-INPUT CONTRACT declares in scope cost the client every
+            # message in the thread — rule 1 — where the same item with
+            # `mime_type=None` was already handled. Absent and null now read
+            # alike. The mirrored TypeScript branch needs nothing: a missing
+            # property there is `undefined`, which `firstNonEmptyString` already
+            # takes.
+            declared_mime_type = _first_non_empty_string(getattr(item, "mime_type", None)) or ""
             # The three payload keys, read through the SAME helper as the MIME
             # type above and for the same reason: `url` / `data` / `id` are
             # declared `str` and `BinaryInputContent` refuses a non-string at the

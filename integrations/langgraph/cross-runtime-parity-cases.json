@@ -147,7 +147,10 @@
     "than being reconstructed. The guard is not dead in Python, though: the",
     "`outbound/malformed/payload/binary-…` cases reach it with `pythonBuild:",
     "\"unvalidated\"`, because an item whose three payload keys are all present and",
-    "UNUSABLE now falls into it in both runtimes.",
+    "UNUSABLE now falls into it in both runtimes, and",
+    "`outbound/malformed/payload/binary-mime-type-absent-and-no-payload` is the same",
+    "input as `binary-empty` REBUILT around validation, which is what puts Python on",
+    "the typed legacy branch and pins the drop the guard emits there.",
     "",
     "LOG PROSE IS NOT ASSERTED. `loggedDrops` counts warnings beginning \"Dropping \"",
     "after prefix normalization. The rest of each message legitimately differs (`int`",
@@ -4455,6 +4458,48 @@
         ],
         "dropped": 0,
         "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-mime-type-absent",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "`mimeType` is the one field on the legacy item with no default, so it is the one that can be ABSENT rather than null. Python read it as a plain attribute and pydantic raised `AttributeError` out of the whole message list; an absent MIME type must read exactly like the null one this table already pins under `binary/no-mime/data`",
+      "content": [
+        {
+          "type": "binary",
+          "data": "QUJD"
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-mime-type-absent-and-no-payload",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the same absent `mimeType` on an item with nothing to send: the MIME read happens BEFORE the `no url, data, or id` guard, so Python raised where it used to drop — this is the one case in the table that was a REGRESSION rather than a pre-existing hole, and the drop it asserts is the one the guard already emits",
+      "content": [
+        {
+          "type": "binary"
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
       }
     },
     {
