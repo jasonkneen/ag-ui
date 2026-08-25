@@ -110,6 +110,11 @@ const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
  * container; they name a format the provider accepts and differ only in how they
  * are written, which is the same defect as `audio/mpeg`.
  *
+ * A `Map` rather than an object literal, for the reason spelled out on
+ * {@link AGUI_MEDIA_TYPES}: the key is derived from a client-supplied MIME
+ * string, and an object literal answers `"constructor"` with an inherited
+ * function. Here that would be a function handed on as the emitted `mime_type`.
+ *
  * KNOWN LIMIT, deliberate: THE REWRITE IS VISIBLE IN THE THREAD. The normalized
  * spelling is what the return leg reads back, so a client that sent `audio/mpeg`
  * finds `audio/mp3` recorded against its own message in the next
@@ -163,10 +168,8 @@ const OPENAI_AUDIO_MIME_TYPES = new Map<string, string>([
  * The provider-accepted spelling for an audio MIME type, or `undefined` if the
  * provider cannot carry that audio format at all.
  *
- * A `Map` rather than an object literal for the same reason as
- * {@link AGUI_MEDIA_TYPES}: the key is derived from a client-supplied MIME
- * string, and an object literal would answer `"constructor"` with an inherited
- * function.
+ * The lookup table is {@link OPENAI_AUDIO_MIME_TYPES}, which documents both the
+ * measured provider behaviour behind its rows and why it is a `Map`.
  */
 function normalizedAudioMimeType(mimeType: unknown): string | undefined {
   // `unknown`, and read through {@link firstNonEmptyString}, for the reason the
@@ -360,10 +363,48 @@ const PLAUSIBLE_EXTENSION = /^[a-z0-9]{1,8}$/;
  *
  * The two runtimes do NOT emit the same block: this one emits
  * `source_type` / `data` / `mime_type` / `metadata.filename`, the Python adapter
- * emits `base64` / `mime_type` / top-level `filename`. Both translate to the same
- * provider part (verified through both real translators), and both run the same
+ * emits `base64` / `mime_type` / top-level `filename`. Both run the same
  * derivation — `_derive_filename` there is kept identical to this — so an
  * attachment gets the same name whichever runtime sent it.
+ *
+ * THE TWO BLOCKS ARE NOT INTERCHANGEABLE. An earlier revision of this paragraph
+ * said they were — "both translate to the same provider part (verified through
+ * both real translators)" — and only three of the four combinations hold.
+ * Measured 2026-08-25 with an `application/pdf` file block, on
+ * `@langchain/openai@1.2.0` + `@langchain/core@1.1.40` (through `ChatOpenAI` with
+ * a stub `fetch`) and `langchain-core@1.2.13` (through
+ * `convert_to_openai_messages`):
+ *
+ *   block emitted by   JS translator            Python translator
+ *   -----------------  -----------------------  -----------------------
+ *   this adapter       file.file_data ✓         file.file_data ✓
+ *                      + file.filename          + file.filename
+ *   the Python adapter FORWARDED VERBATIM ✗     file.file_data ✓
+ *                      (reaches the provider    + file.filename
+ *                      as `{"type": "file",
+ *                      "base64": …, "mime_type":
+ *                      …, "filename": …}`, with
+ *                      no throw and no warning)
+ *
+ * The failing cell is the direction that does not occur. JS gates translation on
+ * `isDataContentBlock`, which tests `source_type` and nothing else, and the
+ * Python adapter never emits that key — the same trap {@link StandardMediaBlock}
+ * documents for the JS-native shape. It stays LATENT because neither adapter's
+ * output crosses into the other's translator, and for asymmetric reasons:
+ *
+ *   - This package drives a LangGraph SERVER over `@langchain/langgraph-sdk`,
+ *     and that server is usually the Python one. Its blocks therefore have to
+ *     translate in BOTH columns — which is exactly why row 1 is measured in both
+ *     and why {@link StandardMediaBlock} picks the shape it picks.
+ *   - The Python adapter's `LangGraphAgent` takes an IN-PROCESS
+ *     `CompiledStateGraph`, not a remote deployment, so a block it emits is only
+ *     ever handed to langchain-core Python — row 2's ✓ cell. Nothing in either
+ *     package routes row 2 into the JS column.
+ *
+ * So the surviving claim is the narrower one: each block produces the same
+ * provider part through the translator its own runtime actually reaches, and
+ * this adapter's block additionally survives the other runtime's. Revisit if the
+ * Python adapter ever grows a remote-server transport.
  *
  * THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough to look
  * like a rule — `application/pdf`, `text/csv` — and then does not:
@@ -418,8 +459,9 @@ function deriveFilename(mimeType: string | undefined): string {
 /**
  * The return leg: which AG-UI media type a standard block becomes.
  *
- * A `Map` rather than an object literal, matching {@link MEDIA_CONTENT_TYPES},
- * and for the same reason: the key is `item.type` off an inbound block, which is
+ * A `Map` rather than an object literal — the same prototype-key immunity
+ * {@link MEDIA_CONTENT_TYPES} gets from being a `Set`, in the form that also
+ * carries a value. The key is `item.type` off an inbound block, which is
  * whatever the LangGraph server relayed from model or tool output and is not
  * author-controlled. An object literal answers `["constructor"]` or
  * `["toString"]` with an inherited `Object.prototype` member — truthy, and a

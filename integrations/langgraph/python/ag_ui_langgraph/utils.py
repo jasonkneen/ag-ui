@@ -1101,10 +1101,46 @@ def _derive_filename(mime_type: str | None) -> str:
 
     The two runtimes do NOT emit the same block: this one emits ``base64`` /
     ``mime_type`` / top-level ``filename``, the TypeScript adapter emits
-    ``source_type`` / ``data`` / ``mime_type`` / ``metadata.filename``. Both
-    translate to the same provider part (verified through both real translators),
-    and both run the same derivation — `deriveFilename` there is kept identical to
-    this — so an attachment gets the same name whichever runtime sent it.
+    ``source_type`` / ``data`` / ``mime_type`` / ``metadata.filename``. Both run
+    the same derivation — `deriveFilename` there is kept identical to this — so
+    an attachment gets the same name whichever runtime sent it.
+
+    THE TWO BLOCKS ARE NOT INTERCHANGEABLE. An earlier revision of this paragraph
+    said they were — "both translate to the same provider part (verified through
+    both real translators)" — and only three of the four combinations hold.
+    Measured 2026-08-25 with an ``application/pdf`` file block, on langchain-core
+    1.2.13 (through `convert_to_openai_messages`) and `@langchain/openai` 1.2.0 +
+    `@langchain/core` 1.1.40 (through `ChatOpenAI` with a stub `fetch`):
+
+      block emitted by     Python translator      JS translator
+      -------------------  ---------------------  ---------------------------
+      this adapter         file.file_data ✓       FORWARDED VERBATIM ✗
+                           + file.filename        (reaches the provider as
+                                                  ``{"type": "file", "base64":
+                                                  …, "mime_type": …,
+                                                  "filename": …}``, with no
+                                                  throw and no warning)
+      the TypeScript one   file.file_data ✓       file.file_data ✓
+                           + file.filename        + file.filename
+
+    The failing cell is the direction that does not occur. JS gates translation on
+    ``isDataContentBlock``, which tests ``source_type`` and nothing else, and this
+    adapter never emits that key. It stays LATENT because neither adapter's output
+    crosses into the other's translator, and for asymmetric reasons:
+
+      * `LangGraphAgent` here takes an IN-PROCESS ``CompiledStateGraph``, not a
+        remote deployment, so a block this function builds is only ever handed to
+        langchain-core Python — the ✓ cell on row 1. Nothing in either package
+        routes row 1 into the JS column.
+      * The TypeScript adapter drives a LangGraph SERVER over
+        `@langchain/langgraph-sdk`, and that server is usually the Python one, so
+        ITS block does have to translate in both columns — which is why it emits
+        the ``source_type`` family and why row 2 is measured in both.
+
+    So the surviving claim is the narrower one: each block produces the same
+    provider part through the translator its own runtime actually reaches, and the
+    TypeScript adapter's block additionally survives this one. Revisit if this
+    adapter ever grows a remote-server transport.
 
     THE SUBTYPE IS NOT THE EXTENSION. It coincides with one often enough to look
     like a rule — ``application/pdf``, ``text/csv`` — and then does not:
@@ -1317,6 +1353,25 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 # Use id as a reference (some providers may support this)
                 content_dict["image_url"] = {"url": item.id}
             else:
+                # NOT dead code, though it looks it: `BinaryInputContent` carries
+                # a pydantic `validate_source` model validator that refuses an
+                # item with no `id`, `url` OR `data`, which rules this branch out
+                # for anything that arrives VALIDATED. Measured 2026-08-25 on
+                # pydantic 2.12.5 / ag-ui-protocol 0.1.19 — every validated route
+                # (the constructor, `model_validate`, `model_validate_json`, and a
+                # whole `RunAgentInput` parse) raises before the item can reach
+                # this loop, with empty strings refused alongside `None`.
+                #
+                # Four unvalidated routes DO land here, all measured: a
+                # `model_construct` item; plain attribute assignment after a valid
+                # construction (the model does not set `validate_assignment`, so
+                # `item.url = None` sticks); `model_copy(update=…)`, which pydantic
+                # documents as unvalidated; and a subclass that overrides
+                # `validate_source`. Those are precisely the inputs THE
+                # MALFORMED-INPUT CONTRACT declares in scope — "a model built with
+                # ``model_construct`` — or any object a caller hands this converter
+                # without validating" — so the guard is doing the job the contract
+                # asks of it, and rule 2 requires the drop to say so.
                 logger.warning(
                     "Dropping BinaryInputContent item: no url, data, or id provided"
                 )
