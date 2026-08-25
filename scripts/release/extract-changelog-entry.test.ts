@@ -47,6 +47,17 @@ function fixtureRoot(): string {
             },
           ],
         },
+        "integration-agno": {
+          description: "Agno integration",
+          sharedVersion: false,
+          packages: [
+            {
+              name: "@ag-ui/agno",
+              path: "integrations/agno",
+              ecosystem: "typescript",
+            },
+          ],
+        },
       },
     }),
   );
@@ -794,6 +805,16 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
     }
     // And an array whose entries lack the required fields — in BOTH scripts,
     // since reconcile reads the same payload shape.
+    //
+    // reconcile is given an EXISTING release body here. Without one it decides
+    // the release is absent and delegates to create-or-update-release.sh,
+    // whose guard then supplies the failure — so this case would pass with
+    // reconcile's own guard deleted.
+    const bodyFile = join(root, "existing-body.txt");
+    writeFileSync(
+      bodyFile,
+      "## Packages Published\n<!-- ag-ui-published: ag_ui_strands@0.3.1 -->\n",
+    );
     for (const script of [RELEASE_SH, RECONCILE_SH]) {
       const r = spawnSync("bash", [script, "typescript", '[{"nope":1}]'], {
         encoding: "utf8",
@@ -801,6 +822,8 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
           ...process.env,
           PATH: `${installGhShim(root)}:${process.env.PATH}`,
           AGUI_RELEASE_REPO_ROOT: root,
+          GH_FIXTURE_BODY: bodyFile,
+          GH_FIXTURE_UPDATED: join(root, "updated-malformed.txt"),
           GH_FIXTURE_CALLS: join(root, "gh-calls.txt"),
           DRY_RUN: "false",
         },
@@ -812,6 +835,120 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
       );
       assert.match(r.stderr, /string \.name and \.version/);
     }
+    assert.equal(
+      existsSync(join(root, "updated-malformed.txt")),
+      false,
+      "nothing may be written for a malformed payload",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a marker quoted inside approved notes cannot fake a recorded package", () => {
+  const root = fixtureRoot();
+  try {
+    // A changelog entry that documents this very mechanism — entirely
+    // plausible for this repo — must not make a LATER package look recorded.
+    writeFileSync(
+      join(root, "integrations/mastra/CHANGELOG.md"),
+      [
+        "# Changelog",
+        "",
+        "## 0.2.0 — 2026-08-25",
+        "",
+        "- Release bodies now carry a per-package marker, for example:",
+        "",
+        "```html",
+        "<!-- ag-ui-published: @ag-ui/agno@9.9.9 -->",
+        "```",
+        "",
+      ].join("\n"),
+    );
+    const updatedFile = join(root, "updated.txt");
+    const created = runReleaseScript(
+      root,
+      [
+        {
+          name: "@ag-ui/mastra",
+          version: "0.2.0",
+          path: "integrations/mastra",
+        },
+      ],
+      join(root, "absent.txt"),
+      updatedFile,
+      { GH_FIXTURE_ABSENT: "1" },
+    );
+    assert.equal(created.status, 0, created.stderr);
+    const body = readFileSync(updatedFile, "utf8");
+    // The quoted marker is neutralised, so only real markers remain...
+    assert.match(body, /&lt;!-- ag-ui-published: @ag-ui\/agno@9\.9\.9 -->/);
+    assert.doesNotMatch(
+      body,
+      /\n<!-- ag-ui-published: @ag-ui\/agno@9\.9\.9 -->/,
+    );
+    // ...and mastra's own marker is intact.
+    assert.match(body, /<!-- ag-ui-published: @ag-ui\/mastra@0\.2\.0 -->/);
+
+    // Now the agno package must still be treated as MISSING and appended.
+    const bodyFile = join(root, "body.txt");
+    writeFileSync(bodyFile, body);
+    const appended = runReleaseScript(
+      root,
+      [{ name: "@ag-ui/agno", version: "9.9.9", path: "integrations/agno" }],
+      bodyFile,
+      join(root, "updated2.txt"),
+    );
+    assert.equal(appended.status, 0, appended.stderr);
+    assert.match(
+      readFileSync(join(root, "updated2.txt"), "utf8"),
+      /`npm install @ag-ui\/agno@9\.9\.9`/,
+      "a package whose marker only appears inside quoted notes must still be appended",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a repaired fault whose version has no entry stops being retried", () => {
+  const root = fixtureRoot();
+  try {
+    // Body records mastra as unreadable (retryable, no published marker).
+    const bodyFile = join(root, "body.txt");
+    writeFileSync(
+      bodyFile,
+      [
+        "## Packages Published",
+        "| @ag-ui/mastra | 7.7.7 | `npm install @ag-ui/mastra@7.7.7` |",
+        "",
+        "#### @ag-ui/mastra@7.7.7",
+        "",
+        "_Release notes could not be read..._",
+        "",
+        "<!-- ag-ui-unreadable: @ag-ui/mastra@7.7.7 -->",
+      ].join("\n"),
+    );
+    // The changelog is readable now, but has no entry for 7.7.7 → exit 3.
+    // That is a RESOLVED state, not a continuing fault: it must be recorded
+    // with the published marker, or reconcile retries it forever.
+    const updatedFile = join(root, "updated.txt");
+    const r = runReleaseScript(
+      root,
+      [
+        {
+          name: "@ag-ui/mastra",
+          version: "7.7.7",
+          path: "integrations/mastra",
+        },
+      ],
+      bodyFile,
+      updatedFile,
+    );
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /still unreadable/);
+    const updated = readFileSync(updatedFile, "utf8");
+    assert.match(updated, /No release notes were approved/);
+    assert.match(updated, /<!-- ag-ui-published: @ag-ui\/mastra@7\.7\.7 -->/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

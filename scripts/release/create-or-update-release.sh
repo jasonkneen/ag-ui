@@ -100,6 +100,15 @@ notes_block() {
   set -e
   printf '%s' "$status" > "$NOTES_STATUS_FILE"
 
+  # Neutralise any marker-looking comment INSIDE the approved notes before it
+  # is embedded. Presence checks grep the assembled body, so a note that
+  # legitimately quotes a marker — entirely plausible for a changelog entry
+  # describing this very mechanism — would make a later package look already
+  # recorded and drop its row and notes. Escaping the opening bracket means
+  # the only real markers in the body are the ones this script writes, and the
+  # quoted example renders as visible text instead of an invisible comment.
+  entry="${entry//<!-- ag-ui-/&lt;!-- ag-ui-}"
+
   if [ "$status" -eq 0 ]; then
     printf '#### %s@%s\n\n%s\n\n%s\n' "$name" "$version" "$entry" "$(published_sentinel "$name" "$version")"
   elif [ "$status" -eq "$EXTRACT_NO_ENTRY" ]; then
@@ -249,7 +258,12 @@ for i in $(seq 1 $MAX_RETRIES); do
         # fails there is nothing new to say, and if it now succeeds the real
         # notes are appended without a second row.
         RETRY_BLOCK="$(notes_block "$NAME" "$VERSION")${NL}${NL}"
-        if [ "$(notes_status)" -ne 0 ]; then
+        RETRY_STATUS="$(notes_status)"
+        # Exit 3 means the fault is GONE and the version simply has no entry —
+        # a resolved state carrying the published marker. Treating it as "still
+        # unreadable" would keep the false placeholder and make reconcile retry
+        # this package on every future run, forever.
+        if [ "$RETRY_STATUS" -ne 0 ] && [ "$RETRY_STATUS" -ne "$EXTRACT_NO_ENTRY" ]; then
           echo "${NAME}@${VERSION} is still unreadable; not duplicating its placeholder" >&2
         else
           USED=$((${#EXISTING_BODY} + ${#APPEND_SECTION} + ${#APPEND_NOTES}))

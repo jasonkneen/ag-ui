@@ -82,7 +82,7 @@ const REQUEST_DEADLINE_MS = 300_000;
 // informational — the committed CHANGELOG.md files are authoritative — so it
 // is safe to bound well under that, leaving room for the workflow's table
 // and boilerplate.
-const MAX_SUMMARY_CHARS = 40_000;
+export const MAX_SUMMARY_CHARS = 40_000;
 
 const CHANGELOG_HEADER = [
   "# Changelog",

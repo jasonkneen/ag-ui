@@ -21,6 +21,7 @@ import {
   hasUnclosedFence,
   hasVersionEntry,
   isValidBump,
+  MAX_SUMMARY_CHARS,
   nestedPathExcludes,
   parseModelOutput,
   scanChangelogLines,
@@ -1733,9 +1734,19 @@ test(
 
       assert.equal(result.status, 0, `stderr: ${result.stderr}`);
       const text = readFileSync(summary, "utf8");
+      // Assert the ceiling the code intends, NOT GitHub's raw 65,536 limit.
+      // Asserting the raw limit passes even if MAX_SUMMARY_CHARS were raised
+      // to 64,000 — at which point the workflow's table, preamble and
+      // boilerplate would push the assembled PR body over the limit and the
+      // PR would 422 after the version bumps were already pushed. The margin
+      // between this ceiling and 65,536 is the point.
       assert.ok(
-        text.length < 65_536,
-        `summary must stay under GitHub's PR-body limit, got ${text.length}`,
+        text.length <= MAX_SUMMARY_CHARS + 1_000,
+        `summary must respect its own ${MAX_SUMMARY_CHARS}-char ceiling (plus the omission notice), got ${text.length}`,
+      );
+      assert.ok(
+        MAX_SUMMARY_CHARS < 50_000,
+        "the ceiling must leave room for the workflow's own PR-body boilerplate",
       );
       assert.match(text, /omitted from this summary/);
       // Every package still gets its own committed changelog — only the
