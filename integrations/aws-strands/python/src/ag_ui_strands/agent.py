@@ -2000,11 +2000,16 @@ class StrandsAgent:
             *self._unreadable_params,
             *self._template_owned_params,
         ]
-        # Reported when the first per-thread agent is built rather than here.
+        # Reported when a per-thread agent is built rather than here.
         # ``thread_agent_kwargs`` can supply any of these, and at construction
         # time it has not run, so warning now would nag a caller who had
         # already handled it.
-        self._warned_uncarried = False
+        #
+        # Tracked per param rather than as a single "have we warned yet" flag.
+        # The hook runs per thread and may answer differently each time, so one
+        # thread supplying everything must not buy silence for the next thread
+        # that supplies nothing.
+        self._reported_uncarried: set[str] = set()
 
         # Hook providers forwarded to each per-thread StrandsAgentCore.
         #
@@ -2392,18 +2397,18 @@ class StrandsAgent:
     def _report_uncarried_params(self, core_kwargs: dict) -> None:
         """Name the params that will not reach this thread's agent.
 
-        Said once per adapter, and only about params the caller's own
-        per-thread kwargs did not supply, so acting on it makes it stop.
+        Said once per param, and only about params this thread's kwargs did not
+        supply, so acting on it makes it stop without the first thread becoming
+        the policy for every later one.
         """
-        if self._warned_uncarried:
-            return
-        self._warned_uncarried = True
-
         still_missing = sorted(
-            name for name in self._unreadable_params if name not in core_kwargs
+            name
+            for name in self._unreadable_params
+            if name not in core_kwargs and name not in self._reported_uncarried
         )
         if not still_missing:
             return
+        self._reported_uncarried.update(still_missing)
         # Phrased as a capability, not an accusation: an unreadable param is
         # unreadable whether or not the caller set one, so this cannot say that
         # anything was actually lost.

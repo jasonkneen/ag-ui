@@ -6,7 +6,7 @@
 import { describe, it, expect, vi } from "vitest";
 import type { AgentConfig, Plugin } from "@strands-agents/sdk";
 import { StrandsAgent } from "../agent";
-import { collect } from "./helpers";
+import { collect, minimalRunInput } from "./helpers";
 
 const capturedConfigs: AgentConfig[] = [];
 
@@ -169,6 +169,59 @@ describe("AgentConfig forwarding", () => {
       expect(said).not.toContain("traceAttributes");
       // The one it did not supply is still named.
       expect(said).toContain("structuredOutputSchema");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warns a later thread that omits what an earlier thread supplied", async () => {
+    // The report is one-shot so a busy adapter does not repeat itself, but
+    // one-shot has to mean per setting, not per adapter. A thread that
+    // supplies everything must not buy silence for a thread that supplies
+    // nothing: the second thread really does lose those settings.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sa = new StrandsAgent({
+        agent: richTemplate(),
+        name: "t",
+        config: {
+          threadAgentConfig: (input) =>
+            input.threadId === "supplies-everything"
+              ? ({
+                  traceAttributes: { team: "agui" },
+                  structuredOutputSchema: { type: "zod-placeholder" },
+                } as never)
+              : ({} as never),
+        },
+      });
+
+      await collect(sa, minimalRunInput({ threadId: "supplies-everything" }));
+      const afterFirst = warn.mock.calls.length;
+      await collect(sa, minimalRunInput({ threadId: "supplies-nothing" }));
+
+      const said = warn.mock.calls
+        .slice(afterFirst)
+        .map((c) => String(c[0]))
+        .join("\n");
+      expect(said).toContain("traceAttributes");
+      expect(said).toContain("structuredOutputSchema");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not repeat a warning it has already given", async () => {
+    // The other half of one-shot: two threads that both omit the same setting
+    // are told once, not once each.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sa = new StrandsAgent({ agent: richTemplate(), name: "t" });
+
+      await collect(sa, minimalRunInput({ threadId: "first" }));
+      const afterFirst = warn.mock.calls.length;
+      await collect(sa, minimalRunInput({ threadId: "second" }));
+
+      expect(warn.mock.calls.length).toBe(afterFirst);
     } finally {
       warn.mockRestore();
     }

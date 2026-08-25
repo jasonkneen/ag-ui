@@ -1204,7 +1204,15 @@ export class StrandsAgent {
    */
   private _uncarriedSetFields: readonly string[] = [];
   private _uncarriedDefaultFields: readonly string[] = [];
-  private _warnedUncarried = false;
+  /**
+   * Fields already reported.
+   *
+   * Tracked per field rather than as a single "have we reported yet" flag. The
+   * hook runs per thread and may answer differently each time, so one thread
+   * supplying everything must not buy silence for the next thread that
+   * supplies nothing.
+   */
+  private readonly _reportedUncarried = new Set<string>();
 
   /**
    * Hook providers forwarded to each per-thread StrandsAgentCore.
@@ -3708,19 +3716,20 @@ export class StrandsAgent {
   /**
    * Name the template settings that will not reach this thread's agent.
    *
-   * Said once per adapter, and only about settings the caller's per-thread
-   * config did not supply, so acting on it makes it stop.
+   * Said once per setting, and only about settings this thread's config did
+   * not supply, so acting on it makes it stop without the first thread
+   * becoming the policy for every later one.
    */
   private _reportUncarried(callerConfig?: Partial<AgentConfig>): void {
-    if (this._warnedUncarried) return;
-    this._warnedUncarried = true;
-
     const supplied = new Set(Object.keys(callerConfig ?? {}));
-    const unmet = (fields: readonly string[]) =>
-      fields.filter((field) => !supplied.has(field));
+    const unreported = (fields: readonly string[]) =>
+      fields.filter(
+        (field) => !supplied.has(field) && !this._reportedUncarried.has(field),
+      );
 
-    const set = unmet(this._uncarriedSetFields);
+    const set = unreported(this._uncarriedSetFields);
     if (set.length > 0) {
+      for (const field of set) this._reportedUncarried.add(field);
       this._log.warn(
         `${LOG_PREFIX} these settings are on the template but do not reach ` +
           `per-thread agents: ${set.join(", ")}. Supply them per thread with ` +
@@ -3728,8 +3737,9 @@ export class StrandsAgent {
       );
     }
 
-    const defaults = unmet(this._uncarriedDefaultFields);
+    const defaults = unreported(this._uncarriedDefaultFields);
     if (defaults.length > 0) {
+      for (const field of defaults) this._reportedUncarried.add(field);
       this._log.debug(
         `${LOG_PREFIX} not shared with per-thread agents: ` +
           `${defaults.join(", ")}. Each is wired to the Agent that owns it, so ` +

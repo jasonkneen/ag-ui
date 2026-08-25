@@ -841,6 +841,68 @@ async def test_unforwardable_params_are_named_when_a_thread_is_built(caplog):
 
 
 @pytest.mark.asyncio
+async def test_later_thread_that_omits_a_param_is_still_warned(caplog):
+    """One-shot has to mean per param, not per adapter.
+
+    A thread that supplies everything must not buy silence for a thread that
+    supplies nothing: the second thread really does lose those settings.
+    """
+    from ag_ui_strands.config import StrandsAgentConfig
+
+    template = Agent(model=_mock_model())
+    config = StrandsAgentConfig(
+        thread_agent_kwargs=lambda inp: (
+            {"some_new_param": "supplied"} if inp.thread_id == "supplies" else {}
+        )
+    )
+
+    with patch(
+        "ag_ui_strands.agent._extract_agent_kwargs",
+        return_value=({}, ["some_new_param"], []),
+    ):
+        ag = StrandsAgent(template, name="test", config=config)
+
+    with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+        await _trigger_thread_creation(ag, "supplies")
+        with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+            await _trigger_thread_creation(ag, "omits")
+
+    assert any("some_new_param" in m for m in caplog.messages), (
+        f"the thread that omitted it was told nothing; got {caplog.messages}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_param_is_only_warned_about_once(caplog):
+    """The other half of one-shot: two threads that both omit it hear once."""
+    template = Agent(model=_mock_model())
+
+    with patch(
+        "ag_ui_strands.agent._extract_agent_kwargs",
+        return_value=({}, ["some_new_param"], []),
+    ):
+        ag = StrandsAgent(template, name="test")
+
+    def mentions() -> int:
+        # Only the message under test: the fake core logs unrelated warnings
+        # of its own, and counting those would measure the stub, not the rule.
+        return sum("some_new_param" in m for m in caplog.messages)
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            await _trigger_thread_creation(ag, "first")
+            after_first = mentions()
+            await _trigger_thread_creation(ag, "second")
+
+    assert after_first == 1, (
+        f"expected the first thread to be told once; got {caplog.messages}"
+    )
+    assert mentions() == after_first, (
+        f"warned twice about the same param; got {caplog.messages}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_warning_for_a_param_the_hook_supplies(caplog):
     """Acting on the warning has to make it stop.
 
