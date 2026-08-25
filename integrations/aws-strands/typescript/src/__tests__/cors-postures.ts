@@ -25,39 +25,19 @@ export const DEFAULT_ALLOW_METHODS = "GET,HEAD,PUT,PATCH,POST,DELETE";
 export const PROBE_REQUEST_HEADERS = "x-custom, content-type";
 
 /**
- * Marks an `Access-Control-Allow-Credentials` expectation as deliberately not
- * asserted.
+ * One measured response: `null` means the header was absent.
  *
- * Today the factory passes `credentials: true` unconditionally, so every
- * posture that installs the middleware emits the header. A separate in-flight
- * change derives it from the origin policy instead, keeping credentials only
- * for a policy that names at least one specific origin: `true`, a non-empty
- * origin string other than `"*"`, or an array holding one of those. Every
- * other installing posture stops emitting the header.
- *
- * Worked through the table below, three rows lose it: the bare `"*"`, `[]`
- * (nothing on the list to name an origin) and `["*"]` (its only entry is the
- * literal wildcard). Pinning today's `true` on those would turn that correct
- * change into a red suite, so they opt out. The rule is "no specific origin
- * named", not "is a wildcard": `[]` holds no wildcard and still opts out,
- * while `["https://a.tld"]` is an array and keeps the assertion.
- *
- * What the factory is handed stays asserted for all three in
- * `cors-middleware-installation.test.ts`, which is the one place that has to
- * change when the derivation lands.
+ * `allowCredentials` is asserted for every posture, including the ones that
+ * withhold the header. The factory derives `credentials` from the resolved
+ * origin (`allowsCredentials` in `server.ts`), so the value is a function of
+ * the posture alone and there is nothing left to opt out of: a policy naming at
+ * least one specific origin emits `"true"`, and `"*"`, `[]` and the arrays that
+ * collapse to `"*"` emit nothing at all.
  */
-export const CREDENTIALS_NOT_ASSERTED = Symbol("credentials not asserted");
-
-export type CredentialsExpectation =
-  | string
-  | null
-  | typeof CREDENTIALS_NOT_ASSERTED;
-
-/** One measured response: `null` means the header was absent. */
 export interface MeasuredResponse {
   status: number;
   allowOrigin: string | null;
-  allowCredentials: CredentialsExpectation;
+  allowCredentials: string | null;
   allowMethods: string | null;
   allowHeaders: string | null;
   vary: string | null;
@@ -68,9 +48,9 @@ export interface CorsPosture {
   label: string;
   /**
    * The `corsOrigin` value as `README.md`'s table spells it, backticks
-   * stripped. Several postures can instantiate one documented row: the
-   * README's array row is written with a placeholder origin, and both a
-   * matching allowlist and a non-matching one instantiate it.
+   * stripped. Several postures can instantiate one documented row: leaving
+   * `corsOrigin` out and passing an explicit `undefined` are two postures for
+   * the README's single `omitted` row.
    */
   readmeValue: string;
   options: CreateStrandsAppOptions;
@@ -184,7 +164,10 @@ export const CORS_POSTURES: CorsPosture[] = [
       status: 204,
       // Emitted verbatim, never the caller's own origin.
       allowOrigin: "*",
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      // Withheld, and the one posture where that is the CORS protocol's own
+      // rule rather than a choice: browsers refuse a literal wildcard paired
+      // with credentials outright.
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: PROBE_REQUEST_HEADERS,
       // No `Vary: Origin`: the response does not depend on the caller.
@@ -193,7 +176,7 @@ export const CORS_POSTURES: CorsPosture[] = [
     preflightFromOther: {
       status: 204,
       allowOrigin: "*",
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: null,
       vary: "Access-Control-Request-Headers",
@@ -201,7 +184,7 @@ export const CORS_POSTURES: CorsPosture[] = [
     simple: {
       status: 200,
       allowOrigin: "*",
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
       vary: null,
@@ -211,7 +194,7 @@ export const CORS_POSTURES: CorsPosture[] = [
       // Verbatim again, so a disallowed caller is not a concept here: the
       // wildcard admits every origin for an uncredentialed request.
       allowOrigin: "*",
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
       vary: null,
@@ -306,43 +289,92 @@ export const CORS_POSTURES: CorsPosture[] = [
   },
   {
     label: "an array holding only `*`",
-    // Instantiates the README's array row: `"*"` inside an array is a literal
-    // four-character origin that no browser origin equals, so the list admits
-    // nobody. Only the bare string `"*"` is the wildcard.
-    readmeValue: '["https://a.tld"]',
+    // Its own documented row rather than an instance of the array row:
+    // `normalizeCorsOrigin` collapses any array containing `"*"` to the bare
+    // string `"*"` before `cors` is constructed, so this is allow-all and not
+    // an allowlist whose single entry no browser origin equals. Measured
+    // byte-identical to the bare `"*"` posture on all four columns.
+    readmeValue: '["*"]',
     options: { corsOrigin: ["*"] },
     installsMiddleware: true,
     preflight: {
       status: 204,
-      allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowOrigin: "*",
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: PROBE_REQUEST_HEADERS,
-      vary: "Origin, Access-Control-Request-Headers",
+      // No `Vary: Origin`, exactly as for the bare `"*"`: the collapse happens
+      // ahead of `cors`, so nothing downstream can tell an array was passed.
+      vary: "Access-Control-Request-Headers",
     },
     preflightFromOther: {
       status: 204,
-      allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowOrigin: "*",
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: null,
-      vary: "Origin, Access-Control-Request-Headers",
+      vary: "Access-Control-Request-Headers",
     },
     simple: {
       status: 200,
-      allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowOrigin: "*",
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
-      vary: "Origin",
+      vary: null,
     },
     simpleFromOther: {
       status: 200,
-      allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowOrigin: "*",
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
-      vary: "Origin",
+      vary: null,
+    },
+  },
+  {
+    label: "an array holding `*` alongside a concrete origin",
+    // The mixed case, and the reason the collapse is `includes("*")` rather
+    // than a length check: one `"*"` anywhere in the array collapses the whole
+    // array, so the concrete entry beside it narrows nothing. Measured
+    // identical to `["*"]`, which is what makes the allowlist this spelling
+    // looks like a policy that does not exist.
+    readmeValue: '["*", "https://a.tld"]',
+    options: { corsOrigin: ["*", ALLOWED_ORIGIN] },
+    installsMiddleware: true,
+    preflight: {
+      status: 204,
+      allowOrigin: "*",
+      allowCredentials: null,
+      allowMethods: DEFAULT_ALLOW_METHODS,
+      allowHeaders: PROBE_REQUEST_HEADERS,
+      vary: "Access-Control-Request-Headers",
+    },
+    preflightFromOther: {
+      status: 204,
+      allowOrigin: "*",
+      allowCredentials: null,
+      allowMethods: DEFAULT_ALLOW_METHODS,
+      allowHeaders: null,
+      vary: "Access-Control-Request-Headers",
+    },
+    simple: {
+      status: 200,
+      allowOrigin: "*",
+      allowCredentials: null,
+      allowMethods: null,
+      allowHeaders: null,
+      vary: null,
+    },
+    simpleFromOther: {
+      status: 200,
+      // Admitted, though it is not the origin the array named: the wildcard
+      // collapsed the list away, so there is no disallowed origin here either.
+      allowOrigin: "*",
+      allowCredentials: null,
+      allowMethods: null,
+      allowHeaders: null,
+      vary: null,
     },
   },
   {
@@ -356,7 +388,9 @@ export const CORS_POSTURES: CorsPosture[] = [
       // Only the absent allow-origin header denies the caller.
       status: 204,
       allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      // No wildcard here, and still no credentials: the rule is "no specific
+      // origin named", and an empty list names none.
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: PROBE_REQUEST_HEADERS,
       vary: "Origin, Access-Control-Request-Headers",
@@ -364,7 +398,7 @@ export const CORS_POSTURES: CorsPosture[] = [
     preflightFromOther: {
       status: 204,
       allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: DEFAULT_ALLOW_METHODS,
       allowHeaders: null,
       vary: "Origin, Access-Control-Request-Headers",
@@ -372,7 +406,7 @@ export const CORS_POSTURES: CorsPosture[] = [
     simple: {
       status: 200,
       allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
       vary: "Origin",
@@ -380,7 +414,7 @@ export const CORS_POSTURES: CorsPosture[] = [
     simpleFromOther: {
       status: 200,
       allowOrigin: null,
-      allowCredentials: CREDENTIALS_NOT_ASSERTED,
+      allowCredentials: null,
       allowMethods: null,
       allowHeaders: null,
       vary: "Origin",

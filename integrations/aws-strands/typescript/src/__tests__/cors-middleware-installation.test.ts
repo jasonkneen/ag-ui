@@ -98,6 +98,15 @@ const NOT_INSTALLED: [string, CreateStrandsAppOptions][] = [
  * Option shapes that do install the middleware, with the exact option object
  * `cors` must receive.
  *
+ * Neither key is a copy of what the caller passed. `origin` is the output of
+ * `normalizeCorsOrigin`, so an array holding `"*"` arrives here as the bare
+ * string `"*"` however many other entries it had, and `credentials` is derived
+ * from that resolved origin by `allowsCredentials`: `true` only for a policy
+ * naming at least one specific origin, which rules out `"*"`, `[]` and every
+ * array that collapsed to `"*"`. This is the one file that pins both, so the
+ * rows below are the boundary between the option a caller wrote and the option
+ * `cors` acts on.
+ *
  * Written out rather than derived from the posture table: deriving the expected
  * object would compute it the same way the source does, and a test that
  * recomputes the implementation cannot catch the implementation changing.
@@ -118,9 +127,12 @@ const INSTALLED: [string, CreateStrandsAppOptions, Record<string, unknown>][] =
       { origin: ALLOWED_ORIGIN, credentials: true },
     ],
     [
+      // Not collapsed: only an array holding `"*"` becomes a string, and an
+      // empty one holds nothing. It reaches `cors` as the empty allowlist it
+      // is, with credentials off because it names no origin.
       "a deny-all empty array",
       { corsOrigin: [] },
-      { origin: [], credentials: true },
+      { origin: [], credentials: false },
     ],
     [
       "an exact-match allowlist",
@@ -130,14 +142,25 @@ const INSTALLED: [string, CreateStrandsAppOptions, Record<string, unknown>][] =
     [
       "the literal wildcard",
       { corsOrigin: "*" },
-      { origin: "*", credentials: true },
+      { origin: "*", credentials: false },
     ],
     [
+      // Collapsed to the bare string before `cors` sees it, which is why the
+      // expected `origin` is not the array that was passed in.
       "an array holding only the literal wildcard",
       { corsOrigin: ["*"] },
-      { origin: ["*"], credentials: true },
+      { origin: "*", credentials: false },
     ],
     [
+      // The concrete entry is dropped along with the array itself: one `"*"`
+      // anywhere collapses the whole list, so this is byte-identical to the
+      // row above and no allowlist ever reaches `cors`.
+      "an array holding the literal wildcard beside a concrete origin",
+      { corsOrigin: ["*", ALLOWED_ORIGIN] },
+      { origin: "*", credentials: false },
+    ],
+    [
+      // Reflection names a specific origin per request, so credentials stay on.
       "origin reflection",
       { corsOrigin: true },
       { origin: true, credentials: true },

@@ -18,7 +18,6 @@ import {
 import {
   ALLOWED_ORIGIN,
   CORS_POSTURES,
-  CREDENTIALS_NOT_ASSERTED,
   DEFAULT_ALLOW_METHODS,
   OTHER_ORIGIN,
   PROBE_REQUEST_HEADERS,
@@ -33,26 +32,19 @@ import {
  *
  * Built as one object comparison rather than a header at a time so a posture
  * cannot quietly grow an unasserted header, and so a test cannot pass by
- * restating the line above it. `Access-Control-Allow-Credentials` drops out of
- * both sides when the fixture opts out (see `CREDENTIALS_NOT_ASSERTED`).
+ * restating the line above it. Every header is asserted for every posture,
+ * `Access-Control-Allow-Credentials` included: the factory derives it from the
+ * resolved origin, so its value is fixed per posture and an absent header is a
+ * measured `null` rather than something left unchecked.
  */
 function expectHeaders(actual: CorsHeaders, expected: MeasuredResponse): void {
-  const skipCredentials =
-    expected.allowCredentials === CREDENTIALS_NOT_ASSERTED;
-  const project = (h: {
-    status: number;
-    allowOrigin: string | null;
-    allowCredentials: unknown;
-    allowMethods: string | null;
-    allowHeaders: string | null;
-    vary: string | null;
-  }) => ({
+  const project = (h: MeasuredResponse) => ({
     status: h.status,
     allowOrigin: h.allowOrigin,
+    allowCredentials: h.allowCredentials,
     allowMethods: h.allowMethods,
     allowHeaders: h.allowHeaders,
     vary: h.vary,
-    ...(skipCredentials ? {} : { allowCredentials: h.allowCredentials }),
   });
   expect(project(actual)).toEqual(project(expected));
 }
