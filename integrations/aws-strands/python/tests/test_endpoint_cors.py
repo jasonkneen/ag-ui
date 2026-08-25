@@ -9,7 +9,10 @@ origins.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -42,6 +45,18 @@ def _granted_preflight(client: TestClient, origin: str) -> Any:
 
 
 def _app(**kwargs: Any) -> TestClient:
+    """Build the app, stating a CORS posture unless the test overrides it.
+
+    Leaving it unstated now takes a deprecated implicit-wildcard path that
+    warns, so a test that means "wildcard" says so rather than inheriting it
+    and breaking when that fallback is removed.
+    """
+    kwargs.setdefault("origins", ["*"])
+    return TestClient(create_strands_app(FakeAgent(), path="/", **kwargs))
+
+
+def _implicit_app(**kwargs: Any) -> TestClient:
+    """The legacy path: no CORS option at all."""
     return TestClient(create_strands_app(FakeAgent(), path="/", **kwargs))
 
 
@@ -50,6 +65,21 @@ def test_default_allows_any_origin_as_a_literal_wildcard() -> None:
     response = _granted_preflight(_app(), OTHER_ORIGIN)
 
     assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_omitting_a_cors_option_still_allows_all_but_warns() -> None:
+    """The implicit wildcard is deprecated, so using it has to say so."""
+    with pytest.warns(FutureWarning, match="Implicit wildcard CORS"):
+        client = _implicit_app()
+
+    response = _granted_preflight(client, OTHER_ORIGIN)
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_an_explicit_wildcard_does_not_warn() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        create_strands_app(FakeAgent(), path="/", origins=["*"])
 
 
 def test_default_does_not_allow_credentials() -> None:
@@ -76,8 +106,16 @@ def test_an_origin_outside_an_explicit_allow_list_is_not_granted() -> None:
 
 
 def test_an_empty_origin_list_falls_back_to_the_wildcard() -> None:
-    """`origins or ["*"]` treats an empty list as unset, not as deny-all."""
-    response = _granted_preflight(_app(origins=[]), OTHER_ORIGIN)
+    """An empty list is documented as the legacy fallback, not as deny-all.
+
+    This is where the two SDKs part company: the TypeScript adapter denies
+    every origin for an empty allow-list, and deliberately does not widen it.
+    Here it warns and allows all, on the deprecation path out.
+    """
+    with pytest.warns(FutureWarning, match="Implicit wildcard CORS"):
+        client = _implicit_app(origins=[])
+
+    response = _granted_preflight(client, OTHER_ORIGIN)
 
     assert response.headers["access-control-allow-origin"] == "*"
     assert "access-control-allow-credentials" not in response.headers
@@ -109,13 +147,13 @@ def test_a_simple_post_carries_the_allow_origin_header() -> None:
 
 
 def test_the_agent_and_ping_routes_are_both_mounted() -> None:
-    client = _app(ping_path="/ping")
+    client = _app(ping_path="/ping", cors_enabled=False, origins=None)
 
     assert client.post("/", json=valid_run_input()).status_code == 200
     assert client.get("/ping").json() == {"status": "healthy"}
 
 
 def test_ping_can_be_disabled() -> None:
-    client = _app(ping_path=None)
+    client = _app(ping_path=None, cors_enabled=False, origins=None)
 
     assert client.get("/ping").status_code == 404

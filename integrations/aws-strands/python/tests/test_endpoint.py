@@ -100,6 +100,41 @@ def test_the_stream_is_marked_uncacheable() -> None:
     assert response.headers["cache-control"] == "no-cache"
 
 
+def test_other_route_options_are_forwarded_to_fastapi() -> None:
+    """Options other than dependencies reach the route too.
+
+    `dependencies` is merged separately, so it cannot stand in for the
+    passthrough: without it the rest would be dropped in silence.
+    """
+    app = FastAPI()
+    add_strands_fastapi_endpoint(
+        app, FakeAgent(), "/agent", tags=["strands"], summary="Run the agent"
+    )
+
+    operation = app.openapi()["paths"]["/agent"]["post"]
+
+    assert operation["tags"] == ["strands"]
+    assert operation["summary"] == "Run the agent"
+
+
+def test_a_dependency_passed_here_runs_alongside_the_built_in_ones() -> None:
+    """Merged with the content-type check rather than replacing it."""
+    seen: list[str] = []
+
+    async def note() -> None:
+        seen.append("called")
+
+    app = FastAPI()
+    agent = FakeAgent()
+    add_strands_fastapi_endpoint(app, agent, "/", dependencies=[Depends(note)])
+    client = TestClient(app)
+
+    assert client.post("/", json=valid_run_input()).status_code == 200
+    assert seen == ["called"]
+    # The helper's own content-type dependency survived the merge.
+    assert client.post("/", content="hello").status_code == 415
+
+
 def test_route_options_are_forwarded_to_fastapi() -> None:
     """A dependency passed here must reach the route, not be dropped."""
     rejected: list[str] = []

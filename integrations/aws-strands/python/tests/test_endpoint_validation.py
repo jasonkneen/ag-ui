@@ -5,16 +5,18 @@ rejected before the agent is reached, so a malformed request fails as an
 HTTP error rather than halfway through a stream that has already returned
 200.
 
-FastAPI validates the body against the `RunAgentInput` model, so rejections
-surface as 422 with a pydantic `detail` list. The TypeScript adapter, which
-validates by hand, answers 415 for a non-JSON content type and 400 for a
-schema failure. Both refuse the request without running the agent; the
-status codes differ because each side uses its framework's idiom.
+A media type that cannot carry JSON is refused up front with 415, matching
+the TypeScript adapter. Past that, the body is validated against the
+`RunAgentInput` model, so a malformed or schema-invalid body surfaces as 422
+with a pydantic `detail` list, where the hand-rolled TypeScript path answers
+400. Both refuse without running the agent; that remaining difference is
+each framework's idiom for the same refusal.
 
-A `+json` subtype diverges further: pydantic parses it, so Python runs the
-agent, while Express's `json()` middleware parses only `application/json`
-and leaves the body empty, which the TypeScript adapter deliberately
-answers with 400 rather than 415. Both are documented in their own suites.
+A `+json` subtype diverges further: both adapters accept the content type,
+but pydantic parses the body so Python runs the agent, while Express's
+`json()` middleware parses only `application/json` and leaves the body
+empty, which the TypeScript adapter deliberately answers with 400 rather
+than 415. Both are documented in their own suites.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from ag_ui_strands.endpoint import add_strands_fastapi_endpoint
 from tests.endpoint_helpers import FakeAgent, valid_run_input
 
 UNPROCESSABLE = 422
+UNSUPPORTED_MEDIA_TYPE = 415
 
 
 @pytest.fixture
@@ -85,16 +88,18 @@ def test_plain_text_under_a_json_content_type_is_rejected(
 def test_body_with_no_content_type_is_rejected(
     client: TestClient, agent: FakeAgent
 ) -> None:
+    """Refused on the media type, before the body is looked at."""
     response = client.post("/", content="hello")
 
-    assert response.status_code == UNPROCESSABLE
+    assert response.status_code == UNSUPPORTED_MEDIA_TYPE
     assert agent.received == []
 
 
 def test_form_encoded_body_is_rejected(client: TestClient, agent: FakeAgent) -> None:
+    """A form media type cannot carry JSON, so it never reaches parsing."""
     response = client.post("/", data={"threadId": "t", "runId": "r"})
 
-    assert response.status_code == UNPROCESSABLE
+    assert response.status_code == UNSUPPORTED_MEDIA_TYPE
     assert agent.received == []
 
 

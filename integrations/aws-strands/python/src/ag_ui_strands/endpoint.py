@@ -1,11 +1,74 @@
-import asyncio
 """FastAPI endpoint utilities for AWS Strands integration."""
 
-from fastapi import FastAPI, Request
+import asyncio
+import json
+from typing import Any, Callable, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from ag_ui.core import EventType, RunAgentInput, RunErrorEvent, RunStartedEvent
+from pydantic import ValidationError
+
+from ag_ui.core import (
+    EventType,
+    RunAgentInput,
+    RunErrorEvent,
+    RunStartedEvent,
+)
 from ag_ui.encoder import AGUI_MEDIA_TYPE, EventEncoder
+
 from .agent import StrandsAgent
+
+
+async def _require_json_content_type(request: Request) -> None:
+    """Reject requests whose media type cannot carry JSON."""
+    content_type = request.headers.get("content-type")
+    media_type = content_type.split(";", 1)[0].strip().lower() if content_type else ""
+    is_json = media_type == "application/json"
+    is_structured_json = media_type.startswith("application/") and media_type.endswith(
+        "+json"
+    )
+
+    if not (is_json or is_structured_json):
+        raise HTTPException(
+            status_code=415,
+            detail="Content-Type must be application/json or application/*+json",
+        )
+
+
+async def _parse_run_agent_input(request: Request) -> RunAgentInput:
+    """Parse and validate the request body after route dependencies run."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body", exc.pos),
+                    "msg": "JSON decode error",
+                    "input": {},
+                    "ctx": {"error": exc.msg},
+                }
+            ],
+            body=exc.doc,
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="There was an error parsing the body",
+        ) from exc
+
+    try:
+        return RunAgentInput.model_validate(body)
+    except ValidationError as exc:
+        errors = []
+        for error in exc.errors():
+            request_error = dict(error)
+            request_error["loc"] = ("body", *error["loc"])
+            errors.append(request_error)
+        raise RequestValidationError(errors, body=body) from exc
+
 
 SSE_MEDIA_TYPE = "text/event-stream"
 
@@ -140,25 +203,53 @@ def _encoded_or_none(encoder: EventEncoder, event) -> str | bytes | None:
     except Exception:
         return None
 
-
 def add_strands_fastapi_endpoint(
     app: FastAPI,
     agent: StrandsAgent,
     path: str,
-    **kwargs
+    *,
+    auth: Optional[Callable[..., Any]] = None,
+    **kwargs: Any,
 ) -> None:
     """Add a Strands agent endpoint to FastAPI app.
 
     Args:
         app: FastAPI application instance
-        agent: The StrandsAgent to serve
+        agent: The StrandsAgent instance
         path: Path for the agent endpoint
-        **kwargs: Forwarded to ``app.post`` (``dependencies``, ``tags``, ...)
+        auth: Optional FastAPI dependency callable used to authenticate requests.
+            It should raise ``fastapi.HTTPException`` to reject a request. The
+            endpoint is unauthenticated when this is ``None``. Authentication
+            runs before the request body is parsed and validated.
+        **kwargs: Forwarded to ``app.post`` (``tags``, ``dependencies``, ...).
+            Any ``dependencies`` given here run after the ones this helper
+            installs, rather than replacing them.
     """
 
-    @app.post(path, **kwargs)
-    async def strands_endpoint(input_data: RunAgentInput, request: Request):
+    dependencies = []
+    if auth is not None:
+        dependencies.append(Depends(auth))
+    dependencies.append(Depends(_require_json_content_type))
+    dependencies.extend(kwargs.pop("dependencies", []))
+
+    kwargs.setdefault(
+        "openapi_extra",
+        {
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": RunAgentInput.model_json_schema(by_alias=True)
+                    }
+                },
+            }
+        },
+    )
+
+    @app.post(path, dependencies=dependencies, **kwargs)
+    async def strands_endpoint(request: Request):
         """AWS Strands agent endpoint."""
+        input_data = await _parse_run_agent_input(request)
         # A client may send Accept as several field lines. `get` returns only
         # the first, which would hide a protobuf entry on a later one; Node
         # joins them before the Express peer ever sees the header.
@@ -243,10 +334,9 @@ def add_strands_fastapi_endpoint(
                 # while this generator is itself being closed; only yielding
                 # again during teardown would raise.
                 #
-                # On a client disconnect this returns, but the agent's own
-                # teardown is cut short at its first await by the cancellation
-                # already in flight, so anything it releases after an await is
-                # not released.
+                # The disconnect path does not arrive here with work left to
+                # do: it is handed to `_settle_and_close` above, which owns the
+                # close from outside the cancelled scope.
                 closer = getattr(iterator, "aclose", None)
                 if closer is not None:
                     try:
@@ -314,7 +404,7 @@ def add_strands_fastapi_endpoint(
         )
 
 
-def add_ping(app: FastAPI, path: str, **kwargs) -> None:
+def add_ping(app: FastAPI, path: str, **kwargs: Any) -> None:
     """Add a ping endpoint to FastAPI app.
 
     Args:
