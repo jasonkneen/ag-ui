@@ -12,6 +12,8 @@ import {
   addPing,
   addCapabilities,
 } from "./endpoint";
+import { authGuard } from "./endpoint";
+import { resolveLogger } from "./logger";
 import type { StrandsAgent } from "./agent";
 import type {
   StrandsAguiCapabilitiesOverrides,
@@ -209,6 +211,41 @@ async function loadCors(): Promise<typeof import("cors")> {
  * caller believing cross-origin access is configured, so name what was passed
  * and what it needs.
  */
+/**
+ * Every key `CreateStrandsAppOptions` accepts. An unknown key is refused rather
+ * than ignored: TypeScript's excess-property check only fires on object
+ * literals in TypeScript, so a JavaScript caller, a spread, or an `any` can
+ * misspell a security option and silently get the insecure default. `autth`
+ * instead of `auth` would leave the agent route unguarded.
+ */
+const CREATE_STRANDS_APP_OPTION_KEYS = [
+  "path",
+  "pingPath",
+  "capabilitiesPath",
+  "capabilities",
+  "corsOrigin",
+  "corsEnabled",
+  "allowMethods",
+  "allowHeaders",
+  "auth",
+] as const;
+
+function assertKnownOptions(options: CreateStrandsAppOptions): void {
+  const known = new Set<string>(CREATE_STRANDS_APP_OPTION_KEYS);
+  const unknown = Object.keys(options).filter((key) => !known.has(key));
+  if (unknown.length === 0) {
+    return;
+  }
+  const plural = unknown.length === 1 ? "option" : "options";
+  throw new Error(
+    `createStrandsApp received unknown ${plural} ${unknown
+      .map((key) => `\`${key}\``)
+      .join(", ")}. A misspelled option would be ignored, and for a ` +
+      `security option that means silently running without it. Valid options ` +
+      `are ${CREATE_STRANDS_APP_OPTION_KEYS.map((key) => `\`${key}\``).join(", ")}.`,
+  );
+}
+
 function corsOptionsWithoutOrigin(names: string[]): string {
   return (
     `${names.join(", ")} ${names.length === 1 ? "was" : "were"} passed to ` +
@@ -295,6 +332,8 @@ export async function createStrandsApp(
   agent: StrandsAgent,
   options: CreateStrandsAppOptions = {},
 ): Promise<import("express").Express> {
+  assertKnownOptions(options);
+
   const {
     path = "/",
     pingPath = "/ping",
@@ -361,9 +400,21 @@ export async function createStrandsApp(
       }),
     );
   }
+  // Auth goes ahead of the body parser, not on the route. `express.json()` is
+  // app-wide, so a route-mounted guard would let an unauthenticated caller
+  // reach the parser first: malformed JSON would answer `400` from the parser
+  // with the guard never consulted, and a valid body would be buffered to the
+  // limit below before being rejected. Mounted as a path-specific POST layer
+  // so `next()` falls through to the parser and then the agent route, while
+  // `/ping` and `/capabilities` stay open.
+  if (auth) {
+    app.post(path, authGuard(auth, resolveLogger(agent.config.logger)));
+  }
   app.use(express.json({ limit: "50mb" }));
 
-  addStrandsExpressEndpoint(app, agent, { path, auth });
+  // `auth` is deliberately not forwarded: it is already mounted above, and
+  // passing it again would run the caller's guard twice per request.
+  addStrandsExpressEndpoint(app, agent, { path });
 
   if (pingPath) {
     addPing(app, pingPath);

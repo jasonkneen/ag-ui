@@ -119,7 +119,11 @@ function bodyForAuthStatus(status: number): { error: string } {
  * rejection there would hang the request. Owning both paths here keeps the
  * behaviour identical across the supported range.
  */
-function authGuard(
+/**
+ * Exported for `createStrandsApp`, which mounts this ahead of its body parser
+ * rather than as route middleware. Not part of the package's public surface.
+ */
+export function authGuard(
   auth: StrandsAuthMiddleware,
   logger: Logger,
 ): (req: Request, res: Response, next: NextFunction) => Promise<void> {

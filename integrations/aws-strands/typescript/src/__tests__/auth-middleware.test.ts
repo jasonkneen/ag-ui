@@ -12,6 +12,7 @@ import {
   closeServer,
   getPath,
   listen,
+  postRaw,
   postRun,
   runAgentInputPayload,
   type StartedApp,
@@ -907,5 +908,100 @@ describe("auth logs through the injectable logger", () => {
     } finally {
       await close();
     }
+  });
+});
+
+describe("auth runs ahead of the factory's body parser", () => {
+  it("rejects malformed JSON at the guard, not at the parser", async () => {
+    let authCalls = 0;
+    const { port, agent, close } = await startAuthedApp((_req, res) => {
+      authCalls += 1;
+      res.status(401).json({ error: "Unauthorized" });
+    });
+    try {
+      // `express.json()` is mounted app-wide by the factory, so this is the
+      // probe that pins the mount order: a body the parser itself rejects
+      // never reaches the route, so a guard mounted on the route instead of
+      // ahead of the parser answers `400` from the parser with the guard never
+      // consulted and the parser's stack in the body. A well-formed body under
+      // the size limit cannot tell the two orders apart, because it parses
+      // either way and the guard then declines it.
+      const res = await postRaw(port, "{ this is not json");
+      expect(res.status).toBe(401);
+      expect(authCalls).toBe(1);
+      expect(agent.runs).toBe(0);
+      expect(res.body).not.toMatch(/\bat\s+\S+:\d+/);
+      expect(res.body).not.toContain("SyntaxError");
+    } finally {
+      await close();
+    }
+  });
+
+  it("runs the guard exactly once per request", async () => {
+    // The factory mounts the guard itself and must not also hand `auth` to
+    // `addStrandsExpressEndpoint`, which would mount a second copy.
+    let authCalls = 0;
+    const { port, agent, close } = await startAuthedApp((_req, _res, next) => {
+      authCalls += 1;
+      next();
+    });
+    try {
+      expect((await postRun(port, { headers: AUTHORIZED })).status).toBe(200);
+      expect(authCalls).toBe(1);
+      expect(agent.runs).toBe(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("leaves ping and capabilities open while the agent route is guarded", async () => {
+    let authCalls = 0;
+    const { port, close } = await startAuthedApp((_req, res) => {
+      authCalls += 1;
+      res.status(401).json({ error: "Unauthorized" });
+    });
+    try {
+      expect((await getPath(port, "/ping")).status).toBe(200);
+      expect((await getPath(port, "/capabilities")).status).toBe(200);
+      expect(authCalls).toBe(0);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe("createStrandsApp refuses unknown options", () => {
+  it("throws for a misspelled security option instead of ignoring it", async () => {
+    const agent = new FixedAgent();
+    await expect(
+      createStrandsApp(agent, {
+        autth: (_req: unknown, _res: unknown, next: () => void) => next(),
+      } as never),
+    ).rejects.toThrow(/unknown option `autth`/);
+    expect(agent.runs).toBe(0);
+  });
+
+  it("names every unknown option and lists the valid ones", async () => {
+    await expect(
+      createStrandsApp(new FixedAgent(), {
+        autth: 1,
+        corsOrigns: 2,
+      } as never),
+    ).rejects.toThrow(/unknown options `autth`, `corsOrigns`[\s\S]*`auth`/);
+  });
+
+  it("still accepts every documented option together", async () => {
+    const app = await createStrandsApp(new FixedAgent(), {
+      path: "/",
+      pingPath: "/ping",
+      capabilitiesPath: "/capabilities",
+      capabilities: {},
+      corsOrigin: ["https://app.example.com"],
+      corsEnabled: true,
+      allowMethods: ["POST"],
+      allowHeaders: ["Content-Type"],
+      auth: (_req, _res, next) => next(),
+    });
+    expect(app).toBeDefined();
   });
 });

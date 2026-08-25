@@ -586,11 +586,19 @@ What the adapter guarantees around it:
   response has already finished, it is left alone. `next("route")` and
   `next("router")` are Express control-flow signals rather than failures and are
   forwarded as such.
-- **`auth` runs before the request-boundary checks.** An unauthenticated
-  request with a non-JSON `Content-Type` gets `401`, not the `415` it would get
-  without a guard. Authenticating before telling an anonymous caller anything
-  about the request contract is the intended order; `415` and `400` still bite
-  behind a guard that passes.
+- **`auth` runs before body parsing and before the request-boundary checks.**
+  `createStrandsApp` mounts the guard as a path-specific `POST` layer ahead of
+  its own `express.json()`, so an unauthenticated request is declined before
+  its body is read. A non-JSON `Content-Type` gets `401` rather than the `415`
+  it would get without a guard, and a body the JSON parser would reject gets
+  `401` rather than the parser's own `400`. Authenticating before telling an
+  anonymous caller anything about the request contract is the intended order;
+  `415` and `400` still bite behind a guard that passes.
+
+  Mounting the endpoint yourself with `addStrandsExpressEndpoint` puts you in
+  charge of that ordering: register the endpoint before your own body parser,
+  or the parser will answer malformed bodies ahead of your guard.
+
 - **`/ping` and `/capabilities` stay open.** Health probes have to keep
   working, and the capabilities document is a static matrix of what this
   adapter supports rather than user data.
