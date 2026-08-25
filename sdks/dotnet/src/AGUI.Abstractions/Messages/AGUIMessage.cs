@@ -11,11 +11,19 @@ namespace AGUI.Abstractions;
 public abstract class AGUIMessage
 {
     [JsonPropertyName("id")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Id { get; set; }
 
     [JsonPropertyName("role")]
     public abstract string Role { get; }
+
+    /// <summary>
+    /// Gets or sets the subagent that produced this message, absent for the parent
+    /// agent's own. Declared on the base because the spec carries it on every role: a
+    /// single MESSAGES_SNAPSHOT mixes the parent's messages with those of every subagent
+    /// that ran, so attribution has to travel per message rather than per event.
+    /// </summary>
+    [JsonPropertyName("subagentRunId")]
+    public string? SubagentRunId { get; set; }
 
     /// <summary>
     /// Extra information attached to this message, open by key.
@@ -39,6 +47,5 @@ public abstract class AGUIMessage
     /// reducer of its own is separate work.
     /// </remarks>
     [JsonPropertyName("metadata")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Metadata { get; set; }
 }
