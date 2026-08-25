@@ -12,7 +12,7 @@ import dns from "node:dns";
 import { readFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo, type Socket } from "node:net";
 import type { InputContent } from "@ag-ui/core";
 
 import {
@@ -2170,6 +2170,105 @@ describe("URL fetch policy: limits that cannot work", () => {
 // ---------------------------------------------------------------------------
 
 describe("URL fetch policy: transport binding", () => {
+  async function rawResponseListener(response: string) {
+    const sockets = new Set<Socket>();
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      socket.once("data", () => socket.end(response));
+    });
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once("error", onError);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", onError);
+        resolve();
+      });
+    });
+    const { port } = server.address() as AddressInfo;
+    return {
+      port,
+      close: async () => {
+        for (const socket of sockets) socket.destroy();
+        if (!server.listening) return;
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      },
+    };
+  }
+
+  async function settleWithin<T>(promise: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("transport did not settle")),
+            500,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function requestRawResponse(port: number) {
+    return urlFetchTransport.request(
+      `http://hostile.example:${port}/probe`,
+      [{ version: 4, bytes: new Uint8Array([127, 0, 0, 1]) }],
+      policy({ timeoutMs: 250 }),
+      new AbortController().signal,
+    );
+  }
+
+  it.each([204, 205, 304])(
+    "represents HTTP %i without constructing a forbidden body",
+    async (status) => {
+      const listener = await rawResponseListener(
+        `HTTP/1.1 ${status} Empty\r\nConnection: close\r\n\r\n`,
+      );
+      try {
+        const response = await settleWithin(requestRawResponse(listener.port));
+
+        expect(response.status).toBe(status);
+        expect(response.body).toBeNull();
+      } finally {
+        await listener.close();
+      }
+    },
+  );
+
+  it("rejects an HTTP status outside the Fetch response range", async () => {
+    const listener = await rawResponseListener(
+      "HTTP/1.1 600 Hostile\r\nConnection: close\r\n\r\n",
+    );
+    try {
+      await expect(
+        settleWithin(requestRawResponse(listener.port)),
+      ).rejects.toThrow(/unsupported HTTP status 600/);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("rejects and closes a protocol upgrade", async () => {
+    const listener = await rawResponseListener(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Connection: upgrade\r\n" +
+        "Upgrade: hostile\r\n\r\n",
+    );
+    try {
+      await expect(
+        settleWithin(requestRawResponse(listener.port)),
+      ).rejects.toThrow(/protocol upgrade/);
+    } finally {
+      await listener.close();
+    }
+  });
+
   /** A listener that records connections and serves a sentinel if reached. */
   async function sentinelListener() {
     const connections: string[] = [];

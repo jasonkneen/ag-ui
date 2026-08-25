@@ -904,6 +904,8 @@ function pinnedLookup(approved: IpAddress[]) {
   };
 }
 
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
 /**
  * Perform one request, reaching only `approved`.
  *
@@ -924,6 +926,22 @@ async function pinnedRequest(
   const agent = new mod.Agent({ keepAlive: false, maxSockets: 1 });
 
   return await new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const resolveOnce = (response: Response) => {
+      if (settled) return;
+      settled = true;
+      resolve(response);
+    };
+    const rejectOnce = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      agent.destroy();
+      reject(
+        error instanceof Error
+          ? error
+          : new UrlFetchUnavailableError("HTTP request failed"),
+      );
+    };
     const request = mod.request(
       {
         protocol: url.protocol,
@@ -938,34 +956,104 @@ async function pinnedRequest(
         // environment, so the socket cannot be routed somewhere unvalidated.
       },
       (message) => {
-        const headers = new Headers();
-        for (const [name, value] of Object.entries(message.headers)) {
-          if (value === undefined) continue;
-          for (const single of Array.isArray(value) ? value : [value]) {
-            headers.append(name, single);
-          }
-        }
-        const body = new ReadableStream<Uint8Array>({
-          start(controller) {
-            message.on("data", (chunk: Buffer) =>
-              controller.enqueue(new Uint8Array(chunk)),
-            );
-            message.on("end", () => controller.close());
-            message.on("error", (error) => controller.error(error));
-          },
-          cancel() {
+        try {
+          const status = message.statusCode;
+          if (status === undefined || status < 200 || status > 599) {
             message.destroy();
-          },
-        });
-        resolve(
-          new Response(body, {
-            status: message.statusCode ?? 0,
-            headers,
-          }),
-        );
+            rejectOnce(
+              new UrlFetchUnavailableError(
+                status === undefined
+                  ? "response carried no HTTP status"
+                  : `response carried unsupported HTTP status ${status}`,
+              ),
+            );
+            return;
+          }
+
+          const headers = new Headers();
+          for (const [name, value] of Object.entries(message.headers)) {
+            if (value === undefined) continue;
+            for (const single of Array.isArray(value) ? value : [value]) {
+              headers.append(name, single);
+            }
+          }
+
+          let body: ReadableStream<Uint8Array> | null = null;
+          if (NULL_BODY_STATUSES.has(status)) {
+            message.resume();
+          } else {
+            body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                let streamSettled = false;
+                const errorStream = (error: unknown) => {
+                  if (streamSettled) return;
+                  streamSettled = true;
+                  try {
+                    controller.error(error);
+                  } catch {
+                    message.destroy();
+                  }
+                };
+                message.on("data", (chunk: Buffer) => {
+                  if (streamSettled) return;
+                  try {
+                    controller.enqueue(new Uint8Array(chunk));
+                  } catch (error) {
+                    errorStream(error);
+                    message.destroy();
+                  }
+                });
+                message.on("end", () => {
+                  if (streamSettled) return;
+                  streamSettled = true;
+                  try {
+                    controller.close();
+                  } catch {
+                    message.destroy();
+                  }
+                });
+                message.on("error", errorStream);
+                message.on("aborted", () =>
+                  errorStream(
+                    new UrlFetchUnavailableError("response body was aborted"),
+                  ),
+                );
+              },
+              cancel() {
+                message.destroy();
+              },
+            });
+          }
+
+          resolveOnce(new Response(body, { status, headers }));
+        } catch {
+          message.destroy();
+          rejectOnce(
+            new UrlFetchUnavailableError(
+              "HTTP response could not be represented safely",
+            ),
+          );
+        }
       },
     );
-    request.on("error", reject);
+    request.once("error", rejectOnce);
+    request.once("upgrade", (_message, socket) => {
+      socket.destroy();
+      rejectOnce(
+        new UrlFetchUnavailableError(
+          "HTTP protocol upgrades are not supported",
+        ),
+      );
+    });
+    request.once("close", () => {
+      if (!settled) {
+        rejectOnce(
+          new UrlFetchUnavailableError(
+            "connection closed before an HTTP response was received",
+          ),
+        );
+      }
+    });
     request.setTimeout(policy.timeoutMs, () => {
       request.destroy(
         new UrlFetchUnavailableError(
