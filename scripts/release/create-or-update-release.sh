@@ -194,9 +194,12 @@ fi
 # correct) and point at the tag's CHANGELOG.md instead of inlining prose.
 RELEASE_BODY_BUDGET=110000
 
-# The pointer that replaces an over-budget block. It keeps whichever marker
-# the real block would have carried: degrading a FAULT to "published" would
-# freeze it, because reconcile only retries packages lacking that marker.
+# The pointer that replaces an over-budget block. Applied ONLY when the
+# extractor succeeded, i.e. when there are real notes worth omitting: the
+# missing-entry and fault blocks are one sentence each, so replacing them saves
+# nothing and destroys the disclosure — "read them in CHANGELOG.md" would point
+# at notes that do not exist, or hide that they could not be read at all. The
+# marker is still selected defensively in case a future caller needs it.
 budget_pointer_block() {
   local name="$1" version="$2" marker status
   status="$(notes_status)"
@@ -214,7 +217,8 @@ while read -r pkg; do
   NAME=$(echo "$pkg" | jq -r '.name')
   VERSION=$(echo "$pkg" | jq -r '.version')
   BLOCK="$(notes_block "$NAME" "$VERSION")${NL}${NL}"
-  if [ $((${#SECTION} + ${#BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
+  if [ "$(notes_status)" -eq 0 ] &&
+    [ $((${#SECTION} + ${#BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
     BLOCK="$(budget_pointer_block "$NAME" "$VERSION")${NL}${NL}"
     echo "::warning title=Release notes omitted::${NAME}@${VERSION}: release body budget reached; notes replaced with a pointer to CHANGELOG.md" >&2
   fi
@@ -265,7 +269,8 @@ for i in $(seq 1 $MAX_RETRIES); do
           echo "${NAME}@${VERSION} is still unreadable; not duplicating its placeholder" >&2
         else
           USED=$((${#EXISTING_BODY} + ${#APPEND_SECTION} + ${#APPEND_NOTES}))
-          if [ $((USED + ${#RETRY_BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
+          if [ "$RETRY_STATUS" -eq 0 ] &&
+            [ $((USED + ${#RETRY_BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
             RETRY_BLOCK="$(budget_pointer_block "$NAME" "$VERSION")${NL}${NL}"
             echo "::warning title=Release notes omitted::${NAME}@${VERSION}: release body budget reached; notes replaced with a pointer to CHANGELOG.md" >&2
           fi
@@ -286,7 +291,8 @@ for i in $(seq 1 $MAX_RETRIES); do
         # fails after that lane's packages are published and tagged.
         BLOCK="$(notes_block "$NAME" "$VERSION")${NL}${NL}"
         USED=$((${#EXISTING_BODY} + ${#APPEND_SECTION} + ${#APPEND_NOTES}))
-        if [ $((USED + ${#BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
+        if [ "$(notes_status)" -eq 0 ] &&
+          [ $((USED + ${#BLOCK})) -gt "$RELEASE_BODY_BUDGET" ]; then
           BLOCK="$(budget_pointer_block "$NAME" "$VERSION")${NL}${NL}"
           echo "::warning title=Release notes omitted::${NAME}@${VERSION}: release body budget reached; notes replaced with a pointer to CHANGELOG.md" >&2
         fi

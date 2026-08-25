@@ -685,13 +685,65 @@ test("an over-budget FAULT stays retryable instead of being marked published", (
     );
     assert.equal(r.status, 0, r.stderr);
     const updated = readFileSync(updatedFile, "utf8");
-    assert.match(updated, /Notes omitted to stay within GitHub/);
+    // The fault block is ONE sentence, so the budget must not replace it:
+    // "read them in CHANGELOG.md" would hide that the notes were unreadable,
+    // and replacing a one-line block saves nothing anyway.
+    assert.match(updated, /could not be read/);
+    assert.doesNotMatch(
+      updated,
+      /Notes omitted to stay within GitHub/,
+      "a fault block must keep its disclosure, not become a pointer",
+    );
     assert.match(updated, /<!-- ag-ui-unreadable: @ag-ui\/mastra@0\.2\.0 -->/);
     assert.doesNotMatch(
       updated,
       /<!-- ag-ui-published: @ag-ui\/mastra@0\.2\.0 -->/,
       "an over-budget fault must not be recorded as published",
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an over-budget MISSING entry keeps its disclosure instead of a pointer", () => {
+  const root = fixtureRoot();
+  try {
+    // No entry for this version (extractor exit 3) AND a body over budget.
+    // Replacing the one-line "no notes were approved" disclosure with
+    // "read them in CHANGELOG.md" would point consumers at notes that do not
+    // exist, and would hide the absence from anyone reading the release.
+    const bodyFile = join(root, "body.txt");
+    writeFileSync(
+      bodyFile,
+      [
+        "## Packages Published",
+        "| ag_ui_strands | 0.3.1 | `pip install ag_ui_strands==0.3.1` |",
+        `- ${"x".repeat(112_000)}`,
+        "<!-- ag-ui-published: ag_ui_strands@0.3.1 -->",
+      ].join("\n"),
+    );
+    const updatedFile = join(root, "updated.txt");
+    const r = runReleaseScript(
+      root,
+      [
+        {
+          name: "@ag-ui/mastra",
+          version: "8.8.8",
+          path: "integrations/mastra",
+        },
+      ],
+      bodyFile,
+      updatedFile,
+    );
+    assert.equal(r.status, 0, r.stderr);
+    const updated = readFileSync(updatedFile, "utf8");
+    assert.match(updated, /No release notes were approved/);
+    assert.doesNotMatch(
+      updated,
+      /Notes omitted to stay within GitHub/,
+      "a missing-entry block must keep its disclosure, not become a pointer",
+    );
+    assert.match(updated, /<!-- ag-ui-published: @ag-ui\/mastra@8\.8\.8 -->/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
