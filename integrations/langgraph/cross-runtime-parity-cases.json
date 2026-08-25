@@ -229,9 +229,7 @@
       "content": [
         {
           "type": "image_url",
-          "image_url": [
-            "https://example.com/a.png"
-          ]
+          "image_url": ["https://example.com/a.png"]
         }
       ],
       "expect": {
@@ -387,9 +385,7 @@
       "content": [
         {
           "type": "text",
-          "text": [
-            "x"
-          ]
+          "text": ["x"]
         }
       ],
       "expect": {
@@ -664,9 +660,7 @@
       "direction": "inbound",
       "axis": "malformed",
       "why": "a JSON null where a block is expected",
-      "content": [
-        null
-      ],
+      "content": [null],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -678,9 +672,7 @@
       "direction": "inbound",
       "axis": "malformed",
       "why": "a bare string where a block is expected",
-      "content": [
-        "just a string"
-      ],
+      "content": ["just a string"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -692,9 +684,7 @@
       "direction": "inbound",
       "axis": "malformed",
       "why": "a number where a block is expected",
-      "content": [
-        7
-      ],
+      "content": [7],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -706,9 +696,7 @@
       "direction": "inbound",
       "axis": "malformed",
       "why": "a boolean where a block is expected",
-      "content": [
-        true
-      ],
+      "content": [true],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -720,11 +708,7 @@
       "direction": "inbound",
       "axis": "malformed",
       "why": "an array where a block is expected",
-      "content": [
-        [
-          "x"
-        ]
-      ],
+      "content": [["x"]],
       "expect": {
         "kept": [],
         "dropped": 1,
