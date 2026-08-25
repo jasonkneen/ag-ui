@@ -2431,6 +2431,18 @@ describe("Multimodal Message Conversion", () => {
       // malformed item that fails schema validation downstream. A prototype key
       // has to be exactly as unrecognized as any other unknown block type:
       // skipped, leaving only the blocks this converter actually understands.
+      //
+      // "Skipped" is not "silent". Each of the five is a DROP, and rule 2 of the
+      // malformed-input contract requires exactly one warning per dropped item —
+      // so the drops are asserted here rather than left unexamined. Without that
+      // assertion this test passed whether the converter announced the drops or
+      // swallowed them, which is the regression the contract exists to stop. The
+      // announcements are STUBBED for the reason given on "should skip media
+      // content with unknown source type": left live they wrote five lines to the
+      // suite's stderr on every run, training everyone reading CI output to
+      // ignore a line the converter emits precisely so a vanished attachment is
+      // traceable.
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const agui = langchainMessagesToAgui([
         {
           id: "prototype-typed",
@@ -2448,6 +2460,14 @@ describe("Multimodal Message Conversion", () => {
 
       const content = (agui[0] as UserMessage).content as Array<any>;
       expect(content).toEqual([{ type: "text", text: "before" }]);
+      expect(warn.mock.calls.map((call) => String(call[0]))).toEqual([
+        '[convertLangchainMultimodalToAgui] Dropping unsupported content block of type "constructor"',
+        '[convertLangchainMultimodalToAgui] Dropping unsupported content block of type "toString"',
+        '[convertLangchainMultimodalToAgui] Dropping unsupported content block of type "valueOf"',
+        '[convertLangchainMultimodalToAgui] Dropping unsupported content block of type "hasOwnProperty"',
+        '[convertLangchainMultimodalToAgui] Dropping unsupported content block of type "isPrototypeOf"',
+      ]);
+      warn.mockRestore();
     });
 
     it("falls through an empty metadata.filename to metadata.name", () => {
@@ -2611,6 +2631,14 @@ describe("cross-runtime parity table", () => {
     axis: string;
     why: string;
     content: unknown[];
+    /**
+     * What the PYTHON harness builds each outbound item into. Declared so this
+     * runtime does not silently ignore a field of the shared table, but not read
+     * here: nothing validates content at this boundary in TypeScript, so there is
+     * no equivalent to record. Python asserts it — see
+     * `test_outbound_cases_record_what_this_runtime_actually_builds`.
+     */
+    pythonBuilds?: string[];
     expect: { kept: unknown[]; dropped: number; loggedDrops: number };
   }
 
@@ -2627,6 +2655,17 @@ describe("cross-runtime parity table", () => {
    * projection: a different VALUE, a different survivor, or a different count
    * still fails. Nothing here inspects the input, so no case can be normalized
    * into agreement.
+   *
+   * `sourceType` is the RECOGNITION MARKER, and it is projected rather than
+   * dropped. It is the key that makes a translator see the block as inline
+   * base64 media at all: here `source_type: "base64"` (`@langchain/core`'s
+   * `isDataContentBlock` tests for `source_type` and nothing else), in Python
+   * the `base64` key itself (measured on `langchain-core` 1.2.13,
+   * `is_data_content_block` returns `True` on `"base64" in block`). Deleting
+   * that key from either emitted block sends the provider a block its
+   * translator does not recognize as media — the failure the outbound design
+   * exists to prevent — and while it was projected away this table could not
+   * see it happen.
    */
   function canonical(direction: string, items: any[]): unknown[] {
     if (direction === "inbound") {
@@ -2648,6 +2687,7 @@ describe("cross-runtime parity table", () => {
       return {
         kind: "standard",
         blockType: block.type,
+        sourceType: block.source_type ?? ("base64" in block ? "base64" : null),
         data: block.data,
         mimeType: block.mime_type || null,
         filename: block.metadata?.filename || null,
@@ -2656,7 +2696,70 @@ describe("cross-runtime parity table", () => {
   }
 
   /**
+   * A module prefix on a log line, e.g. `[convertAguiMultimodalToLangchain] `.
+   *
+   * Stripped before the drop rule is applied, NOT matched around. This runtime
+   * prefixes every line with the emitting function and Python's `getMessage()`
+   * carries no prefix at all, and that difference is the whole reason the two
+   * harnesses ended up enforcing different rules: this one had loosened to a
+   * substring match (`/Dropping /`, matching anywhere in the line) while
+   * Python kept `startswith("Dropping ")`, and both comments claimed the
+   * `startswith` rule. A line that MENTIONS "Dropping " somewhere in its prose
+   * without being a drop announcement was counted here and not there.
+   * Normalize the prefix away, then apply the one rule on the one form.
+   */
+  const LOG_MODULE_PREFIX = /^\[[^\]]*\]\s*/;
+
+  /**
+   * Rule 2 of the malformed-input contract: warnings that BEGIN "Dropping ",
+   * once the runtime's own module prefix is removed.
+   *
+   * The rest of the prose legitimately differs between the runtimes (`int` vs
+   * `number`, `dict` vs `object`), so asserting it would fail on wording rather
+   * than on behaviour. Kept byte-identical to Python's `_count_drop_logs`.
+   */
+  function countDropLogs(warnings: string[]): number {
+    return warnings.filter((line) => line.replace(LOG_MODULE_PREFIX, "").startsWith("Dropping "))
+      .length;
+  }
+
+  /** Drive one converter over one content list and capture what it logged. */
+  function convert(direction: string, content: unknown[]) {
+    const warnings: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(String(args[0]));
+    });
+    try {
+      const converted =
+        direction === "inbound"
+          ? (
+              langchainMessagesToAgui([
+                { id: "parity", type: "human", content } as unknown as LangGraphMessage,
+              ])[0] as UserMessage
+            )?.content
+          : aguiMessagesToLangChain([
+              { id: "parity", role: "user", content } as unknown as UserMessage,
+            ])[0]?.content;
+      return { items: Array.isArray(converted) ? converted : [], warnings };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  /**
    * Run one case and reduce it to the outcome triple the table records.
+   *
+   * `dropped` IS MEASURED, NOT DERIVED. It used to be `content.length -
+   * kept.length`, which is arithmetic on `kept`: it could not fail unless
+   * `kept` had already failed, so the table's third axis was one axis with two
+   * names. Here each input item is removed in turn and the converter re-run:
+   * an item whose removal leaves the output the same LENGTH produced nothing,
+   * and that is what "dropped" means. It is a measurement of the item, not of
+   * the list, so it fails on its own — a run that drops one item while emitting
+   * a second block for another nets to the right length and is caught here.
+   * Blind spot, stated because it is real: two items that convert identically
+   * are indistinguishable by this method (removing either shortens the output
+   * by one), so provenance between duplicates is not pinned.
    *
    * A THROW is reported here rather than allowed to escape as a bare stack: rule
    * 1 of the malformed-input contract is that no case in this table may throw in
@@ -2664,34 +2767,19 @@ describe("cross-runtime parity table", () => {
    * of the harness.
    */
   function outcomeOf(testCase: ParityCase) {
-    const warnings: string[] = [];
-    const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
-      warnings.push(String(args[0]));
-    });
     try {
-      const converted =
-        testCase.direction === "inbound"
-          ? (
-              langchainMessagesToAgui([
-                {
-                  id: "parity",
-                  type: "human",
-                  content: testCase.content,
-                } as unknown as LangGraphMessage,
-              ])[0] as UserMessage
-            )?.content
-          : aguiMessagesToLangChain([
-              { id: "parity", role: "user", content: testCase.content } as unknown as UserMessage,
-            ])[0]?.content;
-      const kept = canonical(testCase.direction, Array.isArray(converted) ? converted : []);
+      const full = convert(testCase.direction, testCase.content);
+      const dropped = testCase.content.filter(
+        (_, index) =>
+          convert(
+            testCase.direction,
+            testCase.content.filter((__, other) => other !== index),
+          ).items.length === full.items.length,
+      ).length;
       return {
-        kept,
-        dropped: testCase.content.length - kept.length,
-        // Rule 2 of the malformed-input contract counts warnings that BEGIN
-        // "Dropping ". The rest of the prose legitimately differs between the
-        // runtimes (`int` vs `number`, module prefixes), so asserting it would
-        // fail on wording rather than on behaviour.
-        loggedDrops: warnings.filter((line) => /Dropping /.test(line)).length,
+        kept: canonical(testCase.direction, full.items),
+        dropped,
+        loggedDrops: countDropLogs(full.warnings),
       };
     } catch (error) {
       throw new Error(
@@ -2702,8 +2790,6 @@ describe("cross-runtime parity table", () => {
           "  throw on this input.",
         { cause: error },
       );
-    } finally {
-      warn.mockRestore();
     }
   }
 

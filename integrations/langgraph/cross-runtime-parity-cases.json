@@ -21,26 +21,47 @@
     "WHAT `expect` ASSERTS — three things, not one, because past divergences hid in",
     "the second and third:",
     "  * `kept`     the canonical value each surviving item converts to, in order.",
-    "  * `dropped`  how many input items produced no output at all. Asserted",
-    "               independently of `kept` so that an item silently REPLACED by a",
-    "               different one is not mistaken for an item kept correctly.",
-    "  * `loggedDrops`  how many warnings beginning \"Dropping \" were emitted. Rule 2",
-    "               of the malformed-input contract (see the comment block above",
-    "               each pair of converters) requires exactly one per dropped item;",
-    "               a silent drop is the failure an operator cannot diagnose, and it",
-    "               is invisible to an assertion on the return value alone.",
+    "  * `dropped`  how many input items produced NO OUTPUT AT ALL — MEASURED, not",
+    "               derived. Each harness removes one input item at a time and re-runs",
+    "               the converter; an item whose removal leaves the output the same",
+    "               LENGTH produced nothing, and that is what dropped means. It used",
+    "               to be `len(content) - len(kept)`, which is arithmetic on `kept`:",
+    "               it could not fail unless `kept` had already failed, so this was",
+    "               one axis wearing two names while this file claimed it was",
+    "               independent. Measuring the ITEM rather than the list makes it its",
+    "               own assertion — a run that drops one item while emitting an extra",
+    "               block for another nets to the right length and still fails here.",
+    "               KNOWN BLIND SPOT: two items that convert identically cannot be",
+    "               told apart this way (removing either shortens the output by one),",
+    "               so provenance between duplicates is not pinned.",
+    "  * `loggedDrops`  how many warnings BEGIN \"Dropping \" once the runtime's own",
+    "               module prefix is stripped. Rule 2 of the malformed-input contract",
+    "               (see the comment block above each pair of converters) requires",
+    "               exactly one per dropped item; a silent drop is the failure an",
+    "               operator cannot diagnose, and it is invisible to an assertion on",
+    "               the return value alone.",
     "Neither runtime may RAISE on any case here. That is rule 1 of the same contract:",
     "these converters build a whole MESSAGES_SNAPSHOT / a whole provider request, so",
     "an exception does not degrade one attachment, it costs the client every message",
     "in the thread.",
+    "",
+    "ONE DROP RULE, ONE NORMALIZED FORM. The two harnesses used to enforce DIFFERENT",
+    "rules for `loggedDrops`: Python matched `startswith(\"Dropping \")` and TypeScript",
+    "matched `/Dropping /` ANYWHERE in the line, while both comments claimed the",
+    "`startswith` rule — the anti-drift harness had itself drifted. The loose regex",
+    "was there because the runtimes legitimately prefix their lines differently",
+    "(`[convertAguiMultimodalToLangchain] Dropping …` versus a bare `Dropping …`).",
+    "The prefix is now STRIPPED (`^\\[[^\\]]*\\]\\s*`) and the one `startswith` rule",
+    "applied to the one normalized form, in both harnesses. A warning that merely",
+    "MENTIONS the word somewhere in its prose is no longer counted as a drop.",
     "",
     "CANONICAL FORM. The two runtimes emit the same content in deliberately different",
     "key vocabularies — outbound, TypeScript emits the `source_type`/`data`/`mimeType`/",
     "`metadata.filename` family and Python emits `base64`/`mime_type`/`filename`; that",
     "difference is documented on `StandardMediaBlock` and is not drift. `expect.kept`",
     "is therefore written in a neutral form and each suite projects its own output",
-    "onto it. The projection is shape-only: it renames keys and nothing else, so a",
-    "difference in VALUE, in what survived, or in what was logged still fails.",
+    "onto it. The projection RENAMES keys; it does not delete them, and it does not",
+    "inspect the input, so no case can be normalized into agreement.",
     "",
     "  inbound  (LangChain content -> AG-UI InputContent)",
     "    {\"kind\": \"text\", \"text\": <str>}",
@@ -51,12 +72,35 @@
     "  outbound (AG-UI InputContent -> LangChain content)",
     "    {\"kind\": \"text\", \"text\": <str>}",
     "    {\"kind\": \"image_url\", \"url\": <str>}",
-    "    {\"kind\": \"standard\", \"blockType\": \"audio\"|\"file\", \"data\": <str>,",
+    "    {\"kind\": \"standard\", \"blockType\": \"audio\"|\"file\",",
+    "     \"sourceType\": \"base64\", \"data\": <str>,",
     "     \"mimeType\": <str|null>, \"filename\": <str|null>}",
+    "",
+    "  `sourceType` is the RECOGNITION MARKER, and it is projected because deleting",
+    "  it from an emitted block used to fail ZERO of these cases. It is the key that",
+    "  makes a translator see the block as inline base64 media at all: TypeScript",
+    "  emits `source_type: \"base64\"` (`@langchain/core`'s `isDataContentBlock` tests",
+    "  for `source_type` and nothing else) and Python emits the `base64` key itself",
+    "  (measured on langchain-core 1.2.13: `is_data_content_block` returns True on",
+    "  `\"base64\" in block`). A block that loses its marker is forwarded to the",
+    "  provider as an unrecognized object — the exact failure the outbound design",
+    "  exists to prevent. On the Python side the marker and the payload are the same",
+    "  key, so `sourceType` there restates `data`; on the TypeScript side they are two",
+    "  keys and this is the only thing pinning the marker.",
     "",
     "  An empty-string mimeType/filename is normalized to null on both sides: neither",
     "  runtime distinguishes \"absent\" from \"present and empty\" for those two fields,",
     "  and pinning a distinction the code does not make would be a false assertion.",
+    "",
+    "WHAT THE PROJECTION DOES NOT COVER, stated so nobody has to rediscover it:",
+    "  * Every key either runtime emits on an OUTBOUND block is projected. Nothing is",
+    "    dropped there any more.",
+    "  * INBOUND, only the AG-UI item's kind, source type, source value, MIME type and",
+    "    `metadata.filename` are compared. Any OTHER key a runtime attached to",
+    "    `metadata`, and the difference between an absent `metadata` and an empty one,",
+    "    are invisible here.",
+    "  * `\"\"` and absent are the same value for `mimeType` and `filename` (above).",
+    "  * Log PROSE is not compared, only the count — see the next section.",
     "",
     "OUTBOUND INPUTS ARE DICTS. TypeScript's converter reads client JSON that nothing",
     "validates. Python's reads pydantic-validated AG-UI content objects, so the suite",
@@ -65,12 +109,32 @@
     "for such an item in production (an item that fails validation is never a typed",
     "content object). The two runtimes therefore reach some outbound drops through",
     "DIFFERENT branches — TypeScript through a typed guard, Python through its",
-    "terminal `else`. That is expected and is why this table asserts the outcome",
-    "triple rather than the log prose.",
+    "terminal `else`.",
     "",
-    "LOG PROSE IS NOT ASSERTED. `loggedDrops` counts warnings beginning \"Dropping \".",
-    "The rest of each message legitimately differs (module prefixes, `int` vs",
-    "`number`, `dict` vs `object`) and pinning it here would fail on wording.",
+    "That divergence is expected, but it was left IMPLICIT and it made most of the",
+    "outbound malformed cases misdescribe themselves: eleven of twelve failed pydantic",
+    "validation and collapsed onto the single terminal `else`, so a case named after",
+    "a text guard or a media guard was not exercising one in Python at all. Two things",
+    "fix that:",
+    "  * `outbound/malformed/ts-only/…` — the id says so. The named BRANCH is reached",
+    "    in TypeScript only; in Python the item cannot become a typed content object,",
+    "    so it arrives as a raw dict and lands in the terminal `else`. Both runtimes",
+    "    still drop it and log once, which is what `expect` asserts.",
+    "  * `pythonBuilds` — every outbound case records, per item, what Python's harness",
+    "    actually builds it into (a class name, or `dict` / `NoneType` for an item no",
+    "    class accepts). It is ASSERTED, so if a schema change ever moves a case onto a",
+    "    different branch, the table says so instead of hiding it behind an unchanged",
+    "    outcome triple.",
+    "",
+    "KNOWN UNREACHABLE IN PYTHON: the legacy-binary `no url, data, or id` guard.",
+    "`BinaryInputContent` refuses to validate without one of the three, so no validated",
+    "item can reach that guard — only TypeScript's copy of it is live. That is why",
+    "`outbound/malformed/ts-only/binary-empty` carries the marker rather than being",
+    "reconstructed: there is no input that would reach the Python branch.",
+    "",
+    "LOG PROSE IS NOT ASSERTED. `loggedDrops` counts warnings beginning \"Dropping \"",
+    "after prefix normalization. The rest of each message legitimately differs (`int`",
+    "vs `number`, `dict` vs `object`) and pinning it here would fail on wording.",
     "",
     "`axis` is documentation only. `malformed` = input no schema allows; `edge` =",
     "legal but easy to get wrong; `wellformed` = the modality x source x vocabulary",
@@ -504,6 +568,36 @@
           {
             "kind": "text",
             "text": "   "
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/edge/identical-blocks-both-survive",
+      "direction": "inbound",
+      "axis": "edge",
+      "why": "the same block twice is two blocks, not one; and this is the case that makes `dropped` falsifiable — a converter that emitted one item twice while dropping the other would net to the right length and be caught only by the leave-one-out measurement",
+      "content": [
+        {
+          "type": "text",
+          "text": "dup"
+        },
+        {
+          "type": "text",
+          "text": "dup"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "text",
+            "text": "dup"
+          },
+          {
+            "kind": "text",
+            "text": "dup"
           }
         ],
         "dropped": 0,
@@ -3670,12 +3764,13 @@
       "id": "outbound/malformed/unknown-type",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a content type added to the AG-UI union later",
+      "why": "a content type added to the AG-UI union later; both runtimes reach their terminal else",
       "content": [
         {
           "type": "totally_unknown"
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3686,12 +3781,13 @@
       "id": "outbound/malformed/no-type",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "an item with no type at all",
+      "why": "an item with no type at all; both runtimes reach their terminal else",
       "content": [
         {
           "foo": "bar"
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3699,16 +3795,17 @@
       }
     },
     {
-      "id": "outbound/malformed/text-number",
+      "id": "outbound/malformed/ts-only/text-number",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a non-string text forwarded into a provider block is a 400",
+      "why": "TypeScript's text guard — a non-string text forwarded into a provider block is a 400. Python cannot reach its text branch: TextInputContent.text is a str, so this stays a raw dict and lands in the terminal else",
       "content": [
         {
           "type": "text",
           "text": 42
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3716,10 +3813,10 @@
       }
     },
     {
-      "id": "outbound/malformed/text-object",
+      "id": "outbound/malformed/ts-only/text-object",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "same with an object",
+      "why": "same guard with an object; same collapse onto Python's terminal else",
       "content": [
         {
           "type": "text",
@@ -3728,6 +3825,7 @@
           }
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3735,16 +3833,17 @@
       }
     },
     {
-      "id": "outbound/malformed/text-null",
+      "id": "outbound/malformed/ts-only/text-null",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "same with a null",
+      "why": "same guard with a null; same collapse onto Python's terminal else",
       "content": [
         {
           "type": "text",
           "text": null
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3752,15 +3851,16 @@
       }
     },
     {
-      "id": "outbound/malformed/media-no-source",
+      "id": "outbound/malformed/ts-only/media-no-source",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a media item with no source",
+      "why": "TypeScript's media branch drops an item whose source yields no URL. Python cannot reach it: source is required on every typed media class, so this stays a raw dict and lands in the terminal else",
       "content": [
         {
           "type": "image"
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3768,16 +3868,17 @@
       }
     },
     {
-      "id": "outbound/malformed/media-null-source",
+      "id": "outbound/malformed/ts-only/media-null-source",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a media item with an explicit null source",
+      "why": "same branch with an explicit null source; same collapse onto Python's terminal else",
       "content": [
         {
           "type": "audio",
           "source": null
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3785,10 +3886,10 @@
       }
     },
     {
-      "id": "outbound/malformed/media-empty-url-source",
+      "id": "outbound/malformed/media-empty-url-source/image",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a url source whose value is empty converts to no URL and must be dropped, not emitted",
+      "why": "a url source whose value is empty converts to no URL and must be dropped, not emitted; both runtimes reach their media branch",
       "content": [
         {
           "type": "image",
@@ -3798,6 +3899,7 @@
           }
         }
       ],
+      "pythonBuilds": ["ImageInputContent"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3805,15 +3907,79 @@
       }
     },
     {
-      "id": "outbound/malformed/binary-empty",
+      "id": "outbound/malformed/media-empty-url-source/audio",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a legacy binary item with no url, data or id",
+      "why": "a url source whose value is empty converts to no URL and must be dropped, not emitted; both runtimes reach their media branch for audio as they do for image",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": ""
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/media-empty-url-source/video",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "a url source whose value is empty converts to no URL and must be dropped, not emitted; both runtimes reach their media branch for video as they do for image",
+      "content": [
+        {
+          "type": "video",
+          "source": {
+            "type": "url",
+            "value": ""
+          }
+        }
+      ],
+      "pythonBuilds": ["VideoInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/media-empty-url-source/document",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "a url source whose value is empty converts to no URL and must be dropped, not emitted; both runtimes reach their media branch for document as they do for image",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": ""
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/ts-only/binary-empty",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "TypeScript's legacy-binary guard — no url, data or id. Python can NEVER reach that guard: BinaryInputContent refuses to validate without one of the three, so this stays a raw dict and lands in the terminal else",
       "content": [
         {
           "type": "binary"
         }
       ],
+      "pythonBuilds": ["dict"],
       "expect": {
         "kept": [],
         "dropped": 1,
@@ -3824,7 +3990,7 @@
       "id": "outbound/malformed/null-entry",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "a JSON null where a content item is expected",
+      "why": "a JSON null where a content item is expected; TypeScript's not-an-object guard, Python's terminal else",
       "content": [
         {
           "type": "text",
@@ -3836,6 +4002,7 @@
           "text": "after"
         }
       ],
+      "pythonBuilds": ["TextInputContent", "NoneType", "TextInputContent"],
       "expect": {
         "kept": [
           {
@@ -3855,7 +4022,7 @@
       "id": "outbound/malformed/neighbours-survive",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "rule 3 on the outbound leg",
+      "why": "rule 3 on the outbound leg, around the terminal else both runtimes reach",
       "content": [
         {
           "type": "text",
@@ -3869,6 +4036,7 @@
           "text": "after"
         }
       ],
+      "pythonBuilds": ["TextInputContent", "dict", "TextInputContent"],
       "expect": {
         "kept": [
           {
@@ -3885,10 +4053,10 @@
       }
     },
     {
-      "id": "outbound/malformed/text-neighbours-survive",
+      "id": "outbound/malformed/ts-only/text-neighbours-survive",
       "direction": "outbound",
       "axis": "malformed",
-      "why": "rule 3 on the outbound text branch",
+      "why": "rule 3 around TypeScript's text guard; in Python the middle item is a raw dict, so rule 3 is exercised around the terminal else instead",
       "content": [
         {
           "type": "text",
@@ -3903,6 +4071,7 @@
           "text": "after"
         }
       ],
+      "pythonBuilds": ["TextInputContent", "dict", "TextInputContent"],
       "expect": {
         "kept": [
           {
@@ -3929,11 +4098,43 @@
           "text": ""
         }
       ],
+      "pythonBuilds": ["TextInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "text",
             "text": ""
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/edge/identical-items-both-survive",
+      "direction": "outbound",
+      "axis": "edge",
+      "why": "the same item twice is two blocks, not one; the outbound half of the case that makes `dropped` falsifiable — see its inbound twin",
+      "content": [
+        {
+          "type": "text",
+          "text": "dup"
+        },
+        {
+          "type": "text",
+          "text": "dup"
+        }
+      ],
+      "pythonBuilds": ["TextInputContent", "TextInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "text",
+            "text": "dup"
+          },
+          {
+            "kind": "text",
+            "text": "dup"
           }
         ],
         "dropped": 0,
@@ -3958,11 +4159,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "aGk=",
             "mimeType": "application/pdf",
             "filename": "attachment.pdf"
@@ -3990,11 +4193,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "aGk=",
             "mimeType": "application/pdf",
             "filename": "attachment.pdf"
@@ -4022,14 +4227,84 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "aGk=",
             "mimeType": "application/pdf",
             "filename": "real.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/edge/metadata-filename-non-string-derives",
+      "direction": "outbound",
+      "axis": "edge",
+      "why": "a non-string metadata.filename is not a name, it is a name the client failed to send; without the guard `filename: 12345` reaches the provider, and with it the document derives its own name",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": "aGk=",
+            "mimeType": "application/pdf"
+          },
+          "metadata": {
+            "filename": 12345
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "aGk=",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/edge/metadata-filename-non-string-on-audio",
+      "direction": "outbound",
+      "axis": "edge",
+      "why": "the same guard on an audio block, which has no derivation to fall back on, so the refused name leaves the block with none at all",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "data",
+            "value": "aGk=",
+            "mimeType": "audio/wav"
+          },
+          "metadata": {
+            "filename": 12345
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "aGk=",
+            "mimeType": "audio/wav",
+            "filename": null
           }
         ],
         "dropped": 0,
@@ -4051,6 +4326,7 @@
           }
         }
       ],
+      "pythonBuilds": ["ImageInputContent"],
       "expect": {
         "kept": [
           {
@@ -4077,6 +4353,7 @@
           }
         }
       ],
+      "pythonBuilds": ["ImageInputContent"],
       "expect": {
         "kept": [
           {
@@ -4103,6 +4380,7 @@
           }
         }
       ],
+      "pythonBuilds": ["ImageInputContent"],
       "expect": {
         "kept": [
           {
@@ -4128,6 +4406,7 @@
           }
         }
       ],
+      "pythonBuilds": ["ImageInputContent"],
       "expect": {
         "kept": [
           {
@@ -4154,11 +4433,13 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/wav",
             "filename": null
@@ -4183,11 +4464,13 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/mp3",
             "filename": null
@@ -4212,11 +4495,13 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/wav",
             "filename": null
@@ -4241,6 +4526,7 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
@@ -4267,11 +4553,13 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/wav",
             "filename": null
@@ -4296,6 +4584,7 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
@@ -4321,6 +4610,7 @@
           }
         }
       ],
+      "pythonBuilds": ["AudioInputContent"],
       "expect": {
         "kept": [
           {
@@ -4347,6 +4637,7 @@
           }
         }
       ],
+      "pythonBuilds": ["VideoInputContent"],
       "expect": {
         "kept": [
           {
@@ -4373,6 +4664,7 @@
           }
         }
       ],
+      "pythonBuilds": ["VideoInputContent"],
       "expect": {
         "kept": [
           {
@@ -4398,6 +4690,7 @@
           }
         }
       ],
+      "pythonBuilds": ["VideoInputContent"],
       "expect": {
         "kept": [
           {
@@ -4424,11 +4717,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/pdf",
             "filename": "attachment.pdf"
@@ -4453,11 +4748,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/vnd.ms-excel",
             "filename": "attachment.xls"
@@ -4482,11 +4779,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "text/plain",
             "filename": "attachment.txt"
@@ -4511,11 +4810,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "APPLICATION/PDF",
             "filename": "attachment.pdf"
@@ -4540,11 +4841,13 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/octet-stream",
             "filename": "attachment.bin"
@@ -4568,6 +4871,7 @@
           }
         }
       ],
+      "pythonBuilds": ["DocumentInputContent"],
       "expect": {
         "kept": [
           {
@@ -4591,6 +4895,7 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4614,11 +4919,13 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/wav",
             "filename": null
@@ -4640,11 +4947,13 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "audio",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "audio/wav",
             "filename": null
@@ -4666,6 +4975,7 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4689,6 +4999,7 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4712,11 +5023,13 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/pdf",
             "filename": "attachment.pdf"
@@ -4738,11 +5051,13 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "APPLICATION/PDF",
             "filename": "attachment.pdf"
@@ -4764,6 +5079,7 @@
           "data": "QUJD"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4787,6 +5103,7 @@
           "url": "https://example.com/a.png"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4810,6 +5127,7 @@
           "id": "file-123"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
@@ -4834,11 +5152,13 @@
           "filename": "legacy.pdf"
         }
       ],
+      "pythonBuilds": ["BinaryInputContent"],
       "expect": {
         "kept": [
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/pdf",
             "filename": "legacy.pdf"
@@ -4877,6 +5197,11 @@
           }
         }
       ],
+      "pythonBuilds": [
+        "TextInputContent",
+        "ImageInputContent",
+        "DocumentInputContent"
+      ],
       "expect": {
         "kept": [
           {
@@ -4890,6 +5215,7 @@
           {
             "kind": "standard",
             "blockType": "file",
+            "sourceType": "base64",
             "data": "QUJD",
             "mimeType": "application/pdf",
             "filename": "invoice.pdf"

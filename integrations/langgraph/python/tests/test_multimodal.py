@@ -5,6 +5,7 @@ Tests for multimodal message conversion between AG-UI and LangChain formats.
 import json
 import logging
 import pathlib
+import re
 import unittest
 import warnings
 from datetime import datetime
@@ -2613,6 +2614,37 @@ def _run_converter(direction, content):
     )
 
 
+# A module prefix on a log line, e.g. ``[convert_agui_multimodal_to_langchain] ``.
+#
+# Stripped before the drop rule is applied, NOT matched around. This runtime's
+# ``record.getMessage()`` carries no prefix and the TypeScript adapter prefixes
+# every `console.warn` line with the emitting function, and that difference is
+# the whole reason the two parity harnesses ended up enforcing DIFFERENT rules:
+# TypeScript had loosened to a substring match (``/Dropping /``, matching
+# anywhere in the line) while this side kept ``startswith("Dropping ")``, and
+# both comments claimed the ``startswith`` rule. A line that MENTIONS
+# "Dropping " somewhere in its prose without being a drop announcement counted
+# there and not here. Normalize the prefix away, then apply the one rule on the
+# one form.
+_LOG_MODULE_PREFIX = re.compile(r"^\[[^\]]*\]\s*")
+
+
+def _count_drop_logs(warnings):
+    """Rule 2 of the malformed-input contract: warnings that BEGIN "Dropping ",
+    once the runtime's own module prefix is removed.
+
+    The rest of the prose legitimately differs between the runtimes (``int`` vs
+    ``number``, ``dict`` vs ``object``), so asserting it would fail on wording
+    rather than on behaviour. Kept byte-identical to the TypeScript harness's
+    ``countDropLogs``.
+    """
+    return sum(
+        1
+        for line in warnings
+        if _LOG_MODULE_PREFIX.sub("", line).startswith("Dropping ")
+    )
+
+
 class TestMalformedInputContract(unittest.TestCase):
     """THE MALFORMED-INPUT CONTRACT.
 
@@ -3296,6 +3328,20 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
         else survives the projection: a different VALUE, a different survivor, or
         a different count still fails. Nothing here inspects the input, so no case
         can be normalized into agreement.
+
+        ``sourceType`` is the RECOGNITION MARKER, and it is projected rather than
+        dropped. It is the key that makes a translator see the block as inline
+        base64 media at all: here the ``base64`` key itself (measured on
+        langchain-core 1.2.13, ``is_data_content_block`` returns ``True`` on
+        ``"base64" in block``), in TypeScript ``source_type: "base64"``
+        (``@langchain/core``'s ``isDataContentBlock`` tests for ``source_type``
+        and nothing else). Deleting that key from either emitted block sends the
+        provider a block its translator does not recognize as media — the failure
+        the outbound design exists to prevent — and while it was projected away
+        this table could not see it happen. On THIS side the marker and the
+        payload are the same key, so the projection restates ``data``; on the
+        TypeScript side they are two keys and this is the only thing pinning the
+        marker.
         """
         if direction == "inbound":
             kinds = {
@@ -3332,6 +3378,8 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                 canonical.append({
                     "kind": "standard",
                     "blockType": kind,
+                    "sourceType": block.get("source_type")
+                    or ("base64" if "base64" in block else None),
                     "data": block.get("base64"),
                     "mimeType": block.get("mime_type") or None,
                     "filename": block.get("filename") or None,
@@ -3340,6 +3388,19 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
 
     def _outcome_of(self, case):
         """Run one case and reduce it to the outcome triple the table records.
+
+        ``dropped`` IS MEASURED, NOT DERIVED. It used to be
+        ``len(content) - len(kept)``, which is arithmetic on ``kept``: it could
+        not fail unless ``kept`` had already failed, so the table's third axis was
+        one axis with two names. Here each input item is removed in turn and the
+        converter re-run: an item whose removal leaves the output the same LENGTH
+        produced nothing, and that is what "dropped" means. It is a measurement of
+        the item, not of the list, so it fails on its own — a run that drops one
+        item while emitting a second block for another nets to the right length
+        and is caught here. Blind spot, stated because it is real: two items that
+        convert identically are indistinguishable by this method (removing either
+        shortens the output by one), so provenance between duplicates is not
+        pinned.
 
         A RAISE is reported here rather than allowed to escape as a bare
         traceback: rule 1 of the malformed-input contract is that no case in this
@@ -3351,6 +3412,17 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
             content = [self._build_outbound_item(i) for i in content]
         try:
             outcome = _run_converter(case["direction"], content)
+            dropped = sum(
+                1
+                for index in range(len(content))
+                if len(
+                    _run_converter(
+                        case["direction"],
+                        [c for other, c in enumerate(content) if other != index],
+                    ).content
+                )
+                == len(outcome.content)
+            )
         except Exception as exc:  # noqa: BLE001
             raise self.failureException(
                 f"{self._report(case)}"
@@ -3359,17 +3431,10 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                 "  case in the shared table may raise in either runtime, and the other\n"
                 "  one does not raise on this input.\n"
             ) from exc
-        kept = self._canonical(case["direction"], outcome.content)
         return {
-            "kept": kept,
-            "dropped": len(case["content"]) - len(kept),
-            # Rule 2 of the malformed-input contract counts warnings that BEGIN
-            # "Dropping ". The rest of the prose legitimately differs between the
-            # runtimes (`int` vs `number`, module prefixes), so asserting it would
-            # fail on wording rather than on behaviour.
-            "loggedDrops": sum(
-                1 for w in outcome.warnings if w.startswith("Dropping ")
-            ),
+            "kept": self._canonical(case["direction"], outcome.content),
+            "dropped": dropped,
+            "loggedDrops": _count_drop_logs(outcome.warnings),
         }
 
     @staticmethod
@@ -3419,6 +3484,76 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["id"]):
                 self._assert_case(case)
+
+    def test_outbound_cases_record_what_this_runtime_actually_builds(self):
+        """`pythonBuilds` is the branch each outbound item really reaches, pinned.
+
+        The outcome triple cannot see a case CHANGE BRANCH: eleven of the twelve
+        outbound malformed cases failed pydantic validation and collapsed onto the
+        single terminal ``else``, so a case named after a text guard or a media
+        guard was not exercising one here at all, and nothing said so. Recording
+        what the harness builds each item into — a content class, or ``dict`` /
+        ``NoneType`` for an item no class accepts — makes that visible, and
+        asserting it means a schema change that silently moves a case onto a
+        different branch fails instead of hiding behind an unchanged outcome.
+        """
+        cases = [c for c in self.table["cases"] if c["direction"] == "outbound"]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                self.assertIn(
+                    "pythonBuilds",
+                    case,
+                    f'{self._report(case)}'
+                    "  Every outbound case records what this runtime builds each item\n"
+                    "  into. Add `pythonBuilds` to the shared table for this case.\n",
+                )
+                self.assertEqual(
+                    case["pythonBuilds"],
+                    [
+                        type(self._build_outbound_item(item)).__name__
+                        for item in case["content"]
+                    ],
+                    f'{self._report(case)}'
+                    "  `pythonBuilds` in the shared table no longer matches what this\n"
+                    "  runtime builds. A content class changed what it accepts, so this\n"
+                    "  case now reaches a DIFFERENT branch than the one it was written\n"
+                    "  for — re-read the case before updating the field.\n",
+                )
+
+    def test_ts_only_marks_exactly_the_cases_that_name_a_branch_python_misses(self):
+        """The `ts-only` segment in an id is a claim, so it is checked.
+
+        A case whose item declares a type this runtime HAS a class for, and which
+        that class then refuses to validate, names a branch it never reaches here:
+        it arrives as a raw dict and lands in the terminal ``else``. Those cases
+        carry `/ts-only/` in their id. The check runs both ways — an unmarked case
+        may not have the property and a marked case must — so the id cannot drift
+        away from the behaviour the way the table's own harnesses did.
+        """
+        for case in self.table["cases"]:
+            if case["direction"] != "outbound":
+                continue
+            names_a_branch_python_misses = any(
+                isinstance(item, dict)
+                and item.get("type") in self._CLASS_BY_TYPE
+                and not isinstance(
+                    self._build_outbound_item(item),
+                    self._CLASS_BY_TYPE[item["type"]],
+                )
+                for item in case["content"]
+            )
+            with self.subTest(case=case["id"]):
+                self.assertEqual(
+                    "/ts-only/" in case["id"],
+                    names_a_branch_python_misses,
+                    f'{self._report(case)}'
+                    "  An id carrying `/ts-only/` claims the named branch is reached in\n"
+                    "  TypeScript only, because this runtime cannot validate the item\n"
+                    "  into the class its `type` names. That claim and the behaviour no\n"
+                    "  longer agree — rename the case or rebuild it, but do not leave a\n"
+                    "  name that misdescribes what it covers.\n",
+                )
 
 
 if __name__ == "__main__":
