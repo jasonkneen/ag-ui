@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import re
 import socket
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from functools import partial
@@ -74,6 +75,14 @@ class UrlFetchPolicyError(Exception):
     """Raised when a URL is rejected by the fetch policy (scheme or network range)."""
 
 
+#: Schemes a fetch may ever use.  Only ``http`` and ``https`` get a transport
+#: pinned to the addresses the policy validated (see
+#: :class:`_PinnedConnectionMixin`); every other scheme urllib can open would
+#: resolve the host a second time on its own, which is exactly the rebinding
+#: window the pinning closes.  A policy may narrow this set but not widen it.
+_PINNABLE_SCHEMES: frozenset = frozenset({"http", "https"})
+
+
 @dataclass(frozen=True)
 class UrlFetchPolicy:
     """Policy applied to every server-side URL fetch.
@@ -81,19 +90,88 @@ class UrlFetchPolicy:
     The defaults are deliberately restrictive: only ``http``/``https`` are
     fetched, addresses outside the public internet (loopback, private,
     link-local — notably the ``169.254.169.254`` cloud metadata endpoint —
-    multicast and reserved ranges) are refused, and the response body is
-    capped.  Relaxing address checks is opt-in by passing a custom policy, but
-    link-local ranges (including common cloud metadata endpoints) remain
-    blocked.
+    multicast and reserved ranges) are refused, the response body is capped,
+    and one run gets a bounded number of fetches, a cumulative byte ceiling
+    and a cumulative time ceiling.  Relaxing address checks is opt-in by
+    passing a custom policy, but link-local ranges (including common cloud
+    metadata endpoints) remain blocked, and ``allowed_schemes`` can only be
+    narrowed to a subset of :data:`_PINNABLE_SCHEMES`, never widened.
+
+    ``max_bytes`` and ``timeout`` bound a single fetch; ``max_attachments``,
+    ``max_total_bytes`` and ``max_total_seconds`` bound everything one run
+    fetches together.  ``timeout`` is a socket inactivity timeout, so it does
+    not bound a slow trickle on its own; ``max_total_seconds`` is what stops
+    one, checked between reads.  A fetch already blocked in ``recv`` when the
+    run deadline passes can overshoot it by up to the socket timeout, which
+    is itself clamped to the time the run has left.
     """
 
     allowed_schemes: frozenset = field(default_factory=lambda: frozenset({"http", "https"}))
     allow_private_networks: bool = False
     max_bytes: int = 25 * 1024 * 1024
     timeout: float = 30.0
+    max_attachments: int = 10
+    max_total_bytes: int = 50 * 1024 * 1024
+    max_total_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        unpinnable = sorted(
+            str(scheme) for scheme in self.allowed_schemes
+            if str(scheme).lower() not in _PINNABLE_SCHEMES
+        )
+        if unpinnable:
+            raise ValueError(
+                f"UrlFetchPolicy cannot allow {unpinnable}: only "
+                f"{sorted(_PINNABLE_SCHEMES)} are fetched over a transport pinned "
+                "to a validated address, and any other scheme would resolve the "
+                "host again at connection time"
+            )
 
 
 DEFAULT_URL_FETCH_POLICY = UrlFetchPolicy()
+
+
+@dataclass
+class _FetchBudget:
+    """Ceilings shared by every URL fetch made for one run.
+
+    A per-item cap bounds one attachment; this bounds the whole request, so a
+    long attachment list or a server trickling bytes cannot hold the
+    conversion open indefinitely.
+    """
+
+    policy: Optional[UrlFetchPolicy] = None
+    fetches: int = 0
+    bytes_read: int = 0
+    started: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        self.policy = self.policy or DEFAULT_URL_FETCH_POLICY
+
+    def remaining_seconds(self) -> float:
+        return self.policy.max_total_seconds - (time.monotonic() - self.started)
+
+    def remaining_bytes(self) -> int:
+        return max(0, self.policy.max_total_bytes - self.bytes_read)
+
+    def start_fetch(self) -> None:
+        """Claim a slot for one more fetch, or refuse the run's budget."""
+        if self.fetches >= self.policy.max_attachments:
+            raise UrlFetchPolicyError(
+                f"run already fetched its limit of {self.policy.max_attachments} URLs"
+            )
+        if self.remaining_seconds() <= 0:
+            raise UrlFetchPolicyError(
+                f"run exceeded its {self.policy.max_total_seconds} second total fetch time"
+            )
+        if self.remaining_bytes() <= 0:
+            raise UrlFetchPolicyError(
+                f"run exceeded its {self.policy.max_total_bytes} byte total fetch size"
+            )
+        self.fetches += 1
+
+    def account(self, read: int) -> None:
+        self.bytes_read += read
 
 
 def _is_blocked_address(
@@ -157,11 +235,6 @@ def _validate_and_resolve_fetch_url(
         raise UrlFetchPolicyError("URL userinfo credentials are not supported")
     host = parts.hostname
     if not host:
-        # Explicitly allowed non-network schemes (for example ``data``) have no
-        # host. Requiring both scheme and private-network opt-ins preserves that
-        # escape hatch without weakening the default policy.
-        if policy.allow_private_networks:
-            return []
         raise UrlFetchPolicyError("URL has no host")
     addresses = _resolved_addresses(host, parts.port)
     for ip in addresses:
@@ -284,28 +357,99 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _validate_fetch_url(newurl, self._policy)
+        # A redirect must not quietly move the transfer onto cleartext.
+        if (
+            urlsplit(req.full_url).scheme.lower() == "https"
+            and urlsplit(newurl).scheme.lower() == "http"
+        ):
+            raise UrlFetchPolicyError(
+                "redirect downgrades the transfer from https to http"
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _open_url(url: str, timeout: float, policy: UrlFetchPolicy):
-    """Open *url* with policy checks and address pinning on every hop."""
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
+    """Open *url* with policy checks and address pinning on every hop.
+
+    The opener is assembled by hand rather than with
+    :func:`urllib.request.build_opener`, which would also install urllib's
+    ``ftp``, ``file`` and ``data`` handlers.  Those open a URL without the
+    address pinning the HTTP handlers apply, so keeping them out of the opener
+    means a scheme this module does not pin has no transport at all rather
+    than an unpinned one.  For the same reason no proxy handler is installed:
+    a proxy named in the environment would receive the request in place of the
+    address the policy validated.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
         _PolicyHTTPHandler(policy),
         _PolicyHTTPSHandler(policy),
         _PolicyRedirectHandler(policy),
-    )
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        # Turns an unhandled scheme into a clear URLError instead of a None
+        # response the caller would have to interpret.
+        urllib.request.UnknownHandler(),
+    ):
+        opener.add_handler(handler)
     return opener.open(url, timeout=timeout)
 
 
-def _fetch_url_bytes(url: str, policy: Optional[UrlFetchPolicy] = None) -> Optional[bytes]:
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _read_within_budget(resp, cap: int, budget: _FetchBudget) -> bytes:
+    """Read at most *cap* bytes, giving up if the run runs out of time.
+
+    Reading in chunks is what makes ``max_total_seconds`` enforceable: the
+    socket timeout only fires on inactivity, so a server that sends a little
+    data inside every timeout window keeps a single ``read`` call alive for as
+    long as it likes.  Checking the run deadline between chunks bounds that.
+
+    Reads one byte past *cap* so the caller can tell a body at the limit from
+    one over it.
+    """
+    # ``read1`` hands back the bytes already received; ``read`` waits for the
+    # full amount asked for, which would put the whole body back inside one
+    # blocking call and defeat the deadline check below.
+    read_chunk = getattr(resp, "read1", None)
+    if not callable(read_chunk):
+        read_chunk = resp.read
+    chunks: List[bytes] = []
+    read_total = 0
+    while read_total <= cap:
+        if budget.remaining_seconds() <= 0:
+            raise UrlFetchPolicyError(
+                f"run exceeded its {budget.policy.max_total_seconds} second "
+                "total fetch time"
+            )
+        chunk = read_chunk(min(_READ_CHUNK_BYTES, cap + 1 - read_total))
+        if not chunk:
+            break
+        read_total += len(chunk)
+        budget.account(len(chunk))
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _fetch_url_bytes(
+    url: str,
+    policy: Optional[UrlFetchPolicy] = None,
+    budget: Optional[_FetchBudget] = None,
+) -> Optional[bytes]:
     """Fetch raw bytes from *url* using :mod:`urllib`.
 
     The URL is validated against *policy* (default:
     :data:`DEFAULT_URL_FETCH_POLICY`) before any request is made and again on
     every redirect hop, so ``file://`` reads and requests to private,
     loopback or cloud-metadata addresses are refused.  The response body is
-    capped at ``policy.max_bytes``.
+    capped at ``policy.max_bytes``, or at whatever the run's budget has left
+    if that is less.
+
+    *budget* carries the ceilings shared with the other fetches of the same
+    run (count, cumulative bytes, cumulative time).  Passing one is how a
+    caller converting several attachments bounds their total cost; omitting it
+    gives this fetch a budget of its own.
 
     Non-ASCII characters in the URL path (e.g. CJK filenames) are
     percent-encoded before the request to avoid ``UnicodeEncodeError``.
@@ -314,8 +458,10 @@ def _fetch_url_bytes(url: str, policy: Optional[UrlFetchPolicy] = None) -> Optio
     timeout, oversized body); the reason is logged.
     """
     policy = policy or DEFAULT_URL_FETCH_POLICY
+    budget = budget if budget is not None else _FetchBudget(policy)
     url_id = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
     try:
+        budget.start_fetch()
         _validate_fetch_url(url, policy)
         parts = urlsplit(url)
         # Percent-encode non-ASCII chars in the path; preserve already-valid URL chars.
@@ -335,14 +481,16 @@ def _fetch_url_bytes(url: str, policy: Optional[UrlFetchPolicy] = None) -> Optio
             parts.scheme, parts.netloc, encoded_path,
             encoded_query, parts.fragment,
         ))
-        with _open_url(safe_url, policy.timeout, policy) as resp:
-            # Bounded read: one byte past the cap tells us the body was too big.
-            data = resp.read(policy.max_bytes + 1)
-        if len(data) > policy.max_bytes:
+        # Never wait past the run deadline for a fetch that has stalled.
+        timeout = min(policy.timeout, budget.remaining_seconds())
+        cap = min(policy.max_bytes, budget.remaining_bytes())
+        with _open_url(safe_url, timeout, policy) as resp:
+            data = _read_within_budget(resp, cap, budget)
+        if len(data) > cap:
             logger.error(
                 "Refusing to fetch URL (url_id=%s): response exceeds the %d byte limit",
                 url_id,
-                policy.max_bytes,
+                cap,
             )
             return None
         return data
@@ -363,11 +511,16 @@ def _get_mime_type(source: Any) -> Optional[str]:
     return getattr(source, "mime_type", None)
 
 
-def _resolve_source_bytes(source: Any) -> Optional[bytes]:
+def _resolve_source_bytes(
+    source: Any,
+    policy: Optional[UrlFetchPolicy] = None,
+    budget: Optional[_FetchBudget] = None,
+) -> Optional[bytes]:
     """Resolve bytes from an AG-UI content source.
 
     * :class:`InputContentDataSource` -- base64-decode ``source.value``.
-    * :class:`InputContentUrlSource` -- fetch bytes via :func:`_fetch_url_bytes`.
+    * :class:`InputContentUrlSource` -- fetch bytes via :func:`_fetch_url_bytes`,
+      under *policy* and the run's *budget*.
     """
     if isinstance(source, InputContentDataSource):
         try:
@@ -376,12 +529,16 @@ def _resolve_source_bytes(source: Any) -> Optional[bytes]:
             logger.warning(f"Failed to decode base64 content: {e}")
             return None
     if isinstance(source, InputContentUrlSource):
-        return _fetch_url_bytes(source.value)
+        return _fetch_url_bytes(source.value, policy, budget)
     logger.warning(f"Unknown content source type: {type(source).__name__}, cannot resolve bytes")
     return None
 
 
-def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
+def convert_agui_content_to_strands(
+    content: List[Any],
+    policy: Optional[UrlFetchPolicy] = None,
+    budget: Optional[_FetchBudget] = None,
+) -> List[Dict[str, Any]]:
     """Convert an AG-UI ``InputContent`` list to Strands ``ContentBlock`` dicts.
 
     Supported content types:
@@ -392,15 +549,22 @@ def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
     * :class:`VideoInputContent` -> ``{"video": {"format": ..., "source": {"bytes": ...}}}``
     * :class:`AudioInputContent` -- skipped with a warning (Strands has no audio support).
     * Unknown types -- skipped with a warning.
+
+    URL sources are fetched under *policy* (default:
+    :data:`DEFAULT_URL_FETCH_POLICY`).  *budget* bounds what the whole run
+    fetches; pass the same one to every call made for a single request so the
+    ceilings apply across all of its attachments.
     """
     blocks: List[Dict[str, Any]] = []
+    if budget is None:
+        budget = _FetchBudget(policy)
 
     for item in content:
         if isinstance(item, TextInputContent):
             blocks.append({"text": item.text})
 
         elif isinstance(item, ImageInputContent):
-            raw = _resolve_source_bytes(item.source)
+            raw = _resolve_source_bytes(item.source, policy, budget)
             if raw is None:
                 continue
             fmt = _mime_to_format(_get_mime_type(item.source), _IMAGE_FORMATS)
@@ -414,7 +578,7 @@ def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
             })
 
         elif isinstance(item, DocumentInputContent):
-            raw = _resolve_source_bytes(item.source)
+            raw = _resolve_source_bytes(item.source, policy, budget)
             if raw is None:
                 continue
             fmt = _mime_to_format(_get_mime_type(item.source), _DOCUMENT_FORMATS)
@@ -429,7 +593,7 @@ def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
             })
 
         elif isinstance(item, VideoInputContent):
-            raw = _resolve_source_bytes(item.source)
+            raw = _resolve_source_bytes(item.source, policy, budget)
             if raw is None:
                 continue
             fmt = _mime_to_format(_get_mime_type(item.source), _VIDEO_FORMATS)
@@ -457,7 +621,7 @@ def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
                     logger.warning("Skipping binary content: invalid base64 data")
                     continue
             elif item.url:
-                raw_bytes = _fetch_url_bytes(item.url)
+                raw_bytes = _fetch_url_bytes(item.url, policy, budget)
             if raw_bytes is None:
                 logger.warning("Skipping binary content: could not resolve bytes")
                 continue

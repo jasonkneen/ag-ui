@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import socket
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
+
+from tests.url_response_stub import stub_response
 
 from ag_ui_strands.utils import _fetch_url_bytes, _mime_to_format
 
@@ -30,10 +32,7 @@ class TestFetchUrlBytesEncoding:
     @patch("ag_ui_strands.utils._open_url")
     def test_ascii_url_unchanged(self, mock_urlopen):
         """A plain ASCII URL should be passed through without modification."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"data"
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp = stub_response(b"data")
         mock_urlopen.return_value = mock_resp
 
         result = _fetch_url_bytes("https://example.com/path/file.txt")
@@ -45,10 +44,7 @@ class TestFetchUrlBytesEncoding:
     @patch("ag_ui_strands.utils._open_url")
     def test_chinese_filename_is_percent_encoded(self, mock_urlopen):
         """Chinese characters in the URL path must be percent-encoded."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"content"
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp = stub_response(b"content")
         mock_urlopen.return_value = mock_resp
 
         url = "https://cdn.example.com/docs/大模型学习路线.txt"
@@ -65,10 +61,7 @@ class TestFetchUrlBytesEncoding:
     @patch("ag_ui_strands.utils._open_url")
     def test_chinese_query_string_is_encoded(self, mock_urlopen):
         """Non-ASCII characters in query string must also be percent-encoded."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"ok"
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp = stub_response(b"ok")
         mock_urlopen.return_value = mock_resp
 
         url = "https://example.com/doc/file.txt?name=大模型"
@@ -90,10 +83,7 @@ class TestFetchUrlBytesEncoding:
     @patch("ag_ui_strands.utils._open_url")
     def test_ascii_query_string_unchanged(self, mock_urlopen, query):
         """ASCII query strings with RFC 3986 allowed chars must not be rewritten."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"ok"
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp = stub_response(b"ok")
         mock_urlopen.return_value = mock_resp
 
         url = f"https://example.com/file.txt?{query}"
@@ -115,10 +105,7 @@ class TestFetchUrlBytesEncoding:
     @patch("ag_ui_strands.utils._open_url")
     def test_path_percent_encoding(self, mock_urlopen, path, expected_path):
         """Valid %HH escapes are preserved; stray % becomes %25."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"ok"
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp = stub_response(b"ok")
         mock_urlopen.return_value = mock_resp
 
         _fetch_url_bytes(f"https://example.com/{path}")

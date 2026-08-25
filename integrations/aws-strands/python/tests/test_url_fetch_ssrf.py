@@ -10,11 +10,15 @@ import ipaddress
 import logging
 import socket
 import threading
+import time
+import urllib.error
 import urllib.request
 from unittest.mock import MagicMock, patch
 from urllib.response import addinfourl
 
 import pytest
+
+from tests.url_response_stub import stub_response
 
 from ag_ui.core import ImageInputContent
 from ag_ui.core.types import InputContentUrlSource
@@ -24,16 +28,12 @@ from ag_ui_strands.utils import (
     UrlFetchPolicyError,
     convert_agui_content_to_strands,
     _fetch_url_bytes,
+    _open_url,
     _validate_fetch_url,
 )
 
 
-def _mock_response(payload: bytes) -> MagicMock:
-    resp = MagicMock()
-    resp.read.side_effect = lambda n=None: payload if n is None else payload[:n]
-    resp.__enter__ = lambda s: s
-    resp.__exit__ = MagicMock(return_value=False)
-    return resp
+_mock_response = stub_response
 
 
 def _addrinfo(ip: str, family: int = socket.AF_INET, port: int = 80):
@@ -342,20 +342,27 @@ class TestDnsPinning:
         assert result is connected_socket
         connected_socket.connect.assert_called_once_with(("93.184.216.34", 443))
 
-    def test_fetch_opener_ignores_environment_proxies(self):
-        from ag_ui_strands.utils import _open_url
+    @patch(
+        "ag_ui_strands.utils.socket.getaddrinfo",
+        return_value=_addrinfo("93.184.216.34"),
+    )
+    def test_fetch_opener_ignores_environment_proxies(self, _mock_dns, monkeypatch):
+        monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+        monkeypatch.setenv("https_proxy", "http://proxy.invalid:8080")
+        requested_hosts = []
 
-        opener = MagicMock()
-        with patch("ag_ui_strands.utils.urllib.request.build_opener", return_value=opener) as build:
-            _open_url("https://content.example/file", 1.0, UrlFetchPolicy())
+        def fake_do_open(_handler, _http_class, req, **_kwargs):
+            requested_hosts.append(req.host)
+            return _http_response(req.full_url, 200, body=b"body")
 
-        proxy_handlers = [
-            handler
-            for handler in build.call_args.args
-            if isinstance(handler, urllib.request.ProxyHandler)
-        ]
-        assert len(proxy_handlers) == 1
-        assert proxy_handlers[0].proxies == {}
+        with patch.object(
+            urllib.request.AbstractHTTPHandler, "do_open", new=fake_do_open
+        ):
+            result = _fetch_url_bytes("https://content.example/file")
+
+        # A proxy handler would have rewritten the request host to the proxy.
+        assert result == b"body"
+        assert requested_hosts == ["content.example"]
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +543,11 @@ class TestResponseSizeCap:
 
         _fetch_url_bytes("https://example.com/f.bin", policy=UrlFetchPolicy(max_bytes=1024))
 
-        resp.read.assert_called_once_with(1025)
+        calls = resp.read.call_args_list + resp.read1.call_args_list
+        assert calls, "expected the body to be read"
+        for call in calls:
+            assert call.args, "an unbounded read would ignore the cap"
+            assert 0 < call.args[0] <= 1025
 
     @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
     @patch("ag_ui_strands.utils._open_url")
@@ -677,18 +688,16 @@ class TestPolicyConfiguration:
 
         assert result == b"local"
 
-    @patch("ag_ui_strands.utils._open_url")
-    def test_extra_scheme_can_be_opted_into(self, mock_open):
-        mock_open.return_value = _mock_response(b"data")
-
-        result = _fetch_url_bytes(
-            "ftp://127.0.0.1/f.txt",
-            policy=UrlFetchPolicy(
+    def test_no_extra_scheme_can_be_opted_into(self):
+        with pytest.raises(ValueError):
+            UrlFetchPolicy(
                 allowed_schemes=frozenset({"ftp"}), allow_private_networks=True
-            ),
-        )
+            )
 
-        assert result == b"data"
+    def test_allowed_schemes_can_still_be_narrowed(self):
+        policy = UrlFetchPolicy(allowed_schemes=frozenset({"https"}))
+
+        assert _fetch_url_bytes("http://example.com/a.png", policy=policy) is None
 
 
 # ---------------------------------------------------------------------------
@@ -715,3 +724,376 @@ class TestConversionDoesNotFetchBlockedUrls:
 
         assert blocks == []
         mock_open.assert_not_called()
+
+# ---------------------------------------------------------------------------
+# Only schemes with a pinned transport are fetchable
+# ---------------------------------------------------------------------------
+
+
+class TestUnpinnedSchemesAreUnreachable:
+    """Every fetchable scheme must go through the pinned HTTP transports.
+
+    urllib's own ``ftp``, ``file`` and ``data`` handlers resolve and open a URL
+    themselves, so allowing one of those schemes would reintroduce the second,
+    unvalidated hostname resolution the pinning exists to remove.
+    """
+
+    @pytest.mark.parametrize("scheme", ["ftp", "file", "data", "gopher"])
+    def test_policy_refuses_to_allow_an_unpinned_scheme(self, scheme):
+        with pytest.raises(ValueError) as exc:
+            UrlFetchPolicy(allowed_schemes=frozenset({scheme}))
+
+        assert scheme in str(exc.value)
+
+    def test_adding_a_scheme_beside_the_pinned_ones_is_still_refused(self):
+        with pytest.raises(ValueError):
+            UrlFetchPolicy(allowed_schemes=frozenset({"http", "https", "ftp"}))
+
+    def test_the_opener_has_no_file_transport(self, tmp_path):
+        """The opener itself must not be able to read a local file.
+
+        This is the layer under the scheme check: even reached directly, with
+        no policy rejection in the way, there is no handler that would serve
+        ``file://``.
+        """
+        secret = tmp_path / "secret.txt"
+        secret.write_text("local-file-marker")
+
+        with pytest.raises(urllib.error.URLError) as exc:
+            _open_url(secret.as_uri(), 1.0, UrlFetchPolicy())
+
+        assert "local-file-marker" not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://example.com/secret.txt",
+            "data:text/plain;base64,aGVsbG8=",
+        ],
+    )
+    def test_the_opener_has_no_transport_for_other_urllib_schemes(self, url):
+        with pytest.raises(urllib.error.URLError):
+            _open_url(url, 1.0, UrlFetchPolicy())
+
+
+# ---------------------------------------------------------------------------
+# Redirects may not drop TLS
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectDowngrade:
+    @staticmethod
+    def _fetch_through_redirect(start_url: str, location: str, policy=None):
+        """Run one redirect hop through the real opener, recording each request."""
+        attempted = []
+
+        def fake_do_open(_handler, _http_class, req, **_kwargs):
+            attempted.append(req.full_url)
+            if req.full_url == start_url:
+                return _http_response(start_url, 302, location=location)
+            return _http_response(req.full_url, 200, body=b"redirect target body")
+
+        with patch.object(
+            urllib.request.AbstractHTTPHandler, "do_open", new=fake_do_open
+        ):
+            result = _fetch_url_bytes(start_url, policy=policy)
+        return result, attempted
+
+    @patch(
+        "ag_ui_strands.utils.socket.getaddrinfo",
+        return_value=_addrinfo("93.184.216.34"),
+    )
+    def test_handler_refuses_an_https_to_http_redirect(self, _mock_dns):
+        from ag_ui_strands.utils import _PolicyRedirectHandler
+
+        handler = _PolicyRedirectHandler(UrlFetchPolicy())
+        req = MagicMock()
+        req.full_url = "https://secure.example/start"
+
+        with pytest.raises(UrlFetchPolicyError) as exc:
+            handler.redirect_request(
+                req, MagicMock(), 302, "Found", {}, "http://secure.example/plain"
+            )
+
+        assert "downgrade" in str(exc.value).lower()
+
+    @patch(
+        "ag_ui_strands.utils.socket.getaddrinfo",
+        return_value=_addrinfo("93.184.216.34"),
+    )
+    def test_cleartext_hop_is_never_requested(self, _mock_dns):
+        result, attempted = self._fetch_through_redirect(
+            "https://secure.example/start", "http://secure.example/plain"
+        )
+
+        assert result is None
+        assert attempted == ["https://secure.example/start"]
+
+    @patch(
+        "ag_ui_strands.utils.socket.getaddrinfo",
+        return_value=_addrinfo("93.184.216.34"),
+    )
+    def test_an_upgrade_to_https_is_still_followed(self, _mock_dns):
+        """Guard against over-blocking: only the downgrade direction is refused."""
+        result, attempted = self._fetch_through_redirect(
+            "http://public.example/start", "https://public.example/secure"
+        )
+
+        assert result == b"redirect target body"
+        assert attempted == [
+            "http://public.example/start",
+            "https://public.example/secure",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Per-run budgets
+# ---------------------------------------------------------------------------
+
+
+def _image_item(url: str):
+    return ImageInputContent(
+        type="image",
+        source=InputContentUrlSource(type="url", value=url, mime_type="image/png"),
+    )
+
+
+class _DribbleHandler(BaseHTTPRequestHandler):
+    """Send a body one byte at a time, staying inside the socket timeout."""
+
+    chunks = 40
+    delay = 0.15
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(type(self).chunks))
+        self.end_headers()
+        try:
+            for _ in range(type(self).chunks):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(type(self).delay)
+        except OSError:
+            # The client gave up on its deadline, which is the point.
+            pass
+
+    def log_message(self, _format, *args):
+        pass
+
+
+class TestPerRunBudget:
+    @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
+    @patch("ag_ui_strands.utils._open_url")
+    def test_attachment_count_is_capped_across_one_conversion(self, mock_open, _mock_dns):
+        mock_open.side_effect = lambda *a, **k: _mock_response(b"img")
+        content = [_image_item(f"https://cdn.example/{i}.png") for i in range(4)]
+
+        blocks = convert_agui_content_to_strands(
+            content, UrlFetchPolicy(max_attachments=2)
+        )
+
+        assert len(blocks) == 2
+        assert mock_open.call_count == 2
+
+    @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
+    @patch("ag_ui_strands.utils._open_url")
+    def test_cumulative_bytes_are_capped_across_one_conversion(self, mock_open, _mock_dns):
+        mock_open.side_effect = lambda *a, **k: _mock_response(b"x" * 6)
+        content = [_image_item(f"https://cdn.example/{i}.png") for i in range(3)]
+
+        blocks = convert_agui_content_to_strands(
+            content, UrlFetchPolicy(max_bytes=1024, max_total_bytes=10)
+        )
+
+        # Two 6 byte bodies already pass the 10 byte run ceiling, so the second
+        # one is truncated by the remaining allowance and refused with it.
+        assert len(blocks) == 1
+
+    @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
+    @patch("ag_ui_strands.utils._open_url")
+    def test_a_single_attachment_still_gets_its_own_cap(self, mock_open, _mock_dns):
+        mock_open.return_value = _mock_response(b"x" * 20)
+
+        result = _fetch_url_bytes(
+            "https://cdn.example/big.png",
+            policy=UrlFetchPolicy(max_bytes=10, max_total_bytes=10_000),
+        )
+
+        assert result is None
+
+    def test_a_trickling_server_cannot_outlast_the_run_deadline(self):
+        """The socket timeout never fires here; only the run deadline can stop this.
+
+        The server sends a byte well inside the inactivity timeout, over and
+        over, which is exactly the shape that holds a single unbounded read
+        open for as long as the server likes.
+        """
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _DribbleHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        port = server.server_address[1]
+        budget_seconds = 0.5
+
+        try:
+            started = time.monotonic()
+            result = _fetch_url_bytes(
+                f"http://127.0.0.1:{port}/slow",
+                policy=UrlFetchPolicy(
+                    allow_private_networks=True,
+                    timeout=30.0,
+                    max_total_seconds=budget_seconds,
+                ),
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join()
+
+        assert result is None
+        # The server would have taken chunks * delay seconds to finish.
+        assert elapsed < _DribbleHandler.chunks * _DribbleHandler.delay / 2
+
+    @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
+    @patch("ag_ui_strands.utils._open_url")
+    def test_an_exhausted_time_budget_refuses_the_next_attachment(
+        self, mock_open, _mock_dns
+    ):
+        mock_open.side_effect = lambda *a, **k: _mock_response(b"img")
+
+        result = _fetch_url_bytes(
+            "https://cdn.example/a.png",
+            policy=UrlFetchPolicy(max_total_seconds=0.0),
+        )
+
+        assert result is None
+        mock_open.assert_not_called()
+
+    @patch("ag_ui_strands.utils.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34"))
+    @patch("ag_ui_strands.utils._open_url")
+    def test_the_budget_spans_every_message_of_one_run(self, mock_open, _mock_dns):
+        """A run's ceiling is per request, not per message or per attachment."""
+        from ag_ui_strands.agent import _build_strands_history
+
+        mock_open.side_effect = lambda *a, **k: _mock_response(b"img")
+        messages = []
+        for i in range(3):
+            msg = MagicMock()
+            msg.role = "user"
+            msg.content = [_image_item(f"https://cdn.example/{i}.png")]
+            messages.append(msg)
+
+        _build_strands_history(messages, UrlFetchPolicy(max_attachments=2))
+
+        assert mock_open.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# The policy is reachable from configuration
+# ---------------------------------------------------------------------------
+
+
+class _ContentHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"private cdn bytes")
+
+    def log_message(self, _format, *args):
+        pass
+
+
+class TestPolicyIsReachableFromConfiguration:
+    def test_the_package_exports_the_policy(self):
+        import ag_ui_strands
+
+        assert ag_ui_strands.UrlFetchPolicy is UrlFetchPolicy
+        assert ag_ui_strands.UrlFetchPolicyError is UrlFetchPolicyError
+        assert ag_ui_strands.DEFAULT_URL_FETCH_POLICY.allowed_schemes == frozenset(
+            {"http", "https"}
+        )
+
+    def test_the_config_defaults_to_the_safe_policy(self):
+        from ag_ui_strands import StrandsAgentConfig
+
+        assert StrandsAgentConfig().url_fetch_policy is None
+
+    @staticmethod
+    def _run_agent_with_policy(url: str, policy):
+        """Drive ``agent.run`` and return the reconciled Strands history."""
+        import asyncio
+
+        from ag_ui_strands import StrandsAgentConfig
+        from ag_ui_strands.agent import StrandsAgent
+
+        from tests.test_multimodal_conversion import (
+            MockStrandsAgentForMultimodal,
+            _make_input,
+        )
+
+        agent = StrandsAgent(
+            MockStrandsAgentForMultimodal(),
+            name="test",
+            description="test",
+            config=StrandsAgentConfig(url_fetch_policy=policy),
+        )
+        mock_strands = MockStrandsAgentForMultimodal()
+        agent._agents_by_thread["test-thread"] = mock_strands
+
+        msg = MagicMock()
+        msg.role = "user"
+        msg.content = [_image_item(url)]
+
+        async def drive():
+            async for _event in agent.run(_make_input([msg])):
+                pass
+
+        asyncio.run(drive())
+        return mock_strands.messages
+
+    def test_a_private_cdn_needs_the_override_and_works_with_it(self):
+        """The default policy blocks a private-network attachment; config unblocks it."""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _ContentHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/logo.png"
+
+        try:
+            default_history = self._run_agent_with_policy(url, None)
+            override_history = self._run_agent_with_policy(
+                url, UrlFetchPolicy(allow_private_networks=True)
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join()
+
+        assert not any(
+            "image" in block
+            for message in default_history
+            for block in message["content"]
+        )
+        image_blocks = [
+            block
+            for message in override_history
+            for block in message["content"]
+            if "image" in block
+        ]
+        assert [block["image"]["source"]["bytes"] for block in image_blocks] == [
+            b"private cdn bytes"
+        ]
+
+    def test_the_metadata_endpoint_stays_blocked_under_the_override(self):
+        from ag_ui_strands.agent import _build_strands_history
+
+        msg = MagicMock()
+        msg.role = "user"
+        msg.content = [_image_item("http://169.254.169.254/latest/meta-data/")]
+
+        history = _build_strands_history(
+            [msg], UrlFetchPolicy(allow_private_networks=True)
+        )
+
+        assert not any(
+            "image" in block for message in history for block in message["content"]
+        )
