@@ -727,8 +727,15 @@ class LangGraphAgent:
             "description": self.description,
             "config": dict(self.config) if self.config else None,
         }
+        _KW_KINDS = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         for key, (value, default) in flag_defaults.items():
-            if accepts_var_kw or parameters is None or key in parameters:
+            # A named parameter is only keyword-passable when its KIND allows it:
+            # a positional-only flag parameter would receive the keyword and
+            # throw, so it counts as "cannot accept" (omit at default, raise
+            # otherwise) exactly like an absent parameter.
+            if accepts_var_kw or parameters is None or (
+                key in parameters and parameters[key].kind in _KW_KINDS
+            ):
                 kwargs[key] = value
             elif value != default:
                 raise TypeError(

@@ -139,3 +139,24 @@ class TestCloneNarrowSubclass(unittest.TestCase):
         with self.assertRaises(TypeError) as ctx:
             agent.clone()
         self.assertIn("emit_raw_events", str(ctx.exception))
+
+
+class TestClonePositionalOnlySubclass(unittest.TestCase):
+    def test_a_positional_only_flag_is_omitted_at_its_default(self):
+        # A named parameter is only keyword-passable when its kind allows it —
+        # passing the keyword to a positional-only parameter throws.
+        class PositionalOnlySubclass(LangGraphAgent):
+            def __init__(self, enable_legacy_on_interrupt_event=True, /, *, name, graph,
+                         description=None, config=None):
+                super().__init__(
+                    name=name, graph=graph, description=description, config=config,
+                    enable_legacy_on_interrupt_event=enable_legacy_on_interrupt_event,
+                )
+
+        from unittest.mock import MagicMock
+        from langgraph.graph.state import CompiledStateGraph
+        graph = MagicMock(spec=CompiledStateGraph)
+        graph.nodes = {}
+        agent = PositionalOnlySubclass(name="t", graph=graph)
+        clone = agent.clone()
+        self.assertTrue(clone.enable_legacy_on_interrupt_event)
