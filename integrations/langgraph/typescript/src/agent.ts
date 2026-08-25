@@ -183,6 +183,13 @@ export interface LangGraphAgentConfig extends AgentConfig {
    * before structured interrupts existed.
    */
   emitInterruptOutcome?: boolean;
+  /**
+   * Emit the underlying LangGraph events on the AG-UI event stream.
+   *
+   * When disabled, RAW events are suppressed and `rawEvent` is removed from
+   * typed AG-UI events. AG-UI event metadata is preserved. Defaults to true.
+   */
+  emitRawEvents?: boolean;
 }
 
 const ROOT_SUBGRAPH_NAME = "root";
@@ -222,12 +229,15 @@ export class LangGraphAgent extends AbstractAgent {
   config: LangGraphAgentConfig;
   enableLegacyOnInterruptEvent: boolean;
   emitInterruptOutcome: boolean;
+  emitRawEvents: boolean;
 
   constructor(config: LangGraphAgentConfig) {
     super(config);
     this.config = config;
-    this.enableLegacyOnInterruptEvent = config.enableLegacyOnInterruptEvent ?? true;
+    this.enableLegacyOnInterruptEvent =
+      config.enableLegacyOnInterruptEvent ?? true;
     this.emitInterruptOutcome = config.emitInterruptOutcome ?? false;
+    this.emitRawEvents = config.emitRawEvents ?? true;
     this.messagesInProcess = {};
     this.agentName = config.agentName;
     this.graphId = config.graphId;
@@ -284,6 +294,7 @@ export class LangGraphAgent extends AbstractAgent {
       client: this.client,
       enableLegacyOnInterruptEvent: this.enableLegacyOnInterruptEvent,
       emitInterruptOutcome: this.emitInterruptOutcome,
+      emitRawEvents: this.emitRawEvents,
 
       assistant: this.assistant,
       activeRun: this.activeRun ? structuredClone(this.activeRun) : undefined,
@@ -320,6 +331,17 @@ export class LangGraphAgent extends AbstractAgent {
   }
 
   dispatchEvent(event: ProcessedEvents) {
+    if (!this.emitRawEvents) {
+      if (event.type === EventType.RAW) {
+        return false;
+      }
+
+      const eventWithoutRawEvent = { ...event };
+      delete eventWithoutRawEvent.rawEvent;
+      this.subscriber.next(eventWithoutRawEvent);
+      return true;
+    }
+
     this.subscriber.next(event);
     return true;
   }
@@ -794,7 +816,10 @@ export class LangGraphAgent extends AbstractAgent {
           openInterrupts: this.interruptsToAGUI(interrupts),
         }),
       };
-    } else if (effectiveCommand?.resume && typeof effectiveCommand.resume === "string") {
+    } else if (
+      effectiveCommand?.resume &&
+      typeof effectiveCommand.resume === "string"
+    ) {
       try {
         effectiveCommand.resume = JSON.parse(effectiveCommand.resume);
       } catch {
@@ -1820,7 +1845,8 @@ export class LangGraphAgent extends AbstractAgent {
       // one: the snapshot converter re-emits this same reasoning under that
       // id, and only a matching id lets the client reconcile the streamed
       // copy with the snapshot copy instead of rendering both.
-      const messageId = reasoningData.id ?? this.pendingReasoningId ?? randomUUID();
+      const messageId =
+        reasoningData.id ?? this.pendingReasoningId ?? randomUUID();
       this.pendingReasoningId = undefined;
       this.dispatchEvent({
         type: EventType.REASONING_START,
@@ -2163,8 +2189,7 @@ export class LangGraphAgent extends AbstractAgent {
    * bubbles. See #1317.
    */
   private getOrPinTextMessageId(fallbackId: string): string {
-    const messageId =
-      this.activeRun!.currentTextMessageId ?? fallbackId;
+    const messageId = this.activeRun!.currentTextMessageId ?? fallbackId;
     this.activeRun!.currentTextMessageId = messageId;
     return messageId;
   }
