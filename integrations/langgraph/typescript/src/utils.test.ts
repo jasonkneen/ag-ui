@@ -1562,6 +1562,183 @@ describe("Multimodal Message Conversion", () => {
       ]);
     });
 
+    // ── rules 1+2 on the OUTBOUND payload ─────────────────────────────────
+    //
+    // The contract landed on the inbound leg first and the outbound source
+    // payload was still read without checking it, which broke rule 2 in the
+    // direction that reaches the provider: an item whose `value` was `null`, a
+    // number or the empty string was neither dropped nor logged — it was EMITTED,
+    // as `data: null` on a standard media block, as `data:image/png;base64,42`
+    // inside an `image_url`, or as a bare `image_url: { url: 42 }`. The model
+    // then answers about an attachment it never received, and there is no line in
+    // the log to explain it. Every emission point on this leg is covered below:
+    // the standard media block, the data-URL construction, and the legacy binary
+    // path.
+    const UNUSABLE_PAYLOADS: Array<[string, unknown]> = [
+      ["null", null],
+      ["undefined", undefined],
+      ["the empty string", ""],
+      ["a number", 42],
+      ["a boolean", true],
+      ["an object", {}],
+      ["an array", []],
+    ];
+
+    describe.each([
+      ["document", "application/pdf", "the file standard block"],
+      ["audio", "audio/wav", "the audio standard block"],
+      ["image", "image/png", "the image_url data URL"],
+      ["video", "video/mp4", "the image_url data URL"],
+    ])("a %s data source with an unusable payload (%s)", (type, mimeType, _emissionPoint) => {
+      it.each(UNUSABLE_PAYLOADS)("is dropped and logged once when it is %s", (_name, value) => {
+        const { content, warnings } = outbound([
+          { type, source: { type: "data", value, mimeType } },
+        ]);
+
+        expect(content).toEqual([]);
+        expect(warnings).toEqual([
+          `[convertAguiMultimodalToLangchain] Dropping ${type} content: source could not be converted to URL`,
+        ]);
+      });
+    });
+
+    it.each([
+      ["a number", 42],
+      ["an object", {}],
+      ["an array", []],
+      ["a boolean", true],
+      ["null", null],
+      ["the empty string", ""],
+    ])("drops a url source whose value is %s, with one log", (_name, value) => {
+      // `{}` is the one that DIVERGED rather than merely leaking: truthy here and
+      // falsy in Python, so the same item was kept by this runtime and dropped by
+      // the other. Both drop it now.
+      const { content, warnings } = outbound([{ type: "image", source: { type: "url", value } }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        "[convertAguiMultimodalToLangchain] Dropping image content: source could not be converted to URL",
+      ]);
+    });
+
+    it.each([
+      ["data", "application/pdf", { data: 42 }],
+      ["data", "audio/wav", { data: null }],
+      ["data", "image/png", { data: {} }],
+      ["url", "image/png", { url: 42 }],
+      ["url", "application/pdf", { url: [] }],
+      ["id", "image/png", { id: 42 }],
+      ["id", "image/png", { id: true }],
+    ])(
+      "drops a legacy binary item whose %s payload is unusable (%s)",
+      (_key, mimeType, payload) => {
+        const { content, warnings } = outbound([{ type: "binary", mimeType, ...payload }]);
+
+        expect(content).toEqual([]);
+        expect(warnings).toEqual([
+          "[convertAguiMultimodalToLangchain] Dropping BinaryInputContent: no url, data, or id provided",
+        ]);
+      },
+    );
+
+    it("does not let an unusable legacy url shadow a usable data payload", () => {
+      // An unusable payload is an ABSENT payload — the rule this file already
+      // applies to a MIME type and to a filename. `url` outranks `data` only when
+      // there is a url; a `url` of 42 is not one, so the bytes that ARE there go
+      // out instead of the item being lost with them.
+      const { content, warnings } = outbound([
+        { type: "binary", mimeType: "image/png", url: 42, data: "QUJD" },
+      ]);
+
+      expect(content).toEqual([
+        { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("keeps the items around an unusable outbound payload, and the messages", () => {
+      // Rule 3, and the reason rule 1 is written the way it is. This converter
+      // builds a whole provider request: the cost of getting one attachment wrong
+      // must be that one attachment. Asserted, not assumed — the text on either
+      // side, the GOOD attachment beside it, and the messages before and after.
+      const warnings: string[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        warnings.push(String(args[0]));
+      });
+      let messages;
+      try {
+        messages = aguiMessagesToLangChain([
+          { id: "m1", role: "user", content: "before message" } as UserMessage,
+          {
+            id: "m2",
+            role: "user",
+            content: [
+              { type: "text", text: "before" },
+              { type: "document", source: { type: "data", value: null, mimeType: "application/pdf" } },
+              {
+                type: "document",
+                source: { type: "data", value: "aGk=", mimeType: "application/pdf" },
+              },
+              { type: "text", text: "after" },
+            ],
+          } as unknown as UserMessage,
+          { id: "m3", role: "user", content: "after message" } as UserMessage,
+        ]);
+      } finally {
+        warn.mockRestore();
+      }
+
+      expect(messages.map((m) => m.id)).toEqual(["m1", "m2", "m3"]);
+      expect(messages[0].content).toBe("before message");
+      expect(messages[2].content).toBe("after message");
+      expect(messages[1].content).toEqual([
+        { type: "text", text: "before" },
+        {
+          type: "file",
+          source_type: "base64",
+          data: "aGk=",
+          mime_type: "application/pdf",
+          metadata: { filename: "attachment.pdf" },
+        },
+        { type: "text", text: "after" },
+      ]);
+      expect(warnings).toEqual([
+        "[convertAguiMultimodalToLangchain] Dropping document content: source could not be converted to URL",
+      ]);
+    });
+
+    it("accepts what the data-URL rule produces rather than undoing it", () => {
+      // The sibling fix normalizes a `data:` URL into inline data BEFORE the
+      // block is chosen. The payload check must read the bytes that come out of
+      // that parse, not the url string it came from — checking the wrong one
+      // would push every data-URL-sourced attachment back onto `image_url`, which
+      // is the defect that fix exists to remove.
+      const { content, warnings } = outbound([
+        { type: "document", source: { type: "url", value: "data:application/pdf;base64,JVBERi0=" } },
+        { type: "audio", source: { type: "url", value: "data:audio/wav;base64,QUJD" } },
+        { type: "binary", mimeType: "application/pdf", url: "data:application/pdf;base64,JVBERi0=" },
+      ]);
+
+      expect(content).toEqual([
+        {
+          type: "file",
+          source_type: "base64",
+          data: "JVBERi0=",
+          mime_type: "application/pdf",
+          metadata: { filename: "attachment.pdf" },
+        },
+        { type: "audio", source_type: "base64", data: "QUJD", mime_type: "audio/wav" },
+        {
+          type: "file",
+          source_type: "base64",
+          data: "JVBERi0=",
+          mime_type: "application/pdf",
+          metadata: { filename: "attachment.pdf" },
+        },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
     // ── the KNOWN LIMIT on {@link OPENAI_AUDIO_MIME_TYPES} ─────────────────
     it("re-emits an adapter-normalized audio MIME type unchanged on the next send", () => {
       // The normalization is visible in the thread: a client that sent
@@ -2774,6 +2951,15 @@ describe("cross-runtime parity table", () => {
      * `test_outbound_cases_record_what_this_runtime_actually_builds`.
      */
     pythonBuilds?: string[];
+    /**
+     * How the PYTHON harness builds this case's items — `"unvalidated"` means
+     * `model_construct`, so a payload AG-UI's schema refuses still reaches the
+     * typed branch there. Declared so this runtime does not silently ignore a
+     * field of the shared table, but not read here: nothing validates content at
+     * this boundary in TypeScript, so every case already arrives as the raw JSON
+     * the table records and there is nothing to bypass.
+     */
+    pythonBuild?: "unvalidated";
     expect: { kept: unknown[]; dropped: number; loggedDrops: number };
   }
 

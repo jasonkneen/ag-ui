@@ -281,6 +281,18 @@ function parseBase64DataUrl(
  * ignores everything else. A data URL with an OMITTED mediatype (`data:;base64,…`)
  * has nothing to say, so the source's own `mimeType` is used.
  *
+ * THE PAYLOAD ITSELF IS CHECKED, not just its presence. `value` is declared
+ * `string` and is not validated at this boundary, so a `data` source can carry
+ * `null`, a number or the empty string — and this is the value that goes on the
+ * provider request as the media block's `data`. Emitting `data: null` sends the
+ * model an attachment with no bytes in it, quietly, which is rule 1 of THE
+ * MALFORMED-INPUT CONTRACT read the wrong way round: nothing raised, but nothing
+ * was dropped or logged either, so the operator sees a request that merely fails
+ * to mention the file. An unusable payload is an ABSENT payload — the same rule
+ * this file already applies to a MIME type and to a filename — so it returns
+ * `null` here, {@link mediaSourceToUrl} refuses it too, and the caller drops the
+ * one item with the one warning it already emits for a source it cannot use.
+ *
  * Mirrors `_inline_media_data` in the Python adapter.
  */
 function inlineMediaData(
@@ -289,7 +301,10 @@ function inlineMediaData(
   // Read optionally for the reason {@link mediaSourceToUrl} gives: `source` is
   // declared required but arrives off the wire, and the two functions must not
   // disagree about whether it can be absent.
-  if (source?.type === "data") return { value: source.value, mimeType: source.mimeType };
+  if (source?.type === "data") {
+    const value = firstNonEmptyString(source.value);
+    return value ? { value, mimeType: source.mimeType } : null;
+  }
   if (source?.type === "url") {
     const parsed = parseBase64DataUrl(source.value);
     if (parsed) return { value: parsed.data, mimeType: parsed.mimeType ?? source.mimeType };
@@ -777,6 +792,23 @@ type LangchainContentBlock =
  * where the Python adapter's `isinstance` chain simply returns `None` and lets
  * the caller warn and drop the one bad item. Returning `null` is what keeps the
  * two runtimes degrading the same way.
+ *
+ * THE PAYLOAD IS READ THROUGH {@link firstNonEmptyString} ON BOTH SOURCE KINDS,
+ * for the same reason the MIME type beside it already is. `value` is declared
+ * `string` and nothing enforces that here:
+ *
+ *   * a `data` source carrying `null` / `42` / `""` interpolated STRAIGHT INTO
+ *     the data URL — `data:image/png;base64,null` is a payload the provider will
+ *     try to decode, and the empty-payload spelling `data:image/png;base64,` is
+ *     the exact string {@link parseBase64DataUrl} refuses to read back as bytes,
+ *     so the attachment was already unreadable by this adapter's own rule;
+ *   * a `url` source carrying a non-string was returned VERBATIM, putting a
+ *     number or an object under `image_url.url` on the provider request. That
+ *     one also DIVERGED: `{}` is truthy here and falsy in Python, so the same
+ *     item was kept by one runtime and dropped by the other.
+ *
+ * Both collapse onto `null`, which is the one thing the caller already knows how
+ * to announce.
  */
 function mediaSourceToUrl(
   source: InputContentDataSource | InputContentUrlSource | null | undefined
@@ -798,9 +830,11 @@ function mediaSourceToUrl(
     // reads back as a DOCUMENT, so substituting it here would silently retype a
     // MIME-less image as a document on the next MESSAGES_SNAPSHOT. An omitted
     // mediatype reads back as an image, which is what the item already was.
-    return `data:${firstNonEmptyString(source.mimeType) ?? ""};base64,${source.value}`;
+    const value = firstNonEmptyString(source.value);
+    if (!value) return null;
+    return `data:${firstNonEmptyString(source.mimeType) ?? ""};base64,${value}`;
   } else if (source?.type === "url") {
-    return source.value;
+    return firstNonEmptyString(source.value) ?? null;
   }
   return null;
 }
@@ -1388,6 +1422,19 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // the loop that converts the whole message list. An unusable MIME type is
       // an absent one.
       const declaredMimeType = firstNonEmptyString(item.mimeType) ?? "";
+      // The three payload keys, read through the SAME helper as the MIME type
+      // above and for the same reason: a legacy item is off-the-wire client JSON,
+      // its `url` / `data` / `id` are declared `string` and nothing enforces it,
+      // and each one is emitted VERBATIM below — `image_url: { url: 42 }` on the
+      // provider request, or `data:image/png;base64,42` built out of a number.
+      // An unusable payload is an ABSENT payload, so a `url` of `42` no longer
+      // outranks a usable `data`, and an item whose three keys are all unusable
+      // falls into the guard at the bottom of this branch and is dropped with the
+      // warning it already emits. Python's `convert_agui_multimodal_to_langchain`
+      // reads the same three keys the same way.
+      const suppliedUrl = firstNonEmptyString(item.url);
+      const suppliedData = firstNonEmptyString(item.data);
+      const suppliedId = firstNonEmptyString(item.id);
       // A legacy item's `url` is a source classification point too, and a
       // `data:` URL sitting in it is the same defect the typed path above has:
       // bytes, labelled as a reference, sent to the provider as `image_url`.
@@ -1396,8 +1443,8 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // The url is inspected FIRST and its mediatype wins, because `url` already
       // outranks `data` in the reference form built below — this branch must not
       // promote one payload while the fallback would have sent the other.
-      const inlineUrl = parseBase64DataUrl(item.url);
-      const inlineValue = inlineUrl ? inlineUrl.data : item.url ? undefined : item.data;
+      const inlineUrl = parseBase64DataUrl(suppliedUrl);
+      const inlineValue = inlineUrl ? inlineUrl.data : suppliedUrl ? undefined : suppliedData;
       const mimeType = inlineUrl ? (inlineUrl.mimeType ?? declaredMimeType) : declaredMimeType;
       // Modality is read off a case-folded copy: MIME types are case-insensitive
       // (RFC 2045 §5.1), so `AUDIO/WAV` names the same modality as `audio/wav`
@@ -1420,18 +1467,18 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       let url: string;
 
       // Prioritize url, then data, then id
-      if (item.url) {
-        url = item.url;
-      } else if (item.data) {
+      if (suppliedUrl) {
+        url = suppliedUrl;
+      } else if (suppliedData) {
         // Construct data URL from base64 data. The NORMALIZED `mimeType`, not
         // `item.mimeType`: the raw one is optional on a legacy binary item, and
         // interpolating an absent one writes the literal text `undefined` into
         // the data URL. Same collapse as {@link mediaSourceToUrl}, which is the
         // typed path's version of this line.
-        url = `data:${mimeType};base64,${item.data}`;
-      } else if (item.id) {
+        url = `data:${mimeType};base64,${suppliedData}`;
+      } else if (suppliedId) {
         // Use id as a reference
-        url = item.id;
+        url = suppliedId;
       } else {
         console.warn("[convertAguiMultimodalToLangchain] Dropping BinaryInputContent: no url, data, or id provided");
         continue;

@@ -126,11 +126,28 @@
     "    different branch, the table says so instead of hiding it behind an unchanged",
     "    outcome triple.",
     "",
-    "KNOWN UNREACHABLE IN PYTHON: the legacy-binary `no url, data, or id` guard.",
-    "`BinaryInputContent` refuses to validate without one of the three, so no validated",
-    "item can reach that guard — only TypeScript's copy of it is live. That is why",
-    "`outbound/malformed/ts-only/binary-empty` carries the marker rather than being",
-    "reconstructed: there is no input that would reach the Python branch.",
+    "`pythonBuild: \"unvalidated\"` — THE THIRD OPTION, and the one that lets a",
+    "malformed case exercise Python's TYPED branch instead of collapsing onto the",
+    "terminal `else`. The harness then builds every item in that case with",
+    "`model_construct` (recursively, for `source`) rather than the validating",
+    "constructor. That is not a harness convenience: `model_construct`, plain",
+    "attribute assignment and `model_copy(update=…)` are the three routes THE",
+    "MALFORMED-INPUT CONTRACT already declares in scope, all three are reachable, and",
+    "all three hand this converter a REAL typed content object carrying a payload the",
+    "schema would have refused. A case may only carry the marker if the validating",
+    "route really does refuse one of its items — asserted, so the flag cannot be",
+    "sprinkled onto a case that never needed it. A case whose malformed value the",
+    "schema ACCEPTS (an empty-string payload is one) must not carry it, because the",
+    "ordinary route already reaches the branch.",
+    "",
+    "KNOWN UNREACHABLE IN PYTHON THROUGH THE VALIDATING ROUTE: the legacy-binary",
+    "`no url, data, or id` guard. `BinaryInputContent` refuses to validate without one",
+    "of the three, so no VALIDATED item reaches that guard. That is why",
+    "`outbound/malformed/ts-only/binary-empty` carries the `ts-only` marker rather",
+    "than being reconstructed. The guard is not dead in Python, though: the",
+    "`outbound/malformed/payload/binary-…` cases reach it with `pythonBuild:",
+    "\"unvalidated\"`, because an item whose three payload keys are all present and",
+    "UNUSABLE now falls into it in both runtimes.",
     "",
     "LOG PROSE IS NOT ASSERTED. `loggedDrops` counts warnings beginning \"Dropping \"",
     "after prefix normalization. The rest of each message legitimately differs (`int`",
@@ -4095,6 +4112,402 @@
           {
             "kind": "text",
             "text": "before"
+          },
+          {
+            "kind": "text",
+            "text": "after"
+          }
+        ],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/document-data-null",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the payload emitted as the media block's base64 was never checked: a null one shipped `data: null` to the provider, silently",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": null,
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/document-data-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "same emission point, wrong type rather than absent",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": 42,
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/document-data-empty",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the empty payload reaches the typed branch through the VALIDATING route — AG-UI's source schema accepts `\"\"` — so no runtime needs a bypass to hit it",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": "",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/audio-data-null",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the audio standard block reads the same unchecked payload as the file one",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "data",
+            "value": null,
+            "mimeType": "audio/wav"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/audio-data-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "same emission point, wrong type rather than absent",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "data",
+            "value": 42,
+            "mimeType": "audio/wav"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/image-data-null",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "interpolated straight into the data URL, and the two runtimes did not even agree on the garbage: `base64,null` here, `base64,None` in Python",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "data",
+            "value": null,
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["ImageInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/image-data-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "`data:image/png;base64,42` is a payload the provider will try to decode",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "data",
+            "value": 42,
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["ImageInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/image-data-empty",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "`data:image/png;base64,` is the exact string the inbound leg refuses to read back as bytes, so the attachment was already unreadable by this adapter's own rule",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "data",
+            "value": "",
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "pythonBuilds": ["ImageInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/video-data-null",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "video has no standard block, so it reaches the data-URL construction with the same unchecked payload",
+      "content": [
+        {
+          "type": "video",
+          "source": {
+            "type": "data",
+            "value": null,
+            "mimeType": "video/mp4"
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["VideoInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/document-url-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "a non-string url source value went out verbatim under `image_url.url`",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": 42
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/image-url-object",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the measured DIVERGENCE: `{}` is truthy in TypeScript and falsy in Python, so this same item was kept by one runtime and dropped by the other",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "value": {}
+          }
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["ImageInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-data-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the legacy branch's third emission point: a non-string `data` reached the standard block as its base64",
+      "content": [
+        {
+          "type": "binary",
+          "mimeType": "application/pdf",
+          "data": 42
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-url-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "a non-string legacy `url` went out verbatim under `image_url.url`",
+      "content": [
+        {
+          "type": "binary",
+          "mimeType": "image/png",
+          "url": 42
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-id-non-string",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "the `id` reference form is emitted verbatim too",
+      "content": [
+        {
+          "type": "binary",
+          "mimeType": "image/png",
+          "id": 42
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/binary-unusable-url-does-not-shadow-a-usable-data",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "an unusable payload is an ABSENT one, the rule this file already applies to a MIME type and a filename — so a `url` of 42 no longer outranks a usable `data`, and the item survives instead of being dropped",
+      "content": [
+        {
+          "type": "binary",
+          "mimeType": "image/png",
+          "url": 42,
+          "data": "QUJD"
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:image/png;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/malformed/payload/neighbours-survive",
+      "direction": "outbound",
+      "axis": "malformed",
+      "why": "rule 3 on the outbound payload guard: the bad attachment costs itself and nothing else, not the text around it and not the good attachment beside it",
+      "content": [
+        {
+          "type": "text",
+          "text": "before"
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": null,
+            "mimeType": "application/pdf"
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": "aGk=",
+            "mimeType": "application/pdf"
+          }
+        },
+        {
+          "type": "text",
+          "text": "after"
+        }
+      ],
+      "pythonBuild": "unvalidated",
+      "pythonBuilds": [
+        "TextInputContent",
+        "DocumentInputContent",
+        "DocumentInputContent",
+        "TextInputContent"
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "text",
+            "text": "before"
+          },
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "aGk=",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
           },
           {
             "kind": "text",

@@ -3391,6 +3391,253 @@ class TestMalformedInputContract(unittest.TestCase):
         self.assertEqual(outcome.content[0].source.value, "QUJD,EXTRA")
         self.assertEqual(outcome.content[0].source.mime_type, "image/png")
 
+    # ── rules 1+2 on the OUTBOUND payload ────────────────────────────────
+    #
+    # The contract landed on the inbound leg first and the outbound source
+    # payload was still read without checking it, which broke rule 2 in the
+    # direction that reaches the provider: an item whose ``value`` was ``None``, a
+    # number or the empty string was neither dropped nor logged — it was EMITTED,
+    # as ``base64: None`` on a standard media block, as ``data:image/png;base64,
+    # None`` inside an ``image_url``, or as a bare ``image_url: {"url": 42}``. The
+    # model then answers about an attachment it never received, and there is no
+    # line in the log to explain it. Every emission point on this leg is covered
+    # below: the standard media block, the data-URL construction, and the legacy
+    # binary path.
+    #
+    # ``model_construct`` throughout, for the reason the block above
+    # `_unvalidated_media` gives: AG-UI's source class declares ``value: str``, so
+    # pydantic refuses ``None`` and a non-string at the boundary — but only where
+    # a caller went THROUGH validation. Measured 2026-08-25 on pydantic 2.12.5 /
+    # ag-ui-protocol 0.1.19, all three routes THE MALFORMED-INPUT CONTRACT
+    # declares in scope reach this converter with a real typed object carrying a
+    # refused payload: ``model_construct``, plain attribute assignment (the source
+    # models do not set ``validate_assignment``) and ``model_copy(update=…)``,
+    # which pydantic documents as unvalidated. The EMPTY STRING needs none of
+    # them — the schema accepts it outright.
+    _UNUSABLE_PAYLOADS = [
+        ("None", None),
+        ("the empty string", ""),
+        ("a number", 42),
+        ("a bool", True),
+        ("a dict", {}),
+        ("a list", []),
+    ]
+
+    _MEDIA_EMISSION_POINTS = [
+        (DocumentInputContent, "document", "application/pdf", "the file standard block"),
+        (AudioInputContent, "audio", "audio/wav", "the audio standard block"),
+        (ImageInputContent, "image", "image/png", "the image_url data URL"),
+        (VideoInputContent, "video", "video/mp4", "the image_url data URL"),
+    ]
+
+    def test_an_unusable_data_payload_is_dropped_and_logged_once(self):
+        for cls, kind, mime_type, emission_point in self._MEDIA_EMISSION_POINTS:
+            for label, value in self._UNUSABLE_PAYLOADS:
+                with self.subTest(kind=kind, emits=emission_point, payload=label):
+                    outcome = self._outbound(
+                        [self._unvalidated_media(cls, kind, mime_type, value=value)]
+                    )
+
+                    self.assertEqual(outcome.content, [])
+                    self.assertEqual(
+                        outcome.warnings,
+                        [
+                            f"Dropping {cls.__name__} content: source could not "
+                            "be converted to URL"
+                        ],
+                    )
+
+    def test_an_unusable_url_source_payload_is_dropped_and_logged_once(self):
+        """``{}`` is the one that DIVERGED rather than merely leaking: falsy here
+        and truthy in the TypeScript adapter, so the same item was dropped by this
+        runtime and kept by the other. Both drop it now."""
+        for label, value in self._UNUSABLE_PAYLOADS:
+            with self.subTest(payload=label):
+                outcome = self._outbound([
+                    ImageInputContent.model_construct(
+                        type="image",
+                        source=InputContentUrlSource.model_construct(type="url", value=value),
+                        metadata=None,
+                    )
+                ])
+
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(
+                    outcome.warnings,
+                    [
+                        "Dropping ImageInputContent content: source could not be "
+                        "converted to URL"
+                    ],
+                )
+
+    def test_an_unusable_legacy_binary_payload_is_dropped_and_logged_once(self):
+        for label, mime_type, payload in [
+            ("data", "application/pdf", {"data": 42}),
+            ("data", "audio/wav", {"data": None}),
+            ("data", "image/png", {"data": {}}),
+            ("url", "image/png", {"url": 42}),
+            ("url", "application/pdf", {"url": []}),
+            ("id", "image/png", {"id": 42}),
+            ("id", "image/png", {"id": True}),
+        ]:
+            with self.subTest(key=label, mime_type=mime_type):
+                outcome = self._outbound([
+                    BinaryInputContent.model_construct(
+                        type="binary",
+                        mime_type=mime_type,
+                        url=payload.get("url"),
+                        data=payload.get("data"),
+                        id=payload.get("id"),
+                        filename=None,
+                    )
+                ])
+
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(
+                    outcome.warnings,
+                    ["Dropping BinaryInputContent item: no url, data, or id provided"],
+                )
+
+    def test_an_unusable_legacy_url_does_not_shadow_a_usable_data_payload(self):
+        """An unusable payload is an ABSENT payload — the rule this file already
+        applies to a MIME type and to a filename. ``url`` outranks ``data`` only
+        when there IS a url; a ``url`` of 42 is not one, so the bytes that are
+        really there go out instead of the item being lost with them."""
+        outcome = self._outbound([
+            BinaryInputContent.model_construct(
+                type="binary", mime_type="image/png", url=42, data="QUJD", id=None, filename=None
+            )
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}],
+        )
+        self.assertEqual(outcome.warnings, [])
+
+    def test_the_other_two_bypass_routes_are_dropped_the_same_way(self):
+        """`model_construct` is not the only way a refused payload gets here, and
+        a guard that only covered it would be a guard written to its test. Plain
+        attribute assignment and ``model_copy(update=…)`` are named by the
+        contract and both were measured to reach this converter."""
+        good = InputContentDataSource(
+            type="data", value="aGk=", mime_type="application/pdf"
+        )
+
+        assigned = DocumentInputContent(type="document", source=good.model_copy())
+        assigned.source.value = None
+
+        copied = DocumentInputContent(type="document", source=good).model_copy(
+            update={"source": good.model_copy(update={"value": 42})}
+        )
+
+        for label, item in [("attribute assignment", assigned), ("model_copy", copied)]:
+            with self.subTest(route=label):
+                outcome = self._outbound([item])
+
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(
+                    outcome.warnings,
+                    [
+                        "Dropping DocumentInputContent content: source could not "
+                        "be converted to URL"
+                    ],
+                )
+
+    def test_items_and_messages_around_an_unusable_payload_survive(self):
+        """Rule 3, and the reason rule 1 is written the way it is. This converter
+        builds a whole provider request: the cost of getting one attachment wrong
+        must be that one attachment. Asserted, not assumed — the text on either
+        side, the GOOD attachment beside it, and the messages before and after."""
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING") as logs:
+            messages = agui_messages_to_langchain([
+                UserMessage(id="m1", role="user", content="before message"),
+                UserMessage(
+                    id="m2",
+                    role="user",
+                    content=[
+                        TextInputContent(type="text", text="before"),
+                        self._unvalidated_media(
+                            DocumentInputContent, "document", "application/pdf", value=None
+                        ),
+                        DocumentInputContent(
+                            type="document",
+                            source=InputContentDataSource(
+                                type="data", value="aGk=", mime_type="application/pdf"
+                            ),
+                        ),
+                        TextInputContent(type="text", text="after"),
+                    ],
+                ),
+                UserMessage(id="m3", role="user", content="after message"),
+            ])
+
+        self.assertEqual([m.id for m in messages], ["m1", "m2", "m3"])
+        self.assertEqual(messages[0].content, "before message")
+        self.assertEqual(messages[2].content, "after message")
+        self.assertEqual(
+            messages[1].content,
+            [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "file",
+                    "base64": "aGk=",
+                    "mime_type": "application/pdf",
+                    "filename": "attachment.pdf",
+                },
+                {"type": "text", "text": "after"},
+            ],
+        )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            "Dropping DocumentInputContent content: source could not be converted to URL",
+            logs.output[0],
+        )
+
+    def test_the_payload_check_reads_what_the_data_url_rule_produced(self):
+        """The sibling rule normalizes a ``data:`` URL into inline data BEFORE the
+        block is chosen. The payload check must read the bytes that come out of
+        that parse, not the url string it came from — checking the wrong one would
+        push every data-URL-sourced attachment back onto ``image_url``, which is
+        the defect that rule exists to remove."""
+        outcome = self._outbound([
+            DocumentInputContent(
+                type="document",
+                source=InputContentUrlSource(
+                    type="url", value="data:application/pdf;base64,JVBERi0="
+                ),
+            ),
+            AudioInputContent(
+                type="audio",
+                source=InputContentUrlSource(type="url", value="data:audio/wav;base64,QUJD"),
+            ),
+            BinaryInputContent(
+                type="binary",
+                mime_type="application/pdf",
+                url="data:application/pdf;base64,JVBERi0=",
+            ),
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [
+                {
+                    "type": "file",
+                    "base64": "JVBERi0=",
+                    "mime_type": "application/pdf",
+                    "filename": "attachment.pdf",
+                },
+                {"type": "audio", "base64": "QUJD", "mime_type": "audio/wav"},
+                {
+                    "type": "file",
+                    "base64": "JVBERi0=",
+                    "mime_type": "application/pdf",
+                    "filename": "attachment.pdf",
+                },
+            ],
+        )
+        self.assertEqual(outcome.warnings, [])
+
     # ── the KNOWN LIMIT on `_OPENAI_AUDIO_MIME_TYPES` ────────────────────
     def test_a_normalized_audio_mime_type_is_stable_across_a_second_send(self):
         """The normalization is visible in the thread: a client that sent
@@ -3460,7 +3707,7 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
     }
 
     @classmethod
-    def _build_outbound_item(cls, item):
+    def _build_outbound_item(cls, item, unvalidated=False):
         """Turn a table item into whatever THIS converter would really receive.
 
         The table records outbound inputs as plain JSON, because the TypeScript
@@ -3469,6 +3716,19 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
         cannot pass validation is passed through as the raw dict it is — which is
         also what production does with one, since an item that fails validation
         never becomes a typed content object.
+
+        ``unvalidated`` builds with ``model_construct`` instead, for a case marked
+        ``pythonBuild: "unvalidated"`` in the shared table. Without it a malformed
+        payload can never reach the TYPED branch here — the item fails validation,
+        arrives as a raw dict and lands in the terminal ``else``, so a case named
+        after the media guard would be asserting something else entirely. The
+        marker is not a way around the schema for its own sake: ``model_construct``
+        is one of the three routes THE MALFORMED-INPUT CONTRACT declares in scope
+        (with plain attribute assignment and ``model_copy(update=…)``; all three
+        are reachable, all three were measured, and all three produce a REAL typed
+        content object carrying a payload the schema would have refused).
+        `test_unvalidated_cases_are_exactly_the_ones_that_need_the_marker` keeps
+        the marker honest in both directions.
         """
         if not isinstance(item, dict):
             return item
@@ -3483,14 +3743,27 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                 if source.get("type") == "data"
                 else InputContentUrlSource
             )
-            try:
-                kwargs["source"] = source_class(**source)
-            except Exception:
-                return item
+            if unvalidated:
+                kwargs["source"] = source_class.model_construct(**source)
+            else:
+                try:
+                    kwargs["source"] = source_class(**source)
+                except Exception:
+                    return item
+        if unvalidated:
+            return content_class.model_construct(**kwargs)
         try:
             return content_class(**kwargs)
         except Exception:
             return item
+
+    @classmethod
+    def _build_outbound_content(cls, case):
+        """Every item of one outbound case, built the way that case asks for."""
+        return [
+            cls._build_outbound_item(item, case.get("pythonBuild") == "unvalidated")
+            for item in case["content"]
+        ]
 
     @staticmethod
     def _canonical(direction, items):
@@ -3583,7 +3856,7 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
         """
         content = case["content"]
         if case["direction"] == "outbound":
-            content = [self._build_outbound_item(i) for i in content]
+            content = self._build_outbound_content(case)
         try:
             outcome = _run_converter(case["direction"], content)
             dropped = sum(
@@ -3684,10 +3957,7 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                 )
                 self.assertEqual(
                     case["pythonBuilds"],
-                    [
-                        type(self._build_outbound_item(item)).__name__
-                        for item in case["content"]
-                    ],
+                    [type(item).__name__ for item in self._build_outbound_content(case)],
                     f'{self._report(case)}'
                     "  `pythonBuilds` in the shared table no longer matches what this\n"
                     "  runtime builds. A content class changed what it accepts, so this\n"
@@ -3695,28 +3965,52 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                     "  for — re-read the case before updating the field.\n",
                 )
 
+    @classmethod
+    def _refused_by_validation(cls, case):
+        """Does the VALIDATING route refuse at least one item of this case?
+
+        That is the property both markers turn on: an item declaring a type this
+        runtime has a class for, which the class then refuses to build. Such an
+        item cannot reach the branch its case is named after through the ordinary
+        route — it arrives as a raw dict and lands in the terminal ``else``. The
+        case must then say which of the two things it is: a branch only TypeScript
+        has (`/ts-only/`) or one reached here through a documented
+        validation-bypassing route (`pythonBuild: "unvalidated"`).
+
+        Deliberately measured against `_build_outbound_item` WITHOUT the
+        ``unvalidated`` flag even for a case that carries it — the question is what
+        the schema does, not what the harness was asked to do.
+        """
+        return any(
+            isinstance(item, dict)
+            and item.get("type") in cls._CLASS_BY_TYPE
+            and not isinstance(
+                cls._build_outbound_item(item),
+                cls._CLASS_BY_TYPE[item["type"]],
+            )
+            for item in case["content"]
+        )
+
     def test_ts_only_marks_exactly_the_cases_that_name_a_branch_python_misses(self):
         """The `ts-only` segment in an id is a claim, so it is checked.
 
         A case whose item declares a type this runtime HAS a class for, and which
-        that class then refuses to validate, names a branch it never reaches here:
-        it arrives as a raw dict and lands in the terminal ``else``. Those cases
-        carry `/ts-only/` in their id. The check runs both ways — an unmarked case
-        may not have the property and a marked case must — so the id cannot drift
-        away from the behaviour the way the table's own harnesses did.
+        that class then refuses to validate, names a branch it never reaches here
+        THROUGH THE VALIDATING ROUTE: it arrives as a raw dict and lands in the
+        terminal ``else``. Those cases carry `/ts-only/` in their id — unless they
+        carry `pythonBuild: "unvalidated"`, which builds the item around validation
+        precisely so the named branch IS reached here; that is the other half of
+        the same claim and it is checked in the test below. The check runs both
+        ways — an unmarked case may not have the property and a marked case must —
+        so the id cannot drift away from the behaviour the way the table's own
+        harnesses did.
         """
         for case in self.table["cases"]:
             if case["direction"] != "outbound":
                 continue
-            names_a_branch_python_misses = any(
-                isinstance(item, dict)
-                and item.get("type") in self._CLASS_BY_TYPE
-                and not isinstance(
-                    self._build_outbound_item(item),
-                    self._CLASS_BY_TYPE[item["type"]],
-                )
-                for item in case["content"]
-            )
+            names_a_branch_python_misses = self._refused_by_validation(
+                case
+            ) and case.get("pythonBuild") != "unvalidated"
             with self.subTest(case=case["id"]):
                 self.assertEqual(
                     "/ts-only/" in case["id"],
@@ -3728,6 +4022,72 @@ class TestCrossRuntimeParityTable(unittest.TestCase):
                     "  longer agree — rename the case or rebuild it, but do not leave a\n"
                     "  name that misdescribes what it covers.\n",
                 )
+
+    def test_unvalidated_cases_are_exactly_the_ones_that_need_the_marker(self):
+        """`pythonBuild: "unvalidated"` is a claim too, and it is checked both ways.
+
+        A case carries it to say: the malformed value under test is one AG-UI's
+        schema refuses, so the only way this runtime reaches the TYPED branch the
+        case is named after is a validation-bypassing route — ``model_construct``
+        here, and the contract also names plain attribute assignment and
+        ``model_copy(update=…)``. Unmarked, such a case would silently collapse
+        onto the terminal ``else`` and assert nothing about the branch in its name.
+
+        The reverse matters just as much. A case whose value the schema ACCEPTS —
+        an empty-string payload is one, measured: ``InputContentDataSource(type=
+        "data", value="", mime_type="application/pdf")`` constructs — must NOT
+        carry the marker, because the ordinary validated route already reaches the
+        branch and bypassing validation there would hide the fact that production
+        gets here without any bypass at all.
+
+        It is also EXCLUSIVE with `/ts-only/`. Both markers answer the same
+        question — "the schema refuses this item, so what does this runtime do
+        with it?" — and they give opposite answers: `/ts-only/` says the branch is
+        never reached here and the case asserts the terminal ``else`` instead,
+        `unvalidated` says the branch IS reached, around validation. A case
+        claiming both describes nothing.
+        """
+        marked = set()
+        for case in self.table["cases"]:
+            if case["direction"] != "outbound":
+                continue
+            with self.subTest(case=case["id"]):
+                self.assertIn(
+                    case.get("pythonBuild", "validated"),
+                    ("validated", "unvalidated"),
+                    f'{self._report(case)}'
+                    "  `pythonBuild` may only be `unvalidated`; anything else is a typo\n"
+                    "  this harness would otherwise ignore.\n",
+                )
+                if case.get("pythonBuild") != "unvalidated":
+                    # The other direction — a case that NEEDS the marker and does
+                    # not carry it — is what
+                    # `test_ts_only_marks_exactly_the_cases_that_name_a_branch_python_misses`
+                    # already fails on: without the marker it must be `/ts-only/`.
+                    continue
+                self.assertTrue(
+                    self._refused_by_validation(case),
+                    f'{self._report(case)}'
+                    "  `pythonBuild: \"unvalidated\"` claims the schema refuses at least\n"
+                    "  one item of this case, so the typed branch is only reachable here\n"
+                    "  around validation. The schema now ACCEPTS every item, so the\n"
+                    "  marker is doing nothing but hiding the stronger statement: drop\n"
+                    "  it and let the validated route reach the branch.\n",
+                )
+                self.assertNotIn(
+                    "/ts-only/",
+                    case["id"],
+                    f'{self._report(case)}'
+                    "  A case cannot be both `/ts-only/` (the branch is never reached in\n"
+                    "  Python) and `unvalidated` (the branch IS reached, around\n"
+                    "  validation). Pick the one that is true.\n",
+                )
+                marked.add(case["id"])
+
+        # The marker exists to be used; a table with none of them means the
+        # mechanism was removed and every payload case quietly went back to
+        # asserting the terminal `else`.
+        self.assertGreater(len(marked), 0)
 
 
 if __name__ == "__main__":

@@ -1000,10 +1000,29 @@ def _inline_media_data(
     (``data:;base64,…``) has nothing to say, so the source's own ``mime_type`` is
     used.
 
+    THE PAYLOAD ITSELF IS CHECKED, not just its presence. ``value`` is declared
+    ``str``, and pydantic refuses ``None`` and a non-string AT THE BOUNDARY — but
+    only where a caller went THROUGH validation, and the EMPTY STRING it accepts
+    outright (measured 2026-08-25 on pydantic 2.12.5 / ag-ui-protocol 0.1.19:
+    ``InputContentDataSource(type="data", value="", mime_type="application/pdf")``
+    constructs). The three validation-bypassing routes THE MALFORMED-INPUT
+    CONTRACT already declares in scope all reach here carrying whatever they were
+    given — ``model_construct``, plain attribute assignment (the source models do
+    not set ``validate_assignment``), and ``model_copy(update=…)``, which pydantic
+    documents as unvalidated — and this value is what goes on the provider request
+    as the media block's ``base64``. Emitting ``base64: None`` sends the model an
+    attachment with no bytes in it, quietly: nothing raised, but nothing was
+    dropped or logged either, so the operator sees a request that merely fails to
+    mention the file. An unusable payload is an ABSENT payload — the same rule
+    this file already applies to a MIME type and to a filename — so it returns
+    ``None`` here, `_media_source_to_url` refuses it too, and the caller drops the
+    one item with the one warning it already emits for a source it cannot use.
+
     Mirrors `inlineMediaData` in the TypeScript adapter.
     """
     if isinstance(source, InputContentDataSource):
-        return (source.value, source.mime_type)
+        value = _first_non_empty_string(source.value)
+        return (value, source.mime_type) if value else None
     if isinstance(source, InputContentUrlSource):
         parsed = _parse_base64_data_url(source.value)
         if parsed:
@@ -1121,11 +1140,33 @@ def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSo
     DOCUMENT, so substituting it here would silently retype a MIME-less image as a
     document on the next MESSAGES_SNAPSHOT. An omitted mediatype reads back as an
     image, which is what the item already was.
+
+    THE PAYLOAD IS READ THROUGH `_first_non_empty_string` ON BOTH SOURCE KINDS,
+    for the same reason the MIME type beside it already is, and through the same
+    validation-bypassing routes (`_inline_media_data` lists them):
+
+      * a ``data`` source carrying ``None`` / ``42`` / ``""`` was interpolated
+        STRAIGHT INTO the data URL — ``data:image/png;base64,None`` is a payload
+        the provider will try to decode, and the empty-payload spelling
+        ``data:image/png;base64,`` is the exact string `_parse_base64_data_url`
+        refuses to read back as bytes, so the attachment was already unreadable by
+        this adapter's own rule. It also DIVERGED on prose: this runtime wrote
+        ``None`` where the TypeScript adapter wrote ``null``.
+      * a ``url`` source carrying a non-string was returned VERBATIM, putting a
+        number or a dict under ``image_url.url`` on the provider request. That one
+        diverged on OUTCOME: ``{}`` is falsy here and truthy in TypeScript, so the
+        same item was dropped by one runtime and kept by the other.
+
+    Both collapse onto ``None``, which is the one thing the caller already knows
+    how to announce.
     """
     if isinstance(source, InputContentDataSource):
-        return f"data:{_first_non_empty_string(source.mime_type) or ''};base64,{source.value}"
+        value = _first_non_empty_string(source.value)
+        if not value:
+            return None
+        return f"data:{_first_non_empty_string(source.mime_type) or ''};base64,{value}"
     if isinstance(source, InputContentUrlSource):
-        return source.value
+        return _first_non_empty_string(source.value)
     return None
 
 
@@ -1454,6 +1495,22 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # guarantees it was validated — and the `.split` on the next line then
             # raised out of the loop that converts the whole message list.
             declared_mime_type = _first_non_empty_string(item.mime_type) or ""
+            # The three payload keys, read through the SAME helper as the MIME
+            # type above and for the same reason: `url` / `data` / `id` are
+            # declared `str` and `BinaryInputContent` refuses a non-string at the
+            # boundary, but only for an item that went THROUGH validation — the
+            # four unvalidated routes named on the guard at the bottom of this
+            # branch reach here carrying whatever they were given, and each key is
+            # emitted VERBATIM below (`image_url: {"url": 42}` on the provider
+            # request, or `data:image/png;base64,42` built out of an int). An
+            # unusable payload is an ABSENT payload, so a `url` of `42` no longer
+            # outranks a usable `data`, and an item whose three keys are all
+            # unusable falls into that guard and is dropped with the warning it
+            # already emits. The mirrored TypeScript branch reads the same three
+            # keys the same way.
+            supplied_url = _first_non_empty_string(item.url)
+            supplied_data = _first_non_empty_string(item.data)
+            supplied_id = _first_non_empty_string(item.id)
             # A legacy item's `url` is a source classification point too, and a
             # `data:` URL sitting in it is the same defect the typed path above
             # has: bytes, labelled as a reference, sent to the provider as
@@ -1464,14 +1521,14 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # already outranks `data` in the reference form built below — this
             # branch must not promote one payload while the fallback would have
             # sent the other.
-            inline_url = _parse_base64_data_url(item.url)
+            inline_url = _parse_base64_data_url(supplied_url)
             if inline_url:
                 inline_value = inline_url[1]
                 mime_type = (
                     inline_url[0] if inline_url[0] is not None else declared_mime_type
                 )
             else:
-                inline_value = None if item.url else item.data
+                inline_value = None if supplied_url else supplied_data
                 mime_type = declared_mime_type
             # Modality is read off a case-folded copy: MIME types are
             # case-insensitive (RFC 2045 §5.1), so `AUDIO/WAV` names the same
@@ -1498,9 +1555,9 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             content_dict: Dict[str, Any] = {"type": "image_url"}
 
             # Prioritize url, then data, then id
-            if item.url:
-                content_dict["image_url"] = {"url": item.url}
-            elif item.data:
+            if supplied_url:
+                content_dict["image_url"] = {"url": supplied_url}
+            elif supplied_data:
                 # Construct data URL from base64 data. The NORMALIZED `mime_type`
                 # local, not `item.mime_type`: the raw one is optional on a legacy
                 # binary item, and interpolating an absent or non-string one writes
@@ -1508,10 +1565,10 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 # type — which the return leg then records in the thread. Same
                 # collapse as `_media_source_to_url`, and the same line the
                 # TypeScript adapter already reads from its normalized local.
-                content_dict["image_url"] = {"url": f"data:{mime_type};base64,{item.data}"}
-            elif item.id:
+                content_dict["image_url"] = {"url": f"data:{mime_type};base64,{supplied_data}"}
+            elif supplied_id:
                 # Use id as a reference (some providers may support this)
-                content_dict["image_url"] = {"url": item.id}
+                content_dict["image_url"] = {"url": supplied_id}
             else:
                 # NOT dead code, though it looks it: `BinaryInputContent` carries
                 # a pydantic `validate_source` model validator that refuses an
@@ -1532,6 +1589,12 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 # ``model_construct`` — or any object a caller hands this converter
                 # without validating" — so the guard is doing the job the contract
                 # asks of it, and rule 2 requires the drop to say so.
+                #
+                # Those same routes are also how an item reaches here with all
+                # three keys PRESENT AND UNUSABLE (`url=42`, `data=None`): the
+                # three `supplied_*` locals above collapse an unusable payload
+                # onto an absent one, so such an item lands in this guard instead
+                # of putting `image_url: {"url": 42}` on the provider request.
                 logger.warning(
                     "Dropping BinaryInputContent item: no url, data, or id provided"
                 )
