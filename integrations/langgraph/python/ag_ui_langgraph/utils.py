@@ -155,6 +155,28 @@ class _IncomingMedia(NamedTuple):
     filename: str | None
 
 
+def _first_non_empty_string(*candidates: Any) -> str | None:
+    """The first candidate that is a non-empty ``str``, or ``None``.
+
+    Every caller reads keys that arrive off the wire, where a value can be
+    absent, empty, or of the wrong type entirely, and none of those three is
+    usable. Both distinctions matter: falling through on the EMPTY string is what
+    lets a second spelling of the same field be reached, and rejecting
+    NON-STRINGS is what stops a truthy number from being handed to code that
+    expects text. Mirrors TypeScript's ``firstNonEmptyString``.
+    """
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _describe_type(value: Any) -> str:
+    """A short name for the runtime type of an off-the-wire value, for the
+    "Dropping …" logs rule 2 of the malformed-input contract requires."""
+    return type(value).__name__
+
+
 def _incoming_block_filename(item: Dict[str, Any]) -> str | None:
     """The attachment's original filename, wherever the sender happened to put it.
 
@@ -206,18 +228,21 @@ def _read_incoming_media_block(item: Dict[str, Any]) -> _IncomingMedia | None:
     # them raises a ValidationError that takes the whole snapshot down with it.
     # Treat it as absent instead; the data path already has a documented fallback
     # (`application/octet-stream`) for a block that arrives without one.
-    mime_type = None
-    for candidate in (item.get("mimeType"), item.get("mime_type")):
-        if isinstance(candidate, str) and candidate:
-            mime_type = candidate
-            break
+    mime_type = _first_non_empty_string(item.get("mimeType"), item.get("mime_type"))
 
-    inline_data = item.get("data") or item.get("base64")
-    if isinstance(inline_data, str) and inline_data:
+    # A SCAN FOR THE FIRST NON-EMPTY STRING, not `a or b`. `or` short-circuits on
+    # anything TRUTHY, so a non-string `data` — a number, a dict, `True`, all of
+    # which arrive off the wire — stopped the read dead and the perfectly good
+    # `base64` behind it was never reached, dropping the whole block. The
+    # TypeScript reader scans (`firstNonEmptyString(item.data, item.base64)`) and
+    # recovers it; this line is what made the two runtimes disagree about the
+    # same inbound block.
+    inline_data = _first_non_empty_string(item.get("data"), item.get("base64"))
+    if inline_data:
         return _IncomingMedia(inline_data, False, mime_type, filename)
 
-    url = item.get("url")
-    if isinstance(url, str) and url:
+    url = _first_non_empty_string(item.get("url"))
+    if url:
         return _IncomingMedia(url, True, mime_type, filename)
 
     # `file_id` / `fileId` / `id`-only blocks reference provider-side storage
@@ -317,6 +342,35 @@ def _agui_media_from_standard_block(item: Dict[str, Any]):
     )
 
 
+# THE MALFORMED-INPUT CONTRACT for the two content converters below.
+#
+# Both directions read sequences that nothing validated at this boundary —
+# LangGraph relays whatever the graph put in a message, and the AG-UI side
+# arrives as client JSON — so every field reachable from here can be absent,
+# empty, or of the wrong type. Three rules, and they hold for BOTH converters in
+# BOTH runtimes:
+#
+#   1. DROP, NEVER RAISE. An item this converter cannot make sense of is
+#      skipped. Nothing in either converter raises on its input. These functions
+#      build a whole MESSAGES_SNAPSHOT / a whole provider request, so an
+#      exception does not degrade one attachment — it escapes the loop and costs
+#      the client every message in the thread.
+#   2. EVERY DROP IS LOGGED, once, at warning level, in a message beginning
+#      "Dropping ". A vanished attachment with no string to search for is the
+#      failure an operator cannot diagnose. This covers the drops that have no
+#      branch of their own: an item of an UNRECOGNISED TYPE is a drop too, and
+#      says so.
+#   3. ONE BAD ITEM COSTS ONLY ITSELF. The items on either side of it in the
+#      same content list, and every other message in the list, still convert.
+#
+# All three are checkable from outside: for ANY input, each converter returns a
+# list, emits one warning per dropped item, and the surviving items are exactly
+# what the same input minus the bad item would have produced.
+#
+# The TypeScript adapter carries this same block above
+# `convertLangchainMultimodalToAgui`. The two must not drift.
+
+
 def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[AGUIContentItem]:
     """Convert LangChain's multimodal content to AG-UI format.
 
@@ -333,14 +387,20 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
     :func:`_read_incoming_media_block`.
 
     A block this converter cannot make sense of is SKIPPED AND LOGGED, never
-    raised on. The caller (`langchain_messages_to_agui`) builds the whole
-    MESSAGES_SNAPSHOT, so an exception here does not degrade one attachment —
-    it escapes the conversion and costs the client every message in the thread.
+    raised on — see THE MALFORMED-INPUT CONTRACT above. The caller
+    (`langchain_messages_to_agui`) builds the whole MESSAGES_SNAPSHOT, so an
+    exception here does not degrade one attachment — it escapes the conversion
+    and costs the client every message in the thread.
     """
     agui_content: List[AGUIContentItem] = []
     for item in content:
         if isinstance(item, dict):
-            if item.get("type") == "text":
+            # Read ONCE, into a local. `item.get("type") in _AGUI_MEDIA_CLASSES`
+            # below raises `TypeError: unhashable type` for a `type` that is a
+            # list or a dict — a rule-1 violation that takes the whole snapshot
+            # down — so the membership test goes through a hashable-safe guard.
+            block_type = item.get("type")
+            if block_type == "text":
                 text = item.get("text", "")
                 # `TextInputContent.text` is a `str`; a block whose `text` is
                 # anything else raises a ValidationError that aborts the whole
@@ -355,21 +415,21 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                     type="text",
                     text=text
                 ))
-            elif item.get("type") in _AGUI_MEDIA_CLASSES:
+            elif isinstance(block_type, str) and block_type in _AGUI_MEDIA_CLASSES:
                 media = _agui_media_from_standard_block(item)
                 if media:
                     agui_content.append(media)
                 else:
                     logger.warning(
                         "Dropping %s block: no data, base64 or url to carry back",
-                        item.get("type"),
+                        block_type,
                     )
-            elif item.get("type") == "image_url":
+            elif block_type == "image_url":
                 url = _incoming_image_url(item.get("image_url"))
                 if not url:
                     logger.warning(
                         "Dropping image_url block: no usable url in its %s payload",
-                        type(item.get("image_url")).__name__,
+                        _describe_type(item.get("image_url")),
                     )
                     continue
 
@@ -420,6 +480,28 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                             value=url,
                         ),
                     ))
+            else:
+                # Rule 2 of the malformed-input contract. A block matching NO
+                # branch used to fall out of the loop leaving nothing behind —
+                # no content item and no log — while the docstring above claimed
+                # such a block "is SKIPPED AND LOGGED". It was skipped; it was
+                # never logged. That is the drop most worth announcing: the
+                # others lost one field of a recognized block, this one loses the
+                # attachment whole, and an operator watching a file vanish from a
+                # reopened thread had no string to search for. A block kind
+                # langchain-core adds later lands here.
+                logger.warning(
+                    "Dropping unsupported content block of type %r", block_type
+                )
+        else:
+            # Same rule, one level out. A content list relayed by the LangGraph
+            # server can carry a JSON `null`, a bare string, or a number where a
+            # block is expected. `.get` on one of those would raise out of the
+            # whole message list, so this loop never called it — but it said
+            # nothing either. The TypeScript adapter already warns here.
+            logger.warning(
+                "Dropping content block: not a dict (%s)", _describe_type(item)
+            )
     return agui_content
 
 def _reasoning_block_summary_text(block: Dict[str, Any]) -> str:
@@ -1010,6 +1092,9 @@ def _standard_media_block(
 
 def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List[Dict[str, Any]]:
     """Convert AG-UI multimodal content to LangChain's multimodal format.
+
+    Malformed input is handled per THE MALFORMED-INPUT CONTRACT, documented above
+    `convert_langchain_multimodal_to_agui`.
 
     Handles the new typed content classes (ImageInputContent, AudioInputContent,
     VideoInputContent, DocumentInputContent) as well as legacy BinaryInputContent

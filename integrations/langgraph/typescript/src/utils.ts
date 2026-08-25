@@ -636,6 +636,21 @@ function firstNonEmptyString(...candidates: unknown[]): string | undefined {
 }
 
 /**
+ * A short, safe name for the RUNTIME TYPE of an off-the-wire value, for the
+ * "Dropping …" logs rule 2 of the malformed-input contract requires.
+ *
+ * `typeof null` is `"object"` and `typeof []` is `"object"`, and both of those
+ * arrive here — an operator reading "no usable url in its object payload" for a
+ * JSON `null` learns nothing. Names the same distinctions Python's
+ * `type(x).__name__` does in the mirrored log lines.
+ */
+function describeType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
  * Build the standard media block for an inline-data source.
  *
  * Only reached for combinations {@link standardBlockTypeFor} vouched for, so it
@@ -790,7 +805,66 @@ function suppliedFilename(
 }
 
 /**
+ * The url carried by a legacy `image_url` block, or `undefined` if it has none.
+ *
+ * The payload is whatever the graph put under the `image_url` key. Two shapes
+ * carry a url: LangChain's own `{ url: "…" }` and the bare string both runtimes
+ * also accept. EVERYTHING else — `null`, a number, an array, an object with no
+ * `url` or a non-string/empty one — carries no url at all, and the caller drops
+ * the block rather than deriving one.
+ *
+ * Reading it defensively is the point, and it is rule 1 of the malformed-input
+ * contract documented below: the caller builds the user message inside
+ * MESSAGES_SNAPSHOT, so `payload.url.startsWith(...)` on a NUMERIC url does not
+ * lose one block, it throws out of the whole snapshot and loses the ENTIRE
+ * thread. And a payload that yields `""` is no better for being quiet: it mints
+ * an attachment pointing at nothing.
+ *
+ * Mirrors Python's `_incoming_image_url`, which already read it this way.
+ */
+function incomingImageUrl(payload: unknown): string | undefined {
+  if (typeof payload === "string") return payload || undefined;
+  if (payload !== null && typeof payload === "object") {
+    return firstNonEmptyString((payload as { url?: unknown }).url);
+  }
+  return undefined;
+}
+
+/**
+ * THE MALFORMED-INPUT CONTRACT for the two content converters below.
+ *
+ * Both directions read arrays that nothing validated at this boundary —
+ * LangGraph relays whatever the graph put in a message, and the AG-UI side is
+ * client JSON that TypeScript's types describe but never enforce — so every
+ * field reachable from here can be absent, empty, or of the wrong type. Three
+ * rules, and they hold for BOTH converters in BOTH runtimes:
+ *
+ *   1. DROP, NEVER RAISE. An item this converter cannot make sense of is
+ *      skipped. Nothing in either converter throws on its input. These
+ *      functions build a whole MESSAGES_SNAPSHOT / a whole provider request, so
+ *      an exception does not degrade one attachment — it escapes the loop and
+ *      costs the client every message in the thread.
+ *   2. EVERY DROP IS LOGGED, once, at warning level, in a message beginning
+ *      `Dropping `. A vanished attachment with no string to search for is the
+ *      failure an operator cannot diagnose. This covers the drops that have no
+ *      branch of their own: an item of an UNRECOGNISED TYPE is a drop too, and
+ *      says so.
+ *   3. ONE BAD ITEM COSTS ONLY ITSELF. The items on either side of it in the
+ *      same content array, and every other message in the list, still convert.
+ *
+ * All three are checkable from outside: for ANY input, each converter returns an
+ * array, emits one warning per dropped item, and the surviving items are exactly
+ * what the same input minus the bad item would have produced.
+ *
+ * The Python adapter carries this same block above
+ * `convert_langchain_multimodal_to_agui`. The two must not drift.
+ */
+
+/**
  * Convert LangChain's multimodal content to AG-UI format.
+ *
+ * Malformed input is handled per THE MALFORMED-INPUT CONTRACT, the comment block
+ * immediately above this one.
  *
  * `image_url` blocks are converted with the appropriate source type (data or URL)
  * and to the media type their MIME type names — `image_url` is the fallback block
@@ -820,10 +894,24 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
     // converter does not recognise, prototype key or not.
     const type = AGUI_MEDIA_TYPES.get(item.type);
 
-    if (item.type === "text" && item.text) {
+    if (item.type === "text") {
+      // `text` was previously gated on TRUTHINESS, which got both ends wrong: a
+      // non-string truthy `text` (a number, an object) was emitted verbatim into
+      // `TextInputContent.text` and failed schema validation downstream, and a
+      // present-but-empty one was dropped with no log at all — a rule-2
+      // violation on a block Python keeps. An ABSENT `text` is the empty string
+      // (Python reads it as `item.get("text", "")`); a present non-string one is
+      // unusable and is dropped like any other unusable item.
+      const text = item.text === undefined ? "" : item.text;
+      if (typeof text !== "string") {
+        console.warn(
+          `[convertLangchainMultimodalToAgui] Dropping text block: text is ${text === null ? "null" : typeof text}, not a string`
+        );
+        continue;
+      }
       aguiContent.push({
         type: "text",
-        text: item.text,
+        text,
       });
     } else if (type) {
       const incoming = readIncomingMediaBlock(item);
@@ -866,11 +954,18 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
       // `image_url` is the fallback block for EVERY modality this adapter cannot
       // send as a standard block, not just images, so the block kind is not the
       // media type. See {@link aguiMediaTypeForMimeType}.
-      const imageUrl = typeof item.image_url === "string"
-        ? item.image_url
-        : item.image_url?.url;
+      // Read through {@link incomingImageUrl}, not `item.image_url?.url`: the
+      // raw read accepts a NON-STRING truthy url — `{ url: 42 }` off the wire —
+      // and `imageUrl.startsWith("data:")` on the next line then threw a
+      // TypeError out of the entire message-list conversion.
+      const imageUrl = incomingImageUrl(item.image_url);
 
-      if (!imageUrl) continue;
+      if (!imageUrl) {
+        console.warn(
+          `[convertLangchainMultimodalToAgui] Dropping image_url block: no usable url in its ${describeType(item.image_url)} payload`
+        );
+        continue;
+      }
 
       // Parse data URLs to extract base64 data
       if (imageUrl.startsWith("data:")) {
@@ -911,6 +1006,17 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
           },
         });
       }
+    } else {
+      // Rule 2 of the malformed-input contract. A block matching NO branch used
+      // to fall out of the loop leaving nothing behind — no content item and no
+      // log — while every other drop in this same loop says so. That is the drop
+      // most worth announcing: the others lost one field of a recognized block,
+      // this one loses the attachment whole, and an operator watching a file
+      // vanish from a reopened thread had no string to search for. A block kind
+      // LangChain adds later lands here.
+      console.warn(
+        `[convertLangchainMultimodalToAgui] Dropping unsupported content block of type ${JSON.stringify(item.type)}`
+      );
     }
   }
 
@@ -919,6 +1025,9 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
 
 /**
  * Convert AG-UI multimodal content to LangChain's format.
+ *
+ * Malformed input is handled per THE MALFORMED-INPUT CONTRACT, documented above
+ * {@link convertLangchainMultimodalToAgui}.
  *
  * Handles the new typed content classes (ImageInputContent, AudioInputContent,
  * VideoInputContent, DocumentInputContent) as well as legacy BinaryInputContent
@@ -964,9 +1073,21 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
     }
 
     if (item.type === "text") {
+      // Same read as the inbound converter's text branch. Python reaches this
+      // point with a pydantic-validated `TextInputContent`, so its `text` is a
+      // `str` by construction; nothing validates the equivalent here, and a
+      // non-string forwarded into a provider content block is a 400 from the
+      // provider rather than a dropped word.
+      const text = item.text === undefined ? "" : item.text;
+      if (typeof text !== "string") {
+        console.warn(
+          `[convertAguiMultimodalToLangchain] Dropping text content: text is ${text === null ? "null" : typeof text}, not a string`
+        );
+        continue;
+      }
       langchainContent.push({
         type: "text",
-        text: item.text,
+        text,
       });
     } else if (MEDIA_CONTENT_TYPES.has(item.type)) {
       // ImageInputContent, AudioInputContent, VideoInputContent, DocumentInputContent
@@ -1053,6 +1174,15 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
         type: "image_url",
         image_url: { url },
       });
+    } else {
+      // Rule 2 of the malformed-input contract, and the exact mirror of the
+      // `else` Python's `convert_agui_multimodal_to_langchain` already carries.
+      // An item matching NO branch used to fall out of the loop leaving nothing
+      // behind — no block and no log — while every other drop in this same loop
+      // says so. A new content type added to the AG-UI union lands here.
+      console.warn(
+        `[convertAguiMultimodalToLangchain] Dropping unsupported content item of type ${JSON.stringify((item as { type?: unknown }).type)}`
+      );
     }
   }
 
