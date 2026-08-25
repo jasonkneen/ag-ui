@@ -861,6 +861,25 @@ export class StrandsAgent {
   private readonly _templateFields: TemplateAgentCloneFields;
 
   /**
+   * Template settings that will not reach per-thread agents.
+   *
+   * Both are reported the first time a per-thread agent is built, once the
+   * caller's own per-thread config is known, and only for the ones that config
+   * does not supply. Reporting at construction instead would either nag
+   * callers who already handled these or stay quiet for the ones who handled
+   * only part of them.
+   *
+   * They are kept apart because they deserve different volumes. A field the
+   * caller demonstrably set and that will not be carried is worth a warning.
+   * A field the SDK populates on every Agent whether or not anyone asked for
+   * it, like the conversation manager, is not: warning about that would fire
+   * at every caller including the ones who set nothing.
+   */
+  private _uncarriedSetFields: readonly string[] = [];
+  private _uncarriedDefaultFields: readonly string[] = [];
+  private _warnedUncarried = false;
+
+  /**
    * Hook providers forwarded to each per-thread StrandsAgentCore.
    *
    * Taken directly from the caller rather than read off the template because
@@ -933,30 +952,14 @@ export class StrandsAgent {
     const extracted = _extractTemplateFields(agentCore);
     this._templateFields = extracted.fields;
     this._plugins = plugins ? [...plugins] : [];
-    if (extracted.ignored.length > 0) {
-      // Debug rather than warn: Strands populates some of these on every Agent
-      // whether or not the caller asked for them, so warning here would fire
-      // for callers who set nothing.
-      this._log.debug(
-        `${LOG_PREFIX} not shared with per-thread agents: ` +
-          `${extracted.ignored.join(", ")}. Each is wired to the Agent that owns ` +
-          "it, so one instance cannot serve every thread. Supply them per " +
-          "thread with StrandsAgentConfig.threadAgentConfig.",
-      );
-    }
     // Only fields whose value could actually be read are named here. Strands
     // consumes others into internal state during construction and keeps
     // nothing the adapter can find, so for those "was it set?" has no answer
     // from the outside and a guess would fire at callers who set nothing.
     // Those are documented on threadAgentConfig, which is the route that
     // carries them.
-    if (extracted.unsupported.length > 0 && !this.config.threadAgentConfig) {
-      this._log.warn(
-        `${LOG_PREFIX} these settings are on the template but are not carried ` +
-          `to per-thread agents: ${extracted.unsupported.join(", ")}. Supply ` +
-          "them per thread with StrandsAgentConfig.threadAgentConfig.",
-      );
-    }
+    this._uncarriedSetFields = [...extracted.unsupported].sort();
+    this._uncarriedDefaultFields = [...extracted.ignored].sort();
 
     // Detect the common pitfall: sessionManager set on the template Agent
     // with no per-thread provider. Forwarding it would make every AG-UI
@@ -1072,6 +1075,7 @@ export class StrandsAgent {
           };
         }
       }
+      this._reportUncarried(callerConfig);
       const effectiveSeed = sessionManager ? undefined : seedMessages;
       strandsAgent = new StrandsAgentCore(
         this._buildThreadAgentConfig(
@@ -3194,6 +3198,40 @@ export class StrandsAgent {
     }
   }
 
+  /**
+   * Name the template settings that will not reach this thread's agent.
+   *
+   * Said once per adapter, and only about settings the caller's per-thread
+   * config did not supply, so acting on it makes it stop.
+   */
+  private _reportUncarried(callerConfig?: Partial<AgentConfig>): void {
+    if (this._warnedUncarried) return;
+    this._warnedUncarried = true;
+
+    const supplied = new Set(Object.keys(callerConfig ?? {}));
+    const unmet = (fields: readonly string[]) =>
+      fields.filter((field) => !supplied.has(field));
+
+    const set = unmet(this._uncarriedSetFields);
+    if (set.length > 0) {
+      this._log.warn(
+        `${LOG_PREFIX} these settings are on the template but do not reach ` +
+          `per-thread agents: ${set.join(", ")}. Supply them per thread with ` +
+          "StrandsAgentConfig.threadAgentConfig.",
+      );
+    }
+
+    const defaults = unmet(this._uncarriedDefaultFields);
+    if (defaults.length > 0) {
+      this._log.debug(
+        `${LOG_PREFIX} not shared with per-thread agents: ` +
+          `${defaults.join(", ")}. Each is wired to the Agent that owns it, so ` +
+          "one instance cannot serve every thread. Supply them per thread " +
+          "with StrandsAgentConfig.threadAgentConfig.",
+      );
+    }
+  }
+
   private _buildThreadAgentConfig(
     sessionManager?: SessionManager,
     seedMessages?: AgentConfig["messages"],
@@ -3219,8 +3257,15 @@ export class StrandsAgent {
     // Re-asserted after the caller: these are what keeps threads apart and a
     // run coherent, so they stay the adapter's to set.
     cfg.printer = false;
+    // Assigned or removed, never left alone. Overwriting only when there is a
+    // replacement to hand would make the guarantee conditional on the adapter
+    // happening to have one: with no session-manager provider and a cold
+    // thread, a caller value would survive and every thread would share one
+    // session and one history.
     if (sessionManager) cfg.sessionManager = sessionManager;
+    else delete cfg.sessionManager;
     if (seedMessages && seedMessages.length > 0) cfg.messages = seedMessages;
+    else delete cfg.messages;
     // Only forward plugins when the caller supplied them explicitly. Passing
     // `plugins: []` risks being interpreted by a future SDK as "disable
     // default plugins".

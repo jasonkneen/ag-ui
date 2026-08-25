@@ -1985,16 +1985,11 @@ class StrandsAgent:
             *self._unreadable_params,
             *self._template_owned_params,
         ]
-        if self._unreadable_params:
-            # Phrased as a capability, not an accusation: an unreadable param is
-            # unreadable whether or not the caller set one, so this cannot say
-            # that anything was actually lost.
-            logger.warning(
-                "this Strands release stores these Agent constructor params where "
-                "the adapter cannot read them back, so a value set on the template "
-                "through them will not reach per-thread agents: %s.",
-                ", ".join(sorted(self._unreadable_params)),
-            )
+        # Reported when the first per-thread agent is built rather than here.
+        # ``thread_agent_kwargs`` can supply any of these, and at construction
+        # time it has not run, so warning now would nag a caller who had
+        # already handled it.
+        self._warned_uncarried = False
 
         # Hook providers forwarded to each per-thread StrandsAgentCore.
         #
@@ -2379,6 +2374,32 @@ class StrandsAgent:
                 self._pending_interrupts_by_thread.pop(thread_id, None)
                 self._parked_orchestrators_by_thread.pop(thread_id, None)
 
+    def _report_uncarried_params(self, core_kwargs: dict) -> None:
+        """Name the params that will not reach this thread's agent.
+
+        Said once per adapter, and only about params the caller's own
+        per-thread kwargs did not supply, so acting on it makes it stop.
+        """
+        if self._warned_uncarried:
+            return
+        self._warned_uncarried = True
+
+        still_missing = sorted(
+            name for name in self._unreadable_params if name not in core_kwargs
+        )
+        if not still_missing:
+            return
+        # Phrased as a capability, not an accusation: an unreadable param is
+        # unreadable whether or not the caller set one, so this cannot say that
+        # anything was actually lost.
+        logger.warning(
+            "this Strands release stores these Agent constructor params where the "
+            "adapter cannot read them back, so a value set on the template through "
+            "them will not reach per-thread agents: %s. Supply them per thread "
+            "with StrandsAgentConfig.thread_agent_kwargs.",
+            ", ".join(still_missing),
+        )
+
     async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
         """Run the Strands agent and yield AG-UI events."""
 
@@ -2526,6 +2547,14 @@ class StrandsAgent:
                             logger.error(
                                 "thread_agent_kwargs failed: %s", e, exc_info=True
                             )
+                            # RUN_STARTED first: a run that reports only an
+                            # error leaves a client that brackets on the
+                            # lifecycle events with an unopened run.
+                            yield RunStartedEvent(
+                                type=EventType.RUN_STARTED,
+                                thread_id=input_data.thread_id,
+                                run_id=input_data.run_id,
+                            )
                             yield RunErrorEvent(
                                 type=EventType.RUN_ERROR,
                                 message=(
@@ -2536,6 +2565,9 @@ class StrandsAgent:
                             )
                             return
                         core_kwargs.update(dict(extra or {}))
+                    self._report_uncarried_params(core_kwargs)
+                    if self.config.thread_agent_kwargs is None:
+                        self._report_uncarried_params(core_kwargs)
                     # Re-asserted after the caller: these keep threads apart
                     # and a run coherent, so they stay the adapter's to set.
                     for owned in ("model", "system_prompt", "tools", "session_manager"):

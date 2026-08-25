@@ -130,12 +130,44 @@ describe("AgentConfig forwarding", () => {
     // The point of declaring a field unsupported is that the caller finds out.
     // This template sets several of them plainly, so each is readable and
     // therefore demonstrably chosen rather than an SDK default.
+    //
+    // Said when the first per-thread agent is built, not at construction: a
+    // caller can supply any of these through threadAgentConfig, and at
+    // construction that hook has not run, so warning then would nag callers
+    // who had already handled it.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      new StrandsAgent({ agent: richTemplate(), name: "t" });
+      const sa = new StrandsAgent({ agent: richTemplate(), name: "t" });
+      expect(warn).not.toHaveBeenCalled();
+
+      await collect(sa);
 
       const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
       expect(said).toContain("traceAttributes");
+      expect(said).toContain("structuredOutputSchema");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays quiet about a setting the per-thread hook supplies", async () => {
+    // Acting on the warning has to make it stop, otherwise it is noise that
+    // teaches callers to ignore it.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sa = new StrandsAgent({
+        agent: richTemplate(),
+        name: "t",
+        config: {
+          threadAgentConfig: () =>
+            ({ traceAttributes: { team: "agui" } }) as never,
+        },
+      });
+      await collect(sa);
+
+      const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(said).not.toContain("traceAttributes");
+      // The one it did not supply is still named.
       expect(said).toContain("structuredOutputSchema");
     } finally {
       warn.mockRestore();

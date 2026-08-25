@@ -150,18 +150,33 @@ describe("per-thread agent config against the real Strands SDK", () => {
     );
   });
 
-  it("builds memory and storage per thread rather than sharing one", async () => {
-    // Both hold conversation-scoped data, so the point is not merely that they
-    // arrive but that each thread gets its own.
-    const built: unknown[] = [];
+  it("builds memory, storage and sandbox per thread rather than sharing one", async () => {
+    // These hold conversation-scoped state, so the point is not that the hook
+    // ran but that each thread's agent ends up with its own. Counting the
+    // hook's own calls would pass even if nothing it returned reached an agent.
+    //
+    // `memoryManager` is given a config the SDK accepts and then normalizes
+    // into its own object, so it is checked by kind and by being distinct per
+    // thread rather than by identity. `storage` and `sandbox` pass through, so
+    // those keep identity.
+    const handed: Record<string, Record<string, unknown>> = {};
     const sa = new StrandsAgent({
       agent: template(),
       name: "adapter",
       config: {
-        threadAgentConfig: () => {
-          const storage = { marker: Symbol("per-thread") };
-          built.push(storage);
-          return { storage } as unknown as Partial<AgentConfig>;
+        threadAgentConfig: (input) => {
+          const forThread = {
+            memoryManager: { stores: [{}] },
+            storage: { marker: `storage-${input.threadId}` },
+            // Minimal shape the SDK will accept: initialization asks a
+            // sandbox for its tools.
+            sandbox: {
+              marker: `sandbox-${input.threadId}`,
+              getTools: () => [],
+            },
+          };
+          handed[input.threadId] = forThread;
+          return forThread as unknown as Partial<AgentConfig>;
         },
       },
     });
@@ -169,8 +184,51 @@ describe("per-thread agent config against the real Strands SDK", () => {
     await collect(sa, minimalRunInput({ threadId: "a" }));
     await collect(sa, minimalRunInput({ threadId: "b" }));
 
-    expect(built).toHaveLength(2);
-    expect(built[0]).not.toBe(built[1]);
+    const byThread = (
+      sa as unknown as { _agentsByThread: Map<string, Agent> }
+    )._agentsByThread;
+    const read = (agent: Agent | undefined, field: string) => {
+      const held = agent as unknown as Record<string, unknown> | undefined;
+      // Which name the SDK keeps has moved between releases, so try both.
+      return held?.[field] ?? held?.[`_${field}`];
+    };
+    const kind = (value: unknown) =>
+      value === undefined || value === null
+        ? String(value)
+        : (value as object).constructor?.name;
+
+    for (const field of ["memoryManager", "storage", "sandbox"]) {
+      // Ground truth is what the SDK itself does with this value. On a release
+      // that has the option that is a real instance; on one that predates it
+      // the option is ignored and so is this. Either way a drop by the adapter
+      // alone fails, and so does the adapter handing over something else.
+      const direct = await built({
+        [field]: handed.a[field],
+      } as Partial<AgentConfig>);
+
+      for (const threadId of ["a", "b"]) {
+        expect(
+          kind(read(byThread.get(threadId), field)),
+          `${field} did not reach thread ${threadId} as a direct Agent has it`,
+        ).toBe(kind(read(direct, field)));
+      }
+
+      // Where the SDK keeps it at all, the two threads must not share one.
+      const forA = read(byThread.get("a"), field);
+      if (forA !== undefined) {
+        expect(forA, `${field} is shared between threads`).not.toBe(
+          read(byThread.get("b"), field),
+        );
+      }
+    }
+
+    // The pass-through values keep identity, so each thread has the object
+    // built for it rather than some other thread's.
+    if (read(byThread.get("a"), "storage") !== undefined) {
+      expect(read(byThread.get("a"), "storage")).toBe(handed.a.storage);
+      expect(read(byThread.get("b"), "storage")).toBe(handed.b.storage);
+      expect(read(byThread.get("a"), "sandbox")).toBe(handed.a.sandbox);
+    }
   });
 
   it("still carries what the template can carry", async () => {
@@ -215,6 +273,49 @@ describe("per-thread agent config against the real Strands SDK", () => {
     });
 
     expect((built as unknown as { _printer?: unknown })._printer).toBeFalsy();
+  });
+
+  it("does not let the hook supply session state or history", async () => {
+    // "The adapter owns these" has to hold whether or not the adapter happens
+    // to have a replacement ready. With no session-manager provider and a cold
+    // thread there is nothing to overwrite with, and a conditional re-assert
+    // leaves the caller's value in place: one session manager and one history
+    // reaching every thread, which is the isolation this rebuild exists for.
+    const shared = { marker: "one-session-for-everyone" };
+    const sa = new StrandsAgent({
+      agent: template(),
+      name: "adapter",
+      config: {
+        threadAgentConfig: () =>
+          ({
+            sessionManager: shared,
+            messages: [{ role: "user", content: [{ text: "leaked" }] }],
+          }) as unknown as Partial<AgentConfig>,
+      },
+    });
+
+    await collect(sa, minimalRunInput({ threadId: "a" }));
+    await collect(sa, minimalRunInput({ threadId: "b" }));
+
+    const byThread = (
+      sa as unknown as { _agentsByThread: Map<string, Agent> }
+    )._agentsByThread;
+    const a = byThread.get("a");
+    const b = byThread.get("b");
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+
+    const sessionOf = (agent: Agent | undefined) =>
+      (agent as unknown as { sessionManager?: unknown } | undefined)
+        ?.sessionManager;
+    expect(sessionOf(a)).not.toBe(shared);
+    expect(sessionOf(b)).not.toBe(shared);
+
+    // The injected history must not have become either thread's first turn.
+    const firstTexts = (agent: Agent | undefined) =>
+      JSON.stringify((agent as unknown as { messages?: unknown })?.messages ?? []);
+    expect(firstTexts(a)).not.toContain("leaked");
+    expect(firstTexts(b)).not.toContain("leaked");
   });
 
   it("fails the run when the hook throws, and does not cache the thread", async () => {

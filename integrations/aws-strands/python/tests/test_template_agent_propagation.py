@@ -454,17 +454,24 @@ async def test_template_param_reaches_thread_agent_kwargs(param_name):
     )
 
 
-def test_no_constructor_param_is_dropped_silently(caplog):
+@pytest.mark.asyncio
+async def test_no_constructor_param_is_dropped_silently(caplog):
     """Every constructor param is forwarded, handled explicitly, or announced.
 
     This is the check that would have caught the original defect. When Strands
     adds a param the adapter cannot carry across, the adapter has to say so;
     what it must never do is drop it without a word.
+
+    The saying happens when the first per-thread agent is built rather than at
+    construction, because ``thread_agent_kwargs`` can supply any of these and
+    at construction it has not run.
     """
     template = Agent(model=_mock_model())
+    ag = StrandsAgent(template, name="test")
 
     with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
-        ag = StrandsAgent(template, name="test")
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            await _trigger_thread_creation(ag, "t1")
 
     accounted = (
         set(ag._agent_kwargs) | set(ag._unforwardable_params) | _AGUI_EXPLICIT_PARAMS
@@ -805,18 +812,63 @@ def test_none_valued_attribute_does_not_mask_a_later_convention():
     )
 
 
-def test_constructor_warns_about_unforwardable_params(caplog):
-    """The adapter says so at construction time rather than failing silently."""
+@pytest.mark.asyncio
+async def test_unforwardable_params_are_named_when_a_thread_is_built(caplog):
+    """The adapter says so rather than failing silently.
+
+    Said when the first per-thread agent is built, not at construction: a
+    caller can supply any of these through ``thread_agent_kwargs``, and at
+    construction that hook has not run, so warning then would nag a caller who
+    had already handled it.
+    """
     template = Agent(model=_mock_model())
 
     with patch(
         "ag_ui_strands.agent._extract_agent_kwargs",
         return_value=({}, ["some_new_param"], []),
     ):
-        with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
-            ag = StrandsAgent(template, name="test")
+        ag = StrandsAgent(template, name="test")
 
     assert ag._unforwardable_params == ["some_new_param"]
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            await _trigger_thread_creation(ag, "t1")
+
     assert any("some_new_param" in m for m in caplog.messages), (
         f"expected the unforwardable param to be named; got {caplog.messages}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_warning_for_a_param_the_hook_supplies(caplog):
+    """Acting on the warning has to make it stop.
+
+    A message that keeps arriving after the caller has done what it asked
+    teaches them to ignore it.
+    """
+    from ag_ui_strands.config import StrandsAgentConfig
+
+    template = Agent(model=_mock_model())
+    config = StrandsAgentConfig(
+        thread_agent_kwargs=lambda _input: {"some_new_param": "supplied"}
+    )
+
+    with patch(
+        "ag_ui_strands.agent._extract_agent_kwargs",
+        return_value=({}, ["some_new_param", "another_param"], []),
+    ):
+        ag = StrandsAgent(template, name="test", config=config)
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            await _trigger_thread_creation(ag, "t1")
+
+    said = "\n".join(caplog.messages)
+    assert "some_new_param" not in said, (
+        f"warned about a param the hook supplied; got {caplog.messages}"
+    )
+    # The one it did not supply is still named.
+    assert "another_param" in said, (
+        f"expected the unsupplied param to be named; got {caplog.messages}"
     )

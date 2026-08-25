@@ -160,7 +160,12 @@ async def test_hook_failure_ends_the_run_and_leaves_the_thread_uncached():
         async for event in ag.run(_run_input()):
             events.append(event)
 
-    assert any(e.type == EventType.RUN_ERROR for e in events)
+    types = [e.type for e in events]
+    assert EventType.RUN_ERROR in types
+    # Opened before it failed: a client that brackets a run on the lifecycle
+    # events is left with an unopened run otherwise. Every other early-error
+    # path in this adapter emits the pair.
+    assert types.index(EventType.RUN_STARTED) < types.index(EventType.RUN_ERROR)
     assert "t1" not in ag._agents_by_thread
 
     # Uncached, so the next request retries rather than reusing a thread that
