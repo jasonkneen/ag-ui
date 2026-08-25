@@ -203,9 +203,10 @@ function scrubSecrets(text: string, ...urls: string[]): string {
  * Relaxing the address checks requires passing a custom policy to
  * `fetchUrlBytes`. No supported AG-UI-to-Strands conversion path currently
  * accepts one, so in practice the defaults are what a consumer gets. Even
- * under `allowPrivateNetworks`, link-local ranges and the cloud metadata
- * endpoints listed in `ALWAYS_BLOCKED_IPV4`/`ALWAYS_BLOCKED_IPV6` stay
- * blocked; that list covers the major providers rather than every provider.
+ * under `allowPrivateNetworks`, this-network, link-local ranges and the cloud
+ * metadata endpoints listed in `ALWAYS_BLOCKED_IPV4`/`ALWAYS_BLOCKED_IPV6`
+ * stay blocked; that list covers the major providers rather than every
+ * provider.
  */
 /** The NAT64 prefixes every deployment can be assumed to use. */
 const WELL_KNOWN_NAT64_PREFIX = "64:ff9b::/96"; // RFC 6052
@@ -450,6 +451,7 @@ const BLOCKED_IPV6 = [
 // services, and the individual addresses below are metadata endpoints outside
 // it. None is ever a legitimate source of URL content.
 const ALWAYS_BLOCKED_IPV4 = [
+  cidr("0.0.0.0/8"), // this-network is never a legitimate URL destination
   cidr("169.254.0.0/16"), // link-local, including 169.254.169.254 and 169.254.170.2
   cidr("100.100.100.200/32"), // Alibaba Cloud metadata
   cidr("192.0.0.192/32"), // Oracle Cloud metadata
@@ -552,8 +554,7 @@ function addressesToCheck(
   for (const { prefix } of nat64Prefixes(policy)) {
     if (!inCidr(ip.bytes, prefix)) continue;
     const translated = embeddedNat64Address(ip, prefix[1]);
-    // A candidate in 0.0.0.0/8 is not a real destination.
-    if (translated && translated.bytes[0] !== 0) embedded.push(translated);
+    if (translated) embedded.push(translated);
   }
   for (const { prefix, offset } of IPV4_EMBEDDING_PREFIXES) {
     if (!inCidr(ip.bytes, prefix)) continue;
@@ -599,8 +600,9 @@ function blockedAddress(
   // public one, so the embedded address carries the decision instead.
   const wrapperIsNat64 = isNat64(address, policy);
   for (const ip of addressesToCheck(address, policy)) {
-    // Cloud metadata and other link-local services are never legitimate URL
-    // content sources, even when an application opts into its private network.
+    // This-network, cloud metadata and other link-local services are never
+    // legitimate URL content sources, even when an application opts into its
+    // private network.
     if (isAlwaysBlocked(ip)) return ip;
     if (wrapperIsNat64 && ip === address) continue;
     if (!allowPrivateNetworks && isNonGlobal(ip)) return ip;
@@ -612,7 +614,11 @@ function blockedAddress(
 function isNat64(ip: IpAddress, policy: UrlFetchPolicy): boolean {
   return (
     ip.version === 6 &&
-    nat64Prefixes(policy).some(({ prefix }) => inCidr(ip.bytes, prefix))
+    nat64Prefixes(policy).some(
+      ({ prefix }) =>
+        inCidr(ip.bytes, prefix) &&
+        embeddedNat64Address(ip, prefix[1]) !== null,
+    )
   );
 }
 

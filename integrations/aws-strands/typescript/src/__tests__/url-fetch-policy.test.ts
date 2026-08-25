@@ -682,6 +682,21 @@ describe("URL fetch policy: configuration", () => {
     expect(bytes && Buffer.from(bytes).toString()).toBe("local");
   });
 
+  it("keeps 0.0.0.0/8 blocked when private networks are opted into", async () => {
+    const { spy } = stubFetch(() => new Response("should not be reached"));
+    const log = makeLog();
+
+    expect(
+      await fetchUrlBytes(
+        "http://0.1.2.3/probe",
+        log,
+        policy({ allowPrivateNetworks: true }),
+      ),
+    ).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    expect(String(log.error.mock.calls[0][0])).toContain("0.1.2.3");
+  });
+
   it.each([["ftp"], ["data"], ["file"], ["blob"]])(
     "refuses a policy that allows the %s scheme",
     async (scheme) => {
@@ -890,6 +905,75 @@ describe("URL fetch policy: IPv6 transition forms", () => {
 
     expect(await fetchUrlBytes(url, makeLog())).toBeNull();
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the well-known prefix", "http://[64:ff9b::1]/"],
+    ["the local-use prefix", "http://[64:ff9b:1:0:0:100::]/"],
+  ])("refuses 0.0.0.1 through %s", async (_label, url) => {
+    const { spy } = stubFetch(() => new Response("should not be reached"));
+    const log = makeLog();
+
+    expect(await fetchUrlBytes(url, log)).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    expect(String(log.error.mock.calls[0][0])).toContain("0.0.0.1");
+  });
+
+  it.each([
+    ["the well-known prefix", "http://[64:ff9b::1]/"],
+    ["the local-use prefix", "http://[64:ff9b:1:0:0:100::]/"],
+  ])(
+    "keeps 0.0.0.1 through %s blocked under the private-network opt-in",
+    async (_label, url) => {
+      const { spy } = stubFetch(() => new Response("should not be reached"));
+      const log = makeLog();
+
+      expect(
+        await fetchUrlBytes(url, log, policy({ allowPrivateNetworks: true })),
+      ).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
+      expect(String(log.error.mock.calls[0][0])).toContain("0.0.0.1");
+    },
+  );
+
+  it.each([
+    {
+      label: "direct IPv4 zero-net under the default policy",
+      url: "http://0.0.0.1/probe",
+      fetchPolicy: undefined,
+    },
+    {
+      label: "direct IPv4 zero-net with the private-network opt-in",
+      url: "http://0.0.0.1/probe",
+      fetchPolicy: policy({ allowPrivateNetworks: true }),
+    },
+    {
+      label: "well-known NAT64 zero-net under the default policy",
+      url: "http://[64:ff9b::1]/probe",
+      fetchPolicy: undefined,
+    },
+    {
+      label: "well-known NAT64 zero-net with the private-network opt-in",
+      url: "http://[64:ff9b::1]/probe",
+      fetchPolicy: policy({ allowPrivateNetworks: true }),
+    },
+    {
+      label: "local-use NAT64 zero-net under the default policy",
+      url: "http://[64:ff9b:1:0:0:100::]/probe",
+      fetchPolicy: undefined,
+    },
+    {
+      label: "local-use NAT64 zero-net with the private-network opt-in",
+      url: "http://[64:ff9b:1:0:0:100::]/probe",
+      fetchPolicy: policy({ allowPrivateNetworks: true }),
+    },
+  ])("keeps $label blocked", async ({ url, fetchPolicy }) => {
+    const { spy } = stubFetch(() => new Response("should not be reached"));
+    const log = makeLog();
+
+    expect(await fetchUrlBytes(url, log, fetchPolicy)).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    expect(String(log.error.mock.calls[0][0])).toContain("0.0.0.1");
   });
 
   it.each([
