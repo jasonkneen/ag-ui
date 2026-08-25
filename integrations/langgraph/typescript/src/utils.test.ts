@@ -2,6 +2,7 @@
  * Tests for multimodal message conversion between AG-UI and LangChain formats.
  */
 
+import { readFileSync } from "node:fs";
 import { Message as LangGraphMessage } from "@langchain/langgraph-sdk";
 import {
   Message,
@@ -1046,6 +1047,417 @@ describe("Multimodal Message Conversion", () => {
     });
   });
 
+  // ── THE MALFORMED-INPUT CONTRACT ─────────────────────────────────────────
+  //
+  // The three rules written above the two converters in `utils.ts` (and above
+  // their mirror images in `ag_ui_langgraph/utils.py`): DROP NEVER RAISE, EVERY
+  // DROP IS LOGGED, ONE BAD ITEM COSTS ONLY ITSELF. Everything below asserts one
+  // of those three on one branch. Each has a named counterpart in the Python
+  // suite's `TestMalformedInputContract`, because the defect these exist to catch
+  // is a fix landing in one runtime and not the other — see
+  // `../../cross-runtime-parity-cases.json`, which is the same claim made as data.
+  //
+  // The distinction the second rule turns on: a DROP is logged, a KEPT block is
+  // not. An assertion on the return value alone cannot tell a logged drop from a
+  // silent one, which is how every past divergence here survived review.
+  describe("the malformed-input contract", () => {
+    /** Convert one LangChain content array back to AG-UI, capturing warnings. */
+    function inbound(content: unknown[]): { content: any[]; warnings: string[] } {
+      const warnings: string[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        warnings.push(String(args[0]));
+      });
+      try {
+        const agui = langchainMessagesToAgui([
+          { id: "contract", type: "human", content } as unknown as LangGraphMessage,
+        ]);
+        const converted = (agui[0] as UserMessage)?.content;
+        return { content: Array.isArray(converted) ? converted : [], warnings };
+      } finally {
+        warn.mockRestore();
+      }
+    }
+
+    /** Convert one AG-UI content array to LangChain, capturing warnings. */
+    function outbound(content: unknown[]): { content: any[]; warnings: string[] } {
+      const warnings: string[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        warnings.push(String(args[0]));
+      });
+      try {
+        const lc = aguiMessagesToLangChain([
+          { id: "contract", role: "user", content } as unknown as UserMessage,
+        ]);
+        const converted = lc[0]?.content;
+        return { content: Array.isArray(converted) ? converted : [], warnings };
+      } finally {
+        warn.mockRestore();
+      }
+    }
+
+    const textsOf = (content: any[]) => content.map((c) => c.text);
+
+    // ── rule 1: the `image_url` payload ────────────────────────────────────
+    it("drops an image_url block whose url is not a string instead of throwing", () => {
+      // `{ url: 42 }` is truthy, so the old `item.image_url?.url` read handed a
+      // NUMBER to `imageUrl.startsWith("data:")`, which threw a TypeError out of
+      // the loop that builds the whole MESSAGES_SNAPSHOT — the client got no
+      // messages at all, over one attachment.
+      const { content, warnings } = inbound([{ type: "image_url", image_url: { url: 42 } }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping image_url block: no usable url in its object payload"),
+      ]);
+    });
+
+    it.each([
+      ["a non-string url", { url: 42 }],
+      ["an empty url", { url: "" }],
+      ["a null url", { url: null }],
+      ["an object url", { url: {} }],
+      ["a null payload", null],
+      ["a numeric payload", 42],
+      ["a boolean payload", true],
+      ["an array payload", []],
+      ["a url wrapped in an array", ["https://example.com/a.png"]],
+      ["an object with no url key", {}],
+      ["an empty bare string", ""],
+    ])("logs exactly one drop for an image_url block with %s", (_name, payload) => {
+      // The QUIET half of the same defect. These never threw — they minted an
+      // ImageInputContent whose url is `""`, or dropped the block with nothing
+      // said, which is rule 2's failure: an operator watching an attachment
+      // vanish from a reopened thread had no string to search for.
+      const { content, warnings } = inbound([{ type: "image_url", image_url: payload }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Dropping image_url block");
+    });
+
+    it("logs one drop for an image_url block with no payload at all", () => {
+      const { content, warnings } = inbound([{ type: "image_url" }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping image_url block: no usable url in its undefined payload"),
+      ]);
+    });
+
+    // ── rule 3 ─────────────────────────────────────────────────────────────
+    it("keeps the blocks on either side of an unreadable image_url block", () => {
+      // This is why rule 1 is worth a rule at all: the throw did not degrade one
+      // attachment, it discarded the two text blocks beside it as well.
+      const { content, warnings } = inbound([
+        { type: "text", text: "before" },
+        { type: "image_url", image_url: { url: 42 } },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(textsOf(content)).toEqual(["before", "after"]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it("keeps every OTHER message when one message carries an unreadable block", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const agui = langchainMessagesToAgui([
+        { id: "m1", type: "human", content: "before" },
+        {
+          id: "m2",
+          type: "human",
+          content: [{ type: "image_url", image_url: { url: 42 } }],
+        },
+        { id: "m3", type: "human", content: "after" },
+      ] as unknown as LangGraphMessage[]);
+      warn.mockRestore();
+
+      expect(agui.map((m) => m.id)).toEqual(["m1", "m2", "m3"]);
+      expect(agui[0].content).toBe("before");
+      expect(agui[2].content).toBe("after");
+    });
+
+    // ── rule 1 + 2: the inbound text branch ────────────────────────────────
+    it.each([
+      ["a number", 42, "number"],
+      ["an object", { a: 1 }, "object"],
+      ["a null", null, "null"],
+      ["an array", ["x"], "object"],
+      ["a boolean", true, "boolean"],
+    ])("drops and logs a text block whose text is %s", (_name, text, described) => {
+      // The branch was gated on TRUTHINESS, which got both ends wrong: a truthy
+      // non-string was emitted VERBATIM into `TextInputContent.text` and failed
+      // schema validation downstream, well away from the block that caused it.
+      const { content, warnings } = inbound([{ type: "text", text }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining(`Dropping text block: text is ${described}, not a string`),
+      ]);
+    });
+
+    it("keeps the blocks on either side of an unusable text block", () => {
+      const { content, warnings } = inbound([
+        { type: "text", text: "before" },
+        { type: "text", text: 42 },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(textsOf(content)).toEqual(["before", "after"]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it.each([
+      ["present but empty", { type: "text", text: "" }],
+      ["absent", { type: "text" }],
+    ])("keeps a text block whose text is %s, and says nothing", (_name, block) => {
+      // The OTHER end of the truthiness gate: an empty text is a block Python
+      // keeps, and TypeScript dropped it with no log — a rule-2 violation on a
+      // block that is not malformed at all. `""` is the value, not a drop, so
+      // there must be no warning either.
+      const { content, warnings } = inbound([block]);
+
+      expect(content).toEqual([{ type: "text", text: "" }]);
+      expect(warnings).toEqual([]);
+    });
+
+    // ── rule 2: the drops with no branch of their own ──────────────────────
+    it.each([
+      ["a kind LangChain adds later", { type: "totally_unknown" }],
+      ["no type key at all", { foo: "bar" }],
+      ["an empty type", { type: "" }],
+      ["a numeric type", { type: 7 }],
+      ["a null type", { type: null }],
+      ["an array type", { type: [] }],
+      ["an object type", { type: {} }],
+    ])("logs a drop for an inbound block with %s", (_name, block) => {
+      // A block matching NO branch used to fall out of the loop leaving nothing
+      // behind — no content item and no log — while every other drop in the same
+      // loop said so. That is the drop most worth announcing: the others lose one
+      // field of a recognized block, this one loses the attachment whole.
+      //
+      // The last two also pin rule 1 for Python's benefit: an unhashable `type`
+      // raised `TypeError: unhashable type` out of its whole snapshot, where this
+      // runtime simply answered `undefined` and dropped the block.
+      const { content, warnings } = inbound([block]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping unsupported content block of type"),
+      ]);
+    });
+
+    it("keeps the blocks on either side of a block with an unhashable type", () => {
+      const { content, warnings } = inbound([
+        { type: "text", text: "before" },
+        { type: [] },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(textsOf(content)).toEqual(["before", "after"]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    // ── recovering a payload the first key failed to carry ─────────────────
+    it.each([
+      ["a number", 42],
+      ["an object", { x: 1 }],
+      ["a boolean", true],
+      ["the empty string", ""],
+    ])("reads base64 when data is %s, rather than dropping the block", (_name, data) => {
+      // `data ?? base64` / `data or base64` both stop at a present-but-unusable
+      // `data` and never reach the perfectly good `base64` behind it, dropping
+      // the whole attachment. Python's converter had exactly this bug with `or`;
+      // pinned in both runtimes so a fix to one is not lost on the other.
+      const { content, warnings } = inbound([
+        { type: "image", data, base64: "QUJD", mime_type: "image/png" },
+      ]);
+
+      expect(content).toEqual([
+        { type: "image", source: { type: "data", value: "QUJD", mimeType: "image/png" } },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("reads url when data is present but unusable", () => {
+      const { content, warnings } = inbound([
+        { type: "image", data: 42, url: "https://example.com/a.png" },
+      ]);
+
+      expect(content).toEqual([
+        { type: "image", source: { type: "url", value: "https://example.com/a.png" } },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
+    it.each([
+      ["a non-string url", { type: "image", url: 42 }],
+      ["an empty url", { type: "image", url: "" }],
+      ["every payload key empty", { type: "audio", data: "", base64: "", url: "" }],
+      ["no payload key at all", { type: "image" }],
+    ])("drops and logs a media block with %s", (_name, block) => {
+      const { content, warnings } = inbound([block]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("no data, base64 or url to carry back"),
+      ]);
+    });
+
+    // ── the same three rules on the outbound leg ───────────────────────────
+    it.each([
+      ["a type added to the AG-UI union later", { type: "totally_unknown" }],
+      ["no type key at all", { foo: "bar" }],
+    ])("logs a drop for an outbound content item with %s", (_name, item) => {
+      const { content, warnings } = outbound([item]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping unsupported content item of type"),
+      ]);
+    });
+
+    it.each([
+      ["a number", 42, "number"],
+      ["an object", { a: 1 }, "object"],
+      ["a null", null, "null"],
+    ])("drops and logs an outbound text item whose text is %s", (_name, text, described) => {
+      // Python reaches its outbound converter with a pydantic-validated
+      // `TextInputContent`, so its `text` is a `str` by construction; nothing
+      // validates the equivalent here, and a non-string forwarded into a provider
+      // content block is a 400 from the provider rather than a dropped word.
+      const { content, warnings } = outbound([{ type: "text", text }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining(`Dropping text content: text is ${described}, not a string`),
+      ]);
+    });
+
+    it("keeps the items on either side of an outbound item it cannot convert", () => {
+      const { content, warnings } = outbound([
+        { type: "text", text: "before" },
+        { type: "totally_unknown" },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(content).toEqual([
+        { type: "text", text: "before" },
+        { type: "text", text: "after" },
+      ]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it("keeps the items on either side of an outbound text item it cannot read", () => {
+      const { content, warnings } = outbound([
+        { type: "text", text: "before" },
+        { type: "text", text: 42 },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(content).toEqual([
+        { type: "text", text: "before" },
+        { type: "text", text: "after" },
+      ]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it("converts a well-formed outbound array with nothing logged", () => {
+      // The other side of every guard above: what IS usable must still convert,
+      // and must do it SILENTLY. A guard that logs on good input is a guard that
+      // trains an operator to ignore the log.
+      const { content, warnings } = outbound([
+        { type: "text", text: "hello" },
+        { type: "image", source: { type: "url", value: "https://example.com/a.png" } },
+      ]);
+
+      expect(content).toEqual([
+        { type: "text", text: "hello" },
+        { type: "image_url", image_url: { url: "https://example.com/a.png" } },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("drops and logs a media item whose url source is the empty string", () => {
+      // `mediaSourceToUrl` returns the url VERBATIM, so an empty one comes back
+      // as `""`. Emitting it would put an `image_url` block pointing at nothing
+      // on the provider request; the caller's truthiness check is what stops it,
+      // and Python's `if url:` is the line that must agree.
+      const { content, warnings } = outbound([
+        { type: "image", source: { type: "url", value: "" } },
+      ]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping image content: source could not be converted to URL"),
+      ]);
+    });
+
+    // ── the modality carried inside an image_url data URL ──────────────────
+    //
+    // `image_url` is the fallback block for every modality the outbound leg
+    // cannot send as a standard block, so the MIME type inside its data URL is
+    // the only remaining modality signal on the way back. Reading it wrong
+    // retypes the attachment in MESSAGES_SNAPSHOT permanently.
+    it.each([
+      ["an uppercase major type", "VIDEO/MP4", "video", "VIDEO/MP4"],
+      ["a mixed-case major type", "Audio/WAV", "audio", "Audio/WAV"],
+      ["a padded major type", " video/mp4", "video", " video/mp4"],
+      // The data URL's own `;` separator takes the parameters off before the
+      // MIME type is ever read, so the recorded type is the bare one.
+      ["a major type with parameters", "video/mp4;codecs=avc1", "video", "video/mp4"],
+      ["an unknown major type", "application/pdf", "document", "application/pdf"],
+      // The malformed-MIME guard. Without it these read as documents, because
+      // the major-type lookup misses and the fallback is `document` — so a
+      // MIME-less image would come back as a file. "Not major/subtype" carries
+      // no modality at all, and the historical answer for that is `image`.
+      ["no slash at all", "noslash", "image", "noslash"],
+      ["an empty subtype", "video/", "image", "video/"],
+      ["an empty major type", "/mp4", "image", "/mp4"],
+      ["nothing but a slash", "/", "image", "/"],
+      // Everything after the FIRST slash is the subtype, so `a/b/c` IS
+      // major/subtype and takes the lookup, unlike the four above.
+      ["a third segment", "a/b/c", "document", "a/b/c"],
+    ])(
+      "recovers the modality of an image_url data URL with %s",
+      (_name, mime, type, recorded) => {
+        const { content } = inbound([
+          { type: "image_url", image_url: { url: `data:${mime};base64,QUJD` } },
+        ]);
+
+        expect(content).toEqual([
+          { type, source: { type: "data", value: "QUJD", mimeType: recorded } },
+        ]);
+      },
+    );
+
+    // ── one metadata key, outbound ─────────────────────────────────────────
+    it("reads only metadata.filename outbound, and derives a name when it is absent", () => {
+      // The INBOUND reader scans `filename` then `name` then `title`, because
+      // those are the spellings langchain-core's translators read. The OUTBOUND
+      // writer must NOT: `metadata.filename` is the one documented field of the
+      // block, and widening the read here would put a name on the wire that the
+      // AG-UI item never claimed was a filename. Python's
+      // `_filename_from_metadata` reads the same single key.
+      const { content } = outbound([
+        {
+          type: "document",
+          source: { type: "data", value: "aGk=", mimeType: "application/pdf" },
+          metadata: { name: "from-name.pdf", title: "from-title.pdf" },
+        },
+      ]);
+
+      expect(content).toEqual([
+        {
+          type: "file",
+          source_type: "base64",
+          data: "aGk=",
+          mime_type: "application/pdf",
+          metadata: { filename: "attachment.pdf" },
+        },
+      ]);
+    });
+  });
+
   // ── Provider boundary ────────────────────────────────────────────────────
   //
   // The tests above assert the SHAPE this adapter emits. On their own that is
@@ -1186,8 +1598,11 @@ describe("Multimodal Message Conversion", () => {
       });
     });
 
-    // The four filename situations an attachment can be in, each one carried all
-    // the way to the wire. This is the evidence that the value is load-bearing:
+    // The five filename situations an attachment can be in, each one carried all
+    // the way to the wire: supplied; supplied-but-empty on a typed item;
+    // supplied-but-empty on a legacy binary item; absent with a MIME type
+    // `FILENAME_EXTENSIONS` knows; absent with one it does not.
+    // This is the evidence that the value is load-bearing:
     // the translator THROWS on a file part it cannot find a name for, so a row
     // that reaches `parts` at all is a row that does not kill the run. Mirrored
     // in Python by `test_every_filename_situation_reaches_the_provider`.
@@ -2038,4 +2453,168 @@ describe("resolveReasoningContent - DeepSeek-style reasoning_content", () => {
     expect(result).not.toBeNull();
     expect(result!.text).toBe("from content block");
   });
+});
+
+// ── The cross-runtime parity table ─────────────────────────────────────────
+//
+// The mechanism that makes DRIFT fail a test instead of surviving to review.
+//
+// This adapter exists twice — once here, once in `ag_ui_langgraph/utils.py` —
+// implementing one contract as two independent bodies of code. Three review
+// rounds found the same class of defect fixed on one side and not mirrored to
+// the other; nothing in either suite could see it, because each runtime pinned
+// behaviour the other left unpinned, so every divergence survived until a human
+// read both files side by side.
+//
+// `../../cross-runtime-parity-cases.json` is the shared table both suites read.
+// It is the single source of truth for the CASES and for the EXPECTED OUTCOME:
+// a case added there is picked up by this suite and by Python's
+// `TestCrossRuntimeParityTable` with no edit to either. There is deliberately no
+// second list to keep in sync — hand-mirroring is the exact failure this exists
+// to prevent.
+//
+// Read the `readme` array at the top of that file before adding a case.
+describe("cross-runtime parity table", () => {
+  interface ParityCase {
+    id: string;
+    direction: "inbound" | "outbound";
+    axis: string;
+    why: string;
+    content: unknown[];
+    expect: { kept: unknown[]; dropped: number; loggedDrops: number };
+  }
+
+  const table: { readme: string[]; cases: ParityCase[] } = JSON.parse(
+    readFileSync(new URL("../../cross-runtime-parity-cases.json", import.meta.url), "utf8"),
+  );
+
+  /**
+   * Project this runtime's output onto the table's neutral vocabulary.
+   *
+   * SHAPE ONLY. The two runtimes emit the same content under deliberately
+   * different keys — see {@link StandardMediaBlock} in `utils.ts` — and that
+   * difference is documented, not drift. Everything else survives the
+   * projection: a different VALUE, a different survivor, or a different count
+   * still fails. Nothing here inspects the input, so no case can be normalized
+   * into agreement.
+   */
+  function canonical(direction: string, items: any[]): unknown[] {
+    if (direction === "inbound") {
+      return items.map((item) =>
+        item.type === "text"
+          ? { kind: "text", text: item.text }
+          : {
+              kind: item.type,
+              source: item.source?.type,
+              value: item.source?.value,
+              mimeType: item.source?.mimeType || null,
+              filename: item.metadata?.filename || null,
+            },
+      );
+    }
+    return items.map((block) => {
+      if (block.type === "text") return { kind: "text", text: block.text };
+      if (block.type === "image_url") return { kind: "image_url", url: block.image_url?.url };
+      return {
+        kind: "standard",
+        blockType: block.type,
+        data: block.data,
+        mimeType: block.mime_type || null,
+        filename: block.metadata?.filename || null,
+      };
+    });
+  }
+
+  /**
+   * Run one case and reduce it to the outcome triple the table records.
+   *
+   * A THROW is reported here rather than allowed to escape as a bare stack: rule
+   * 1 of the malformed-input contract is that no case in this table may throw in
+   * either runtime, so a throw is a parity failure with a name, not an accident
+   * of the harness.
+   */
+  function outcomeOf(testCase: ParityCase) {
+    const warnings: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(String(args[0]));
+    });
+    try {
+      const converted =
+        testCase.direction === "inbound"
+          ? (
+              langchainMessagesToAgui([
+                {
+                  id: "parity",
+                  type: "human",
+                  content: testCase.content,
+                } as unknown as LangGraphMessage,
+              ])[0] as UserMessage
+            )?.content
+          : aguiMessagesToLangChain([
+              { id: "parity", role: "user", content: testCase.content } as unknown as UserMessage,
+            ])[0]?.content;
+      const kept = canonical(testCase.direction, Array.isArray(converted) ? converted : []);
+      return {
+        kept,
+        dropped: testCase.content.length - kept.length,
+        // Rule 2 of the malformed-input contract counts warnings that BEGIN
+        // "Dropping ". The rest of the prose legitimately differs between the
+        // runtimes (`int` vs `number`, module prefixes), so asserting it would
+        // fail on wording rather than on behaviour.
+        loggedDrops: warnings.filter((line) => /Dropping /.test(line)).length,
+      };
+    } catch (error) {
+      throw new Error(
+        `${report(testCase)}\n` +
+          `  This runtime THREW ${String(error)}\n` +
+          "  Rule 1 of the malformed-input contract is DROP, NEVER THROW — no case in\n" +
+          "  the shared table may throw in either runtime, and the other one does not\n" +
+          "  throw on this input.",
+        { cause: error },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  /**
+   * The failure text. A bare boolean is useless to whoever hits this: it has to
+   * say which case, what the shared table says both runtimes must produce, and
+   * why the case is in the table at all.
+   */
+  function report(testCase: ParityCase) {
+    return [
+      `cross-runtime parity case "${testCase.id}" (${testCase.direction}, ${testCase.axis})`,
+      `  why: ${testCase.why}`,
+      `  input: ${JSON.stringify(testCase.content)}`,
+      "  This runtime (TypeScript) disagrees with cross-runtime-parity-cases.json,",
+      "  which records the outcome BOTH adapters must produce and which the Python",
+      "  adapter produces today. Fix the runtime that is wrong — do not split the",
+      "  expectation.",
+    ].join("\n");
+  }
+
+  const inboundCases = table.cases.filter((c) => c.direction === "inbound");
+  const outboundCases = table.cases.filter((c) => c.direction === "outbound");
+
+  it("reads a non-empty shared table", () => {
+    // A path typo or a truncated file would otherwise turn every parity
+    // assertion below into zero assertions, silently.
+    expect(inboundCases.length).toBeGreaterThan(0);
+    expect(outboundCases.length).toBeGreaterThan(0);
+  });
+
+  it.each(inboundCases.map((c) => [c.id, c] as const))(
+    "inbound %s",
+    (_id, testCase) => {
+      expect(outcomeOf(testCase), report(testCase)).toEqual(testCase.expect);
+    },
+  );
+
+  it.each(outboundCases.map((c) => [c.id, c] as const))(
+    "outbound %s",
+    (_id, testCase) => {
+      expect(outcomeOf(testCase), report(testCase)).toEqual(testCase.expect);
+    },
+  );
 });

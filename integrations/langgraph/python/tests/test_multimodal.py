@@ -2,9 +2,13 @@
 Tests for multimodal message conversion between AG-UI and LangChain formats.
 """
 
+import json
+import logging
+import pathlib
 import unittest
 import warnings
 from datetime import datetime
+from typing import NamedTuple
 from ag_ui.core import (
     UserMessage,
     TextInputContent,
@@ -1361,8 +1365,10 @@ class TestProviderBoundary(unittest.TestCase):
                 self.assertIsInstance(returned, ImageInputContent)
 
     def test_every_filename_situation_reaches_the_provider(self):
-        """The four filename situations an attachment can be in, each carried all
-        the way to the payload.
+        """The five filename situations an attachment can be in, each carried all
+        the way to the payload: supplied; supplied-but-empty on a typed item;
+        supplied-but-empty on a legacy binary item; absent with a MIME type
+        `_FILENAME_EXTENSIONS` knows; absent with one it does not.
 
         langchain-core only WARNS about a nameless file block, so the assertion
         here is on the name that lands — but the mirrored TypeScript translator
@@ -2353,9 +2359,31 @@ class TestMalformedGraphContentDegrades(unittest.TestCase):
     loses the entire thread.
 
     So every case below asserts the same two things: the conversion does not
-    raise, and the blocks around the bad one survive. The TypeScript adapter
-    already skips these; a divergence between the runtimes on the same wire input
-    is the class of bug this branch exists to close.
+    raise, and the blocks around the bad one survive.
+
+    An earlier revision of this docstring said "the TypeScript adapter already
+    skips these". It did not. Measured by running the 16 inputs this class
+    exercises through `langchainMessagesToAgui` at `8d53261c4` (the commit before
+    `a2a24afab`, which wrote the malformed-input contract into both files) and
+    again after:
+
+      * ``{"image_url": {"url": 42}}`` — TypeScript RAISED
+        ``TypeError: imageUrl.startsWith is not a function`` out of the whole
+        message-list conversion. Not skipped: the client got no messages at all.
+      * ``{"type": "text", "text": {...}}`` — TypeScript emitted it VERBATIM into
+        ``TextInputContent.text``, where it failed schema validation downstream.
+        Not skipped either.
+      * the other eleven — TypeScript did skip them, but SILENTLY: zero warnings,
+        where this runtime logged one. Skipping and announcing a drop are two
+        different behaviours and the runtimes agreed on only the first.
+      * the two non-string ``mime_type`` cases — TypeScript already matched.
+
+    What is true NOW: as of `a2a24afab` all sixteen agree on the value returned,
+    on what was dropped, and on a drop being logged. Keeping them agreeing is not
+    this docstring's job — it is
+    `../../cross-runtime-parity-cases.json`, the shared table both suites read
+    (see `TestCrossRuntimeParityTable`), which fails when either runtime moves
+    alone.
     """
 
     # ── the `image_url` payload ──────────────────────────────────────────
@@ -2541,6 +2569,679 @@ class TestMalformedGraphContentDegrades(unittest.TestCase):
             messages[1].tool_calls[0].function.arguments,
             '{"when": "2026-01-02T03:04:05"}',
         )
+
+
+class _ConverterOutcome(NamedTuple):
+    """What one converter call did, in the three terms the contract is written in."""
+
+    content: list
+    warnings: list
+
+
+def _run_converter(direction, content):
+    """Drive one converter and capture every warning it emitted.
+
+    `assertLogs` cannot express "and nothing was logged" without a second API, and
+    the contract's second rule is a COUNT ("logged, once"), not a presence check —
+    so the records are captured directly and counted.
+    """
+    logger = logging.getLogger("ag_ui_langgraph.utils")
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    previous_level, previous_propagate = logger.level, logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    try:
+        if direction == "inbound":
+            converted = convert_langchain_multimodal_to_agui(content)
+        else:
+            converted = convert_agui_multimodal_to_langchain(content)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+    return _ConverterOutcome(
+        list(converted),
+        [r.getMessage() for r in records if r.levelno >= logging.WARNING],
+    )
+
+
+class TestMalformedInputContract(unittest.TestCase):
+    """THE MALFORMED-INPUT CONTRACT.
+
+    The three rules written above the two converters in ``ag_ui_langgraph/utils.py``
+    (and above their mirror images in the TypeScript adapter's ``utils.ts``): DROP
+    NEVER RAISE, EVERY DROP IS LOGGED, ONE BAD ITEM COSTS ONLY ITSELF. Every test
+    here asserts one of those three on one branch, and every one has a named
+    counterpart in the TypeScript suite's ``describe("the malformed-input
+    contract")`` — because the defect these exist to catch is a fix landing in one
+    runtime and not the other. `cross-runtime-parity-cases.json`, read by
+    `TestCrossRuntimeParityTable` below, is the same claim made as data.
+
+    The distinction the second rule turns on: a DROP is logged, a KEPT block is
+    not. An assertion on the return value alone cannot tell a logged drop from a
+    silent one, which is how every past divergence here survived review.
+    """
+
+    def _inbound(self, content):
+        return _run_converter("inbound", content)
+
+    def _outbound(self, content):
+        return _run_converter("outbound", content)
+
+    # ── rule 1: the `image_url` payload ──────────────────────────────────
+    def test_non_string_url_is_dropped_instead_of_raising(self):
+        """``{"url": 42}`` is truthy, so a raw read handed a NUMBER to
+        ``startswith("data:")`` and raised out of the loop that builds the whole
+        MESSAGES_SNAPSHOT — the client got no messages at all, over one
+        attachment."""
+        outcome = self._inbound([{"type": "image_url", "image_url": {"url": 42}}])
+
+        self.assertEqual(outcome.content, [])
+        self.assertEqual(len(outcome.warnings), 1)
+        self.assertIn(
+            "Dropping image_url block: no usable url in its dict payload",
+            outcome.warnings[0],
+        )
+
+    def test_every_unusable_image_url_payload_logs_exactly_one_drop(self):
+        """The QUIET half of the same defect: these never raised, they minted an
+        ``ImageInputContent`` whose url is ``""`` — an attachment pointing at
+        nothing — or dropped the block with nothing said."""
+        payloads = [
+            ("a non-string url", {"url": 42}),
+            ("an empty url", {"url": ""}),
+            ("a null url", {"url": None}),
+            ("a dict url", {"url": {}}),
+            ("a None payload", None),
+            ("a numeric payload", 42),
+            ("a boolean payload", True),
+            ("a list payload", []),
+            ("a url wrapped in a list", ["https://example.com/a.png"]),
+            ("a dict with no url key", {}),
+            ("an empty bare string", ""),
+        ]
+        for name, payload in payloads:
+            with self.subTest(payload=name):
+                outcome = self._inbound(
+                    [{"type": "image_url", "image_url": payload}]
+                )
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+                self.assertIn("Dropping image_url block", outcome.warnings[0])
+
+    def test_image_url_block_with_no_payload_key_logs_one_drop(self):
+        outcome = self._inbound([{"type": "image_url"}])
+
+        self.assertEqual(outcome.content, [])
+        self.assertEqual(
+            outcome.warnings,
+            ["Dropping image_url block: no usable url in its NoneType payload"],
+        )
+
+    # ── rule 3 ───────────────────────────────────────────────────────────
+    def test_blocks_on_either_side_of_an_unreadable_image_url_survive(self):
+        """Why rule 1 is worth a rule: the raise did not degrade one attachment,
+        it discarded the two text blocks beside it as well."""
+        outcome = self._inbound([
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": 42}},
+            {"type": "text", "text": "after"},
+        ])
+
+        self.assertEqual([c.text for c in outcome.content], ["before", "after"])
+        self.assertEqual(len(outcome.warnings), 1)
+
+    def test_every_other_message_survives_one_unreadable_block(self):
+        with self.assertLogs("ag_ui_langgraph.utils", level="WARNING"):
+            messages = langchain_messages_to_agui([
+                HumanMessage(id="m1", content="before"),
+                HumanMessage(
+                    id="m2",
+                    content=[{"type": "image_url", "image_url": {"url": 42}}],
+                ),
+                HumanMessage(id="m3", content="after"),
+            ])
+
+        self.assertEqual([m.id for m in messages], ["m1", "m2", "m3"])
+        self.assertEqual(messages[0].content, "before")
+        self.assertEqual(messages[2].content, "after")
+
+    # ── rule 1 + 2: the inbound text branch ──────────────────────────────
+    def test_non_string_text_blocks_are_dropped_and_logged(self):
+        """``TextInputContent.text`` is a ``str``; anything else raised a
+        ValidationError that aborted the whole message list. The mirrored
+        TypeScript branch was gated on TRUTHINESS instead, which emitted a truthy
+        non-string VERBATIM and failed schema validation downstream."""
+        for text, described in [
+            (42, "int"),
+            ({"a": 1}, "dict"),
+            (None, "NoneType"),
+            (["x"], "list"),
+            (True, "bool"),
+        ]:
+            with self.subTest(text=described):
+                outcome = self._inbound([{"type": "text", "text": text}])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(
+                    outcome.warnings,
+                    [f"Dropping text block: text is {described}, not a string"],
+                )
+
+    def test_blocks_on_either_side_of_an_unusable_text_block_survive(self):
+        outcome = self._inbound([
+            {"type": "text", "text": "before"},
+            {"type": "text", "text": 42},
+            {"type": "text", "text": "after"},
+        ])
+
+        self.assertEqual([c.text for c in outcome.content], ["before", "after"])
+        self.assertEqual(len(outcome.warnings), 1)
+
+    def test_empty_and_absent_text_are_kept_and_say_nothing(self):
+        """The other end of the TypeScript truthiness gate: an empty text is a
+        block THIS runtime keeps, and the TypeScript one dropped silently — a
+        rule-2 violation on a block that is not malformed at all. ``""`` is the
+        value, not a drop, so there must be no warning either."""
+        for name, block in [
+            ("present but empty", {"type": "text", "text": ""}),
+            ("absent", {"type": "text"}),
+        ]:
+            with self.subTest(text=name):
+                outcome = self._inbound([block])
+                self.assertEqual([c.text for c in outcome.content], [""])
+                self.assertEqual(outcome.warnings, [])
+
+    # ── rule 2: the drops with no branch of their own ────────────────────
+    def test_unrecognised_inbound_blocks_are_logged(self):
+        """A block matching NO branch fell out of the loop leaving nothing behind
+        — no content item and no log — while this converter's own docstring
+        claimed such a block "is SKIPPED AND LOGGED". It was skipped; it was never
+        logged.
+
+        The last two also pin rule 1: an unhashable ``type`` raised
+        ``TypeError: unhashable type`` out of the whole snapshot, where the
+        TypeScript adapter's ``Map`` lookup simply answered ``undefined``.
+        """
+        blocks = [
+            ("a kind langchain-core adds later", {"type": "totally_unknown"}),
+            ("no type key at all", {"foo": "bar"}),
+            ("an empty type", {"type": ""}),
+            ("a numeric type", {"type": 7}),
+            ("a None type", {"type": None}),
+            ("a list type", {"type": []}),
+            ("a dict type", {"type": {}}),
+        ]
+        for name, block in blocks:
+            with self.subTest(block=name):
+                outcome = self._inbound([block])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+                self.assertIn(
+                    "Dropping unsupported content block of type", outcome.warnings[0]
+                )
+
+    def test_blocks_beside_an_unhashable_type_survive(self):
+        outcome = self._inbound([
+            {"type": "text", "text": "before"},
+            {"type": []},
+            {"type": "text", "text": "after"},
+        ])
+
+        self.assertEqual([c.text for c in outcome.content], ["before", "after"])
+        self.assertEqual(len(outcome.warnings), 1)
+
+    def test_non_dict_entries_are_dropped_and_logged(self):
+        """``.get`` on one of these would raise out of the whole message list, so
+        the loop never called it — but it said nothing either."""
+        for entry, described in [
+            (None, "NoneType"),
+            ("just a string", "str"),
+            (7, "int"),
+            (True, "bool"),
+            (["x"], "list"),
+        ]:
+            with self.subTest(entry=described):
+                outcome = self._inbound([entry])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(
+                    outcome.warnings,
+                    [f"Dropping content block: not a dict ({described})"],
+                )
+
+    # ── recovering a payload the first key failed to carry ───────────────
+    def test_base64_is_read_when_data_is_present_but_unusable(self):
+        """``item.get("data") or item.get("base64")`` short-circuits on anything
+        TRUTHY, so a non-string ``data`` stopped the read dead and the perfectly
+        good ``base64`` behind it was never reached — the whole attachment was
+        dropped, while the TypeScript reader recovered it."""
+        for data, described in [(42, "int"), ({"x": 1}, "dict"), (True, "bool"), ("", "empty str")]:
+            with self.subTest(data=described):
+                outcome = self._inbound([
+                    {"type": "image", "data": data, "base64": "QUJD", "mime_type": "image/png"}
+                ])
+                self.assertEqual(len(outcome.content), 1)
+                self.assertEqual(outcome.content[0].source.value, "QUJD")
+                self.assertEqual(outcome.content[0].source.mime_type, "image/png")
+                self.assertEqual(outcome.warnings, [])
+
+    def test_url_is_read_when_data_is_present_but_unusable(self):
+        outcome = self._inbound([
+            {"type": "image", "data": 42, "url": "https://example.com/a.png"}
+        ])
+
+        self.assertEqual(len(outcome.content), 1)
+        self.assertEqual(outcome.content[0].source.type, "url")
+        self.assertEqual(outcome.content[0].source.value, "https://example.com/a.png")
+        self.assertEqual(outcome.warnings, [])
+
+    def test_empty_mime_type_falls_through_to_the_spelling_behind_it(self):
+        """A block carrying BOTH key spellings, the first one empty, must not lose
+        its real MIME type and arrive as ``application/octet-stream``. Mirrors the
+        TypeScript suite's "keeps mime_type when mimeType is the empty string",
+        which had no counterpart here — exactly the asymmetry that lets a fix land
+        in one runtime and not the other."""
+        for name, first in [("empty", ""), ("non-string", 42)]:
+            with self.subTest(mimeType=name):
+                outcome = self._inbound([
+                    {
+                        "type": "file",
+                        "mimeType": first,
+                        "mime_type": "application/pdf",
+                        "base64": "JVBERi0xLjQK",
+                    }
+                ])
+                self.assertEqual(outcome.content[0].source.mime_type, "application/pdf")
+                self.assertEqual(outcome.warnings, [])
+
+    def test_unreadable_media_blocks_are_dropped_and_logged(self):
+        blocks = [
+            ("a non-string url", {"type": "image", "url": 42}),
+            ("an empty url", {"type": "image", "url": ""}),
+            ("every payload key empty", {"type": "audio", "data": "", "base64": "", "url": ""}),
+            ("no payload key at all", {"type": "image"}),
+        ]
+        for name, block in blocks:
+            with self.subTest(block=name):
+                outcome = self._inbound([block])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+                self.assertIn("no data, base64 or url to carry back", outcome.warnings[0])
+
+    # ── the modality carried inside an image_url data URL ────────────────
+    def test_modality_is_recovered_from_the_data_url_mime_type(self):
+        """``image_url`` is the fallback block for every modality the outbound leg
+        cannot send as a standard block, so the MIME type inside its data URL is
+        the only remaining modality signal on the way back. Reading it wrong
+        retypes the attachment in MESSAGES_SNAPSHOT permanently.
+
+        The four ``image`` rows are the malformed-MIME guard. Without it they read
+        as DOCUMENTS — the major-type lookup misses and the fallback is
+        ``document`` — so a MIME-less image would come back as a file. A string
+        that is not ``major/subtype`` carries no modality at all.
+        """
+        cases = [
+            ("an uppercase major type", "VIDEO/MP4", VideoInputContent, "VIDEO/MP4"),
+            ("a mixed-case major type", "Audio/WAV", AudioInputContent, "Audio/WAV"),
+            ("a padded major type", " video/mp4", VideoInputContent, " video/mp4"),
+            # The data URL's own `;` separator takes the parameters off before the
+            # MIME type is ever read, so the recorded type is the bare one.
+            ("parameters", "video/mp4;codecs=avc1", VideoInputContent, "video/mp4"),
+            ("an unknown major type", "application/pdf", DocumentInputContent, "application/pdf"),
+            ("no slash at all", "noslash", ImageInputContent, "noslash"),
+            ("an empty subtype", "video/", ImageInputContent, "video/"),
+            ("an empty major type", "/mp4", ImageInputContent, "/mp4"),
+            ("nothing but a slash", "/", ImageInputContent, "/"),
+            # Everything after the FIRST slash is the subtype, so `a/b/c` IS
+            # major/subtype and takes the lookup, unlike the four above.
+            ("a third segment", "a/b/c", DocumentInputContent, "a/b/c"),
+        ]
+        for name, mime, expected_class, recorded in cases:
+            with self.subTest(mime=name):
+                outcome = self._inbound([
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,QUJD"}}
+                ])
+                self.assertEqual(len(outcome.content), 1)
+                self.assertIsInstance(outcome.content[0], expected_class)
+                self.assertEqual(outcome.content[0].source.mime_type, recorded)
+                self.assertEqual(outcome.content[0].source.value, "QUJD")
+
+    # ── the same three rules on the outbound leg ─────────────────────────
+    #
+    # These converters do not receive the same thing in the two runtimes.
+    # TypeScript reads client JSON that nothing validates; this one reads
+    # pydantic-validated AG-UI content objects, so an item that cannot pass
+    # validation never becomes a typed content object and arrives as the raw dict
+    # it was — which lands in the terminal `else`. The two runtimes therefore
+    # reach some of these drops through DIFFERENT branches while producing the
+    # same outcome, and that is what `cross-runtime-parity-cases.json` asserts.
+    def test_unrecognised_outbound_items_are_logged(self):
+        for name, item in [
+            ("a type added to the AG-UI union later", {"type": "totally_unknown"}),
+            ("no type key at all", {"foo": "bar"}),
+            ("an item that is not a content object", None),
+        ]:
+            with self.subTest(item=name):
+                outcome = self._outbound([item])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+                self.assertIn(
+                    "Dropping unsupported content item of type", outcome.warnings[0]
+                )
+
+    def test_a_non_string_text_item_is_dropped_not_forwarded(self):
+        """``TextInputContent`` cannot hold a non-string ``text`` — pydantic
+        rejects it — so such an item reaches this converter as a raw dict and is
+        dropped by the terminal ``else``. The mirrored TypeScript converter has no
+        validation in front of it and needs an explicit guard on the same value,
+        which is why it logs a different message for the same outcome."""
+        for text in (42, {"a": 1}, None):
+            with self.subTest(text=type(text).__name__):
+                with self.assertRaises(Exception):
+                    TextInputContent(type="text", text=text)
+
+                outcome = self._outbound([{"type": "text", "text": text}])
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+
+    def test_items_on_either_side_of_an_unconvertible_outbound_item_survive(self):
+        outcome = self._outbound([
+            TextInputContent(type="text", text="before"),
+            {"type": "totally_unknown"},
+            TextInputContent(type="text", text="after"),
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [{"type": "text", "text": "before"}, {"type": "text", "text": "after"}],
+        )
+        self.assertEqual(len(outcome.warnings), 1)
+
+    def test_a_well_formed_outbound_array_converts_silently(self):
+        """The other side of every guard above: what IS usable must still convert,
+        and must do it SILENTLY. A guard that logs on good input is a guard that
+        trains an operator to ignore the log."""
+        outcome = self._outbound([
+            TextInputContent(type="text", text="hello"),
+            ImageInputContent(
+                type="image",
+                source=InputContentUrlSource(type="url", value="https://example.com/a.png"),
+            ),
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ],
+        )
+        self.assertEqual(outcome.warnings, [])
+
+    def test_an_empty_url_source_is_dropped_not_emitted(self):
+        """``_media_source_to_url`` returns the url VERBATIM, so an empty one comes
+        back as ``""``. Emitting it would put an ``image_url`` block pointing at
+        nothing on the provider request; the caller's truthiness check is what
+        stops it, and the TypeScript ``if (url)`` is the line that must agree.
+
+        ``InputContentUrlSource(value="")`` passes validation — ``value`` is a
+        required ``str``, and the empty string is one — so this is reachable from
+        a real client, not a constructed impossibility."""
+        outcome = self._outbound([
+            ImageInputContent(
+                type="image", source=InputContentUrlSource(type="url", value="")
+            )
+        ])
+
+        self.assertEqual(outcome.content, [])
+        self.assertEqual(
+            outcome.warnings,
+            ["Dropping ImageInputContent content: source could not be converted to URL"],
+        )
+
+    # ── one metadata key, outbound ───────────────────────────────────────
+    def test_only_metadata_filename_is_read_outbound(self):
+        """The INBOUND reader scans ``filename`` then ``name`` then ``title``,
+        because those are the spellings langchain-core's translators read. The
+        OUTBOUND writer must NOT: ``metadata.filename`` is the one documented
+        field of the block, and widening the read here would put a name on the
+        wire that the AG-UI item never claimed was a filename. The TypeScript
+        ``filenameFromMetadata`` reads the same single key."""
+        outcome = self._outbound([
+            DocumentInputContent(
+                type="document",
+                source=InputContentDataSource(
+                    type="data", value="aGk=", mime_type="application/pdf"
+                ),
+                metadata={"name": "from-name.pdf", "title": "from-title.pdf"},
+            )
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [
+                {
+                    "type": "file",
+                    "base64": "aGk=",
+                    "mime_type": "application/pdf",
+                    # DERIVED, not `from-name.pdf`.
+                    "filename": "attachment.pdf",
+                }
+            ],
+        )
+        self.assertEqual(outcome.warnings, [])
+
+
+class TestCrossRuntimeParityTable(unittest.TestCase):
+    """The cross-runtime parity table — the mechanism that makes DRIFT fail a test.
+
+    This adapter exists twice — once here, once in the TypeScript ``utils.ts`` —
+    implementing one contract as two independent bodies of code. Three review
+    rounds found the same class of defect fixed on one side and not mirrored to
+    the other; nothing in either suite could see it, because each runtime pinned
+    behaviour the other left unpinned, so every divergence survived until a human
+    read both files side by side.
+
+    ``integrations/langgraph/cross-runtime-parity-cases.json`` is the shared table
+    both suites read. It is the single source of truth for the CASES and for the
+    EXPECTED OUTCOME: a case added there is picked up by this suite and by the
+    TypeScript ``describe("cross-runtime parity table")`` with no edit to either.
+    There is deliberately no second list to keep in sync — hand-mirroring is the
+    exact failure this exists to prevent.
+
+    Read the ``readme`` array at the top of that file before adding a case.
+    """
+
+    TABLE_PATH = (
+        pathlib.Path(__file__).resolve().parents[2] / "cross-runtime-parity-cases.json"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.table = json.loads(cls.TABLE_PATH.read_text())
+
+    _CLASS_BY_TYPE = {
+        "text": TextInputContent,
+        "binary": BinaryInputContent,
+        "image": ImageInputContent,
+        "audio": AudioInputContent,
+        "video": VideoInputContent,
+        "document": DocumentInputContent,
+    }
+
+    @classmethod
+    def _build_outbound_item(cls, item):
+        """Turn a table item into whatever THIS converter would really receive.
+
+        The table records outbound inputs as plain JSON, because the TypeScript
+        converter reads exactly that. This one reads pydantic-validated content
+        objects, so each item is built into its declared class. An item that
+        cannot pass validation is passed through as the raw dict it is — which is
+        also what production does with one, since an item that fails validation
+        never becomes a typed content object.
+        """
+        if not isinstance(item, dict):
+            return item
+        content_class = cls._CLASS_BY_TYPE.get(item.get("type"))
+        if content_class is None:
+            return item
+        kwargs = dict(item)
+        source = kwargs.get("source")
+        if isinstance(source, dict):
+            source_class = (
+                InputContentDataSource
+                if source.get("type") == "data"
+                else InputContentUrlSource
+            )
+            try:
+                kwargs["source"] = source_class(**source)
+            except Exception:
+                return item
+        try:
+            return content_class(**kwargs)
+        except Exception:
+            return item
+
+    @staticmethod
+    def _canonical(direction, items):
+        """Project this runtime's output onto the table's neutral vocabulary.
+
+        SHAPE ONLY. The two runtimes emit the same content under deliberately
+        different keys — see `_standard_media_block` and its TypeScript
+        counterpart — and that difference is documented, not drift. Everything
+        else survives the projection: a different VALUE, a different survivor, or
+        a different count still fails. Nothing here inspects the input, so no case
+        can be normalized into agreement.
+        """
+        if direction == "inbound":
+            kinds = {
+                "ImageInputContent": "image",
+                "AudioInputContent": "audio",
+                "VideoInputContent": "video",
+                "DocumentInputContent": "document",
+            }
+            canonical = []
+            for item in items:
+                if isinstance(item, TextInputContent):
+                    canonical.append({"kind": "text", "text": item.text})
+                    continue
+                metadata = item.metadata if isinstance(item.metadata, dict) else {}
+                canonical.append({
+                    "kind": kinds[type(item).__name__],
+                    "source": item.source.type,
+                    "value": item.source.value,
+                    "mimeType": getattr(item.source, "mime_type", None) or None,
+                    "filename": metadata.get("filename") or None,
+                })
+            return canonical
+
+        canonical = []
+        for block in items:
+            kind = block.get("type")
+            if kind == "text":
+                canonical.append({"kind": "text", "text": block.get("text")})
+            elif kind == "image_url":
+                canonical.append(
+                    {"kind": "image_url", "url": block.get("image_url", {}).get("url")}
+                )
+            else:
+                canonical.append({
+                    "kind": "standard",
+                    "blockType": kind,
+                    "data": block.get("base64"),
+                    "mimeType": block.get("mime_type") or None,
+                    "filename": block.get("filename") or None,
+                })
+        return canonical
+
+    def _outcome_of(self, case):
+        """Run one case and reduce it to the outcome triple the table records.
+
+        A RAISE is reported here rather than allowed to escape as a bare
+        traceback: rule 1 of the malformed-input contract is that no case in this
+        table may raise in either runtime, so a raise is a parity failure with a
+        name, not an accident of the harness.
+        """
+        content = case["content"]
+        if case["direction"] == "outbound":
+            content = [self._build_outbound_item(i) for i in content]
+        try:
+            outcome = _run_converter(case["direction"], content)
+        except Exception as exc:  # noqa: BLE001
+            raise self.failureException(
+                f"{self._report(case)}"
+                f"  This runtime RAISED {type(exc).__name__}: {exc}\n"
+                "  Rule 1 of the malformed-input contract is DROP, NEVER RAISE — no\n"
+                "  case in the shared table may raise in either runtime, and the other\n"
+                "  one does not raise on this input.\n"
+            ) from exc
+        kept = self._canonical(case["direction"], outcome.content)
+        return {
+            "kept": kept,
+            "dropped": len(case["content"]) - len(kept),
+            # Rule 2 of the malformed-input contract counts warnings that BEGIN
+            # "Dropping ". The rest of the prose legitimately differs between the
+            # runtimes (`int` vs `number`, module prefixes), so asserting it would
+            # fail on wording rather than on behaviour.
+            "loggedDrops": sum(
+                1 for w in outcome.warnings if w.startswith("Dropping ")
+            ),
+        }
+
+    @staticmethod
+    def _report(case):
+        """The failure header.
+
+        A bare boolean is useless to whoever hits this: it has to say which case,
+        what the shared table says both runtimes must produce, and why the case is
+        in the table at all.
+        """
+        return (
+            f'\ncross-runtime parity case "{case["id"]}" '
+            f'({case["direction"]}, {case["axis"]})\n'
+            f'  why: {case["why"]}\n'
+            f'  input: {json.dumps(case["content"])}\n'
+            "  This runtime (Python) disagrees with cross-runtime-parity-cases.json,\n"
+            "  which records the outcome BOTH adapters must produce and which the\n"
+            "  TypeScript adapter produces today. Fix the runtime that is wrong — do\n"
+            "  not split the expectation.\n"
+        )
+
+    def _assert_case(self, case):
+        self.assertEqual(
+            case["expect"],
+            self._outcome_of(case),
+            self._report(case)
+            + "  `first` above is the shared table; `second` is this runtime.\n",
+        )
+
+    def test_the_shared_table_is_readable_and_non_empty(self):
+        """A path typo or a truncated file would otherwise turn every parity
+        assertion below into zero assertions, silently."""
+        directions = {c["direction"] for c in self.table["cases"]}
+        self.assertEqual(directions, {"inbound", "outbound"})
+        self.assertGreater(len(self.table["cases"]), 0)
+
+    def test_inbound_cases_match_the_shared_table(self):
+        cases = [c for c in self.table["cases"] if c["direction"] == "inbound"]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                self._assert_case(case)
+
+    def test_outbound_cases_match_the_shared_table(self):
+        cases = [c for c in self.table["cases"] if c["direction"] == "outbound"]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                self._assert_case(case)
 
 
 if __name__ == "__main__":
