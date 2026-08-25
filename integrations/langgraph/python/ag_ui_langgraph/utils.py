@@ -243,6 +243,31 @@ def _read_incoming_media_block(item: Dict[str, Any]) -> _IncomingMedia | None:
 
     url = _first_non_empty_string(item.get("url"))
     if url:
+        # A `data:` URL is url-SHAPED but it is not a reference: RFC 2397 puts
+        # the bytes in the string. Recording it as an AG-UI URL SOURCE writes a
+        # claim into the thread that the attachment lives somewhere else, and the
+        # outbound leg then believes it — a PDF stored this way went back out as
+        # `image_url`, the exact provider failure the standard-block path exists
+        # to prevent. Normalizing here rather than only outbound means the THREAD
+        # is right too, which is what `MESSAGES_SNAPSHOT` shows the client and
+        # what `flatten_user_content` and every other reader of AG-UI content
+        # sees.
+        #
+        # The MIME type inside the data URL wins over the block's declared one,
+        # for the reason `_inline_media_data` gives; a data URL with an omitted
+        # mediatype falls back to the block's.
+        #
+        # A REMOTE url, and a data URL this cannot read as inline bytes (no
+        # `;base64`, no comma, empty payload — see `_parse_base64_data_url`),
+        # stay url sources exactly as before.
+        data_url = _parse_base64_data_url(url)
+        if data_url:
+            return _IncomingMedia(
+                data_url[1],
+                False,
+                data_url[0] if data_url[0] is not None else mime_type,
+                filename,
+            )
         return _IncomingMedia(url, True, mime_type, filename)
 
     # `file_id` / `fileId` / `id`-only blocks reference provider-side storage
@@ -880,6 +905,112 @@ _OPENAI_AUDIO_MIME_TYPES = {
 }
 
 
+def _parse_base64_data_url(value: Any) -> tuple[str | None, str] | None:
+    """The ``(mime_type, base64_payload)`` inside a ``data:`` URL, or ``None``.
+
+    WHY THIS EXISTS. A ``data:`` URL is url-SHAPED but it is not a reference —
+    RFC 2397 puts the bytes in the URL itself. Classifying one as a URL source is
+    what sent a PDF to the provider as ``image_url``: `_inline_media_data` refuses
+    url sources for the standard-block path because a REMOTE url raises inside
+    both translators, and a data URL was being swept up by that same rule even
+    though the identical payload, handed to the translator as an inline block,
+    converts to a ``file`` / ``input_audio`` part.
+
+    WHAT COUNTS. Only ``data:[<mediatype>][;…];base64,<non-empty payload>``.
+    Three near-misses are deliberately NOT read as inline data, and each one falls
+    through to the caller's pre-existing url handling rather than being guessed
+    at:
+
+      1. NO ``;base64`` PARAMETER (``data:text/plain,hello``). RFC 2397's default
+         encoding is percent-encoded text, not base64. The standard media block's
+         payload key is base64 BY DEFINITION — both translators feed it straight
+         into ``data:<mime>;base64,…`` — so putting percent-encoded text there
+         would hand the provider a payload that decodes to garbage. A
+         wrong-but-quiet attachment is worse than the ``image_url`` this leaves it
+         as.
+      2. NO COMMA (``data:application/pdf;base64``) — not a data URL at all,
+         there is no payload delimiter.
+      3. AN EMPTY PAYLOAD (``data:application/pdf;base64,``). Same rule the
+         inbound ``image_url`` branch already applies: a block whose payload is
+         the empty string is an attachment pointing at nothing.
+
+    ``startswith("data:")`` is CASE-SENSITIVE, matching the ``image_url`` branch
+    of `convert_langchain_multimodal_to_agui` byte for byte. URI schemes are
+    case-insensitive per RFC 3986 §3.1, so ``DATA:`` is a legal spelling this
+    declines — but this file already declined it in the one place it looked for a
+    data URL, and one rule applied everywhere is worth more here than a second,
+    better rule applied in one place. The ``;base64`` parameter itself IS matched
+    case-insensitively, because RFC 2045 §6.1 makes the encoding token
+    case-insensitive and ``;Base64`` occurs in the wild.
+
+    Mirrors `parseBase64DataUrl` in the TypeScript adapter.
+    """
+    # Read through the same helper as every other off-the-wire string in this
+    # file: a non-string `url` reaches both call sites (an inbound block relayed
+    # by the graph, an AG-UI source built without validation), and `.startswith`
+    # on one raises out of the loop that converts the whole message list — rule 1
+    # of THE MALFORMED-INPUT CONTRACT.
+    url = _first_non_empty_string(value)
+    if not url or not url.startswith("data:"):
+        return None
+
+    # Split on the FIRST comma and keep everything after it, matching the
+    # `image_url` branch: base64 has no commas, but a payload that carries one
+    # must not be silently truncated.
+    header, separator, data = url.partition(",")
+    if not separator or not data:
+        return None
+
+    parameters = header[len("data:"):].split(";")
+    # Scanning the parameters rather than testing the last one: `;base64` is
+    # documented as trailing, but `data:audio/wav;codecs=1;base64,…` is a shape
+    # this can be handed and the encoding is still base64.
+    if not any(parameter.strip().lower() == "base64" for parameter in parameters[1:]):
+        return None
+    return (_first_non_empty_string(parameters[0].strip()), data)
+
+
+def _inline_media_data(
+    source: Union[InputContentDataSource, InputContentUrlSource],
+) -> tuple[str, Any] | None:
+    """The inline bytes an AG-UI media source carries, as ``(value, mime_type)``.
+
+    ``None`` when it carries none.
+
+    A ``data`` source obviously carries them. A ``url`` source carries them too
+    WHEN THE URL IS A ``data:`` URL — that is the whole point of this function,
+    and the defect it fixes: those bytes were being classified as a remote
+    reference and sent to the provider as ``image_url``.
+
+    A REMOTE url source returns ``None`` and is left exactly where it was. That
+    rule is not squeamishness, it is measured: a ``source_type: "url"`` standard
+    block raises here and throws in the TypeScript runtime for audio, document and
+    video alike, so promoting one would turn a degraded request into a dead run.
+    (NOT true of a url-sourced ``image`` standard block, which both runtimes
+    convert — but images have no row in `_STANDARD_BLOCK_TYPES` and never take
+    this path.)
+
+    The MIME type INSIDE the data URL wins over one declared alongside it. RFC
+    2397 §2 makes the mediatype a description of the payload that follows it in
+    the same string, where a ``mime_type`` on the source describes the reference;
+    when the two disagree the one attached to the bytes is the one the provider
+    has to be told. This is also what the ``image_url`` return leg already does —
+    it recovers the modality by reading the MIME type back out of the data URL and
+    ignores everything else. A data URL with an OMITTED mediatype
+    (``data:;base64,…``) has nothing to say, so the source's own ``mime_type`` is
+    used.
+
+    Mirrors `inlineMediaData` in the TypeScript adapter.
+    """
+    if isinstance(source, InputContentDataSource):
+        return (source.value, source.mime_type)
+    if isinstance(source, InputContentUrlSource):
+        parsed = _parse_base64_data_url(source.value)
+        if parsed:
+            return (parsed[1], parsed[0] if parsed[0] is not None else source.mime_type)
+    return None
+
+
 def _normalized_audio_mime_type(mime_type: Any) -> str | None:
     """The provider-accepted spelling for an audio MIME type.
 
@@ -908,6 +1039,10 @@ def _standard_block_for(block_type: str | None, mime_type: Any) -> tuple[str, st
 
     ``None`` means the combination has no standard block that survives the
     translator, so the caller keeps the pre-existing ``image_url`` form.
+
+    ``mime_type`` is the type of the INLINE BYTES, as `_inline_media_data`
+    resolved it — not the source's declared one, which for a data URL describes
+    the reference rather than the payload.
 
     Audio is the only modality whose MIME type is rewritten: the type that goes on
     the wire is the normalized spelling, not the one the client sent. A document
@@ -1268,19 +1403,26 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             block_type = _by_content_class(_STANDARD_BLOCK_TYPES, item)
             # Only inline data converts. Measured 2026-08-25: for the two
             # modalities that reach here with a `block_type` — audio and file — a
-            # URL-sourced standard block raises in this runtime and throws in the
+            # REMOTE-url standard block raises in this runtime and throws in the
             # TypeScript one, so those fall through to `image_url` below. (A
             # url-sourced `image` standard block does convert in both, but images
             # have no row in `_STANDARD_BLOCK_TYPES` and never take this path.)
             # Audio in a format the provider's `input_audio.format` enum cannot
             # name falls through too — `_standard_block_for` returns None for it.
-            if block_type and isinstance(item.source, InputContentDataSource):
-                standard = _standard_block_for(block_type, item.source.mime_type)
+            #
+            # `_inline_media_data` FIRST, so the decision is made on what the
+            # source actually CARRIES rather than on which of AG-UI's two source
+            # kinds it was labelled with: a `url` source holding a `data:` URL
+            # carries bytes, and classifying it as a remote reference is what sent
+            # a PDF to the provider as `image_url`.
+            inline = _inline_media_data(item.source) if block_type else None
+            if inline:
+                standard = _standard_block_for(block_type, inline[1])
                 if standard:
                     langchain_content.append(
                         _standard_media_block(
                             standard[0],
-                            item.source.value,
+                            inline[0],
                             standard[1],
                             _filename_from_metadata(item.metadata),
                         )
@@ -1302,7 +1444,7 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # for inline data with a declared MIME type. The decision then goes
             # through the SAME `_standard_block_for` the typed path uses, so an
             # audio type the provider cannot carry is refused identically on both
-            # paths — url-only, id-only, image and video items, and unsupported
+            # paths — REMOTE-url, id-only, image and video items, and unsupported
             # audio types, all keep the historical `image_url` reference form
             # because the standard block for those raises inside the translator or
             # sends an invalid `format` enum.
@@ -1311,7 +1453,26 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # a NON-string `mime_type` — this is a legacy item and nothing
             # guarantees it was validated — and the `.split` on the next line then
             # raised out of the loop that converts the whole message list.
-            mime_type = _first_non_empty_string(item.mime_type) or ""
+            declared_mime_type = _first_non_empty_string(item.mime_type) or ""
+            # A legacy item's `url` is a source classification point too, and a
+            # `data:` URL sitting in it is the same defect the typed path above
+            # has: bytes, labelled as a reference, sent to the provider as
+            # `image_url`. Resolved here so the ONE data-URL rule covers both
+            # entry points.
+            #
+            # The url is inspected FIRST and its mediatype wins, because `url`
+            # already outranks `data` in the reference form built below — this
+            # branch must not promote one payload while the fallback would have
+            # sent the other.
+            inline_url = _parse_base64_data_url(item.url)
+            if inline_url:
+                inline_value = inline_url[1]
+                mime_type = (
+                    inline_url[0] if inline_url[0] is not None else declared_mime_type
+                )
+            else:
+                inline_value = None if item.url else item.data
+                mime_type = declared_mime_type
             # Modality is read off a case-folded copy: MIME types are
             # case-insensitive (RFC 2045 §5.1), so `AUDIO/WAV` names the same
             # modality as `audio/wav` and must not be routed as a document. The
@@ -1319,8 +1480,7 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # carried inside a data URL rather than matched against an enum.
             modality = mime_type.split(";")[0].strip().lower()
             if (
-                item.data
-                and not item.url
+                inline_value
                 and mime_type
                 and not modality.startswith("image/")
                 and not modality.startswith("video/")
@@ -1330,7 +1490,7 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
                 if standard:
                     langchain_content.append(
                         _standard_media_block(
-                            standard[0], item.data, standard[1], item.filename
+                            standard[0], inline_value, standard[1], item.filename
                         )
                     )
                     continue

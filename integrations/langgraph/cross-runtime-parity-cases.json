@@ -138,7 +138,25 @@
     "",
     "`axis` is documentation only. `malformed` = input no schema allows; `edge` =",
     "legal but easy to get wrong; `wellformed` = the modality x source x vocabulary",
-    "matrix that must not regress."
+    "matrix that must not regress; `data-url` = the one rule that decides whether a",
+    "url-SHAPED source is a reference or bytes.",
+    "",
+    "THE `data-url` AXIS, because it is the one place where the two legs have to",
+    "agree with each other as well as with the sibling runtime. A `data:` URL is",
+    "url-shaped but RFC 2397 puts the bytes IN the string, so it is inline data on",
+    "both legs: inbound it is stored as a `data` source (a url source would be a",
+    "false claim in the thread about where the attachment lives), and outbound a url",
+    "source holding one still reaches the standard block (threads persisted before",
+    "this rule, and client JSON that never passed through the inbound leg, both hold",
+    "such sources). A REMOTE url is untouched on both legs — the standard block for",
+    "one throws in TypeScript and raises in Python, so promoting it would turn a",
+    "degraded request into a dead run. Three near-misses are refused and left on",
+    "whatever path they take today rather than guessed at: a data URL with no",
+    "`;base64` parameter (RFC 2397's default encoding is percent-encoded text, and",
+    "the standard block's payload key is base64 by definition), one with no comma,",
+    "and one with an empty payload. The `data:` scheme is matched case-sensitively",
+    "and the `;base64` token case-insensitively, and both spellings have a case here",
+    "so the two runtimes cannot drift on either."
   ],
   "cases": [
     {
@@ -5219,6 +5237,976 @@
             "data": "QUJD",
             "mimeType": "application/pdf",
             "filename": "invoice.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/file/data-url-becomes-inline-data",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "a data: URL carries its bytes inline, so it is stored as a data source, not a url source; stored as a url source it went back out as image_url and reached the provider as an image",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:application/pdf;base64,JVBERi0xLjQK",
+          "mime_type": "application/pdf",
+          "metadata": {
+            "filename": "in.pdf"
+          }
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "data",
+            "value": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": "in.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/file/round-trip-of-the-inbound-leg-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the other half of inbound/data-url/file/data-url-becomes-inline-data: exactly what that case stores, sent again, must reach the provider as a file block",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "data",
+            "value": "JVBERi0xLjQK",
+            "mimeType": "application/pdf"
+          },
+          "metadata": {
+            "filename": "in.pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": "in.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/file/url-source-holding-a-data-url-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a url source can hold a data URL without having come from this adapter's inbound leg — a thread persisted before the fix, or client JSON — so the outbound leg classifies on what the source CARRIES, not on its label",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;base64,JVBERi0xLjQK"
+          },
+          "metadata": {
+            "filename": "in.pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": "in.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/audio/data-url-becomes-inline-data",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "same as the file case, for audio: stored as a url source it went back out as image_url instead of input_audio",
+      "content": [
+        {
+          "type": "audio",
+          "url": "data:audio/wav;base64,SGVsbG8=",
+          "mime_type": "audio/wav"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "audio",
+            "source": "data",
+            "value": "SGVsbG8=",
+            "mimeType": "audio/wav",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/audio/round-trip-of-the-inbound-leg-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the other half of inbound/data-url/audio/data-url-becomes-inline-data",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "data",
+            "value": "SGVsbG8=",
+            "mimeType": "audio/wav"
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "SGVsbG8=",
+            "mimeType": "audio/wav",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/audio/url-source-holding-a-data-url-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a url source holding an audio data URL reaches input_audio rather than image_url",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": "data:audio/wav;base64,SGVsbG8="
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "SGVsbG8=",
+            "mimeType": "audio/wav",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/file/source_type-url-spelling",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "the deprecated source_type family spells the same block differently and must classify the same way",
+      "content": [
+        {
+          "type": "file",
+          "source_type": "url",
+          "url": "data:application/pdf;base64,JVBERi0xLjQK",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "data",
+            "value": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/mediatype-inside-the-url-wins-over-the-declared-one",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "RFC 2397 makes the mediatype a description of the payload that follows it in the same string; a mime_type on the block describes the reference",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:application/pdf;base64,JVBERi0xLjQK",
+          "mime_type": "image/png"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "data",
+            "value": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/omitted-mediatype-falls-back-to-the-declared-one",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "data:;base64,... says nothing about its payload, so the block's own mime_type is the only signal left",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:;base64,QUJD",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "data",
+            "value": "QUJD",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/mediatype-inside-the-url-wins-over-the-declared-one",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the outbound leg reads the payload's own mediatype for the same reason the inbound leg does",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;base64,JVBERi0xLjQK",
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/omitted-mediatype-falls-back-to-the-declared-one",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a MIME-less data URL on a url source that declares one",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:;base64,QUJD",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "QUJD",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/grammar/base64-token-is-case-insensitive",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "RFC 2045 6.1 makes the encoding token case-insensitive and ;Base64 occurs in the wild",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;BASE64,QUJD"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "QUJD",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/grammar/parameters-before-the-base64-token",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the base64 token is documented as trailing but other parameters can precede it, and the encoding is still base64",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": "data:audio/wav;codecs=1;base64,SGVsbG8="
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "SGVsbG8=",
+            "mimeType": "audio/wav",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/grammar/payload-carrying-a-comma-is-not-truncated",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "split on the FIRST comma and keep the whole remainder, the rule the image_url branch already applies",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;base64,QUJD,RUZH"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "QUJD,RUZH",
+            "mimeType": "application/pdf",
+            "filename": "attachment.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/not-base64/percent-encoded-stays-a-url-source",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "RFC 2397's default encoding is percent-encoded text, not base64; putting it in a block whose payload key is base64 BY DEFINITION would hand the provider bytes that decode to garbage",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:text/plain,hello%20there",
+          "mime_type": "text/plain"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "url",
+            "value": "data:text/plain,hello%20there",
+            "mimeType": "text/plain",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/not-base64/percent-encoded-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the same refusal on the other leg: a non-base64 data URL keeps the pre-existing image_url form rather than being guessed at",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:text/plain,hello%20there",
+            "mimeType": "text/plain"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:text/plain,hello%20there"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/malformed/no-comma-stays-a-url-source",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "no comma means no payload delimiter, so this is not a data URL at all",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:application/pdf;base64",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "url",
+            "value": "data:application/pdf;base64",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/malformed/no-comma-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "no comma means no payload delimiter, so this is not a data URL at all",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;base64",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:application/pdf;base64"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/malformed/empty-payload-stays-a-url-source",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "an empty payload would mint an inline attachment pointing at nothing, the same defect the image_url branch already rejects",
+      "content": [
+        {
+          "type": "file",
+          "url": "data:application/pdf;base64,",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "url",
+            "value": "data:application/pdf;base64,",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/malformed/empty-payload-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "an empty payload would emit a standard block with no bytes in it",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "data:application/pdf;base64,",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:application/pdf;base64,"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/malformed/uppercase-scheme-stays-a-url-source",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "URI schemes are case-insensitive per RFC 3986 3.1, but this file already matched data: case-sensitively in the image_url branch and one rule applied everywhere beats a better rule applied in one place",
+      "content": [
+        {
+          "type": "file",
+          "url": "DATA:application/pdf;base64,QUJD",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "url",
+            "value": "DATA:application/pdf;base64,QUJD",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/malformed/uppercase-scheme-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the same case-sensitivity rule on the other leg, so the two runtimes cannot drift on it",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "DATA:application/pdf;base64,QUJD",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "DATA:application/pdf;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/remote-url-is-untouched",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "a REMOTE url is a reference and stays one — this is the row the data-URL rule must not widen into",
+      "content": [
+        {
+          "type": "file",
+          "url": "https://example.com/a.pdf",
+          "mime_type": "application/pdf"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "document",
+            "source": "url",
+            "value": "https://example.com/a.pdf",
+            "mimeType": "application/pdf",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/remote-url-is-untouched",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a REMOTE-url standard block throws in the TypeScript translator and raises in Python, so it keeps image_url",
+      "content": [
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "value": "https://example.com/a.pdf",
+            "mimeType": "application/pdf"
+          }
+        }
+      ],
+      "pythonBuilds": ["DocumentInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/a.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/remote-audio-url-is-untouched",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the same for audio, whose remote-url standard block raises 'Key base64 is required for audio blocks'",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": "https://example.com/a.wav",
+            "mimeType": "audio/wav"
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/a.wav"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/image/data-url-becomes-inline-data",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "an image data URL carries bytes too, and this is what the image_url branch already made of the identical payload — the two inbound branches now agree",
+      "content": [
+        {
+          "type": "image",
+          "url": "data:image/png;base64,QUJD"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image",
+            "source": "data",
+            "value": "QUJD",
+            "mimeType": "image/png",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/image/url-source-holding-a-data-url-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "images keep image_url unconditionally, so the data-URL rule must leave the emitted url byte-for-byte what it was",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "value": "data:image/png;base64,QUJD"
+          }
+        }
+      ],
+      "pythonBuilds": ["ImageInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:image/png;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "inbound/data-url/video/data-url-becomes-inline-data",
+      "direction": "inbound",
+      "axis": "data-url",
+      "why": "video too: the AG-UI item tells the truth about where its bytes are, even though the outbound leg still cannot promote it",
+      "content": [
+        {
+          "type": "video",
+          "url": "data:video/mp4;base64,QUJD"
+        }
+      ],
+      "expect": {
+        "kept": [
+          {
+            "kind": "video",
+            "source": "data",
+            "value": "QUJD",
+            "mimeType": "video/mp4",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/video/url-source-holding-a-data-url-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a video standard block is rejected by both translators, so the data-URL rule must not promote one",
+      "content": [
+        {
+          "type": "video",
+          "source": {
+            "type": "url",
+            "value": "data:video/mp4;base64,QUJD"
+          }
+        }
+      ],
+      "pythonBuilds": ["VideoInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:video/mp4;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/audio/unsupported-format-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "audio the provider's format enum cannot name keeps image_url, and the url it keeps is the ORIGINAL data URL rather than one rebuilt from the parse",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": "data:audio/ogg;base64,SGVsbG8="
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:audio/ogg;base64,SGVsbG8="
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/audio/mpeg-normalizes-through-the-data-url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "audio/mpeg is the standard type for MP3 and the provider's enum lists mp3, so the normalization has to survive the data-URL parse",
+      "content": [
+        {
+          "type": "audio",
+          "source": {
+            "type": "url",
+            "value": "data:audio/mpeg;base64,SGVsbG8="
+          }
+        }
+      ],
+      "pythonBuilds": ["AudioInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "SGVsbG8=",
+            "mimeType": "audio/mp3",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/binary/url-holding-a-data-url-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a legacy item's url is a source classification point too, and a data URL in it is the same defect: bytes labelled as a reference",
+      "content": [
+        {
+          "type": "binary",
+          "url": "data:application/pdf;base64,JVBERi0xLjQK",
+          "mimeType": "application/pdf",
+          "filename": "in.pdf"
+        }
+      ],
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "file",
+            "sourceType": "base64",
+            "data": "JVBERi0xLjQK",
+            "mimeType": "application/pdf",
+            "filename": "in.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/binary/audio-url-holding-a-data-url-reaches-the-standard-block",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "the same for a legacy audio attachment",
+      "content": [
+        {
+          "type": "binary",
+          "url": "data:audio/wav;base64,SGVsbG8=",
+          "mimeType": "audio/wav"
+        }
+      ],
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "standard",
+            "blockType": "audio",
+            "sourceType": "base64",
+            "data": "SGVsbG8=",
+            "mimeType": "audio/wav",
+            "filename": null
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/binary/remote-url-is-untouched",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "url still outranks data on the legacy item, and a remote one keeps the historical reference form",
+      "content": [
+        {
+          "type": "binary",
+          "url": "https://example.com/a.pdf",
+          "mimeType": "application/pdf",
+          "data": "QUJD"
+        }
+      ],
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/a.pdf"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      }
+    },
+    {
+      "id": "outbound/data-url/binary/image-data-url-stays-image_url",
+      "direction": "outbound",
+      "axis": "data-url",
+      "why": "a legacy image keeps image_url, so the legacy data-URL rule must not widen into it either",
+      "content": [
+        {
+          "type": "binary",
+          "url": "data:image/png;base64,QUJD",
+          "mimeType": "image/png"
+        }
+      ],
+      "pythonBuilds": ["BinaryInputContent"],
+      "expect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:image/png;base64,QUJD"
           }
         ],
         "dropped": 0,

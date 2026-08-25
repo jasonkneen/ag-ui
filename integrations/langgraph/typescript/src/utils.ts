@@ -189,6 +189,115 @@ function normalizedAudioMimeType(mimeType: unknown): string | undefined {
 }
 
 /**
+ * The MIME type and base64 payload carried INSIDE a `data:` URL, or `null` if
+ * this string is not one this adapter can read as inline bytes.
+ *
+ * WHY THIS EXISTS. A `data:` URL is url-SHAPED but it is not a reference — RFC
+ * 2397 puts the bytes in the URL itself. Classifying one as a URL source is what
+ * sent a PDF to the provider as `image_url`: {@link inlineMediaData} refuses url
+ * sources for the standard-block path because a REMOTE url throws inside both
+ * translators, and a data URL was being swept up by that same rule even though
+ * the identical payload, handed to the translator as an inline block, converts
+ * to a `file` / `input_audio` part.
+ *
+ * WHAT COUNTS. Only `data:[<mediatype>][;…];base64,<non-empty payload>`. Three
+ * near-misses are deliberately NOT read as inline data, and each one falls
+ * through to the caller's pre-existing url handling rather than being guessed at:
+ *
+ *   1. NO `;base64` PARAMETER (`data:text/plain,hello`). RFC 2397's default
+ *      encoding is percent-encoded text, not base64. The standard media block's
+ *      `data` field is base64 BY DEFINITION — both translators feed it straight
+ *      into `data:<mime>;base64,…` — so putting percent-encoded text there would
+ *      hand the provider a payload that decodes to garbage. A wrong-but-quiet
+ *      attachment is worse than the `image_url` this leaves it as.
+ *   2. NO COMMA (`data:application/pdf;base64`) — not a data URL at all, there
+ *      is no payload delimiter.
+ *   3. AN EMPTY PAYLOAD (`data:application/pdf;base64,`). Same rule the inbound
+ *      `image_url` branch already applies: a block whose `data` is the empty
+ *      string is an attachment pointing at nothing.
+ *
+ * `startsWith("data:")` is CASE-SENSITIVE, matching the `image_url` branch of
+ * {@link convertLangchainMultimodalToAgui} byte for byte. URI schemes are
+ * case-insensitive per RFC 3986 §3.1, so `DATA:` is a legal spelling this
+ * declines — but this file already declined it in the one place it looked for a
+ * data URL, and one rule applied everywhere is worth more here than a second,
+ * better rule applied in one place. The `;base64` parameter itself IS matched
+ * case-insensitively, because RFC 2045 §6.1 makes the encoding token
+ * case-insensitive and `;Base64` occurs in the wild.
+ *
+ * Mirrors `_parse_base64_data_url` in the Python adapter.
+ */
+function parseBase64DataUrl(
+  value: unknown
+): { mimeType: string | undefined; data: string } | null {
+  // Read through the same helper as every other off-the-wire string in this
+  // file: a non-string `url` reaches both call sites (an inbound block relayed
+  // by the graph, an AG-UI source built without validation), and `.startsWith`
+  // on one throws out of the loop that converts the whole message list — rule 1
+  // of THE MALFORMED-INPUT CONTRACT.
+  const url = firstNonEmptyString(value);
+  if (!url || !url.startsWith("data:")) return null;
+
+  // Split on the FIRST comma and keep everything after it, for the reason the
+  // `image_url` branch gives: base64 has no commas, but a payload that carries
+  // one must not be silently truncated, and Python reads it with `split(",", 1)`.
+  const comma = url.indexOf(",");
+  if (comma < 0) return null;
+  const data = url.slice(comma + 1);
+  if (!data) return null;
+
+  const parameters = url.slice("data:".length, comma).split(";");
+  // Scanning the parameters rather than testing the last one: `;base64` is
+  // documented as trailing, but `data:audio/wav;codecs=1;base64,…` is a shape
+  // this can be handed and the encoding is still base64.
+  if (!parameters.slice(1).some((parameter) => parameter.trim().toLowerCase() === "base64")) {
+    return null;
+  }
+  return { mimeType: firstNonEmptyString(parameters[0].trim()), data };
+}
+
+/**
+ * The inline bytes an AG-UI media source carries, or `null` if it carries none.
+ *
+ * A `data` source obviously carries them. A `url` source carries them too WHEN
+ * THE URL IS A `data:` URL — that is the whole point of this function, and the
+ * defect it fixes: those bytes were being classified as a remote reference and
+ * sent to the provider as `image_url`.
+ *
+ * A REMOTE url source returns `null` and is left exactly where it was. That
+ * rule is not squeamishness, it is measured: a `source_type: "url"` standard
+ * block throws in JS and raises in Python for audio, document and video alike,
+ * so promoting one would turn a degraded request into a dead run. (NOT true of a
+ * url-sourced `image` standard block, which both runtimes convert — but images
+ * never take the standard-block path at all, they keep `image_url`
+ * unconditionally, so that row is irrelevant here.)
+ *
+ * The MIME type INSIDE the data URL wins over one declared alongside it. RFC
+ * 2397 §2 makes the mediatype a description of the payload that follows it in
+ * the same string, where a `mimeType` on the source describes the reference; when
+ * the two disagree the one attached to the bytes is the one the provider has to
+ * be told. This is also what the `image_url` return leg already does — it
+ * recovers the modality by reading the MIME type back out of the data URL and
+ * ignores everything else. A data URL with an OMITTED mediatype (`data:;base64,…`)
+ * has nothing to say, so the source's own `mimeType` is used.
+ *
+ * Mirrors `_inline_media_data` in the Python adapter.
+ */
+function inlineMediaData(
+  source: InputContentDataSource | InputContentUrlSource | null | undefined
+): { value: string; mimeType: unknown } | null {
+  // Read optionally for the reason {@link mediaSourceToUrl} gives: `source` is
+  // declared required but arrives off the wire, and the two functions must not
+  // disagree about whether it can be absent.
+  if (source?.type === "data") return { value: source.value, mimeType: source.mimeType };
+  if (source?.type === "url") {
+    const parsed = parseBase64DataUrl(source.value);
+    if (parsed) return { value: parsed.data, mimeType: parsed.mimeType ?? source.mimeType };
+  }
+  return null;
+}
+
+/**
  * Which LangChain standard content block an AG-UI media item becomes — with the
  * MIME type to emit for it — or `null` to keep the pre-existing `image_url`
  * block.
@@ -218,14 +327,14 @@ function normalizedAudioMimeType(mimeType: unknown): string | undefined {
  *   any other type    audio/wav or audio/mp3")            `format` enum → API 400
  *                     — so these keep `image_url`; see {@link OPENAI_AUDIO_MIME_TYPES}
  *   audio, url        throws ("must be formatted as a     throws ("Key base64 is required
- *                     data URL")                          for audio blocks")
+ *   (REMOTE)          data URL")                          for audio blocks")
  *   video, any        throws ("Unable to convert content  throws ("Block of type video is
  *                     block type 'video' ... not          not supported")
  *                     recognized")
  *   document, data    file.file_data ✓ — but ONLY with a  file.file_data ✓
  *                     filename; see {@link deriveFilename}
  *   document, url     throws (JS: needs a data URL)       throws ("does not support file
- *                                                         URLs")
+ *   (REMOTE)                                              URLs")
  *   image, any        already worked as `image_url`, and is left alone
  *
  * Note what the audio rows do NOT say: they do not say "audio, data converts".
@@ -233,24 +342,27 @@ function normalizedAudioMimeType(mimeType: unknown): string | undefined {
  * document rows are unqualified because `file.file_data` carries the MIME type
  * inside the data URL rather than through an enum, so no subtype is special.
  *
+ * The two `url` rows say REMOTE because a `data:` URL is not one of them. It is
+ * url-SHAPED but carries its bytes inline, and {@link inlineMediaData} resolves
+ * it to those bytes before this function is reached — so a data-URL-backed PDF
+ * takes the `document, data` row, which converts. Measured on the same versions
+ * and the same day as every other cell here.
+ *
  * Revisit a row when its translator grows support for that combination.
  */
 function standardBlockTypeFor(
   mediaType: string,
-  source: InputContentDataSource | InputContentUrlSource
+  /**
+   * The MIME type of the INLINE BYTES, as {@link inlineMediaData} resolved it —
+   * not the source's declared one, which for a data URL describes the reference
+   * rather than the payload. `unknown` because it arrives off the wire and every
+   * read of it here goes through {@link firstNonEmptyString}.
+   */
+  mimeType: unknown
 ): { type: "audio" | "file"; mimeType?: string } | null {
-  // Only inline data converts, for every modality this function would otherwise
-  // promote. Measured 2026-08-25: a `source_type: "url"` block throws in JS and
-  // raises in Python for audio, document and video alike.
-  //
-  // NOT true of a url-sourced `image` standard block, which both runtimes DO
-  // convert (to `image_url` / `image_url`, the same part the fallback below
-  // produces). That row is simply irrelevant here — images never take the
-  // standard-block path at all, they keep `image_url` unconditionally.
-  if (source?.type !== "data") return null;
   if (mediaType === "audio") {
-    const mimeType = normalizedAudioMimeType(source.mimeType);
-    return mimeType ? { type: "audio", mimeType } : null;
+    const normalized = normalizedAudioMimeType(mimeType);
+    return normalized ? { type: "audio", mimeType: normalized } : null;
   }
   if (mediaType === "document") {
     // A document with NO usable MIME type still has to name one, because the
@@ -276,7 +388,7 @@ function standardBlockTypeFor(
     // {@link mediaSourceToUrl}.
     return {
       type: "file",
-      mimeType: firstNonEmptyString(source.mimeType) ?? "application/octet-stream",
+      mimeType: firstNonEmptyString(mimeType) ?? "application/octet-stream",
     };
   }
   return null;
@@ -857,6 +969,26 @@ function readIncomingMediaBlock(item: IncomingMediaBlock): {
     return { value: inlineData, isUrl: false, mimeType, filename };
   }
   if (url) {
+    // A `data:` URL is url-SHAPED but it is not a reference: RFC 2397 puts the
+    // bytes in the string. Recording it as an AG-UI URL SOURCE writes a claim
+    // into the thread that the attachment lives somewhere else, and the outbound
+    // leg then believes it — a PDF stored this way went back out as `image_url`,
+    // the exact provider failure the standard-block path exists to prevent.
+    // Normalizing here rather than only outbound means the THREAD is right too,
+    // which is what `MESSAGES_SNAPSHOT` shows the client and what `flatten`
+    // and every other reader of AG-UI content sees.
+    //
+    // The MIME type inside the data URL wins over the block's declared one, for
+    // the reason {@link inlineMediaData} gives; a data URL with an omitted
+    // mediatype falls back to the block's.
+    //
+    // A REMOTE url, and a data URL this cannot read as inline bytes (no
+    // `;base64`, no comma, empty payload — see {@link parseBase64DataUrl}), stay
+    // url sources exactly as before.
+    const dataUrl = parseBase64DataUrl(url);
+    if (dataUrl) {
+      return { value: dataUrl.data, isUrl: false, mimeType: dataUrl.mimeType ?? mimeType, filename };
+    }
     return { value: url, isUrl: true, mimeType, filename };
   }
   // `fileId`-only blocks reference provider-side storage with no bytes and no
@@ -1210,13 +1342,19 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
     } else if (MEDIA_CONTENT_TYPES.has(item.type)) {
       // ImageInputContent, AudioInputContent, VideoInputContent, DocumentInputContent
       const mediaItem = item as ImageInputContent | AudioInputContent | VideoInputContent | DocumentInputContent;
-      const standard = standardBlockTypeFor(item.type, mediaItem.source);
+      // {@link inlineMediaData} FIRST, so the standard-block decision is made on
+      // what the source actually carries rather than on which of AG-UI's two
+      // source kinds it was labelled with. A `url` source holding a `data:` URL
+      // carries bytes, and classifying it as a remote reference is what sent a
+      // PDF to the provider as `image_url`.
+      const inline = inlineMediaData(mediaItem.source);
+      const standard = inline ? standardBlockTypeFor(item.type, inline.mimeType) : null;
 
-      if (standard) {
+      if (standard && inline) {
         langchainContent.push(
           standardMediaBlock(
             standard.type,
-            (mediaItem.source as InputContentDataSource).value,
+            inline.value,
             standard.mimeType,
             filenameFromMetadata((mediaItem as { metadata?: unknown }).metadata)
           )
@@ -1240,7 +1378,7 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // carries (the typed classes above announce their own), and only for inline
       // data with a declared MIME type. The decision then goes through the SAME
       // {@link standardBlockTypeFor} the typed path uses, so an audio type the
-      // provider cannot carry is refused identically on both paths — url-only,
+      // provider cannot carry is refused identically on both paths — REMOTE-url,
       // id-only, image and video items, and unsupported audio types, all keep the
       // historical `image_url` reference form because the standard block for
       // those throws inside the translator.
@@ -1249,7 +1387,18 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // wire — and the `.split(";")` on the next line would then throw out of
       // the loop that converts the whole message list. An unusable MIME type is
       // an absent one.
-      const mimeType = firstNonEmptyString(item.mimeType) ?? "";
+      const declaredMimeType = firstNonEmptyString(item.mimeType) ?? "";
+      // A legacy item's `url` is a source classification point too, and a
+      // `data:` URL sitting in it is the same defect the typed path above has:
+      // bytes, labelled as a reference, sent to the provider as `image_url`.
+      // Resolved here so the ONE data-URL rule covers both entry points.
+      //
+      // The url is inspected FIRST and its mediatype wins, because `url` already
+      // outranks `data` in the reference form built below — this branch must not
+      // promote one payload while the fallback would have sent the other.
+      const inlineUrl = parseBase64DataUrl(item.url);
+      const inlineValue = inlineUrl ? inlineUrl.data : item.url ? undefined : item.data;
+      const mimeType = inlineUrl ? (inlineUrl.mimeType ?? declaredMimeType) : declaredMimeType;
       // Modality is read off a case-folded copy: MIME types are case-insensitive
       // (RFC 2045 §5.1), so `AUDIO/WAV` names the same modality as `audio/wav`
       // and must not be routed as a document. The ORIGINAL string is what gets
@@ -1257,12 +1406,12 @@ function convertAguiMultimodalToLangchain(content: InputContent[]): LangchainCon
       // matched against an enum.
       const modality = mimeType.split(";")[0].trim().toLowerCase();
 
-      if (item.data && !item.url && mimeType && !modality.startsWith("image/") && !modality.startsWith("video/")) {
+      if (inlineValue && mimeType && !modality.startsWith("image/") && !modality.startsWith("video/")) {
         const mediaType = modality.startsWith("audio/") ? "audio" : "document";
-        const standard = standardBlockTypeFor(mediaType, { type: "data", value: item.data, mimeType });
+        const standard = standardBlockTypeFor(mediaType, mimeType);
         if (standard) {
           langchainContent.push(
-            standardMediaBlock(standard.type, item.data, standard.mimeType, item.filename)
+            standardMediaBlock(standard.type, inlineValue, standard.mimeType, item.filename)
           );
           continue;
         }

@@ -2185,6 +2185,141 @@ describe("Multimodal Message Conversion", () => {
 
       expect(parts[1]).toEqual({ type: "image_url", image_url: { url: "data:;base64,aGk=" } });
     });
+
+    // ── Data URLs, all the way to the wire ────────────────────────────────
+    //
+    // THE CLAIM THAT MATTERS for the data-URL rule, and it is only checkable
+    // here. The adapter's own output for these inputs is a standard block, and
+    // a standard block that the translator then rejected would be strictly
+    // WORSE than the `image_url` it replaced — a dead run instead of a bad
+    // request. So these run the whole leg: an inbound block carrying a `data:`
+    // URL, through the AG-UI item it becomes, back out through the converter,
+    // and into `@langchain/openai` with a stubbed `fetch`.
+    //
+    // Before the data-URL rule both of these reached the provider as
+    // `image_url` — a PDF and a WAV labelled as images, which is the failure
+    // this whole PR exists to fix, recreated by a url-SHAPED source that
+    // carried its bytes inline all along.
+    //
+    // Mirrored in Python by `test_a_data_url_backed_pdf_reaches_the_provider_as_a_file_part`
+    // and `test_a_data_url_backed_wav_reaches_the_provider_as_input_audio`.
+    it("carries a data-URL-backed PDF round trip to OpenAI as a file part", async () => {
+      const agui = (
+        langchainMessagesToAgui([
+          {
+            id: "boundary-data-url-pdf",
+            type: "human",
+            content: [
+              {
+                type: "file",
+                url: "data:application/pdf;base64,JVBERi0xLjQK",
+                mime_type: "application/pdf",
+                metadata: { filename: "in.pdf" },
+              },
+            ],
+          } as unknown as LangGraphMessage,
+        ])[0] as UserMessage
+      ).content;
+
+      // The AG-UI item the thread now holds says the bytes are INLINE, which is
+      // where they really are. Pinned here as well as in the parity table
+      // because it is the input to the leg below.
+      expect(agui).toEqual([
+        {
+          type: "document",
+          source: { type: "data", value: "JVBERi0xLjQK", mimeType: "application/pdf" },
+          metadata: { filename: "in.pdf" },
+        },
+      ]);
+
+      const parts = await partsOnTheWire(
+        emittedBlocks({ id: "boundary-data-url-pdf", role: "user", content: agui }),
+      );
+
+      expect(parts[1]).toEqual({
+        type: "file",
+        file: { file_data: "data:application/pdf;base64,JVBERi0xLjQK", filename: "in.pdf" },
+      });
+    });
+
+    it("carries a data-URL-backed WAV round trip to OpenAI as an input_audio part", async () => {
+      const agui = (
+        langchainMessagesToAgui([
+          {
+            id: "boundary-data-url-wav",
+            type: "human",
+            content: [{ type: "audio", url: "data:audio/wav;base64,SGVsbG8=", mime_type: "audio/wav" }],
+          } as unknown as LangGraphMessage,
+        ])[0] as UserMessage
+      ).content;
+
+      expect(agui).toEqual([
+        { type: "audio", source: { type: "data", value: "SGVsbG8=", mimeType: "audio/wav" } },
+      ]);
+
+      const parts = await partsOnTheWire(
+        emittedBlocks({ id: "boundary-data-url-wav", role: "user", content: agui }),
+      );
+
+      expect(parts[1]).toEqual({
+        type: "input_audio",
+        input_audio: { data: "SGVsbG8=", format: "wav" },
+      });
+    });
+
+    // The outbound half on its own, for a url source that did NOT come from
+    // this adapter's inbound leg: a thread persisted before the data-URL rule
+    // existed still holds one, and so does client JSON that built it directly.
+    it.each([
+      [
+        "PDF",
+        { type: "document", source: { type: "url", value: "data:application/pdf;base64,JVBERi0xLjQK" }, metadata: { filename: "in.pdf" } },
+        { type: "file", file: { file_data: "data:application/pdf;base64,JVBERi0xLjQK", filename: "in.pdf" } },
+      ],
+      [
+        "WAV",
+        { type: "audio", source: { type: "url", value: "data:audio/wav;base64,SGVsbG8=" } },
+        { type: "input_audio", input_audio: { data: "SGVsbG8=", format: "wav" } },
+      ],
+      [
+        "legacy binary PDF",
+        { type: "binary", url: "data:application/pdf;base64,JVBERi0xLjQK", mimeType: "application/pdf", filename: "in.pdf" },
+        { type: "file", file: { file_data: "data:application/pdf;base64,JVBERi0xLjQK", filename: "in.pdf" } },
+      ],
+    ])("carries a stored url source holding a data URL to OpenAI: %s", async (_name, item, expected) => {
+      const parts = await partsOnTheWire(
+        emittedBlocks({
+          id: "boundary-stored-data-url",
+          role: "user",
+          content: [item],
+        } as unknown as UserMessage),
+      );
+
+      expect(parts[1]).toEqual(expected);
+    });
+
+    // The other side of the rule, and the reason it is narrow. A REMOTE url
+    // must still reach the provider as `image_url`: the standard block for one
+    // is what `@langchain/openai` throws on, so widening the rule to cover it
+    // would turn a degraded request into a dead run. `resolves` rather than a
+    // shape-only assertion because a throw here is the regression.
+    it.each([
+      ["document", { type: "document", source: { type: "url", value: "https://example.com/a.pdf" } }, "https://example.com/a.pdf"],
+      ["audio", { type: "audio", source: { type: "url", value: "https://example.com/a.wav" } }, "https://example.com/a.wav"],
+      // Not base64, so not readable as inline bytes — see `parseBase64DataUrl`.
+      ["non-base64 data URL", { type: "document", source: { type: "url", value: "data:text/plain,hello" } }, "data:text/plain,hello"],
+      ["payload-less data URL", { type: "document", source: { type: "url", value: "data:application/pdf;base64," } }, "data:application/pdf;base64,"],
+    ])("leaves a url the data-URL rule does not claim on image_url: %s", async (_name, item, url) => {
+      const parts = await partsOnTheWire(
+        emittedBlocks({
+          id: "boundary-untouched-url",
+          role: "user",
+          content: [item],
+        } as unknown as UserMessage),
+      );
+
+      expect(parts[1]).toEqual({ type: "image_url", image_url: { url } });
+    });
   });
 
   // ── An empty MIME type is an absent MIME type ────────────────────────────

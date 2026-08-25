@@ -1745,6 +1745,180 @@ class TestProviderBoundary(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self._provider_payload(standard_block)
 
+    # ── Data URLs, all the way to the wire ────────────────────────────────
+    #
+    # THE CLAIM THAT MATTERS for the data-URL rule, and it is only checkable
+    # here. The adapter's own output for these inputs is a standard block, and a
+    # standard block the translator then REJECTED would be strictly worse than
+    # the `image_url` it replaced — a dead run instead of a bad request. So these
+    # run the whole leg: an inbound block carrying a `data:` URL, through the
+    # AG-UI item it becomes, back out through the converter, and into
+    # `convert_to_openai_messages`.
+    #
+    # Before the data-URL rule both of these reached the provider as `image_url`
+    # — a PDF and a WAV labelled as images, which is the failure this whole
+    # change exists to fix, recreated by a url-SHAPED source that carried its
+    # bytes inline all along.
+    #
+    # Mirrored in TypeScript by the two `carries a data-URL-backed …` tests in
+    # `describe("provider boundary (@langchain/openai)")`.
+    def test_a_data_url_backed_pdf_reaches_the_provider_as_a_file_part(self):
+        agui = convert_langchain_multimodal_to_agui(
+            [
+                {
+                    "type": "file",
+                    "url": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "mime_type": "application/pdf",
+                    "metadata": {"filename": "in.pdf"},
+                }
+            ]
+        )
+
+        # The AG-UI item the thread now holds says the bytes are INLINE, which is
+        # where they really are. Pinned here as well as in the parity table
+        # because it is the input to the leg below.
+        self.assertEqual(
+            agui,
+            [
+                DocumentInputContent(
+                    source=InputContentDataSource(
+                        type="data", value="JVBERi0xLjQK", mime_type="application/pdf"
+                    ),
+                    metadata={"filename": "in.pdf"},
+                )
+            ],
+        )
+
+        self.assertEqual(
+            self._provider_payload(self._emit(agui[0])),
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                    "filename": "in.pdf",
+                },
+            },
+        )
+
+    def test_a_data_url_backed_wav_reaches_the_provider_as_input_audio(self):
+        agui = convert_langchain_multimodal_to_agui(
+            [{"type": "audio", "url": "data:audio/wav;base64,SGVsbG8=", "mime_type": "audio/wav"}]
+        )
+
+        self.assertEqual(
+            agui,
+            [
+                AudioInputContent(
+                    source=InputContentDataSource(
+                        type="data", value="SGVsbG8=", mime_type="audio/wav"
+                    )
+                )
+            ],
+        )
+
+        self.assertEqual(
+            self._provider_payload(self._emit(agui[0])),
+            {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+        )
+
+    def test_a_stored_url_source_holding_a_data_url_reaches_the_provider(self):
+        """The outbound half on its own, for a url source that did NOT come from
+        this adapter's inbound leg: a thread persisted before the data-URL rule
+        existed still holds one, and so does client JSON that built it directly.
+        """
+        stored = {
+            "PDF": (
+                DocumentInputContent(
+                    source=InputContentUrlSource(
+                        type="url", value="data:application/pdf;base64,JVBERi0xLjQK"
+                    ),
+                    metadata={"filename": "in.pdf"},
+                ),
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                        "filename": "in.pdf",
+                    },
+                },
+            ),
+            "WAV": (
+                AudioInputContent(
+                    source=InputContentUrlSource(
+                        type="url", value="data:audio/wav;base64,SGVsbG8="
+                    )
+                ),
+                {"type": "input_audio", "input_audio": {"data": "SGVsbG8=", "format": "wav"}},
+            ),
+            "legacy binary PDF": (
+                BinaryInputContent(
+                    mime_type="application/pdf",
+                    url="data:application/pdf;base64,JVBERi0xLjQK",
+                    filename="in.pdf",
+                ),
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+                        "filename": "in.pdf",
+                    },
+                },
+            ),
+        }
+
+        for name, (item, expected) in stored.items():
+            with self.subTest(name):
+                self.assertEqual(self._provider_payload(self._emit(item)), expected)
+
+    def test_a_url_the_data_url_rule_does_not_claim_still_reaches_image_url(self):
+        """The other side of the rule, and the reason it is narrow.
+
+        A REMOTE url must still reach the provider as `image_url`: the standard
+        block for one RAISES inside `convert_to_openai_data_block`, so widening
+        the rule to cover it would turn a degraded request into a dead run. The
+        two data-URL spellings below are refused for their own reasons — see
+        `_parse_base64_data_url`.
+        """
+        untouched = {
+            "remote document": (
+                DocumentInputContent(
+                    source=InputContentUrlSource(
+                        type="url", value="https://example.com/a.pdf"
+                    )
+                ),
+                "https://example.com/a.pdf",
+            ),
+            "remote audio": (
+                AudioInputContent(
+                    source=InputContentUrlSource(
+                        type="url", value="https://example.com/a.wav"
+                    )
+                ),
+                "https://example.com/a.wav",
+            ),
+            "non-base64 data URL": (
+                DocumentInputContent(
+                    source=InputContentUrlSource(type="url", value="data:text/plain,hello")
+                ),
+                "data:text/plain,hello",
+            ),
+            "payload-less data URL": (
+                DocumentInputContent(
+                    source=InputContentUrlSource(
+                        type="url", value="data:application/pdf;base64,"
+                    )
+                ),
+                "data:application/pdf;base64,",
+            ),
+        }
+
+        for name, (item, url) in untouched.items():
+            with self.subTest(name):
+                self.assertEqual(
+                    self._provider_payload(self._emit(item)),
+                    {"type": "image_url", "image_url": {"url": url}},
+                )
+
 
 def _as_typescript_wire_block(block):
     """Re-spell a block THIS package emits into the one the TypeScript adapter
