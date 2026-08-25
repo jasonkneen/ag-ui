@@ -579,9 +579,15 @@ jobs:
 
       - name: Upgrade to the newest published strands-agents
         working-directory: integrations/aws-strands/python
+        # --upgrade-package, not --upgrade: this lane exists to report on the
+        # newest Strands, and a bare --upgrade also drags shared transitive
+        # dependencies forward. That produced a starlette the locked fastapi
+        # cannot work with, and the lane failed in the endpoint's CORS tests,
+        # nowhere near the SDK it was meant to be testing. A gate that fails
+        # for unrelated reasons is a gate people learn to ignore.
         run: |
           set -euo pipefail
-          uv pip install --upgrade strands-agents
+          uv pip install --upgrade-package strands-agents strands-agents
           uv run --no-sync python -c \
             "import importlib.metadata as m; print('strands-agents', m.version('strands-agents'))"
 
