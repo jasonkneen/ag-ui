@@ -181,7 +181,13 @@ export class EventTraceRecorder {
       throw new Error("AG-UI journey assertion captured no non-RAW events");
     }
 
-    await compare(actual, expected);
+    // Normalize the GOLDEN too: readJourney already normalizes the actual, and
+    // the "a trace recorded without a key must still match one recorded with
+    // it" property only holds when both sides pass through the same
+    // normalization — a golden recorded on a stack that emitted an
+    // environment-varying key (e.g. langgraph_auth_user_id) must match an
+    // actual from a stack that omits it, and vice versa.
+    await compare(actual, normalizeEventTrace(expected));
     this.assertedStreamCount = this.streams.length;
   }
 
