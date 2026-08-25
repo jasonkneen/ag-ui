@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -502,16 +503,22 @@ public static class AGUIChatMessageExtensions
                 return preservedMetadata.Clone();
             }
 
-            IDictionary<string, object?> mergedMetadata = new Dictionary<string, object?>();
-            foreach (var property in preservedMetadata.EnumerateObject())
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
             {
-                mergedMetadata[property.Name] = property.Value.Clone();
+                writer.WriteStartObject();
+                foreach (var property in preservedMetadata.EnumerateObject())
+                {
+                    property.WriteTo(writer);
+                }
+
+                writer.WriteString("filename", filename);
+                writer.WriteEndObject();
             }
 
-            mergedMetadata["filename"] = filename;
-            return JsonSerializer.SerializeToElement(
-                mergedMetadata,
-                jsonSerializerOptions.GetTypeInfo(typeof(IDictionary<string, object?>)));
+            stream.Position = 0;
+            using var document = JsonDocument.Parse(stream);
+            return document.RootElement.Clone();
         }
 
         IDictionary<string, object?> metadata = new Dictionary<string, object?>();
