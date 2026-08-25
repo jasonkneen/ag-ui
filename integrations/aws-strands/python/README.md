@@ -196,6 +196,41 @@ JSON-safe (no raw `bytes`): Strands' `SessionAgent.to_dict()` — unlike
 JSON serializable` from `FileSessionManager`/`S3SessionManager` and aborts the
 run.
 
+## Fetching URL content sources
+
+A user message may carry an image, document or video as a URL rather than
+inline data. The adapter fetches those server-side, so every fetch runs under
+a `UrlFetchPolicy`. The default refuses everything but `http`/`https`, refuses
+any host that resolves outside the public internet (loopback, private,
+link-local, including the cloud metadata endpoints), pins the connection to
+the address it validated so a second DNS answer cannot redirect it, re-checks
+every redirect hop, refuses a redirect that drops TLS, and bounds both one
+attachment and everything a single run fetches.
+
+A deployment whose attachments live on a private CDN or behind split DNS opts
+in explicitly:
+
+```python
+from ag_ui_strands import StrandsAgent, StrandsAgentConfig, UrlFetchPolicy
+
+agent = StrandsAgent(
+    strands_agent,
+    name="my-agent",
+    config=StrandsAgentConfig(
+        url_fetch_policy=UrlFetchPolicy(
+            allow_private_networks=True,
+            max_attachments=20,
+            max_total_bytes=100 * 1024 * 1024,
+            max_total_seconds=120.0,
+        ),
+    ),
+)
+```
+
+Link-local addresses stay blocked under `allow_private_networks`, and
+`allowed_schemes` can only be narrowed, never widened: a scheme with no pinned
+transport would resolve the host again at connection time.
+
 ## Supported AG-UI Events
 
 The integration supports the following AG-UI event families:
