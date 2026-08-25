@@ -1,6 +1,12 @@
 /** Express endpoint utilities for AWS Strands integration. */
 
-import type { Express, NextFunction, Request, Response } from "express";
+import type {
+  Express,
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+} from "express";
 import { STATUS_CODES } from "http";
 import {
   EventType,
@@ -53,6 +59,72 @@ export interface AddStrandsEndpointOptions {
    * which is the default and unchanged behaviour.
    */
   auth?: StrandsAuthMiddleware;
+  /**
+   * Optional route-scoped body parser. It is mounted after `auth` and before
+   * the agent handler, so an unauthenticated request can be rejected without
+   * first buffering or parsing its body. For example:
+   * `bodyParser: express.json({ limit: "50mb" })`.
+   *
+   * Omit this when the app has already populated `req.body`. In that case the
+   * caller owns the order of its app-wide middleware relative to this route.
+   */
+  bodyParser?: RequestHandler;
+}
+
+const ADD_STRANDS_ENDPOINT_OPTION_KEYS = [
+  "path",
+  "auth",
+  "bodyParser",
+] as const;
+
+const ADD_STRANDS_ENDPOINT_OPTION_KEY_SET = new Set<string>(
+  ADD_STRANDS_ENDPOINT_OPTION_KEYS,
+);
+
+function assertAddStrandsEndpointOptions(
+  options: unknown,
+): asserts options is AddStrandsEndpointOptions {
+  if (
+    typeof options !== "object" ||
+    options === null ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError("addStrandsExpressEndpoint options must be an object.");
+  }
+
+  const values = options as Record<string, unknown>;
+  const unknown = Object.keys(values).filter(
+    (key) => !ADD_STRANDS_ENDPOINT_OPTION_KEY_SET.has(key),
+  );
+  if (unknown.length > 0) {
+    const plural = unknown.length === 1 ? "option" : "options";
+    throw new Error(
+      `addStrandsExpressEndpoint received unknown ${plural} ${unknown
+        .map((key) => `\`${key}\``)
+        .join(", ")}. A misspelled security option would be ignored and ` +
+        `silently leave the route without it. Valid options are ` +
+        `${ADD_STRANDS_ENDPOINT_OPTION_KEYS.map((key) => `\`${key}\``).join(", ")}.`,
+    );
+  }
+
+  if (typeof values.path !== "string") {
+    throw new TypeError(
+      "addStrandsExpressEndpoint option `path` must be a string.",
+    );
+  }
+  if (values.auth !== undefined && typeof values.auth !== "function") {
+    throw new TypeError(
+      "addStrandsExpressEndpoint option `auth` must be a function or undefined.",
+    );
+  }
+  if (
+    values.bodyParser !== undefined &&
+    typeof values.bodyParser !== "function"
+  ) {
+    throw new TypeError(
+      "addStrandsExpressEndpoint option `bodyParser` must be an Express request handler or undefined.",
+    );
+  }
 }
 
 /**
@@ -118,10 +190,9 @@ function bodyForAuthStatus(status: number): { error: string } {
  * 4 (still an accepted peer range) does not await handlers at all, so a
  * rejection there would hang the request. Owning both paths here keeps the
  * behaviour identical across the supported range.
- */
-/**
- * Exported for `createStrandsApp`, which mounts this ahead of its body parser
- * rather than as route middleware. Not part of the package's public surface.
+ *
+ * Used by `addStrandsExpressEndpoint` to keep auth ahead of the optional body
+ * parser in one route. Not part of the package's public surface.
  */
 export function authGuard(
   auth: StrandsAuthMiddleware,
@@ -252,6 +323,8 @@ export function addStrandsExpressEndpoint(
   agent: StrandsAgent,
   options: AddStrandsEndpointOptions,
 ): void {
+  assertAddStrandsEndpointOptions(options);
+
   const runAgent = async (req: Request, res: Response): Promise<void> => {
     // Request boundary validation. Express's `express.json()` middleware
     // skips bodies whose Content-Type isn't JSON — it leaves `req.body` as
@@ -391,16 +464,20 @@ export function addStrandsExpressEndpoint(
     }
   };
 
+  const handlers: RequestHandler[] = [];
   if (options.auth) {
     // Auth failures go through the adapter's own injectable logger
     // (`StrandsAgentConfig.logger`), not straight to the console, so an app
     // that redirected the adapter's output gets these in the same place as
     // everything else the adapter logs.
     const logger = resolveLogger(agent.config.logger);
-    app.post(options.path, authGuard(options.auth, logger), runAgent);
-  } else {
-    app.post(options.path, runAgent);
+    handlers.push(authGuard(options.auth, logger));
   }
+  if (options.bodyParser) {
+    handlers.push(options.bodyParser);
+  }
+  handlers.push(runAgent);
+  app.post(options.path, ...handlers);
 }
 
 /** Add a ping endpoint returning `{status: "healthy"}`. */

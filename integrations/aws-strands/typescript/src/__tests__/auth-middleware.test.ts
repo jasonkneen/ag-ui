@@ -172,6 +172,8 @@ interface BareApp extends StartedApp {
 
 interface BareAppOptions<A extends StrandsAgent> {
   auth?: StrandsAuthMiddleware;
+  /** Route-scoped parser to mount after auth and before the agent. */
+  bodyParser?: RequestHandler;
   /** Agent to mount. Defaults to a plain `FixedAgent`. */
   agent?: A;
   /**
@@ -192,9 +194,15 @@ async function startBareAppWith<A extends StrandsAgent>(
   const expressModule = await import("express");
   const express = expressModule.default ?? expressModule;
   const app = express();
-  app.use(express.json());
+  if (!options.bodyParser) {
+    app.use(express.json());
+  }
   const agent = options.agent;
-  addStrandsExpressEndpoint(app, agent, { path: "/", auth: options.auth });
+  addStrandsExpressEndpoint(app, agent, {
+    path: "/",
+    auth: options.auth,
+    bodyParser: options.bodyParser,
+  });
   options.mountAfter?.(app);
   const appErrors: string[] = [];
   app.use(
@@ -471,6 +479,46 @@ describe("auth on addStrandsExpressEndpoint directly", () => {
     }
   });
 
+  it("can keep auth and parsing in the same route, in that order", async () => {
+    const expressModule = await import("express");
+    const express = expressModule.default ?? expressModule;
+    const jsonParser = express.json();
+    let authCalls = 0;
+    let parserCalls = 0;
+    const bodyParser: RequestHandler = (req, res, next) => {
+      parserCalls += 1;
+      jsonParser(req, res, next);
+    };
+    const agent = new FixedAgent();
+    const { port, close } = await startBareAppWith({
+      agent,
+      bodyParser,
+      auth: (req, res, next) => {
+        authCalls += 1;
+        if (req.header("authorization") === "Bearer secret") {
+          next();
+          return;
+        }
+        res.status(401).json(CALLER_401);
+      },
+    });
+    try {
+      const rejected = await postRaw(port, "{ this is not json");
+      expect(rejected.status).toBe(401);
+      expect(authCalls).toBe(1);
+      expect(parserCalls).toBe(0);
+      expect(agent.runs).toBe(0);
+
+      const admitted = await postRun(port, { headers: AUTHORIZED });
+      expect(admitted.status).toBe(200);
+      expect(authCalls).toBe(2);
+      expect(parserCalls).toBe(1);
+      expect(agent.runs).toBe(1);
+    } finally {
+      await close();
+    }
+  });
+
   it("does not advance a guard that answered the request and continued anyway", async () => {
     const answeredThenContinued: StrandsAuthMiddleware = (_req, res, next) => {
       res.status(401).json(CALLER_401);
@@ -679,6 +727,37 @@ describe("auth forwards Express control-flow signals", () => {
       expect(logger.error).not.toHaveBeenCalled();
     } finally {
       await close();
+    }
+  });
+
+  it('skips the factory agent route for next("route")', async () => {
+    const agent = new FixedAgent();
+    let authCalls = 0;
+    const app = await createStrandsApp(agent, {
+      auth: (_req, _res, next) => {
+        authCalls += 1;
+        next("route");
+      },
+    });
+    app.post("/", (req, res) => {
+      res.status(299).json({
+        answered: "next-route",
+        threadId: req.body.threadId,
+      });
+    });
+    const server = await listen(app);
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const res = await postRun(port, { headers: AUTHORIZED });
+      expect(res.status).toBe(299);
+      expect(JSON.parse(res.body)).toEqual({
+        answered: "next-route",
+        threadId: "t",
+      });
+      expect(authCalls).toBe(1);
+      expect(agent.runs).toBe(0);
+    } finally {
+      await closeServer(server);
     }
   });
 
@@ -970,7 +1049,7 @@ describe("auth runs ahead of the factory's body parser", () => {
   });
 });
 
-describe("createStrandsApp refuses unknown options", () => {
+describe("createStrandsApp validates options", () => {
   it("throws for a misspelled security option instead of ignoring it", async () => {
     const agent = new FixedAgent();
     await expect(
@@ -990,6 +1069,31 @@ describe("createStrandsApp refuses unknown options", () => {
     ).rejects.toThrow(/unknown options `autth`, `corsOrigns`[\s\S]*`auth`/);
   });
 
+  it.each([
+    ["path", 1, "a string"],
+    ["pingPath", false, "a string, null, or undefined"],
+    ["capabilitiesPath", false, "a string, null, or undefined"],
+    ["capabilities", [], "an object or undefined"],
+    ["corsOrigin", 1, "a string, boolean, string array, or undefined"],
+    [
+      "corsOrigin",
+      ["https://app.example.com", 1],
+      "a string, boolean, string array, or undefined",
+    ],
+    ["corsEnabled", "true", "a boolean or undefined"],
+    ["allowMethods", ["POST", 1], "a string array or undefined"],
+    ["allowHeaders", "Content-Type", "a string array or undefined"],
+    ["auth", false, "a function or undefined"],
+  ])("rejects an invalid %s value", async (option, value, expected) => {
+    await expect(
+      createStrandsApp(new FixedAgent(), {
+        [option]: value,
+      } as never),
+    ).rejects.toThrow(
+      `createStrandsApp option \`${option}\` must be ${expected}`,
+    );
+  });
+
   it("still accepts every documented option together", async () => {
     const app = await createStrandsApp(new FixedAgent(), {
       path: "/",
@@ -1003,5 +1107,37 @@ describe("createStrandsApp refuses unknown options", () => {
       auth: (_req, _res, next) => next(),
     });
     expect(app).toBeDefined();
+  });
+});
+
+describe("addStrandsExpressEndpoint validates options", () => {
+  it("throws for a misspelled security option before mounting a route", () => {
+    const post = vi.fn();
+    const app = { post } as unknown as Express;
+    expect(() =>
+      addStrandsExpressEndpoint(app, new FixedAgent(), {
+        path: "/",
+        autth: (_req: unknown, _res: unknown, next: () => void) => next(),
+      } as never),
+    ).toThrow(/unknown option `autth`/);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["path", 1, "a string"],
+    ["auth", false, "a function or undefined"],
+    ["bodyParser", false, "an Express request handler or undefined"],
+  ])("rejects an invalid %s value", (option, value, expected) => {
+    const post = vi.fn();
+    const app = { post } as unknown as Express;
+    expect(() =>
+      addStrandsExpressEndpoint(app, new FixedAgent(), {
+        path: "/",
+        [option]: value,
+      } as never),
+    ).toThrow(
+      `addStrandsExpressEndpoint option \`${option}\` must be ${expected}`,
+    );
+    expect(post).not.toHaveBeenCalled();
   });
 });
