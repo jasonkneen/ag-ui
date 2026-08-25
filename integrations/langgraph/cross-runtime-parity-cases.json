@@ -1517,8 +1517,8 @@
     {
       "id": "inbound/image_url/data-url-no-comma",
       "direction": "inbound",
-      "axis": "edge",
-      "why": "PINS PRE-EXISTING SHARED BEHAVIOUR, not an endorsement of it: a data URL with no comma has a header and no payload, and both runtimes keep it as an image with an empty value rather than dropping it. Recorded so a unilateral change to either runtime fails here",
+      "axis": "malformed",
+      "why": "a data URL with no comma has a header and no payload, so keeping it minted an attachment whose value was the empty string — an item pointing at nothing. Both runtimes now drop and log it, which is what the standard-block path already did for an empty data/base64. This expectation was previously recorded as kept-with-an-empty-value, explicitly to make a UNILATERAL change fail; the change that replaced it was made in both runtimes together",
       "content": [
         {
           "type": "image_url",
@@ -1528,17 +1528,9 @@
         }
       ],
       "expect": {
-        "kept": [
-          {
-            "kind": "image",
-            "source": "data",
-            "value": "",
-            "mimeType": "image/png",
-            "filename": null
-          }
-        ],
-        "dropped": 0,
-        "loggedDrops": 0
+        "kept": [],
+        "dropped": 1,
+        "loggedDrops": 1
       }
     },
     {

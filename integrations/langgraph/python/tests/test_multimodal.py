@@ -3038,6 +3038,183 @@ class TestMalformedInputContract(unittest.TestCase):
         )
         self.assertEqual(outcome.warnings, [])
 
+    # ── rule 1 on the TYPED media path ───────────────────────────────────
+    #
+    # ``model_construct``, not the validating constructor: AG-UI's source class
+    # declares ``mime_type: str``, so pydantic refuses a non-string at the
+    # boundary — but it refuses it only where a caller went THROUGH validation.
+    # A content object built around it, or a subclass, reaches this converter
+    # carrying whatever it was given, and the converter's own comments already
+    # accept that (see `_media_source_to_url`, which documents the
+    # ``model_construct``-with-``None`` case). Before this change the read was
+    # ``or ""`` and ``.split`` raised an AttributeError out of the whole
+    # message-list conversion — rule 1 — on typed audio, typed document AND the
+    # legacy binary branch, while the mirrored TypeScript adapter dropped
+    # cleanly on two of the three.
+    def _unvalidated_media(self, cls, kind, mime_type, value="QUJD"):
+        return cls.model_construct(
+            type=kind,
+            source=InputContentDataSource.model_construct(
+                type="data", value=value, mime_type=mime_type
+            ),
+            metadata=None,
+        )
+
+    def test_a_non_string_mime_type_on_typed_audio_does_not_raise(self):
+        for label, mime_type in [
+            ("a number", 42),
+            ("a dict", {}),
+            ("a list", []),
+            ("True", True),
+            ("None", None),
+        ]:
+            with self.subTest(label):
+                outcome = self._outbound(
+                    [self._unvalidated_media(AudioInputContent, "audio", mime_type)]
+                )
+
+                # An unusable MIME type is an absent one: no audio format is
+                # named, so the item keeps the `image_url` fallback with an
+                # OMITTED mediatype. Not `data:42;base64,` or `data:None;base64,`
+                # — those interpolations wrote a media type the client never sent
+                # into the thread, and diverged from TypeScript, which produced
+                # `data:;base64,QUJD` for every one of these.
+                self.assertEqual(
+                    outcome.content,
+                    [{"type": "image_url", "image_url": {"url": "data:;base64,QUJD"}}],
+                )
+                self.assertEqual(outcome.warnings, [])
+
+    def test_a_non_string_mime_type_on_a_typed_document_does_not_raise(self):
+        """The document path reached `_derive_filename` with the same value and
+        raised there. `application/octet-stream` is this file's answer for
+        unidentified bytes, and `attachment.bin` is the name that agrees with
+        it — which is what the TypeScript adapter already produced."""
+        outcome = self._outbound(
+            [self._unvalidated_media(DocumentInputContent, "document", 42)]
+        )
+
+        self.assertEqual(
+            outcome.content,
+            [{
+                "type": "file",
+                "base64": "QUJD",
+                "mime_type": "application/octet-stream",
+                "filename": "attachment.bin",
+            }],
+        )
+        self.assertEqual(outcome.warnings, [])
+
+    def test_a_non_string_mime_type_on_a_legacy_binary_item_does_not_raise(self):
+        """The legacy branch read ``item.mime_type or ""`` where the mirrored
+        TypeScript branch read through its non-empty-string helper — and the
+        comment explaining why was already on the TypeScript side."""
+        outcome = self._outbound([
+            BinaryInputContent.model_construct(
+                type="binary", data="QUJD", url=None, id=None, mime_type=42, filename=None
+            )
+        ])
+
+        self.assertEqual(
+            outcome.content,
+            [{"type": "image_url", "image_url": {"url": "data:;base64,QUJD"}}],
+        )
+        self.assertEqual(outcome.warnings, [])
+
+    def test_items_beside_a_typed_audio_item_with_a_non_string_mime_survive(self):
+        """Rule 3. The raise cost both neighbours, not just the attachment."""
+        outcome = self._outbound([
+            TextInputContent(type="text", text="before"),
+            self._unvalidated_media(AudioInputContent, "audio", 42),
+            TextInputContent(type="text", text="after"),
+        ])
+
+        self.assertEqual(
+            [block["type"] for block in outcome.content],
+            ["text", "image_url", "text"],
+        )
+        self.assertEqual(
+            [b["text"] for b in outcome.content if b["type"] == "text"],
+            ["before", "after"],
+        )
+
+    # ── rule 1 + 2: a data URL with no payload ───────────────────────────
+    def test_a_data_url_with_no_payload_is_dropped_and_logged(self):
+        """Kept before this change as an attachment whose ``value`` is the EMPTY
+        STRING — an item pointing at nothing, written into the thread and read
+        back on every later open. `_read_incoming_media_block` already dropped an
+        empty ``data``/``base64`` on the standard-block path; this branch was the
+        one place that did not."""
+        for label, url in [
+            ("no comma at all", "data:image/png;base64"),
+            ("nothing after the comma", "data:image/png;base64,"),
+            ("no mediatype and no payload", "data:;base64,"),
+            ("nothing but the scheme", "data:"),
+            ("a mediatype and nothing else", "data:image/png"),
+        ]:
+            with self.subTest(label):
+                outcome = self._inbound([{"type": "image_url", "image_url": {"url": url}}])
+
+                self.assertEqual(outcome.content, [])
+                self.assertEqual(len(outcome.warnings), 1)
+                self.assertIn(
+                    "Dropping image_url block: data URL carries no payload",
+                    outcome.warnings[0],
+                )
+
+    def test_blocks_beside_a_payload_less_data_url_survive(self):
+        outcome = self._inbound([
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64"}},
+            {"type": "text", "text": "after"},
+        ])
+
+        self.assertEqual([item.text for item in outcome.content], ["before", "after"])
+        self.assertEqual(len(outcome.warnings), 1)
+
+    def test_a_data_url_with_several_commas_keeps_its_whole_payload(self):
+        """The payload is everything after the FIRST comma (RFC 2397 §3). This
+        runtime already read it that way; the TypeScript one used
+        ``split(",", 2)`` and silently truncated at the second comma, so the two
+        disagreed on exactly this line."""
+        outcome = self._inbound([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD,EXTRA"}}
+        ])
+
+        self.assertEqual(len(outcome.content), 1)
+        self.assertEqual(outcome.content[0].source.value, "QUJD,EXTRA")
+        self.assertEqual(outcome.content[0].source.mime_type, "image/png")
+
+    # ── the KNOWN LIMIT on `_OPENAI_AUDIO_MIME_TYPES` ────────────────────
+    def test_a_normalized_audio_mime_type_is_stable_across_a_second_send(self):
+        """The normalization is visible in the thread: a client that sent
+        ``audio/mpeg`` reads ``audio/mp3`` back. Left that way deliberately — see
+        the KNOWN LIMIT on `_OPENAI_AUDIO_MIME_TYPES` for why the
+        `_supplied_filename` treatment does not transfer. What makes it
+        acceptable is that it does not DRIFT: the value the return leg records
+        re-normalizes to itself, so every later send carries the identical MIME
+        type and the modality survives. This test is that property."""
+        first = self._outbound([
+            AudioInputContent(
+                type="audio",
+                source=InputContentDataSource(
+                    type="data", value="QUJD", mime_type="audio/mpeg"
+                ),
+            )
+        ])
+        self.assertEqual(
+            first.content,
+            [{"type": "audio", "base64": "QUJD", "mime_type": "audio/mp3"}],
+        )
+
+        read_back = self._inbound(first.content)
+        self.assertEqual(len(read_back.content), 1)
+        self.assertIsInstance(read_back.content[0], AudioInputContent)
+        self.assertEqual(read_back.content[0].source.mime_type, "audio/mp3")
+
+        second = self._outbound(read_back.content)
+        self.assertEqual(second.content, first.content)
+
 
 class TestCrossRuntimeParityTable(unittest.TestCase):
     """The cross-runtime parity table — the mechanism that makes DRIFT fail a test.

@@ -439,6 +439,24 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                     parts = url.split(",", 1)
                     header = parts[0]
                     data = parts[1] if len(parts) > 1 else ""
+
+                    # Rule 1 and rule 2 of the malformed-input contract. A `data:`
+                    # URL with no comma at all (`data:image/png;base64`) or nothing
+                    # after it (`data:image/png;base64,`) has no payload, and the
+                    # branch below would mint an AG-UI content item whose `value`
+                    # is the EMPTY STRING — an attachment pointing at nothing,
+                    # written into the thread and read back on every later open.
+                    # That is the same defect `_incoming_image_url` rejects one
+                    # level up for a payload that yields `""`, and the same one
+                    # `_read_incoming_media_block` already rejects on the
+                    # standard-block path, where an empty `data`/`base64` drops the
+                    # block. This branch was the one place that kept it.
+                    if not data:
+                        logger.warning(
+                            "Dropping image_url block: data URL carries no payload"
+                        )
+                        continue
+
                     # `or "image/png"`, not just the `":" in header` gate. A
                     # `data:` URL ALWAYS has a colon, so the gate never falls
                     # through for one — but the mediatype it then extracts is the
@@ -813,6 +831,39 @@ def _by_content_class(table: Dict[Any, Any], item: Any, default: Any = None) -> 
 # name a format the provider accepts and differ only in how they are written,
 # which is the same defect as `audio/mpeg`.
 #
+# KNOWN LIMIT, deliberate: THE REWRITE IS VISIBLE IN THE THREAD. The normalized
+# spelling is what the return leg reads back, so a client that sent `audio/mpeg`
+# finds `audio/mp3` recorded against its own message in the next
+# MESSAGES_SNAPSHOT — an adapter-invented value attributed to the client, which is
+# the same defect `_supplied_filename` strips on the way back for a DERIVED
+# FILENAME. That precedent does not transfer here, for three reasons:
+#
+#   1. NOTHING TO RECOGNISE. `_derive_filename` is a function of a DIFFERENT field
+#      (MIME type -> filename), so recomputing it tests a real claim. This map is a
+#      function of the field itself, it is many-to-one, and its image overlaps its
+#      domain — `audio/mp3` and `audio/wav` map to themselves. A returned
+#      `audio/wav` has six preimages and a returned `audio/mp3` has two, so
+#      recomputing identifies every provider-acceptable audio block, rewritten or
+#      not, rather than identifying a fabrication.
+#   2. NOTHING TO STRIP. The precedent's remedy is to make the field ABSENT and let
+#      the outbound leg re-derive it. An AG-UI data source REQUIRES a `mime_type`,
+#      and the inbound converter's answer for a missing one is
+#      `application/octet-stream` — which loses the modality, so the NEXT send
+#      would no longer see audio at all and would fall back to `image_url`.
+#      Stripping is strictly worse than recording `audio/mp3`.
+#   3. SUBSTITUTING BACK JUST MOVES THE VICTIM. Mapping `audio/mp3` ->
+#      `audio/mpeg` on the return leg would rewrite a block that genuinely said
+#      `audio/mp3` — which a graph can legitimately produce, and which the parity
+#      table treats as well-formed inbound content. That is the same invention
+#      pointed the other way, and it addresses one of the six rewrites: the wav
+#      aliases are not recoverable at all.
+#
+# What makes leaving it acceptable is that the round trip is STABLE rather than
+# drifting: `audio/mp3` re-normalizes to `audio/mp3`, so every later send carries
+# the identical MIME type, and the recorded value is a legal spelling of the same
+# format with the modality — the thing this converter exists to preserve — intact.
+# Pinned by "an emitted audio MIME type is stable across a second send".
+#
 # Kept in lockstep with `OPENAI_AUDIO_MIME_TYPES` in the TypeScript adapter. A
 # divergence here is the class of bug this converter exists to fix.
 #
@@ -829,21 +880,30 @@ _OPENAI_AUDIO_MIME_TYPES = {
 }
 
 
-def _normalized_audio_mime_type(mime_type: str | None) -> str | None:
+def _normalized_audio_mime_type(mime_type: Any) -> str | None:
     """The provider-accepted spelling for an audio MIME type.
 
     Returns ``None`` when the provider cannot carry that audio format at all, in
     which case the caller keeps the pre-existing ``image_url`` block. See
     `_OPENAI_AUDIO_MIME_TYPES`.
+
+    ``Any``, and read through `_first_non_empty_string`, because the declared
+    ``str`` is not enforced on the way in: AG-UI's source classes are pydantic
+    models, but a model built with ``model_construct`` — or any object a caller
+    hands this converter without validating — carries whatever it was given.
+    ``or ""`` accepts a non-string, and ``.split`` then raised an AttributeError
+    out of the loop that converts the whole message list, which is a rule-1
+    violation of THE MALFORMED-INPUT CONTRACT. An unusable MIME type is an absent
+    one, which is what the mirrored TypeScript adapter already made of it.
     """
     # Parameters (`;codecs=…`, `;charset=…`) are part of a legal MIME type but not
     # part of its identity, and this runtime's translator would forward them into
     # the `format` enum verbatim.
-    base = (mime_type or "").split(";")[0].strip().lower()
+    base = (_first_non_empty_string(mime_type) or "").split(";")[0].strip().lower()
     return _OPENAI_AUDIO_MIME_TYPES.get(base)
 
 
-def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[str, str | None] | None:
+def _standard_block_for(block_type: str | None, mime_type: Any) -> tuple[str, str | None] | None:
     """Which standard block to emit and with WHICH MIME type, or ``None``.
 
     ``None`` means the combination has no standard block that survives the
@@ -870,6 +930,15 @@ def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[
     Note the divergence from the mirrored TypeScript adapter, where all three of
     those spellings produce ``data:;base64,`` and none of them raise.
 
+    The MIME type is read through `_first_non_empty_string` for the reason spelled
+    out on `_normalized_audio_mime_type`: the declared ``str`` is not enforced at
+    this boundary, ``or`` accepts a non-string, and handing one on to
+    `_derive_filename` raised an AttributeError out of the whole message-list
+    conversion — rule 1 of THE MALFORMED-INPUT CONTRACT. An unusable MIME type is
+    an absent one, so a document carrying one gets the same
+    `application/octet-stream` as a document carrying none, which is what the
+    mirrored TypeScript adapter already answered for it.
+
     `application/octet-stream` is this file's existing answer for unidentified
     bytes, and the two legs are inverses, so it applies here rather than merely
     being available: `_agui_media_from_standard_block` already normalizes a
@@ -889,7 +958,7 @@ def _standard_block_for(block_type: str | None, mime_type: str | None) -> tuple[
     if block_type == "audio":
         normalized = _normalized_audio_mime_type(mime_type)
         return ("audio", normalized) if normalized else None
-    return (block_type, mime_type or "application/octet-stream")
+    return (block_type, _first_non_empty_string(mime_type) or "application/octet-stream")
 
 
 def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSource]) -> str | None:
@@ -899,11 +968,16 @@ def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSo
     For URL sources, returns the URL directly.
 
     A MIME-less data source becomes ``data:;base64,…`` — an omitted mediatype —
-    measured 2026-08-25. "MIME-less" here means ``mime_type=""``: AG-UI declares
-    `InputContentDataSource.mime_type` as a required ``str``, so pydantic rejects
-    ``None`` at construction and the f-string below never sees it. (A source built
-    around validation with ``model_construct`` and a ``None`` would render the
-    literal text ``data:None;base64,…``.) Deliberately NOT the
+    measured 2026-08-25. "MIME-less" here covers all three spellings of it:
+    AG-UI declares `InputContentDataSource.mime_type` as a required ``str``, so
+    pydantic rejects ``None`` and a non-string at construction, but a source built
+    AROUND validation with ``model_construct`` carries whatever it was given, and
+    interpolating that renders the literal text ``data:None;base64,…`` /
+    ``data:42;base64,…`` — a media type the client never sent, which the return
+    leg then records in the thread. Reading it through `_first_non_empty_string`
+    collapses all three onto the omitted mediatype the data URL grammar already
+    has, which is what the mirrored TypeScript adapter produces for the same
+    input. Deliberately NOT the
     ``application/octet-stream`` that
     `_standard_block_for` substitutes for a document. This is the ``image_url``
     fallback path, which carries every modality the standard-block path refuses,
@@ -914,7 +988,7 @@ def _media_source_to_url(source: Union[InputContentDataSource, InputContentUrlSo
     image, which is what the item already was.
     """
     if isinstance(source, InputContentDataSource):
-        return f"data:{source.mime_type};base64,{source.value}"
+        return f"data:{_first_non_empty_string(source.mime_type) or ''};base64,{source.value}"
     if isinstance(source, InputContentUrlSource):
         return source.value
     return None
@@ -1050,6 +1124,14 @@ def _derive_filename(mime_type: str | None) -> str:
          ``.bin``, which is what an unidentified byte stream is called.
 
     MIME types are case-insensitive (RFC 2045 §5.1), so the lookup is case-folded.
+
+    NO non-string guard here, unlike `_normalized_audio_mime_type`, and that is
+    load-bearing rather than an oversight: ``str | None`` is ENFORCED for every
+    caller by the two functions that resolve a MIME type before this one is
+    reached — `_standard_block_for` substitutes for an unusable one and
+    `_read_incoming_media_block` reads it through `_first_non_empty_string`. The
+    TypeScript `deriveFilename` is guarded by the same two, so the pair agrees.
+    Widen this signature and the guard has to come with it.
     """
     base = (mime_type or "").split(";")[0].strip().lower()
 
@@ -1188,7 +1270,12 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             # audio types, all keep the historical `image_url` reference form
             # because the standard block for those raises inside the translator or
             # sends an invalid `format` enum.
-            mime_type = item.mime_type or ""
+            # Read through `_first_non_empty_string`, exactly as the mirrored
+            # TypeScript branch does and for the reason it gives: `or ""` accepts
+            # a NON-string `mime_type` — this is a legacy item and nothing
+            # guarantees it was validated — and the `.split` on the next line then
+            # raised out of the loop that converts the whole message list.
+            mime_type = _first_non_empty_string(item.mime_type) or ""
             # Modality is read off a case-folded copy: MIME types are
             # case-insensitive (RFC 2045 §5.1), so `AUDIO/WAV` names the same
             # modality as `audio/wav` and must not be routed as a document. The
@@ -1218,8 +1305,14 @@ def convert_agui_multimodal_to_langchain(content: List[AGUIContentItem]) -> List
             if item.url:
                 content_dict["image_url"] = {"url": item.url}
             elif item.data:
-                # Construct data URL from base64 data
-                content_dict["image_url"] = {"url": f"data:{item.mime_type};base64,{item.data}"}
+                # Construct data URL from base64 data. The NORMALIZED `mime_type`
+                # local, not `item.mime_type`: the raw one is optional on a legacy
+                # binary item, and interpolating an absent or non-string one writes
+                # the literal text `None` / `42` into the data URL as the media
+                # type — which the return leg then records in the thread. Same
+                # collapse as `_media_source_to_url`, and the same line the
+                # TypeScript adapter already reads from its normalized local.
+                content_dict["image_url"] = {"url": f"data:{mime_type};base64,{item.data}"}
             elif item.id:
                 # Use id as a reference (some providers may support this)
                 content_dict["image_url"] = {"url": item.id}

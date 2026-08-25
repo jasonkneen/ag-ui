@@ -110,6 +110,39 @@ const MEDIA_CONTENT_TYPES = new Set(["image", "audio", "video", "document"]);
  * container; they name a format the provider accepts and differ only in how they
  * are written, which is the same defect as `audio/mpeg`.
  *
+ * KNOWN LIMIT, deliberate: THE REWRITE IS VISIBLE IN THE THREAD. The normalized
+ * spelling is what the return leg reads back, so a client that sent `audio/mpeg`
+ * finds `audio/mp3` recorded against its own message in the next
+ * MESSAGES_SNAPSHOT — an adapter-invented value attributed to the client, which
+ * is the same defect {@link suppliedFilename} strips on the way back for a
+ * DERIVED FILENAME. That precedent does not transfer here, for three reasons:
+ *
+ *   1. NOTHING TO RECOGNISE. `deriveFilename` is a function of a DIFFERENT field
+ *      (MIME type -> filename), so recomputing it tests a real claim. This map is
+ *      a function of the field itself, it is many-to-one, and its image overlaps
+ *      its domain — `audio/mp3` and `audio/wav` map to themselves. A returned
+ *      `audio/wav` has six preimages and a returned `audio/mp3` has two, so
+ *      recomputing identifies every provider-acceptable audio block, rewritten or
+ *      not, rather than identifying a fabrication.
+ *   2. NOTHING TO STRIP. The precedent's remedy is to make the field ABSENT and
+ *      let the outbound leg re-derive it. An AG-UI data source REQUIRES a
+ *      `mimeType`, and the inbound converter's answer for a missing one is
+ *      `application/octet-stream` — which loses the modality, so the NEXT send
+ *      would no longer see audio at all and would fall back to `image_url`.
+ *      Stripping is strictly worse than recording `audio/mp3`.
+ *   3. SUBSTITUTING BACK JUST MOVES THE VICTIM. Mapping `audio/mp3` ->
+ *      `audio/mpeg` on the return leg would rewrite a block that genuinely said
+ *      `audio/mp3` — which a graph can legitimately produce, and which the parity
+ *      table treats as well-formed inbound content. That is the same invention
+ *      pointed the other way, and it addresses one of the six rewrites: the wav
+ *      aliases are not recoverable at all.
+ *
+ * What makes leaving it acceptable is that the round trip is STABLE rather than
+ * drifting: `audio/mp3` re-normalizes to `audio/mp3`, so every later send carries
+ * the identical MIME type, and the recorded value is a legal spelling of the same
+ * format with the modality — the thing this converter exists to preserve —
+ * intact. Pinned by "an emitted audio MIME type is stable across a second send".
+ *
  * Kept in lockstep with `_OPENAI_AUDIO_MIME_TYPES` in the Python adapter. A
  * divergence here is the class of bug this converter exists to fix.
  *
@@ -135,11 +168,20 @@ const OPENAI_AUDIO_MIME_TYPES = new Map<string, string>([
  * string, and an object literal would answer `"constructor"` with an inherited
  * function.
  */
-function normalizedAudioMimeType(mimeType: string | undefined): string | undefined {
+function normalizedAudioMimeType(mimeType: unknown): string | undefined {
+  // `unknown`, and read through {@link firstNonEmptyString}, for the reason the
+  // legacy `binary` branch already gives for the same read: the caller's
+  // `source.mimeType` is DECLARED a string but arrives off the wire, and nothing
+  // validates it at this boundary. `?? ""` accepts a non-string — `mimeType: 42`
+  // on a typed audio item — and `.split` then threw a TypeError out of the loop
+  // that converts the whole message list, which is a rule-1 violation of the
+  // malformed-input contract. The guard was on the legacy branch and not on its
+  // typed sibling; both reach this function, so it belongs here, once.
+  //
   // Parameters (`;codecs=…`, `;charset=…`) are part of a legal MIME type but not
   // part of its identity, and Python's translator would forward them into the
   // `format` enum verbatim.
-  const base = (mimeType ?? "").split(";")[0].trim().toLowerCase();
+  const base = (firstNonEmptyString(mimeType) ?? "").split(";")[0].trim().toLowerCase();
   return OPENAI_AUDIO_MIME_TYPES.get(base);
 }
 
@@ -343,6 +385,14 @@ const PLAUSIBLE_EXTENSION = /^[a-z0-9]{1,8}$/;
  * MIME types are case-insensitive (RFC 2045 §5.1), so the lookup is case-folded.
  */
 function deriveFilename(mimeType: string | undefined): string {
+  // NO non-string guard here, unlike {@link normalizedAudioMimeType}, and that is
+  // load-bearing rather than an oversight: `string | undefined` is ENFORCED for
+  // every caller by the two functions that resolve a MIME type before this one
+  // is reached — {@link standardBlockTypeFor} substitutes for an unusable one and
+  // {@link readIncomingMediaBlock} reads it through {@link firstNonEmptyString}.
+  // Python's `_derive_filename` is guarded by the same two (`_standard_block_for`,
+  // `_read_incoming_media_block`), so the pair agrees. Widen this signature and
+  // the guard has to come with it.
   const base = (mimeType ?? "").split(";")[0].trim().toLowerCase();
 
   let extension = FILENAME_EXTENSIONS.get(base);
@@ -970,7 +1020,33 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
       // Parse data URLs to extract base64 data
       if (imageUrl.startsWith("data:")) {
         // Format: data:mime_type;base64,data
-        const [header, data] = imageUrl.split(",", 2);
+        //
+        // Split on the FIRST comma and keep everything after it, rather than
+        // `split(",", 2)`, which keeps only the segment BETWEEN the first and
+        // second commas and silently truncates the payload of a `data:` URL
+        // carrying more than one. Base64 has no commas so no well-formed
+        // attachment changes, but Python reads it with `split(",", 1)` and kept
+        // the whole remainder — a divergence on exactly this line.
+        const comma = imageUrl.indexOf(",");
+        const header = comma < 0 ? imageUrl : imageUrl.slice(0, comma);
+        const data = comma < 0 ? "" : imageUrl.slice(comma + 1);
+
+        // Rule 1 and rule 2 of the malformed-input contract. A `data:` URL with
+        // no comma at all (`data:image/png;base64`) or nothing after it
+        // (`data:image/png;base64,`) has no payload, and the branch below would
+        // mint an AG-UI attachment whose `value` is the EMPTY STRING — a content
+        // item pointing at nothing, written into the thread and read back on
+        // every later open. That is the same defect {@link incomingImageUrl}
+        // rejects one level up for a payload that yields `""`, and the same one
+        // {@link readIncomingMediaBlock} already rejects on the standard-block
+        // path, where an empty `data`/`base64` drops the block. This branch was
+        // the one place that kept it.
+        if (!data) {
+          console.warn(
+            "[convertLangchainMultimodalToAgui] Dropping image_url block: data URL carries no payload"
+          );
+          continue;
+        }
         // `|| "image/png"`, not just the `includes(":")` gate. A `data:` URL
         // ALWAYS has a colon, so the gate never falls through for one — but the
         // mediatype it then extracts is the empty string for the `data:;base64,…`
@@ -990,7 +1066,7 @@ function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputC
           type: aguiMediaTypeForMimeType(mimeType),
           source: {
             type: "data",
-            value: data || "",
+            value: data,
             mimeType,
           },
         } as InputContent);

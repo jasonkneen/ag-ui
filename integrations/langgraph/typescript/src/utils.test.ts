@@ -1456,6 +1456,136 @@ describe("Multimodal Message Conversion", () => {
         },
       ]);
     });
+
+    // ── rule 1 on the TYPED media path ─────────────────────────────────────
+    //
+    // The guard for a non-string MIME type was written on the legacy `binary`
+    // branch and not on its typed sibling, so `mimeType: 42` on a typed AUDIO
+    // item reached `normalizedAudioMimeType`'s `.split` and threw a TypeError
+    // out of the whole message-list conversion — the same defect the legacy
+    // branch already had a comment explaining. Measured before the fix:
+    // typed audio + a numeric or object MIME threw; legacy binary and typed
+    // document with the same MIME did not.
+    it.each([
+      ["a number", 42],
+      ["an object", {}],
+      ["an array", []],
+      ["true", true],
+      ["null", null],
+    ])("does not throw when a typed audio item's mimeType is %s", (_name, mimeType) => {
+      const { content, warnings } = outbound([
+        { type: "audio", source: { type: "data", value: "QUJD", mimeType } },
+      ]);
+
+      // An unusable MIME type is an absent one: no audio format is named, so
+      // the item keeps the `image_url` fallback with an omitted mediatype —
+      // byte for byte what the legacy branch already produced, and what
+      // Python's `_normalized_audio_mime_type` now produces too.
+      expect(content).toEqual([{ type: "image_url", image_url: { url: "data:;base64,QUJD" } }]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("does not throw when a typed document item's mimeType is not a string", () => {
+      // The document path reached `deriveFilename` with the same value. It
+      // survived here because `standardBlockTypeFor` substitutes for it first,
+      // but Python's did not, and the two derivations must not disagree about
+      // what a non-string MIME type is.
+      const { content, warnings } = outbound([
+        { type: "document", source: { type: "data", value: "QUJD", mimeType: 42 } },
+      ]);
+
+      expect(content).toEqual([
+        {
+          type: "file",
+          source_type: "base64",
+          data: "QUJD",
+          mime_type: "application/octet-stream",
+          metadata: { filename: "attachment.bin" },
+        },
+      ]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("keeps the items on either side of a typed audio item with a non-string mimeType", () => {
+      // Rule 3. The throw cost both neighbours, not just the attachment.
+      const { content } = outbound([
+        { type: "text", text: "before" },
+        { type: "audio", source: { type: "data", value: "QUJD", mimeType: 42 } },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(content.map((c: any) => c.type)).toEqual(["text", "image_url", "text"]);
+      expect(textsOf(content.filter((c: any) => c.type === "text"))).toEqual(["before", "after"]);
+    });
+
+    // ── rule 1 + 2: a data URL with no payload ─────────────────────────────
+    it.each([
+      ["no comma at all", "data:image/png;base64"],
+      ["nothing after the comma", "data:image/png;base64,"],
+      ["no mediatype and no payload", "data:;base64,"],
+      ["nothing but the scheme", "data:"],
+      ["a mediatype and nothing else", "data:image/png"],
+    ])("drops and logs an image_url data URL with %s", (_name, url) => {
+      // Kept before this change as an attachment whose `value` is the EMPTY
+      // STRING — an item pointing at nothing, written into the thread and read
+      // back on every later open. The standard-block path already dropped an
+      // empty `data`/`base64`; this branch was the one place that did not.
+      const { content, warnings } = inbound([{ type: "image_url", image_url: { url } }]);
+
+      expect(content).toEqual([]);
+      expect(warnings).toEqual([
+        expect.stringContaining("Dropping image_url block: data URL carries no payload"),
+      ]);
+    });
+
+    it("keeps the blocks on either side of a payload-less data URL", () => {
+      const { content, warnings } = inbound([
+        { type: "text", text: "before" },
+        { type: "image_url", image_url: { url: "data:image/png;base64" } },
+        { type: "text", text: "after" },
+      ]);
+
+      expect(textsOf(content)).toEqual(["before", "after"]);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it("keeps the whole payload of a data URL carrying more than one comma", () => {
+      // The payload is everything after the FIRST comma (RFC 2397 §3).
+      // `split(",", 2)` kept only the segment between the first and second and
+      // silently truncated the rest, where Python's `split(",", 1)` kept it all.
+      const { content } = inbound([
+        { type: "image_url", image_url: { url: "data:image/png;base64,QUJD,EXTRA" } },
+      ]);
+
+      expect(content).toEqual([
+        { type: "image", source: { type: "data", value: "QUJD,EXTRA", mimeType: "image/png" } },
+      ]);
+    });
+
+    // ── the KNOWN LIMIT on {@link OPENAI_AUDIO_MIME_TYPES} ─────────────────
+    it("re-emits an adapter-normalized audio MIME type unchanged on the next send", () => {
+      // The normalization is visible in the thread: a client that sent
+      // `audio/mpeg` reads `audio/mp3` back. Left that way deliberately — see
+      // the KNOWN LIMIT on `OPENAI_AUDIO_MIME_TYPES` for why the
+      // `suppliedFilename` treatment does not transfer. What makes it
+      // acceptable is that it does not DRIFT: the value the return leg records
+      // re-normalizes to itself, so every later send carries the identical MIME
+      // type and the modality survives. This test is that property.
+      const first = outbound([
+        { type: "audio", source: { type: "data", value: "QUJD", mimeType: "audio/mpeg" } },
+      ]);
+      expect(first.content).toEqual([
+        { type: "audio", source_type: "base64", data: "QUJD", mime_type: "audio/mp3" },
+      ]);
+
+      const readBack = inbound(first.content);
+      expect(readBack.content).toEqual([
+        { type: "audio", source: { type: "data", value: "QUJD", mimeType: "audio/mp3" } },
+      ]);
+
+      const second = outbound(readBack.content);
+      expect(second.content).toEqual(first.content);
+    });
   });
 
   // ── Provider boundary ────────────────────────────────────────────────────
