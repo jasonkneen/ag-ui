@@ -103,3 +103,39 @@ class TestClone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NarrowSubclass(LangGraphAgent):
+    """Mimics the released copilotkit LangGraphAGUIAgent: only the four base
+    kwargs, no flag parameters at all."""
+
+    def __init__(self, *, name, graph, description=None, config=None):
+        super().__init__(name=name, graph=graph, description=description, config=config)
+
+
+class TestCloneNarrowSubclass(unittest.TestCase):
+    def _graph(self):
+        from unittest.mock import MagicMock
+        from langgraph.graph.state import CompiledStateGraph
+        graph = MagicMock(spec=CompiledStateGraph)
+        graph.nodes = {}
+        return graph
+
+    def test_default_flags_clone_through_a_narrow_subclass(self):
+        # The released copilotkit subclass 500'd on every request because
+        # clone() blindly passed flags its __init__ rejects. With defaults,
+        # omission is lossless — the subclass's super() chain re-applies them.
+        agent = NarrowSubclass(name="t", graph=self._graph())
+        clone = agent.clone()
+        self.assertIsInstance(clone, NarrowSubclass)
+        self.assertEqual(clone.subagent_visibility, "inline")
+        self.assertTrue(clone.enable_legacy_on_interrupt_event)
+
+    def test_a_non_default_flag_still_raises_helpfully(self):
+        # Silently dropping a non-default flag is the per-request revert bug
+        # the always-pass design guarded against — that guarantee stays.
+        agent = NarrowSubclass(name="t", graph=self._graph())
+        agent.emit_raw_events = False
+        with self.assertRaises(TypeError) as ctx:
+            agent.clone()
+        self.assertIn("emit_raw_events", str(ctx.exception))

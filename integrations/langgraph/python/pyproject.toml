@@ -63,3 +63,14 @@ packages = ["ag_ui_langgraph"]
 exclude = [
     "examples/**",
 ]
+
+# The sdist must exclude the examples too: their pyproject/uv.lock carry
+# dev-only [tool.uv.sources] path overrides (this package and ag-ui-protocol),
+# which are meaningless — and misleading — inside a published artifact. With
+# this, the PNI-274 release flip is exactly one change in THIS file (floor bump
+# + delete the sources table + relock); the examples keep their own overrides
+# for local development.
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "examples/**",
+]

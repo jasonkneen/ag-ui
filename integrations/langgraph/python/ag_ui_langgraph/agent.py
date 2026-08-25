@@ -687,30 +687,59 @@ class LangGraphAgent:
     def clone(self) -> Self:
         """Create a fresh copy with clean per-request state.
 
-        Subclasses that add required __init__ parameters must override clone()
-        to pass those parameters through.
+        Every constructor flag must survive a clone: the FastAPI endpoint
+        clones per request, so a flag silently dropped here reverts to its
+        default in the standard serving path. But subclasses narrower than
+        this class exist in the wild — the released copilotkit
+        LangGraphAGUIAgent accepts only (name, graph, description, config),
+        and blindly passing every flag made each request 500 on a TypeError.
+        So the clone is signature-aware: a flag the subclass cannot accept is
+        OMITTED when it still holds its default (the subclass's super() chain
+        re-applies the same default, nothing is lost) and RAISES when it does
+        not (dropping a non-default flag is the silent-revert bug the
+        always-pass design guarded against). Inline/attributed travel as the
+        boolean alias so pre-subagent_visibility subclasses keep cloning;
+        "hidden" needs the new kwarg, so opting in requires accepting it.
         """
-        try:
-            return type(self)(
-                name=self.name,
-                graph=self.graph,
-                description=self.description,
-                config=dict(self.config) if self.config else None,
-                enable_legacy_on_interrupt_event=self.enable_legacy_on_interrupt_event,
-                emit_interrupt_outcome=self.emit_interrupt_outcome,
-                emit_raw_events=self.emit_raw_events,
-                # Every constructor flag must survive a clone: the FastAPI endpoint
-                # clones per request, so a flag dropped here silently reverts to its
-                # default in the standard serving path. Inline/attributed travel as
-                # the boolean alias so existing subclasses whose __init__ predates
-                # subagent_visibility keep cloning; only "hidden" needs the new
-                # kwarg (a subclass opting into it must accept it).
-                **(
-                    {"subagent_visibility": self.subagent_visibility}
-                    if self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
-                    else {"emit_subagent_events": self.emit_subagent_events}
-                ),
+        flag_defaults = {
+            "enable_legacy_on_interrupt_event": (self.enable_legacy_on_interrupt_event, True),
+            "emit_interrupt_outcome": (self.emit_interrupt_outcome, False),
+            "emit_raw_events": (self.emit_raw_events, True),
+        }
+        if self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN:
+            flag_defaults["subagent_visibility"] = (
+                self.subagent_visibility, SUBAGENT_VISIBILITY_INLINE,
             )
+        else:
+            flag_defaults["emit_subagent_events"] = (self.emit_subagent_events, False)
+
+        try:
+            parameters = inspect.signature(type(self).__init__).parameters
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+            )
+        except (TypeError, ValueError):
+            parameters, accepts_var_kw = None, True
+
+        kwargs = {
+            "name": self.name,
+            "graph": self.graph,
+            "description": self.description,
+            "config": dict(self.config) if self.config else None,
+        }
+        for key, (value, default) in flag_defaults.items():
+            if accepts_var_kw or parameters is None or key in parameters:
+                kwargs[key] = value
+            elif value != default:
+                raise TypeError(
+                    f"{type(self).__name__}.__init__ does not accept '{key}', but this "
+                    f"agent sets it to {value!r} (default {default!r}). Override clone() "
+                    f"or accept the parameter — omitting it would silently revert the "
+                    f"flag on every request."
+                )
+
+        try:
+            return type(self)(**kwargs)
         except TypeError as exc:
             raise TypeError(
                 f"{type(self).__name__} must override clone() or ensure its "
