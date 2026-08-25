@@ -349,7 +349,12 @@ export async function createStrandsApp(
   // `corsEnabled: false` vetoes every other CORS option; otherwise a truthy
   // `corsOrigin` is what installs the middleware. Anything that narrows a
   // policy which will never exist is a misconfiguration, not a no-op.
-  const installCors = corsEnabled !== false && Boolean(corsOrigin);
+  // A falsy origin (omitted, `false`, `""`) and a `corsEnabled: false` veto
+  // both resolve to no policy at all. Narrowing to `undefined` here rather
+  // than testing a boolean keeps the origin's type usable below.
+  const corsPolicy =
+    corsEnabled === false ? undefined : corsOrigin || undefined;
+  const installCors = corsPolicy !== undefined;
   if (!installCors && corsEnabled !== false) {
     const orphaned = [
       corsEnabled === true ? "`corsEnabled: true`" : null,
@@ -386,7 +391,7 @@ export async function createStrandsApp(
     const cors = await loadCors();
     // Normalize before deciding credentials: `allowsCredentials` expects the
     // wildcard spellings to have collapsed already.
-    const resolvedCorsOrigin = normalizeCorsOrigin(corsOrigin);
+    const resolvedCorsOrigin = normalizeCorsOrigin(corsPolicy);
     app.use(
       cors({
         origin: resolvedCorsOrigin,
