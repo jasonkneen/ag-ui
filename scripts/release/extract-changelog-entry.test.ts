@@ -806,16 +806,19 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
     // And an array whose entries lack the required fields — in BOTH scripts,
     // since reconcile reads the same payload shape.
     //
-    // reconcile is given an EXISTING release body here. Without one it decides
-    // the release is absent and delegates to create-or-update-release.sh,
-    // whose guard then supplies the failure — so this case would pass with
-    // reconcile's own guard deleted.
+    // Asserting only "exits non-zero with this message" is not enough for
+    // reconcile: with its own guard deleted, jq yields literal `null` fields,
+    // reconcile decides the package is missing and delegates to
+    // create-or-update-release.sh, and THAT script's guard produces the same
+    // failure and message. So assert reconcile rejects before it touches
+    // GitHub at all — with the guard, it makes no `gh` call whatsoever.
     const bodyFile = join(root, "existing-body.txt");
     writeFileSync(
       bodyFile,
       "## Packages Published\n<!-- ag-ui-published: ag_ui_strands@0.3.1 -->\n",
     );
     for (const script of [RELEASE_SH, RECONCILE_SH]) {
+      const callsFile = join(root, `calls-${script.split("/").pop()}.txt`);
       const r = spawnSync("bash", [script, "typescript", '[{"nope":1}]'], {
         encoding: "utf8",
         env: {
@@ -824,7 +827,7 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
           AGUI_RELEASE_REPO_ROOT: root,
           GH_FIXTURE_BODY: bodyFile,
           GH_FIXTURE_UPDATED: join(root, "updated-malformed.txt"),
-          GH_FIXTURE_CALLS: join(root, "gh-calls.txt"),
+          GH_FIXTURE_CALLS: callsFile,
           DRY_RUN: "false",
         },
       });
@@ -834,6 +837,11 @@ test("malformed packages-json fails loudly instead of publishing an empty releas
         `${script} must reject entries missing fields`,
       );
       assert.match(r.stderr, /string \.name and \.version/);
+      assert.equal(
+        existsSync(callsFile),
+        false,
+        `${script} must reject the payload before invoking gh at all`,
+      );
     }
     assert.equal(
       existsSync(join(root, "updated-malformed.txt")),

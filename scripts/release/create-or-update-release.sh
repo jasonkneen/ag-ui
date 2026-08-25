@@ -100,14 +100,12 @@ notes_block() {
   set -e
   printf '%s' "$status" > "$NOTES_STATUS_FILE"
 
-  # Neutralise any marker-looking comment INSIDE the approved notes before it
-  # is embedded. Presence checks grep the assembled body, so a note that
-  # legitimately quotes a marker — entirely plausible for a changelog entry
-  # describing this very mechanism — would make a later package look already
-  # recorded and drop its row and notes. Escaping the opening bracket means
-  # the only real markers in the body are the ones this script writes, and the
-  # quoted example renders as visible text instead of an invisible comment.
-  entry="${entry//<!-- ag-ui-/&lt;!-- ag-ui-}"
+  # NOTE: marker-looking comments inside the entry are neutralised by
+  # extract-changelog-entry.py, not here. Doing it in bash is not portable:
+  # bash 5.2 enables patsub_replacement, where an unquoted `&` in a
+  # ${v//a/b} replacement expands to the matched text, and the spellings that
+  # work on 5.2 leave literal backslashes or quotes on the bash 3.2 that ships
+  # with macOS.
 
   if [ "$status" -eq 0 ]; then
     printf '#### %s@%s\n\n%s\n\n%s\n' "$name" "$version" "$entry" "$(published_sentinel "$name" "$version")"

@@ -180,6 +180,22 @@ def main() -> int:
 
     if demote:
         entry = demote_headings(entry, demote)
+
+    # Neutralise marker-looking comments. The publisher greps the assembled
+    # release body for a per-package marker, so an entry that QUOTES one -
+    # entirely plausible for a changelog describing this very mechanism -
+    # would make a later package look already recorded and drop its row and
+    # notes. Escaping the opening bracket means only markers the publisher
+    # writes are real, and the quoted example renders as visible text rather
+    # than an invisible comment.
+    #
+    # This lives here, not in the calling shell script: bash 5.2 enables
+    # patsub_replacement by default, where an unquoted `&` in a ${v//a/b}
+    # replacement expands to the matched text. The portable spellings differ
+    # between bash 3.2 and 5.2, so the same line cannot be correct on a
+    # developer's macOS shell and on the Linux CI runner at once.
+    entry = entry.replace("<!-- ag-ui-", "&lt;!-- ag-ui-")
+
     print(entry)
     return EXIT_OK
 
