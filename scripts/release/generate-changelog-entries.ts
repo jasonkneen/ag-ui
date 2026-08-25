@@ -84,15 +84,12 @@ const REQUEST_DEADLINE_MS = 300_000;
 // and boilerplate.
 export const MAX_SUMMARY_CHARS = 40_000;
 
-const CHANGELOG_HEADER = [
-  "# Changelog",
-  "",
-  "<!-- Entries are generated at release time and reviewed as part of the",
-  "     release PR. Edit freely before the PR merges; the merged text is",
-  "     published to the GitHub Release with heading levels shifted to nest",
-  "     under it. -->",
-  "",
-].join("\n");
+// Only used when a package has no CHANGELOG.md yet. Deliberately just the
+// title: an explanatory comment here would appear in new files but never in
+// ones that already exist (so it could not be relied on), would be hidden by
+// Markdown rendering anyway, and would duplicate — across 46 packages — the
+// text the release PR body already states where reviewers can see it.
+const CHANGELOG_HEADER = ["# Changelog", ""].join("\n");
 
 function warn(msg: string): void {
   console.error(`[changelog-entries] ${msg}`);
