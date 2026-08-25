@@ -46,6 +46,7 @@ AGUI.Abstractions.AGUIBinaryInputContent.Url.get -> string?
 AGUI.Abstractions.AGUIBinaryInputContent.Url.set -> void
 AGUI.Abstractions.AGUIEventTypes
 
+AGUI.Abstractions.AGUIJsonSerializerContext.JsonObject.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<System.Text.Json.Nodes.JsonObject>
 AGUI.Abstractions.AGUIJsonSerializerContext.StateDeltaEvent.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.StateDeltaEvent>
 AGUI.Abstractions.AGUIJsonSerializerContext.StateSnapshotEvent.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.StateSnapshotEvent>
 AGUI.Abstractions.AGUIJsonSerializerContext.ReasoningStartEvent.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.ReasoningStartEvent>

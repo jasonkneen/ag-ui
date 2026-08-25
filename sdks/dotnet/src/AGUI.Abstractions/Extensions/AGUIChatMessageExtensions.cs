@@ -1,9 +1,9 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.AI;
 
 namespace AGUI.Abstractions;
@@ -503,22 +503,11 @@ public static class AGUIChatMessageExtensions
                 return preservedMetadata.Clone();
             }
 
-            using var stream = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(stream))
-            {
-                writer.WriteStartObject();
-                foreach (var property in preservedMetadata.EnumerateObject())
-                {
-                    property.WriteTo(writer);
-                }
-
-                writer.WriteString("filename", filename);
-                writer.WriteEndObject();
-            }
-
-            stream.Position = 0;
-            using var document = JsonDocument.Parse(stream);
-            return document.RootElement.Clone();
+            var metadataObject = JsonObject.Create(preservedMetadata)!;
+            metadataObject["filename"] = filename;
+            return JsonSerializer.SerializeToElement(
+                metadataObject,
+                AGUIJsonSerializerContext.Default.JsonObject);
         }
 
         IDictionary<string, object?> metadata = new Dictionary<string, object?>();
