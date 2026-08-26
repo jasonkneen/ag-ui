@@ -1959,19 +1959,30 @@ class StrandsAgent:
                 for msg in reversed(input_data.messages):
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
-                        if tool_name is None:
+                        # An entry in the durable wire->native map is only ever
+                        # recorded when a frontend tool call is emitted, so its
+                        # presence proves this result came from a client-executed
+                        # tool. A backend tool never has one: its wire id IS the
+                        # native id.
+                        _native_id = wire_to_native.get(msg.tool_call_id)
+                        if tool_name is None and _native_id:
                             # A frontend tool is emitted under a fresh wire id, so
                             # the name recovered from native session history above is
                             # keyed by the native ``toolUseId`` instead. Translate
                             # through the durable map and retry. Kept as a fallback
                             # rather than translating up front: when the assistant
                             # message IS in the payload the lookup is already keyed
-                            # by the wire id, and a backend tool has no wire entry at
-                            # all because its wire id is the native id.
-                            _native_id = wire_to_native.get(msg.tool_call_id)
-                            if _native_id:
-                                tool_name = _tool_call_id_to_name.get(_native_id)
-                        if tool_name and tool_name in frontend_tool_names:
+                            # by the wire id.
+                            tool_name = _tool_call_id_to_name.get(_native_id)
+                        # Provenance is either signal, not membership alone: a
+                        # continuation that declares no tools (``tools: []``) still
+                        # carries a real frontend result, and reading membership
+                        # alone would file it as a backend result and hand the model
+                        # an empty prompt — the very loop this derivation prevents.
+                        _is_frontend_result = bool(tool_name) and (
+                            tool_name in frontend_tool_names or bool(_native_id)
+                        )
+                        if _is_frontend_result:
                             # Forward the ACTUAL result so the model can act on the
                             # human's decision (e.g. an approval resolving to
                             # {"approved": false}). Hardcoding a success string here
@@ -2011,10 +2022,11 @@ class StrandsAgent:
                                     f"{tool_name} executed successfully with no return value."
                                 )
                         elif tool_name:
-                            # Named, but not client-declared: this result
-                            # belongs to a tool Strands ran itself, so the
-                            # model already has it in the native history and
-                            # the continuation prompt has nothing to carry.
+                            # Named, but neither signal says frontend: not in
+                            # the current declarations and no wire-map entry.
+                            # That is a tool Strands ran itself, so the model
+                            # already has it in the native history and the
+                            # continuation prompt has nothing to carry.
                             logger.debug(
                                 f"Skipping non-frontend tool result in the continuation "
                                 f"message: tool_name={tool_name}, "

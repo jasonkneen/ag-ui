@@ -819,6 +819,52 @@ class TestSessionFrontendToolReconciliation:
         assert "executed successfully" not in instance.stream_prompts[0]
 
     @pytest.mark.parametrize(
+        ("content", "error", "expected"),
+        [
+            pytest.param(
+                '{"approved": false}',
+                None,
+                'approve returned: {"approved": false}',
+                id="normal-result",
+            ),
+            pytest.param(
+                "",
+                "invalid id",
+                "approve failed: invalid id",
+                id="empty-content-error",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_wire_map_hit_is_frontend_provenance_without_declarations(
+        self, tmp_path, content, error, expected
+    ):
+        """A continuation that declares no tools still carries a real
+        frontend result. Membership in ``input_data.tools`` is not the only
+        proof of provenance: the durable wire->native entry is recorded when
+        the call is emitted, so it establishes the same thing by itself.
+        Reading membership alone files the result as a backend one and hands
+        the model ``""`` — the re-fire loop this derivation exists to stop."""
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(
+            session_id="thread-no-declarations", storage_dir=str(tmp_path)
+        )
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[_payload_tool("wire-1", content, error=error)],
+            tools=[],
+            wire_map={"wire-1": "native-1"},
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1"),
+            ],
+            config_kwargs={"replay_history_into_strands": False},
+        )
+        assert instance.stream_prompts == [expected]
+
+    @pytest.mark.parametrize(
         "content", ["tool failed: invalid id", ""], ids=["with-text", "empty"]
     )
     @pytest.mark.asyncio
