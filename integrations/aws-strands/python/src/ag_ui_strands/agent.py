@@ -730,8 +730,7 @@ def _extract_tool_result_data(result_content: Any) -> Any:
     if not isinstance(result_content, list):
         return None
 
-    fallback = None
-    fallback_set = False
+    fallback_results = []
     text_result = None
     text_found = False
     for content_item in result_content:
@@ -753,16 +752,18 @@ def _extract_tool_result_data(result_content: Any) -> Any:
                     text_result = text_content
             continue
 
-        if not fallback_set:
-            if "json" in content_item:
-                fallback = content_item["json"]
-            else:
-                # Strands media blocks are already JSON-shaped dicts. Unknown
-                # non-text blocks are kept too, for forward compatibility.
-                fallback = content_item
-            fallback_set = True
+        if "json" in content_item:
+            fallback_results.append(content_item["json"])
+        else:
+            # Strands media blocks are already JSON-shaped dicts. Unknown
+            # non-text blocks are kept too, for forward compatibility.
+            fallback_results.append(content_item)
 
-    return text_result if text_found else fallback
+    if text_found:
+        return text_result
+    if len(fallback_results) == 1:
+        return fallback_results[0]
+    return fallback_results or None
 
 
 def _serialize_tool_result_data(result_data: Any) -> str:

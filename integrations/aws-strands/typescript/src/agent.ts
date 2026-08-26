@@ -2143,13 +2143,13 @@ export class StrandsAgent {
             // legitimate — emit an empty TOOL_CALL_RESULT so the UI still
             // renders a result card.
             let resultData: unknown = null;
-            let fallbackResultData: unknown = null;
-            let matchedStructuredResult = false;
+            const fallbackResultData: unknown[] = [];
+            let matchedTextResult = false;
             const contentBlocks = hookEvent.result?.content;
             if (Array.isArray(contentBlocks)) {
               for (const cb of contentBlocks) {
                 if (cb instanceof TextBlock) {
-                  matchedStructuredResult = true;
+                  matchedTextResult = true;
                   try {
                     resultData = JSON.parse(cb.text);
                   } catch {
@@ -2167,29 +2167,26 @@ export class StrandsAgent {
                 }
                 const maybeJson = (cb as unknown as { json?: unknown }).json;
                 if (maybeJson !== undefined) {
-                  matchedStructuredResult = true;
-                  resultData = maybeJson;
-                  break;
+                  fallbackResultData.push(maybeJson);
+                  continue;
                 }
 
-                if (fallbackResultData == null) {
-                  const serializableBlock = cb as unknown as {
-                    toJSON?: () => unknown;
-                  };
-                  fallbackResultData =
-                    typeof serializableBlock.toJSON === "function"
-                      ? serializableBlock.toJSON()
-                      : cb;
-                }
+                const serializableBlock = cb as unknown as {
+                  toJSON?: () => unknown;
+                };
+                fallbackResultData.push(
+                  typeof serializableBlock.toJSON === "function"
+                    ? serializableBlock.toJSON()
+                    : cb,
+                );
               }
             }
 
-            if (
-              !matchedStructuredResult &&
-              resultData == null &&
-              fallbackResultData != null
-            ) {
-              resultData = fallbackResultData;
+            if (!matchedTextResult && fallbackResultData.length > 0) {
+              resultData =
+                fallbackResultData.length === 1
+                  ? fallbackResultData[0]
+                  : fallbackResultData;
             }
 
             if (!resultToolId) continue;

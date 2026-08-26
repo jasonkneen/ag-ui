@@ -127,6 +127,31 @@ async def test_non_text_result_is_forwarded(block: dict, expected: dict):
     assert json.loads(content) == expected
 
 
+async def test_multiple_non_text_results_are_forwarded_in_order():
+    content = await _tool_result_content(
+        [
+            {"image": {"format": "png", "source": {"bytes": b"\x00\x01"}}},
+            {
+                "document": {
+                    "name": "result.pdf",
+                    "format": "pdf",
+                    "source": {"bytes": b"\x02\x03"},
+                }
+            },
+        ]
+    )
+    assert json.loads(content) == [
+        {"image": {"format": "png", "source": {"bytes": "AAE="}}},
+        {
+            "document": {
+                "name": "result.pdf",
+                "format": "pdf",
+                "source": {"bytes": "AgM="},
+            }
+        },
+    ]
+
+
 async def test_empty_result_still_closes_the_tool_with_empty_content():
     assert await _tool_result_content([]) == ""
 

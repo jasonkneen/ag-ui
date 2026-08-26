@@ -303,21 +303,25 @@ describe("StrandsAgent.run — tool calls", () => {
   it.each([
     [
       "image",
-      new ImageBlock({
-        format: "png",
-        source: { bytes: new Uint8Array([0, 1]) },
-      }),
+      [
+        new ImageBlock({
+          format: "png",
+          source: { bytes: new Uint8Array([0, 1]) },
+        }),
+      ],
       {
         image: { format: "png", source: { bytes: "AAE=" } },
       },
     ],
     [
       "document",
-      new DocumentBlock({
-        name: "result.pdf",
-        format: "pdf",
-        source: { bytes: new Uint8Array([2, 3]) },
-      }),
+      [
+        new DocumentBlock({
+          name: "result.pdf",
+          format: "pdf",
+          source: { bytes: new Uint8Array([2, 3]) },
+        }),
+      ],
       {
         document: {
           name: "result.pdf",
@@ -328,17 +332,43 @@ describe("StrandsAgent.run — tool calls", () => {
     ],
     [
       "video",
-      new VideoBlock({
-        format: "mp4",
-        source: { bytes: new Uint8Array([4, 5]) },
-      }),
+      [
+        new VideoBlock({
+          format: "mp4",
+          source: { bytes: new Uint8Array([4, 5]) },
+        }),
+      ],
       {
         video: { format: "mp4", source: { bytes: "BAU=" } },
       },
     ],
+    [
+      "multiple blocks",
+      [
+        new ImageBlock({
+          format: "png",
+          source: { bytes: new Uint8Array([0, 1]) },
+        }),
+        new DocumentBlock({
+          name: "result.pdf",
+          format: "pdf",
+          source: { bytes: new Uint8Array([2, 3]) },
+        }),
+      ],
+      [
+        { image: { format: "png", source: { bytes: "AAE=" } } },
+        {
+          document: {
+            name: "result.pdf",
+            format: "pdf",
+            source: { bytes: "AgM=" },
+          },
+        },
+      ],
+    ],
   ])(
-    "serializes %s-only backend tool results",
-    async (_kind, contentBlock, expected) => {
+    "serializes %s backend tool results",
+    async (_kind, contentBlocks, expected) => {
       const toolUseId = `backend-${_kind}`;
       const block = new ToolUseBlock({
         name: "backend_tool",
@@ -348,7 +378,7 @@ describe("StrandsAgent.run — tool calls", () => {
       const resultBlock = new ToolResultBlock({
         toolUseId,
         status: "success",
-        content: [contentBlock],
+        content: contentBlocks,
       });
       const agent = scriptedStrandsAgent([
         block as unknown as AgentStreamEvent,
