@@ -34,6 +34,7 @@ from strands import Agent, tool
 from strands.types.tools import ToolContext
 from ag_ui_strands import StrandsAgent, create_strands_app
 from server.model_factory import create_model
+from server.settings import cors_origins
 
 
 @tool(context=True)
@@ -88,4 +89,4 @@ agui_agent = StrandsAgent(
     description="AWS Strands agent whose scheduling tool pauses for the user to pick a time",
 )
 
-app = create_strands_app(agui_agent, "/")
+app = create_strands_app(agui_agent, "/", origins=cors_origins())

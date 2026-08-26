@@ -12,13 +12,37 @@ This package exposes a lightweight wrapper that lets any `strands.Agent` speak t
 
 ## Quick Start
 
-The `examples/server/__main__.py` module mounts all demo routes behind a single FastAPI app. Run:
+The `examples/server` package mounts all demo routes behind a single FastAPI app. Run:
 
 ```bash
 cd integrations/aws-strands/python/examples
 poetry install
 poetry run python -m server
 ```
+
+`PORT` selects the port and defaults to 8000. It must be written in plain
+decimal digits with no leading zero and no sign, giving a number between 1 and
+65535. Anything else is refused at startup, naming the variable and the value,
+rather than silently binding somewhere unreachable: `0` binds an arbitrary free
+port, and Python would otherwise read `0100` as 100 and `1_0` as 10.
+
+`CORS_ALLOW_ORIGINS` is a comma-separated list of browser origins to allow. It
+is applied to the dojo app and to every demo mounted inside it, because both
+install CORS middleware and the mounted one answers first.
+
+Entries are matched against the `Origin` header exactly. A trailing slash and
+letter case are repaired, since a browser sends neither, but nothing else is
+validated: an entry that is not an origin stays in the list and simply matches
+nothing. `null`, which a sandboxed iframe or a `file://` page sends, is matched
+like any other entry, but it names no site, so its presence disables
+credentials for the whole list, exactly as `*` does.
+
+Only an unset or blank value allows every origin. That is the local-development
+default, and the server says so once at startup. A value that was written but
+holds nothing a browser could send, `/` or `*/` for instance, refuses every
+cross-origin request instead of widening to allow all of them, and is reported
+separately at startup. Setting the variable is a request to restrict, so a typo
+in it must never grant more than was asked for.
 
 It exposes:
 
@@ -58,6 +82,7 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for diagrams and a deeper dive.
 | `src/ag_ui_strands/agent.py`    | Core wrapper translating Strands streams into AG-UI events                      |
 | `src/ag_ui_strands/config.py`   | Config primitives (`StrandsAgentConfig`, `ToolBehavior`, `PredictStateMapping`) |
 | `src/ag_ui_strands/endpoint.py` | FastAPI endpoint helper                                                         |
+| `src/ag_ui_strands/utils.py`    | `create_strands_app`, multimodal conversion, and `UrlFetchPolicy`               |
 | `examples/server/api/*.py`      | Ready-to-run demo apps                                                          |
 
 ## Amazon Bedrock AgentCore considerations
@@ -68,10 +93,10 @@ If you are planning to deploy your agent into Amazon Bedrock AgentCore (AC), ple
 - The path `/invocations - POST` is implemented and can be used for interacting with the agent.
 - The path `/ping - GET` is implemented and can be used for verifying that the agent is operational and ready to handle requests.
 
-To implement the path mentioned above, you can use the helper function `create_strands_app` and pass the agent interaction path and the ping path as shown below:
+To implement the path mentioned above, you can use the helper function `create_strands_app` and pass the agent interaction path and the ping path as shown below. Pass `origins` too: omitting every CORS option selects the deprecated implicit wildcard and emits a `FutureWarning`.
 
 ```python
-    create_strands_app(agui_agent, "/invocations", "/ping")
+    create_strands_app(agui_agent, "/invocations", "/ping", origins=["https://app.example"])
 ```
 
 You can also use the helper functions `add_strands_fastapi_endpoint` and `add_ping` for adding the mentioned paths to a FastAPI app that you are creating separately:
@@ -107,6 +132,14 @@ app = create_strands_app(
     auth=require_token,
 )
 ```
+
+Pass `origins` to every app you mount as well as to the parent. A mounted app
+installs its own CORS middleware and answers first, so one left on the wildcard
+default replies `Access-Control-Allow-Origin: *` to an origin the parent would
+have refused, and the parent's middleware then adds
+`Access-Control-Allow-Credentials: true` on the way out. Preflighted requests
+are still refused by the parent, but any route reachable as a simple request,
+including `/ping`, is readable by any origin.
 
 The same `auth` argument is accepted by `add_strands_fastapi_endpoint` and is
 evaluated before JSON decoding or model validation. The ping endpoint is left
