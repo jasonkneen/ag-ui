@@ -17,6 +17,9 @@ import { createModel } from "./model-factory";
 import { createA2UIDynamicSchemaAgent } from "./api/a2ui-dynamic-schema";
 import { createA2UIFixedSchemaAgent } from "./api/a2ui-fixed-schema";
 import { createA2UIRecoveryAgent } from "./api/a2ui-recovery";
+import { createInterruptAgent } from "./api/interrupt";
+import { createMultiAgentGraphAgent } from "./api/multi-agent";
+import { createPredictiveStateUpdatesAgent } from "./api/predictive-state-updates";
 
 function mountAgent(
   app: express.Express,
@@ -319,6 +322,21 @@ async function main(): Promise<void> {
     }),
   );
 
+  /* ---------------- interrupt ---------------- */
+  // `schedule_meeting` pauses itself mid-body by calling the tool context's
+  // `interrupt()`, and resumes with the time the user picked. See ./api/interrupt.
+  mountAgent(app, "/interrupt", await createInterruptAgent());
+
+  /* ---------------- predictive-state-updates ---------------- */
+  // `write_document` is a FRONTEND tool; the predictState mapping tells the UI
+  // to paint `state.document` from its streaming args. See
+  // ./api/predictive-state-updates.
+  mountAgent(
+    app,
+    "/predictive-state-updates",
+    await createPredictiveStateUpdatesAgent(),
+  );
+
   /* ---------------- tool-based-generative-ui ---------------- */
   const haikuAgent = new Agent({
     model: await createModel(),
@@ -342,6 +360,12 @@ Do not respond with plain text — always use the tool.`,
       description: "Haiku generator with frontend-rendered tool",
     }),
   );
+
+  /* ---------------- multi-agent ---------------- */
+  // A Graph orchestrator rather than a single Agent: the adapter detects the
+  // missing `.model` accessor and drives `.stream()` instead of cloning a
+  // per-thread agent.
+  mountAgent(app, "/multi-agent", await createMultiAgentGraphAgent());
 
   /* ---------------- a2ui (auto-injected tool) ---------------- */
   // Both demos are PLAIN Strands agents with NO a2ui tool wiring (each in its
