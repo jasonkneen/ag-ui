@@ -1290,6 +1290,24 @@ class TestSubagentNewFields(unittest.TestCase):
         self.assertEqual([e.type for e in evs], [EventType.SUBAGENT_FINISHED])
         self.assertEqual(evs[0].result, "the subagent result")
 
+    def test_finish_accepts_command_single_tool_message_and_direct_dict(self):
+        from langchain_core.messages import ToolMessage
+        class _Cmd:
+            def __init__(self, messages):
+                self.update = {"messages": messages}
+        for messages, expected in [
+            (ToolMessage(content="live result", tool_call_id="tc1"), "live result"),
+            ({"type": "tool", "content": "dict result", "tool_call_id": "tc2"}, "dict result"),
+        ]:
+            agent = _make_agent()
+            agent.active_run = {"active_subagents": {"tools:sub1": "alpha"},
+                                "current_subagent_run_id": "tools:sub1",
+                                "subagent_task_runs": {"run-1": "tools:sub1"}}
+            evs = agent._finish_subagent_on_task_end(
+                {"event": "on_tool_end", "run_id": "run-1", "data": {"output": _Cmd(messages)}}
+            )
+            self.assertEqual(evs[0].result, expected)
+
 
 class TestNestedSubagentParent(unittest.TestCase):
     def test_parent_derived_from_boundary_segments(self):

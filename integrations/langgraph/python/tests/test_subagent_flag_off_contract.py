@@ -530,10 +530,7 @@ class TestTaskEndResultExtraction(unittest.TestCase):
 
         events = self._finish(_Cmd())
         self.assertEqual([e.type for e in events], [EventType.SUBAGENT_FINISHED])
-        self.assertIsNone(
-            events[0].result,
-            "an un-listed payload yields no result rather than killing the run",
-        )
+        self.assertEqual(events[0].result, "solo")
 
     def test_a_dict_shaped_message_still_yields_its_content(self):
         class _Cmd:
@@ -563,6 +560,24 @@ class TestTaskEndResultExtraction(unittest.TestCase):
             events = self._finish(_Cmd())
         self.assertIsNone(events[0].result)
         self.assertTrue(any("result" in r.getMessage() for r in logs.records))
+
+
+class TestCommandToolEndResultExtraction(unittest.IsolatedAsyncioTestCase):
+    async def test_single_tool_message_and_direct_dict_emit_tool_results(self):
+        from langgraph.types import Command
+        for message, tool_call_id, content in [
+            (ToolMessage(content="single", tool_call_id="tc-single", name="my_tool"), "tc-single", "single"),
+            ({"type": "tool", "content": "dict", "tool_call_id": "tc-dict", "name": "my_tool"}, "tc-dict", "dict"),
+        ]:
+            collected = await _drive(_make_agent(), [_chain_start("model", {"langgraph_node": "model"}), {
+                "event": "on_tool_end", "run_id": "run-1", "name": "tools",
+                "metadata": {"langgraph_node": "tools"},
+                "data": {"output": Command(update={"messages": message}), "input": {}},
+            }])
+            results = [e for e in collected if getattr(e, "type", None) == EventType.TOOL_CALL_RESULT]
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].tool_call_id, tool_call_id)
+            self.assertEqual(results[0].content, content)
 
 
 class TestTaskToolErrorTerminatesTheSubagent(unittest.TestCase):

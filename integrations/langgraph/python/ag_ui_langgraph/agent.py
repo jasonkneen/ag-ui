@@ -127,6 +127,22 @@ class SubagentContext:
     parent_subagent_run_id: Optional[str] = None
 
 
+def _command_update_tool_messages(messages: Any) -> List[ToolMessage]:
+    entries = [] if messages is None else (
+        messages if isinstance(messages, (list, tuple)) else [messages]
+    )
+    tool_messages = []
+    for entry in entries:
+        if isinstance(entry, ToolMessage):
+            tool_messages.append(entry)
+        elif (isinstance(entry, dict) and entry.get("tool_call_id")
+              and (entry.get("type") == "tool" or entry.get("role") == "tool")):
+            tool_messages.append(ToolMessage(content=entry.get("content") or "",
+                                             tool_call_id=entry["tool_call_id"],
+                                             name=entry.get("name"), id=entry.get("id")))
+    return tool_messages
+
+
 # Lane key for root/supervisor-level streaming state (events with no subagent).
 # Subagent lanes use the derived subagent id (e.g. "tools:<uuid>").
 _ROOT_LANE = "__root__"
@@ -1328,7 +1344,7 @@ class LangGraphAgent:
         output = (event.get("data") or {}).get("output")
         update = getattr(output, "update", None)
         if isinstance(update, dict):
-            msgs = update.get("messages")
+            msgs = _command_update_tool_messages(update.get("messages")) or update.get("messages")
             if isinstance(msgs, (list, tuple)):
                 # Prefer a genuine ToolMessage (the same filtering the OnToolEnd
                 # handler applies), since a Command update can also carry the
@@ -3502,7 +3518,7 @@ class LangGraphAgent:
                 # of crashing with AttributeError on ``.get``.
                 update = tool_call_output.update
                 if isinstance(update, dict):
-                    messages = update.get('messages', []) or []
+                    messages = _command_update_tool_messages(update.get('messages', []) or [])
                 else:
                     messages = []
 
