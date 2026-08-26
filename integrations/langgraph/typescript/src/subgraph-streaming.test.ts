@@ -17,10 +17,13 @@ import { EventType } from "@ag-ui/core";
 import type { MessagesSnapshotEvent, StateSnapshotEvent } from "@ag-ui/core";
 import { LangGraphAgent } from "./agent";
 import type { LangGraphAgentConfig } from "./agent";
+// @langchain/langgraph-sdk is a graph persistence client, not an LLM provider;
+// aimock does not apply to these checkpoint-history tests.
 import type {
   Message as LangGraphMessage,
   ThreadState as LangGraphThreadState,
 } from "@langchain/langgraph-sdk";
+import type { Durability } from "@langchain/langgraph-sdk/dist/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,6 +69,7 @@ type SnapshotHarness = {
     orderedStateValues?: LangGraphThreadState<unknown>["values"],
     hasOrderedStateValues?: boolean,
     boundaryCheckpointStep?: number,
+    durability?: Durability,
   ) => Promise<LangGraphThreadState<unknown>["values"]>;
 };
 
@@ -125,7 +129,7 @@ function setupSnapshotHarness(state: MockThreadState) {
   const { agent, dispatched } = makeAgent(config);
   const agentHarness = snapshotHarness(agent);
   agentHarness.activeRun = { id: "run-1" };
-  return { agentHarness, dispatched, getState };
+  return { agentHarness, config, dispatched, getState };
 }
 
 function eventTypes(dispatched: any[]): string[] {
@@ -365,6 +369,111 @@ describe("getStateAndMessagesSnapshots", () => {
     const ids = messagesSnap?.messages.map((message) => message.id);
     expect(ids).toEqual(["u1", "c1"]);
   });
+});
+
+describe("boundary checkpoint durability", () => {
+  it("retries an empty default-async history lookup", async () => {
+    const user = msg("u1", "human", "AMS to SF");
+    const committedSubgraphAssistant = msg(
+      "s1",
+      "ai",
+      "Subgraph committed a hotel",
+    );
+    const { agentHarness, config, dispatched, getState } = setupSnapshotHarness(
+      {
+        values: {
+          messages: [
+            user,
+            committedSubgraphAssistant,
+            msg("future", "ai", "Future root response"),
+          ],
+          futureOnly: true,
+        },
+      },
+    );
+    const boundaryState = makeMockThreadState({
+      values: {
+        messages: [user, committedSubgraphAssistant],
+        itinerary: { hotel: "Hotel Zoe" },
+      },
+      metadata: { step: 6 },
+    });
+    const getHistory = vi.mocked(config.client!.threads.getHistory);
+    getHistory.mockResolvedValueOnce([]).mockResolvedValueOnce([boundaryState]);
+
+    await agentHarness.getStateAndMessagesSnapshots(
+      "thread-1",
+      undefined,
+      false,
+      6,
+    );
+
+    expect(getHistory).toHaveBeenCalledTimes(2);
+    expect(getState).not.toHaveBeenCalled();
+    const stateSnapshot = dispatched.find(
+      (event): event is StateSnapshotEvent =>
+        event?.type === EventType.STATE_SNAPSHOT,
+    );
+    expect(stateSnapshot?.snapshot).toEqual(boundaryState.values);
+    expect(stateSnapshot?.snapshot).not.toHaveProperty("futureOnly");
+  });
+
+  it("fails explicitly for exit durability without reading thread head", async () => {
+    const { agentHarness, config, dispatched, getState } = setupSnapshotHarness(
+      {
+        values: {
+          messages: [msg("future", "ai", "Future root response")],
+          futureOnly: true,
+        },
+      },
+    );
+    const getHistory = setMockGetHistory(config, []);
+
+    await expect(
+      agentHarness.getStateAndMessagesSnapshots(
+        "thread-1",
+        undefined,
+        false,
+        6,
+        "exit",
+      ),
+    ).rejects.toThrow('durability "exit"');
+
+    expect(getHistory).not.toHaveBeenCalled();
+    expect(getState).not.toHaveBeenCalled();
+    expect(dispatched).toEqual([]);
+  });
+
+  it.each([
+    ["async", 3],
+    ["sync", 1],
+  ] as const)(
+    "bounds %s durability checkpoint lookup to %i attempt(s)",
+    async (durability, expectedAttempts) => {
+      const { agentHarness, config, dispatched, getState } =
+        setupSnapshotHarness({
+          values: {
+            messages: [msg("future", "ai", "Future root response")],
+            futureOnly: true,
+          },
+        });
+      const getHistory = setMockGetHistory(config, []);
+
+      await expect(
+        agentHarness.getStateAndMessagesSnapshots(
+          "thread-1",
+          undefined,
+          false,
+          6,
+          durability,
+        ),
+      ).rejects.toThrow("No LangGraph checkpoint found for boundary step 6");
+
+      expect(getHistory).toHaveBeenCalledTimes(expectedAttempts);
+      expect(getState).not.toHaveBeenCalled();
+      expect(dispatched).toEqual([]);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
