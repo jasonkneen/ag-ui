@@ -37,10 +37,12 @@ class FakeOrchestrator:
         self.events = events
         self.raises = raises
         self.prompts: list[Any] = []
+        self.invocation_states: list[dict[str, Any] | None] = []
         self.closed = False
 
     async def stream_async(self, task, invocation_state=None, **kwargs):
         self.prompts.append(task)
+        self.invocation_states.append(invocation_state)
         try:
             for event in self.events:
                 yield event
@@ -71,8 +73,18 @@ def node_stream(node_id: str, inner: dict) -> dict:
     return {"type": "multiagent_node_stream", "node_id": node_id, "event": inner}
 
 
-async def collect(agent: StrandsAgent, input_data=None) -> list:
-    return [e async for e in agent.run(input_data or FakeInput())]
+async def collect(
+    agent: StrandsAgent,
+    input_data=None,
+    *,
+    invocation_state: dict[str, Any] | None = None,
+) -> list:
+    kwargs = (
+        {"invocation_state": invocation_state}
+        if invocation_state is not None
+        else {}
+    )
+    return [e async for e in agent.run(input_data or FakeInput(), **kwargs)]
 
 
 async def _drain(stream) -> list:
@@ -121,6 +133,17 @@ async def test_orchestrator_path_chosen_when_agent_has_no_model():
     assert types[0] == EventType.RUN_STARTED
     assert types[-1] == EventType.RUN_FINISHED
     assert EventType.RUN_ERROR not in types
+
+
+@pytest.mark.asyncio
+async def test_shared_orchestrator_receives_an_isolated_invocation_state():
+    orchestrator = FakeOrchestrator([])
+    invocation_state = {"tenant_id": "tenant-1"}
+
+    await collect(make_agent(orchestrator), invocation_state=invocation_state)
+
+    assert orchestrator.invocation_states == [invocation_state]
+    assert orchestrator.invocation_states[0] is not invocation_state
 
 
 @pytest.mark.asyncio
@@ -1050,6 +1073,24 @@ async def test_a_factory_builds_a_fresh_orchestrator_per_run():
     # One at construction to validate the factory, then one per run.
     assert len(built) == 3
     assert built[1] is not built[2]
+
+
+@pytest.mark.asyncio
+async def test_factory_orchestrator_receives_invocation_state_for_its_run():
+    built = []
+
+    def build():
+        orchestrator = FakeOrchestrator([])
+        built.append(orchestrator)
+        return orchestrator
+
+    agent = StrandsAgent(build, name="multi_agent")
+    invocation_state = {"request_id": "request-1"}
+
+    await collect(agent, invocation_state=invocation_state)
+
+    assert built[1].invocation_states == [invocation_state]
+    assert built[1].invocation_states[0] is not invocation_state
 
 
 @pytest.mark.asyncio

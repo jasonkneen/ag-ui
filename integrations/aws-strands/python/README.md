@@ -131,6 +131,40 @@ agentcore deploy
 
 For the complete deployment walkthrough, see [Deploy AG-UI servers in AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-agui.html).
 
+## Request-scoped invocation state
+
+Use `invocation_state_provider` to make trusted server context available to
+Strands hooks and tools for one request. The provider may be synchronous or
+asynchronous and receives both the FastAPI `Request` and the validated
+`RunAgentInput`:
+
+```python
+from fastapi import Request
+from ag_ui.core import RunAgentInput
+from ag_ui_strands import create_strands_app
+
+async def invocation_state(
+    request: Request,
+    input_data: RunAgentInput,
+) -> dict[str, object]:
+    return {
+        "tenant_id": request.state.tenant_id,
+        "run_id": input_data.run_id,
+    }
+
+app = create_strands_app(
+    agui_agent,
+    auth=require_token,
+    invocation_state_provider=invocation_state,
+)
+```
+
+The adapter shallow-copies the returned dictionary before each invocation,
+because Strands adds its own runtime entries to that dictionary. Do not source
+trusted values from client-controlled `forwarded_props`; derive them from
+authenticated request context instead. Custom routes can pass the same state
+directly with `agent.run(input_data, invocation_state={...})`.
+
 ## Human-in-the-loop (native Strands interrupts)
 
 Tools that pause with `tool_context.interrupt(...)` are bridged to the AG-UI

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
 from ag_ui.core import (
+    AssistantMessage,
+    FunctionCall,
     RunAgentInput,
     Tool,
+    ToolCall,
     ToolMessage,
     UserMessage,
 )
@@ -29,6 +33,16 @@ def _mock_model():
 def _run_input(thread_id: str, *, reconcile: bool = False) -> RunAgentInput:
     messages = (
         [
+            AssistantMessage(
+                id="assistant-1",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="wire-1",
+                        function=FunctionCall(name="approve", arguments="{}"),
+                    )
+                ],
+            ),
             ToolMessage(
                 id="tool-1",
                 role="tool",
@@ -106,7 +120,12 @@ async def test_invocation_state_is_forwarded_unchanged(replay_history):
         replay_history=replay_history,
     )
 
-    assert core.calls[0][1]["invocation_state"] is invocation_state
+    forwarded = core.calls[0][1]["invocation_state"]
+    assert forwarded == invocation_state
+    assert forwarded is not invocation_state
+
+    forwarded["mutated_by_strands"] = True
+    assert invocation_state == {"request_id": "request-1"}
 
 
 @pytest.mark.asyncio
@@ -142,4 +161,12 @@ async def test_invocation_state_is_forwarded_during_session_reconciliation():
             pass
 
     core = _CapturingCore.instances[-1]
-    assert core.calls[0][1]["invocation_state"] is invocation_state
+    forwarded = core.calls[0][1]["invocation_state"]
+    assert forwarded == invocation_state
+    assert forwarded is not invocation_state
+
+
+def test_strands_stream_async_accepts_invocation_state_by_keyword_only():
+    parameter = inspect.signature(Agent.stream_async).parameters["invocation_state"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
