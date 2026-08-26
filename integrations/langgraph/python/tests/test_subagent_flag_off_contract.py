@@ -579,6 +579,21 @@ class TestCommandToolEndResultExtraction(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(results[0].tool_call_id, tool_call_id)
             self.assertEqual(results[0].content, content)
 
+    async def test_command_tool_args_are_safely_serialized(self):
+        from langgraph.types import Command
+        from datetime import datetime, timezone; import uuid
+
+        collected = await _drive(_make_agent(), [_chain_start("model", {"langgraph_node": "model"}), {
+            "event": "on_tool_end", "run_id": "run-1", "name": "tools", "metadata": {"langgraph_node": "tools"},
+            "data": {
+                "output": Command(update={"messages": ToolMessage(content="single", tool_call_id="tc-single", name="my_tool")}),
+                "input": {"id": uuid.UUID("12345678-1234-5678-1234-567812345678"), "at": datetime(2026, 8, 25, tzinfo=timezone.utc)},
+            },
+        }])
+        args = [e for e in collected if getattr(e, "type", None) == EventType.TOOL_CALL_ARGS]
+        self.assertEqual(len(args), 1)
+        self.assertTrue("12345678-1234-5678-1234-567812345678" in args[0].delta and "datetime.datetime(2026, 8, 25" in args[0].delta)
+
 
 class TestTaskToolErrorTerminatesTheSubagent(unittest.TestCase):
     """A failed `task` delegation must end in SUBAGENT_ERROR, not FINISHED.

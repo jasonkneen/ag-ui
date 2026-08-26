@@ -3563,7 +3563,7 @@ class LangGraphAgent:
                             ToolCallArgsEvent(
                                 type=EventType.TOOL_CALL_ARGS,
                                 tool_call_id=public_call_id,
-                                delta=json.dumps(event["data"].get("input", {})),
+                                delta=dump_json_safe(event["data"].get("input", {})),
                                 raw_event=event
                             )
                         )
