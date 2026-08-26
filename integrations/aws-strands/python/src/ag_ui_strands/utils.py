@@ -8,6 +8,7 @@ import logging
 import re
 import socket
 import time
+import urllib.error
 import urllib.request
 import warnings
 from dataclasses import dataclass, field
@@ -351,10 +352,11 @@ class _PolicyHTTPSHandler(urllib.request.HTTPSHandler):
 
 
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Re-applies the fetch policy to every redirect target."""
+    """Re-applies the fetch policy and the run's ceilings to every redirect."""
 
-    def __init__(self, policy: UrlFetchPolicy):
+    def __init__(self, policy: UrlFetchPolicy, budget: _FetchBudget):
         self._policy = policy
+        self._budget = budget
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _validate_fetch_url(newurl, self._policy)
@@ -368,8 +370,45 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
             )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+    def _follow_redirect(self, req, fp, code, msg, headers):
+        """Follow one hop with the run's byte and time ceilings applied.
 
-def _open_url(url: str, timeout: float, policy: UrlFetchPolicy):
+        urllib drains the redirect body with an unbounded read and hands the
+        next hop the timeout the previous one was given, so on its own the
+        ceilings bound nothing but the final response.
+        """
+        remaining = self._budget.remaining_seconds()
+        if remaining <= 0:
+            fp.close()
+            raise UrlFetchPolicyError(
+                f"run exceeded its {self._policy.max_total_seconds} second "
+                "total fetch time"
+            )
+        # The next hop gets what is left of the run, not another full timeout.
+        req.timeout = min(self._policy.timeout, remaining)
+        cap = min(self._policy.max_bytes, self._budget.remaining_bytes())
+        bounded = _BudgetedRedirectBody(fp, cap, self._budget)
+        try:
+            return super().http_error_302(req, bounded, code, msg, headers)
+        except UrlFetchPolicyError:
+            fp.close()
+            raise
+
+    # urllib binds these aliases to its own ``http_error_302``, so each one has
+    # to be re-pointed for a hop of that code to reach the override above.
+    http_error_301 = _follow_redirect
+    http_error_302 = _follow_redirect
+    http_error_303 = _follow_redirect
+    http_error_307 = _follow_redirect
+
+
+# Only re-point 308 where urllib follows it at all, so this does not start
+# following a redirect the interpreter would otherwise have refused.
+if hasattr(urllib.request.HTTPRedirectHandler, "http_error_308"):
+    _PolicyRedirectHandler.http_error_308 = _PolicyRedirectHandler._follow_redirect
+
+
+def _open_url(url: str, timeout: float, policy: UrlFetchPolicy, budget: _FetchBudget):
     """Open *url* with policy checks and address pinning on every hop.
 
     The opener is assembled by hand rather than with
@@ -385,7 +424,7 @@ def _open_url(url: str, timeout: float, policy: UrlFetchPolicy):
     for handler in (
         _PolicyHTTPHandler(policy),
         _PolicyHTTPSHandler(policy),
-        _PolicyRedirectHandler(policy),
+        _PolicyRedirectHandler(policy, budget),
         urllib.request.HTTPDefaultErrorHandler(),
         urllib.request.HTTPErrorProcessor(),
         # Turns an unhandled scheme into a clear URLError instead of a None
@@ -393,7 +432,14 @@ def _open_url(url: str, timeout: float, policy: UrlFetchPolicy):
         urllib.request.UnknownHandler(),
     ):
         opener.add_handler(handler)
-    return opener.open(url, timeout=timeout)
+    try:
+        return opener.open(url, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        # The error carries the response it was raised for, and no caller ever
+        # reads that body, so nothing else would release the socket.
+        if exc.fp is not None:
+            exc.close()
+        raise
 
 
 _READ_CHUNK_BYTES = 64 * 1024
@@ -431,6 +477,35 @@ def _read_within_budget(resp, cap: int, budget: _FetchBudget) -> bytes:
         budget.account(len(chunk))
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+class _BudgetedRedirectBody:
+    """Puts urllib's drain of a redirect body under the run's ceilings.
+
+    Only the reads urllib performs before following a ``Location`` header go
+    through this, so ``read`` is shaped for that one caller: it refuses the
+    fetch outright once the body passes the cap rather than returning a
+    truncated body no one would look at.
+    """
+
+    def __init__(self, fp, cap: int, budget: _FetchBudget):
+        self._fp = fp
+        self._cap = cap
+        self._budget = budget
+
+    def read(self, amt: Optional[int] = None) -> bytes:
+        limit = self._cap if amt is None else min(self._cap, amt)
+        data = _read_within_budget(self._fp, limit, self._budget)
+        if len(data) > limit:
+            raise UrlFetchPolicyError(
+                f"redirect response body exceeds the {limit} byte limit left "
+                "in this run"
+            )
+        self._cap -= len(data)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
 
 
 def _fetch_url_bytes(
@@ -485,7 +560,7 @@ def _fetch_url_bytes(
         # Never wait past the run deadline for a fetch that has stalled.
         timeout = min(policy.timeout, budget.remaining_seconds())
         cap = min(policy.max_bytes, budget.remaining_bytes())
-        with _open_url(safe_url, timeout, policy) as resp:
+        with _open_url(safe_url, timeout, policy, budget) as resp:
             data = _read_within_budget(resp, cap, budget)
         if len(data) > cap:
             logger.error(

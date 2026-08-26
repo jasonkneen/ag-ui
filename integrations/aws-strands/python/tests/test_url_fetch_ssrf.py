@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from email.message import Message
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,7 @@ from ag_ui_strands.utils import (
     UrlFetchPolicy,
     UrlFetchPolicyError,
     convert_agui_content_to_strands,
+    _FetchBudget,
     _fetch_url_bytes,
     _open_url,
     _validate_fetch_url,
@@ -435,7 +437,8 @@ class TestRedirectValidation:
     def test_redirect_to_metadata_ip_is_blocked(self):
         from ag_ui_strands.utils import _PolicyRedirectHandler
 
-        handler = _PolicyRedirectHandler(UrlFetchPolicy())
+        policy = UrlFetchPolicy()
+        handler = _PolicyRedirectHandler(policy, _FetchBudget(policy))
         req = MagicMock()
         with pytest.raises(UrlFetchPolicyError):
             handler.redirect_request(
@@ -450,7 +453,8 @@ class TestRedirectValidation:
     def test_redirect_to_file_scheme_is_blocked(self):
         from ag_ui_strands.utils import _PolicyRedirectHandler
 
-        handler = _PolicyRedirectHandler(UrlFetchPolicy())
+        policy = UrlFetchPolicy()
+        handler = _PolicyRedirectHandler(policy, _FetchBudget(policy))
         with pytest.raises(UrlFetchPolicyError):
             handler.redirect_request(
                 MagicMock(), MagicMock(), 302, "Found", {}, "file:///etc/passwd"
@@ -759,8 +763,9 @@ class TestUnpinnedSchemesAreUnreachable:
         secret = tmp_path / "secret.txt"
         secret.write_text("local-file-marker")
 
+        policy = UrlFetchPolicy()
         with pytest.raises(urllib.error.URLError) as exc:
-            _open_url(secret.as_uri(), 1.0, UrlFetchPolicy())
+            _open_url(secret.as_uri(), 1.0, policy, _FetchBudget(policy))
 
         assert "local-file-marker" not in str(exc.value)
 
@@ -772,8 +777,9 @@ class TestUnpinnedSchemesAreUnreachable:
         ],
     )
     def test_the_opener_has_no_transport_for_other_urllib_schemes(self, url):
+        policy = UrlFetchPolicy()
         with pytest.raises(urllib.error.URLError):
-            _open_url(url, 1.0, UrlFetchPolicy())
+            _open_url(url, 1.0, policy, _FetchBudget(policy))
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +812,8 @@ class TestRedirectDowngrade:
     def test_handler_refuses_an_https_to_http_redirect(self, _mock_dns):
         from ag_ui_strands.utils import _PolicyRedirectHandler
 
-        handler = _PolicyRedirectHandler(UrlFetchPolicy())
+        policy = UrlFetchPolicy()
+        handler = _PolicyRedirectHandler(policy, _FetchBudget(policy))
         req = MagicMock()
         req.full_url = "https://secure.example/start"
 
@@ -844,6 +851,270 @@ class TestRedirectDowngrade:
             "http://public.example/start",
             "https://public.example/secure",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Redirect hops are inside the run's ceilings
+# ---------------------------------------------------------------------------
+
+
+_REDIRECT_TARGET_BODY = b"redirect target body"
+
+
+@contextmanager
+def _loopback_server(handler_cls):
+    """Serve *handler_cls* on a loopback port for the duration of the block."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def _redirect_chain(*, hops: int, body_size: int, chunk_size: int = 64 * 1024,
+                    chunk_delay: float = 0.0, status: int = 302):
+    """Build a handler serving *hops* redirects, each with a body, then a target.
+
+    The body on a redirect response is the part urllib drains before it follows
+    the ``Location`` header, so its size and its pacing are what the byte and
+    time ceilings have to survive.
+    """
+    requested: list = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            hop = int(self.path.rsplit("/", 1)[-1])
+            if hop > hops:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(_REDIRECT_TARGET_BODY)))
+                self.end_headers()
+                self.wfile.write(_REDIRECT_TARGET_BODY)
+                return
+            self.send_response(status)
+            self.send_header("Location", f"/hop/{hop + 1}")
+            self.send_header("Content-Length", str(body_size))
+            self.end_headers()
+            self._write_body()
+
+        def _write_body(self):
+            written = 0
+            try:
+                while written < body_size:
+                    chunk = min(chunk_size, body_size - written)
+                    self.wfile.write(b"r" * chunk)
+                    self.wfile.flush()
+                    written += chunk
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
+            except OSError:
+                # The client stopped reading the body, which is the point.
+                pass
+
+        def log_message(self, _format, *args):
+            pass
+
+    return Handler, requested
+
+
+class TestRedirectBodyIsBounded:
+    @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+    def test_a_redirect_body_cannot_exceed_the_run_byte_ceiling(self, status):
+        """urllib drains a redirect body before following it; that read is capped.
+
+        Without a cap on the drain the ceiling only ever bounds the body of the
+        final response, so a redirect whose own body is far past the limit is
+        transferred in full and the fetch still succeeds. Every redirect status
+        is covered because urllib routes them through separate handler methods.
+        """
+        handler, requested = _redirect_chain(
+            hops=1, body_size=4 * 1024 * 1024, status=status
+        )
+
+        with _loopback_server(handler) as port:
+            result = _fetch_url_bytes(
+                f"http://127.0.0.1:{port}/hop/1",
+                policy=UrlFetchPolicy(
+                    allow_private_networks=True,
+                    max_total_bytes=1024,
+                ),
+            )
+
+        assert result is None
+        assert requested == ["/hop/1"]
+
+    def test_a_small_redirect_body_is_still_followed(self):
+        """Guard against over-blocking: an ordinary redirect body is fine."""
+        handler, requested = _redirect_chain(hops=1, body_size=32)
+
+        with _loopback_server(handler) as port:
+            result = _fetch_url_bytes(
+                f"http://127.0.0.1:{port}/hop/1",
+                policy=UrlFetchPolicy(allow_private_networks=True),
+            )
+
+        assert result == _REDIRECT_TARGET_BODY
+        assert requested == ["/hop/1", "/hop/2"]
+
+    def test_the_time_ceiling_spans_the_whole_redirect_chain(self):
+        """Every hop draws on one deadline instead of restarting the clock.
+
+        Each hop here trickles its body inside the socket timeout, so nothing
+        but the run deadline can stop the chain. An unbounded drain sits
+        through a whole hop before the deadline is looked at again.
+        """
+        budget_seconds = 1.0
+        handler, _requested = _redirect_chain(
+            hops=2, body_size=20, chunk_size=1, chunk_delay=0.2
+        )
+
+        with _loopback_server(handler) as port:
+            started = time.monotonic()
+            result = _fetch_url_bytes(
+                f"http://127.0.0.1:{port}/hop/1",
+                policy=UrlFetchPolicy(
+                    allow_private_networks=True,
+                    timeout=30.0,
+                    max_total_seconds=budget_seconds,
+                ),
+            )
+            elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed < budget_seconds * 2
+
+    @patch(
+        "ag_ui_strands.utils.socket.getaddrinfo",
+        return_value=_addrinfo("93.184.216.34"),
+    )
+    def test_a_later_hop_is_given_only_the_time_the_run_has_left(self, _mock_dns):
+        """A hop that stalls outright can only overshoot by what the run has left.
+
+        The socket timeout is the one thing bounding a hop that never answers,
+        so reusing the timeout the first hop was given lets every further hop
+        overshoot the run deadline by a full budget of its own.
+        """
+        spent = 0.5
+        policy = UrlFetchPolicy(timeout=30.0, max_total_seconds=1.0)
+        timeouts = []
+
+        def fake_do_open(_handler, _http_class, req, **_kwargs):
+            timeouts.append(req.timeout)
+            if len(timeouts) == 1:
+                time.sleep(spent)
+                return _http_response(req.full_url, 302, location="/next")
+            return _http_response(req.full_url, 200, body=_REDIRECT_TARGET_BODY)
+
+        with patch.object(
+            urllib.request.AbstractHTTPHandler, "do_open", new=fake_do_open
+        ):
+            _fetch_url_bytes("http://public.example/start", policy=policy)
+
+        assert len(timeouts) == 2, "expected the redirect to have been followed"
+        assert timeouts[1] < timeouts[0]
+        assert timeouts[1] <= policy.max_total_seconds - spent
+
+
+# ---------------------------------------------------------------------------
+# Response sockets are always closed
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _recorded_responses():
+    """Record every response the HTTP handlers hand back, closed or not."""
+    responses: list = []
+    real_do_open = urllib.request.AbstractHTTPHandler.do_open
+
+    def recording_do_open(handler, http_class, req, **kwargs):
+        response = real_do_open(handler, http_class, req, **kwargs)
+        responses.append(response)
+        return response
+
+    with patch.object(
+        urllib.request.AbstractHTTPHandler, "do_open", new=recording_do_open
+    ):
+        yield responses
+
+
+def _status_handler(status: int, location: str | None = None):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            if location is not None:
+                self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *args):
+            pass
+
+    return Handler
+
+
+class TestResponsesAreClosed:
+    def test_a_non_2xx_response_is_closed(self):
+        """The error urllib raises for a non-2xx carries the response socket.
+
+        Holding that error is what makes the close observable: CPython's
+        response wrapper closes the socket from a finalizer once the error is
+        released, so a caller that keeps the error (or an interpreter that
+        collects on its own schedule) is left holding the socket open.
+        """
+        policy = UrlFetchPolicy(allow_private_networks=True)
+
+        with _loopback_server(_status_handler(404)) as port:
+            with _recorded_responses() as responses:
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    _open_url(
+                        f"http://127.0.0.1:{port}/missing.png",
+                        1.0,
+                        policy,
+                        _FetchBudget(policy),
+                    )
+
+                # Keeping the error referenced is the point: releasing it here
+                # would let the finalizer stand in for an explicit close.
+                assert raised.value.fp is not None
+                assert responses, "expected the handler to have opened a response"
+                assert all(response.closed for response in responses)
+
+    def test_a_response_that_ends_a_redirect_loop_is_closed(self):
+        """The hop urllib gives up on is the bounded body, not the raw response."""
+        handler, _requested = _redirect_chain(hops=100, body_size=8)
+        policy = UrlFetchPolicy(allow_private_networks=True)
+
+        with _loopback_server(handler) as port:
+            with _recorded_responses() as responses:
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    _open_url(
+                        f"http://127.0.0.1:{port}/hop/1",
+                        5.0,
+                        policy,
+                        _FetchBudget(policy),
+                    )
+
+                assert "redirect" in str(raised.value).lower()
+                assert len(responses) > 1
+                assert all(response.closed for response in responses)
+
+    def test_a_refused_redirect_closes_the_response_it_came_on(self):
+        with _loopback_server(
+            _status_handler(302, location="http://169.254.169.254/latest/meta-data/")
+        ) as port:
+            with _recorded_responses() as responses:
+                result = _fetch_url_bytes(
+                    f"http://127.0.0.1:{port}/start",
+                    policy=UrlFetchPolicy(allow_private_networks=True),
+                )
+
+        assert result is None
+        assert responses, "expected the handler to have opened a response"
+        assert all(response.closed for response in responses)
 
 
 # ---------------------------------------------------------------------------
