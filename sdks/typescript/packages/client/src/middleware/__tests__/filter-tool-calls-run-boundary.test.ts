@@ -9,7 +9,7 @@ import {
   ToolCallResultEvent,
   ToolCallStartEvent,
 } from "@ag-ui/core";
-import { Observable } from "rxjs";
+import { Observable, Subject } from "rxjs";
 import { toArray } from "rxjs/operators";
 
 /**
@@ -109,9 +109,6 @@ const makeInput = (runId: string): RunAgentInput => ({
   forwardedProps: {},
 });
 
-const blockedIds = (middleware: FilterToolCallsMiddleware): Set<string> =>
-  (middleware as unknown as { blockedToolCallIds: Set<string> }).blockedToolCallIds;
-
 describe("FilterToolCallsMiddleware - run boundaries (issue #2443)", () => {
   it("does not carry blocked tool call IDs into the next run", async () => {
     const middleware = new FilterToolCallsMiddleware({
@@ -138,6 +135,11 @@ describe("FilterToolCallsMiddleware - run boundaries (issue #2443)", () => {
     expect(types).toContain(EventType.TOOL_CALL_RESULT);
   });
 
+  /*
+   * Asserted through behaviour rather than through the set, because the set is no longer reachable
+   * from the instance: each subscription owns one. Reusing the first run's ID after five
+   * interrupted runs is what accumulation would break.
+   */
   it("does not accumulate blocked tool call IDs across interrupted runs", async () => {
     const middleware = new FilterToolCallsMiddleware({
       disallowedToolCalls: ["blocked_tool"],
@@ -150,52 +152,86 @@ describe("FilterToolCallsMiddleware - run boundaries (issue #2443)", () => {
         .toPromise();
     }
 
-    expect(blockedIds(middleware).size).toBe(0);
+    const events = (await middleware
+      .run(makeInput("run-5"), new CompleteToolCallAgent("tool-call-0", "allowed_tool"))
+      .pipe(toArray())
+      .toPromise()) as BaseEvent[];
+
+    const types = events.map((event) => event.type);
+    expect(types).toContain(EventType.TOOL_CALL_START);
+    expect(types).toContain(EventType.TOOL_CALL_RESULT);
   });
 
-  it("clears blocked tool call IDs left behind by a stalled run when the next run starts", () => {
+  /*
+   * This replaces a test that asserted the opposite. It checked that starting the next run emptied
+   * the set, which is the leak rather than the fix: the stalled run was still subscribed and those
+   * IDs were the only thing filtering its remaining events. Per-subscription state means the next
+   * run cannot reach them, so the stalled run keeps filtering. Covered end to end in
+   * filter-tool-calls-per-run.test.ts; kept here as the boundary case it was filed as.
+   */
+  it("leaves a stalled run still filtering when the next run starts", async () => {
     const middleware = new FilterToolCallsMiddleware({
       disallowedToolCalls: ["blocked_tool"],
     });
 
-    // A run that emits a blocked tool call and then stalls: it never
-    // completes, errors or gets unsubscribed.
+    const stalled = new Subject<BaseEvent>();
     class StalledAgent extends AbstractAgent {
-      run(input: RunAgentInput): Observable<BaseEvent> {
-        return new Observable<BaseEvent>((subscriber) => {
-          subscriber.next({
-            type: EventType.RUN_STARTED,
-            threadId: input.threadId,
-            runId: input.runId,
-          });
-          subscriber.next({
-            type: EventType.TOOL_CALL_START,
-            toolCallId: "tool-call-1",
-            toolCallName: "blocked_tool",
-            parentMessageId: "message-1",
-          } as ToolCallStartEvent);
-        });
+      run(): Observable<BaseEvent> {
+        return stalled.asObservable();
       }
     }
 
-    middleware.run(makeInput("run-1"), new StalledAgent()).subscribe();
-    expect(blockedIds(middleware).size).toBe(1);
+    const seen: BaseEvent[] = [];
+    const subscription = middleware
+      .run(makeInput("run-1"), new StalledAgent())
+      .subscribe((event) => seen.push(event));
 
-    // Starting the next run must not inherit the stalled run's state.
-    middleware.run(makeInput("run-2"), new CompleteToolCallAgent("tool-call-2", "allowed_tool"));
-    expect(blockedIds(middleware).size).toBe(0);
+    stalled.next({
+      type: EventType.RUN_STARTED,
+      threadId: "thread-1",
+      runId: "run-1",
+    } as BaseEvent);
+    stalled.next({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "tool-call-1",
+      toolCallName: "blocked_tool",
+      parentMessageId: "message-1",
+    } as ToolCallStartEvent);
+
+    await middleware
+      .run(makeInput("run-2"), new CompleteToolCallAgent("tool-call-2", "allowed_tool"))
+      .pipe(toArray())
+      .toPromise();
+
+    stalled.next({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "tool-call-1",
+      delta: "{}",
+    } as ToolCallArgsEvent);
+
+    expect(seen.filter((event) => event.type === EventType.TOOL_CALL_ARGS)).toHaveLength(0);
+    subscription.unsubscribe();
   });
 
-  it("clears blocked tool call IDs when a run is unsubscribed mid-stream", async () => {
+  /*
+   * Unsubscribing drops the set with the subscription, so there is nothing left to clear. Shown by
+   * a later run reusing the abandoned ID for a tool that is allowed.
+   */
+  it("leaves nothing behind when a run is unsubscribed mid-stream", async () => {
     const middleware = new FilterToolCallsMiddleware({
       disallowedToolCalls: ["blocked_tool"],
     });
 
-    const subscription = middleware
+    middleware
       .run(makeInput("run-1"), new InterruptedToolCallAgent("tool-call-1", "blocked_tool"))
-      .subscribe();
-    subscription.unsubscribe();
+      .subscribe()
+      .unsubscribe();
 
-    expect(blockedIds(middleware).size).toBe(0);
+    const events = (await middleware
+      .run(makeInput("run-2"), new CompleteToolCallAgent("tool-call-1", "allowed_tool"))
+      .pipe(toArray())
+      .toPromise()) as BaseEvent[];
+
+    expect(events.map((event) => event.type)).toContain(EventType.TOOL_CALL_RESULT);
   });
 });
