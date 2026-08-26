@@ -341,6 +341,24 @@ class TestHiddenPairing(unittest.TestCase):
             "or the wire carries an unpaired STEP_STARTED",
         )
 
+    def test_same_name_hidden_subagent_step_does_not_close_the_parent(self):
+        agent = self._agent()
+        agent.active_run["lane_nodes"] = {None: "model", "tools:s1": "model"}
+        parent_opened = list(agent.start_step("model", None))
+        self.assertIsNotNone(parent_opened[0])
+
+        self._enter_window(agent, "tools:s1")
+        hidden_opened = list(agent.start_step("model", "tools:s1"))
+        self.assertIsNone(hidden_opened[0])
+
+        parent_closed = agent.end_step(None)
+        self.assertIsNotNone(
+            parent_closed,
+            "a hidden subagent's same-name step must not consume the visible "
+            "parent close",
+        )
+        self.assertIsNone(parent_closed.subagent_run_id)
+
     def test_a_visible_messages_continuation_survives_the_window(self):
         agent = self._agent()
         start = agent._dispatch_event(TextMessageStartEvent(
