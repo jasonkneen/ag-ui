@@ -253,25 +253,29 @@ function normalizeForwardedHeaders(
 function normalizeAppContextContent(value: string) {
   if (!value.startsWith(APP_CONTEXT_PREFIX)) return value;
 
+  let context: unknown;
   try {
-    const context: unknown = JSON.parse(value.slice(APP_CONTEXT_PREFIX.length));
-    if (!isPlainRecord(context)) return value;
-    const headers = context.copilotkit_forwarded_headers;
-    // Neither the presence nor the shape of this key is ours to assume: it is
-    // absent until an `x-` header arrives, and a caller can put any JSON value
-    // there. So this guard is what keeps `Object.entries(undefined)` from throwing
-    // on an everyday payload, and what keeps `Object.entries`/`Object.fromEntries`
-    // from reshaping a primitive or array bag into `{}` or `{"0": ...}`. Leave the
-    // whole content string untouched rather than re-serializing it, so a payload
-    // this rewrite does not understand survives byte-for-byte.
-    if (!isPlainRecord(headers)) return value;
-
-    context.copilotkit_forwarded_headers = normalizeForwardedHeaders(headers);
-    return `${APP_CONTEXT_PREFIX}${JSON.stringify(context, null, 2)}`;
+    context = JSON.parse(value.slice(APP_CONTEXT_PREFIX.length));
   } catch {
     // This is ordinary message content unless it is valid App Context JSON.
+    // Only the parse is guarded: a bug in the rewrite below must surface, not
+    // degrade into silently unnormalized content.
     return value;
   }
+
+  if (!isPlainRecord(context)) return value;
+  const headers = context.copilotkit_forwarded_headers;
+  // Neither the presence nor the shape of this key is ours to assume: it is
+  // absent until an `x-` header arrives, and a caller can put any JSON value
+  // there. So this guard is what keeps `Object.entries(undefined)` from throwing
+  // on an everyday payload, and what keeps `Object.entries`/`Object.fromEntries`
+  // from reshaping a primitive or array bag into `{}` or `{"0": ...}`. Leave the
+  // whole content string untouched rather than re-serializing it, so a payload
+  // this rewrite does not understand survives byte-for-byte.
+  if (!isPlainRecord(headers)) return value;
+
+  context.copilotkit_forwarded_headers = normalizeForwardedHeaders(headers);
+  return `${APP_CONTEXT_PREFIX}${JSON.stringify(context, null, 2)}`;
 }
 
 /**
