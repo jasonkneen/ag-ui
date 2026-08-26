@@ -34,6 +34,7 @@ def _template_agent() -> MagicMock:
     mock.system_prompt = "You are helpful"
     mock.tool_registry.registry = {}
     mock.record_direct_tool_call = True
+    mock._session_manager = None
     return mock
 
 
@@ -70,16 +71,16 @@ async def _collect(agent: StrandsAgent, inp: RunAgentInput) -> list:
     return [e async for e in agent.run(inp)]
 
 
-def _order(events: list) -> list[str]:
-    """Wire order of just the events this bug is about."""
-    interesting = {
+def _ordered_events(events: list) -> list:
+    """Wire events relevant to the text/tool ordering contract."""
+    relevant = {
         EventType.TEXT_MESSAGE_START,
         EventType.TEXT_MESSAGE_CONTENT,
         EventType.TEXT_MESSAGE_END,
         EventType.TOOL_CALL_START,
         EventType.TOOL_CALL_END,
     }
-    return [e.type.value for e in events if e.type in interesting]
+    return [event for event in events if event.type in relevant]
 
 
 class TestBackendToolTextOrdering:
@@ -112,44 +113,32 @@ class TestBackendToolTextOrdering:
         {"data": "currently 21 degrees."},
     ]
 
-    async def test_text_message_end_precedes_tool_call_start(self):
+    async def test_text_tool_text_order_and_message_ids(self):
         agent = _build_agent(self.THREAD, self.STREAM)
         events = await _collect(agent, _input(self.THREAD, []))
-        order = _order(events)
+        ordered = _ordered_events(events)
 
-        assert EventType.TEXT_MESSAGE_END.value in order, (
-            f"no TEXT_MESSAGE_END emitted at all; order={order}"
-        )
-        first_end = order.index(EventType.TEXT_MESSAGE_END.value)
-        tool_start = order.index(EventType.TOOL_CALL_START.value)
-        assert first_end < tool_start, (
-            "assistant text message was not closed before the tool call -- "
-            f"this is issue #3030; order={order}"
-        )
-
-    async def test_post_tool_text_opens_a_new_message(self):
-        agent = _build_agent(self.THREAD, self.STREAM)
-        events = await _collect(agent, _input(self.THREAD, []))
-        order = _order(events)
-
-        tool_start = order.index(EventType.TOOL_CALL_START.value)
-        starts_after = [
-            i
-            for i, t in enumerate(order)
-            if t == EventType.TEXT_MESSAGE_START.value and i > tool_start
+        assert [event.type for event in ordered] == [
+            EventType.TEXT_MESSAGE_START,
+            EventType.TEXT_MESSAGE_CONTENT,
+            EventType.TEXT_MESSAGE_END,
+            EventType.TOOL_CALL_START,
+            EventType.TOOL_CALL_END,
+            EventType.TEXT_MESSAGE_START,
+            EventType.TEXT_MESSAGE_CONTENT,
+            EventType.TEXT_MESSAGE_END,
         ]
-        assert starts_after, (
-            "post-tool text did not open a new TEXT_MESSAGE_START, so it "
-            f"renders as part of the pre-tool message; order={order}"
+        pre_start, pre_content, pre_end = ordered[:3]
+        post_start, post_content, post_end = ordered[5:]
+        assert (
+            pre_start.message_id == pre_content.message_id == pre_end.message_id
         )
-
-        text_starts = [
-            e for e in events if e.type == EventType.TEXT_MESSAGE_START
-        ]
-        ids = [e.message_id for e in text_starts]
-        assert len(set(ids)) == len(ids), (
-            f"pre- and post-tool text reused the same message_id: {ids}"
+        assert (
+            post_start.message_id
+            == post_content.message_id
+            == post_end.message_id
         )
+        assert pre_start.message_id != post_start.message_id
 
 
 class TestFrontendToolTextOrdering:
@@ -174,17 +163,16 @@ class TestFrontendToolTextOrdering:
     async def test_text_message_end_precedes_tool_call_start(self):
         agent = _build_agent(self.THREAD, self.STREAM)
         events = await _collect(agent, _input(self.THREAD, self.TOOLS))
-        order = _order(events)
+        ordered = _ordered_events(events)
 
-        assert EventType.TOOL_CALL_START.value in order, (
-            f"frontend tool call never reached the wire; order={order}"
-        )
-        assert EventType.TEXT_MESSAGE_END.value in order, (
-            f"no TEXT_MESSAGE_END emitted at all; order={order}"
-        )
-        first_end = order.index(EventType.TEXT_MESSAGE_END.value)
-        tool_start = order.index(EventType.TOOL_CALL_START.value)
-        assert first_end < tool_start, (
-            "assistant text message was not closed before the frontend tool "
-            f"call -- this is issue #3030; order={order}"
+        assert [event.type for event in ordered] == [
+            EventType.TEXT_MESSAGE_START,
+            EventType.TEXT_MESSAGE_CONTENT,
+            EventType.TEXT_MESSAGE_END,
+            EventType.TOOL_CALL_START,
+            EventType.TOOL_CALL_END,
+        ]
+        text_start, text_content, text_end = ordered[:3]
+        assert (
+            text_start.message_id == text_content.message_id == text_end.message_id
         )
