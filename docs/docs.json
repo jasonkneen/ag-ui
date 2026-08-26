@@ -32,7 +32,8 @@
                   },
                   "quickstart/clients"
                 ]
-              }
+              },
+              "talk-to-us"
             ]
           },
           {
@@ -43,11 +44,13 @@
               "concepts/agents",
               "concepts/middleware",
               "concepts/messages",
+              "concepts/metadata",
               "concepts/reasoning",
               "concepts/state",
               "concepts/interrupts",
               "concepts/serialization",
               "concepts/tools",
+              "concepts/subagents",
               "concepts/capabilities",
               "concepts/generative-ui-specs"
             ]
@@ -66,7 +69,7 @@
               "development/updates",
               "development/roadmap",
               "development/contributing",
-              "talk-to-us"
+              "support"
             ]
           }
         ]

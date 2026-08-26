@@ -89,6 +89,12 @@ export const featureConfig: FeatureConfig[] = [
     tags: ["Chat", "Multi-agent architecture", "Streaming", "Subgraphs"],
   }),
   createFeatureConfig({
+    id: "multi_agent",
+    name: "Multi-Agent",
+    description: "Watch a graph of specialist agents hand work down a pipeline",
+    tags: ["Chat", "Multi-agent architecture", "Streaming"],
+  }),
+  createFeatureConfig({
     id: "a2a_chat",
     name: "A2A Chat",
     description: "Chat with your Copilot and call frontend tools",
@@ -141,6 +147,19 @@ export const featureConfig: FeatureConfig[] = [
     description:
       "Automatic A2UI error recovery — invalid surfaces are regenerated (no wipe), with a tasteful hard-failure fallback",
     tags: ["A2UI", "Error Recovery", "Streaming"],
+  }),
+  createFeatureConfig({
+    id: "crew_chat",
+    name: "Crew Chat",
+    description: "Chat with a CrewAI crew wrapped in a dict-state chat flow",
+    tags: ["Chat", "CrewAI", "Streaming"],
+  }),
+  createFeatureConfig({
+    id: "error_flow",
+    name: "Error Flow",
+    description:
+      "Backend flow that raises an error, surfaced to the client as a RunErrorEvent",
+    tags: ["CrewAI", "Error Handling"],
   }),
 ];
 
