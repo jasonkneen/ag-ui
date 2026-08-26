@@ -1024,6 +1024,75 @@ class TestSessionFrontendToolReconciliation:
         ]
 
     @pytest.mark.asyncio
+    async def test_non_trailing_frontend_result_is_still_reconciled(self, tmp_path):
+        # The client delivers the frontend result on a LATER turn: it sits in
+        # history with a user message after it, so nothing is trailing and
+        # ``pending_tool_result_ids`` is empty. Scoping collection to the
+        # trailing ids alone drops the result entirely and the persisted
+        # toolResult keeps the proxy placeholder for the rest of the thread's
+        # life. Admission rests on the durable map instead: this call's entry
+        # is still there precisely because it was never corrected.
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(session_id="thread-late", storage_dir=str(tmp_path))
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[
+                _payload_assistant("wire-1", "approve"),
+                _payload_tool("wire-1", '{"approved": true}'),
+                UserMessage(id="u2", content="do the next thing"),
+            ],
+            tools=[_frontend_tool("approve")],
+            wire_map={"wire-1": "native-1"},
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1"),
+            ],
+        )
+
+        block = _result_content(sm, "default", 1)[0]["toolResult"]
+        assert block["content"] == [{"text": '{"approved": true}'}]
+        assert block["status"] == "success"
+        # Corrected, so the entry is pruned and cannot be re-collected later.
+        assert (instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}) == {}
+
+    @pytest.mark.asyncio
+    async def test_non_trailing_result_without_a_live_map_entry_is_left_alone(
+        self, tmp_path
+    ):
+        # The counterpart. An earlier call that was already reconciled had its
+        # wire->native entry pruned, so re-sending it in history — with no
+        # trailing result at all — must not pull it back into reconciliation.
+        # That is the property the trailing-only scope protected, and it now
+        # rests on the map directly: the same assumption
+        # ``test_multi_turn_reconciles_only_the_trailing_result`` already
+        # encodes when it prunes its historical entries.
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(session_id="thread-done", storage_dir=str(tmp_path))
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[
+                _payload_assistant("wire-1", "approve"),
+                _payload_tool("wire-1", "OLD"),
+                UserMessage(id="u2", content="do the next thing"),
+            ],
+            tools=[_frontend_tool("approve")],
+            wire_map={},  # already corrected on an earlier turn -> pruned
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1", text="OLD"),
+            ],
+        )
+
+        assert _result_content(sm, "default", 1)[0]["toolResult"]["content"] == [
+            {"text": "OLD"}
+        ]
+        assert instance.stream_prompts == ["do the next thing"]
+
+    @pytest.mark.asyncio
     async def test_partially_resolvable_turn_falls_back_to_legacy(self, tmp_path):
         # Two frontend results in one turn, both recognized as frontend, but only
         # one resolves to a native id (wire-2 is not in the map and its

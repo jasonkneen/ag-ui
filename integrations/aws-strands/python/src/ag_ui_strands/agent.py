@@ -3018,17 +3018,32 @@ class StrandsAgent:
                             exc_info=True,
                         )
 
-            # Scope to the TRAILING tool results (this continuation's just-
-            # returned results). ``pending_tool_result_ids`` holds those ids;
-            # without this, a multi-turn continuation re-sends already-reconciled
-            # historical results, which can never be re-corrected and would force
-            # the legacy fallback every turn.
+            # Scope: this continuation's just-returned results, plus any earlier
+            # frontend call whose placeholder is still uncorrected.
+            #
+            # ``pending_tool_result_ids`` holds the TRAILING ids only (it is built
+            # by a reversed scan that stops at the first non-tool message). On its
+            # own it misses a result the client delivers on a LATER turn, with a
+            # user message after it: that result never reaches reconciliation and
+            # the persisted toolResult keeps ``PROXY_RESULT_PLACEHOLDER`` forever.
+            #
+            # A live entry in ``wire_to_native`` is the second admission signal,
+            # and it is safe precisely because of how that map is maintained below:
+            # entries are dropped once their placeholder is actually corrected, and
+            # kept only so a later turn can retry. An already-reconciled historical
+            # result is therefore absent from the map and still cannot re-enter
+            # here — which is what scoping to the trailing ids was protecting.
             frontend_results: List[Dict[str, Any]] = []
             for msg in (input_data.messages or []):
                 if getattr(msg, "role", None) != "tool":
                     continue
                 wire_id = getattr(msg, "tool_call_id", None)
-                if not wire_id or wire_id not in pending_tool_result_ids:
+                if not wire_id:
+                    continue
+                if (
+                    wire_id not in pending_tool_result_ids
+                    and wire_id not in wire_to_native
+                ):
                     continue
                 name = _tool_call_id_to_name.get(wire_id)
                 if name not in frontend_tool_names and wire_id not in wire_to_native:
