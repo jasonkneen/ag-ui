@@ -127,6 +127,22 @@ class SubagentContext:
     parent_subagent_run_id: Optional[str] = None
 
 
+def _command_update_tool_messages(messages: Any) -> List[ToolMessage]:
+    entries = [] if messages is None else (
+        messages if isinstance(messages, (list, tuple)) else [messages]
+    )
+    tool_messages = []
+    for entry in entries:
+        if isinstance(entry, ToolMessage):
+            tool_messages.append(entry)
+        elif (isinstance(entry, dict) and entry.get("tool_call_id")
+              and (entry.get("type") == "tool" or entry.get("role") == "tool")):
+            tool_messages.append(ToolMessage(content=entry.get("content") or "",
+                                             tool_call_id=entry["tool_call_id"],
+                                             name=entry.get("name"), id=entry.get("id")))
+    return tool_messages
+
+
 # Lane key for root/supervisor-level streaming state (events with no subagent).
 # Subagent lanes use the derived subagent id (e.g. "tools:<uuid>").
 _ROOT_LANE = "__root__"
@@ -847,14 +863,21 @@ class LangGraphAgent:
         if etype == EventType.STEP_STARTED:
             if in_window:
                 steps = state["steps"]
-                steps[event.step_name] = steps.get(event.step_name, 0) + 1
+                key = self._hidden_step_key(active_run, event)
+                steps[key] = steps.get(key, 0) + 1
                 return True
             return False
         if etype == EventType.STEP_FINISHED:
             steps = state["steps"]
-            if steps.get(event.step_name, 0) > 0:
-                steps[event.step_name] -= 1
+            key = self._hidden_step_key(active_run, event)
+            if steps.get(key, 0) > 0:
+                steps[key] -= 1
                 return True
+            if "subagent_run_id" not in getattr(event, "model_fields_set", set()):
+                matches = [k for k, count in steps.items() if k[1] == event.step_name and count > 0]
+                if len(matches) == 1:
+                    steps[matches[0]] -= 1
+                    return True
             # Closes a step whose open was emitted (e.g. the parent's `tools`
             # step closing mid-window) — must stay visible.
             return False
@@ -960,6 +983,12 @@ class LangGraphAgent:
             return in_window
         return False
 
+    def _hidden_step_key(self, active_run, event: ProcessedEvents) -> tuple:
+        owner = getattr(event, "subagent_run_id", None)
+        if "subagent_run_id" not in getattr(event, "model_fields_set", set()):
+            owner = active_run.get("current_subagent_run_id")
+        return (owner, event.step_name)
+
     def _raw_payload_is_subagent_side(self, active_run, payload) -> bool:
         """Whether a RAW event's upstream payload originates inside a subagent.
 
@@ -1019,6 +1048,7 @@ class LangGraphAgent:
             c for c in candidates
             if isinstance(c, dict) and c.get("name") == "task" and isinstance(c.get("id"), str)
         ]
+        task_calls = [c for c in task_calls if _is_deepagents_task_call(c)]
         active_run = getattr(self, "active_run", None)
         if active_run is None:
             return
@@ -1314,7 +1344,7 @@ class LangGraphAgent:
         output = (event.get("data") or {}).get("output")
         update = getattr(output, "update", None)
         if isinstance(update, dict):
-            msgs = update.get("messages")
+            msgs = _command_update_tool_messages(update.get("messages")) or update.get("messages")
             if isinstance(msgs, (list, tuple)):
                 # Prefer a genuine ToolMessage (the same filtering the OnToolEnd
                 # handler applies), since a Command update can also carry the
@@ -3488,7 +3518,7 @@ class LangGraphAgent:
                 # of crashing with AttributeError on ``.get``.
                 update = tool_call_output.update
                 if isinstance(update, dict):
-                    messages = update.get('messages', []) or []
+                    messages = _command_update_tool_messages(update.get('messages', []) or [])
                 else:
                     messages = []
 
@@ -3533,7 +3563,7 @@ class LangGraphAgent:
                             ToolCallArgsEvent(
                                 type=EventType.TOOL_CALL_ARGS,
                                 tool_call_id=public_call_id,
-                                delta=json.dumps(event["data"].get("input", {})),
+                                delta=dump_json_safe(event["data"].get("input", {})),
                                 raw_event=event
                             )
                         )
@@ -4097,17 +4127,20 @@ class LangGraphAgent:
 
     def start_step(self, step_name: str, lane: str | None = None) -> Generator[ProcessedEvents, None, None]:
         """Emit STEP_STARTED for ``step_name``; node_name bookkeeping is done by handle_node_change."""
-        event = self._dispatch_event(
-            StepStartedEvent(
-                type=EventType.STEP_STARTED,
-                step_name=step_name
-            )
-        )
+        step_owner = lane if lane is not None else None
         # Remember who opened this step so end_step can attribute the close to the
         # same owner. Read back off the dispatched event rather than from
         # current_subagent_run_id so the two halves can never disagree about what the
         # chokepoint actually stamped.
-        self.active_run.setdefault("step_owners", {})[lane] = getattr(event, "subagent_run_id", None)
+        self.active_run.setdefault("step_owners", {})[lane] = step_owner
+        event = StepStartedEvent(
+            type=EventType.STEP_STARTED,
+            step_name=step_name
+        )
+        event.subagent_run_id = step_owner
+        event = self._dispatch_event(
+            event
+        )
         yield event
 
     def end_step(self, lane: str | None = None) -> ProcessedEvents:
@@ -4120,11 +4153,13 @@ class LangGraphAgent:
             raise ValueError("No active step to end")
 
         step_owner = self.active_run.get("step_owners", {}).get(lane)
+        event = StepFinishedEvent(
+            type=EventType.STEP_FINISHED,
+            step_name=node_name
+        )
+        event.subagent_run_id = step_owner
         event = self._dispatch_event(
-            StepFinishedEvent(
-                type=EventType.STEP_FINISHED,
-                step_name=node_name
-            )
+            event
         )
         if event is None:
             # Suppressed by subagent_visibility="hidden": the step bookkeeping

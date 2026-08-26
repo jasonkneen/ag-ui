@@ -12,6 +12,7 @@ continues from where it paused.
 """
 
 import os
+from functools import partial
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -20,6 +21,11 @@ from langgraph.types import interrupt
 from deepagents import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
 
+def _openai_api_key() -> str:
+    return os.environ["OPENAI_API_KEY"]
+
+
+ChatOpenAI = partial(ChatOpenAI, api_key=_openai_api_key)
 model = ChatOpenAI(model="gpt-4o-mini")
 
 
