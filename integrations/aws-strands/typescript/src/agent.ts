@@ -2550,10 +2550,13 @@ export class StrandsAgent {
             // legitimate — emit an empty TOOL_CALL_RESULT so the UI still
             // renders a result card.
             let resultData: unknown = null;
+            const fallbackResultData: unknown[] = [];
+            let matchedTextResult = false;
             const contentBlocks = hookEvent.result?.content;
             if (Array.isArray(contentBlocks)) {
               for (const cb of contentBlocks) {
                 if (cb instanceof TextBlock) {
+                  matchedTextResult = true;
                   try {
                     resultData = JSON.parse(cb.text);
                   } catch {
@@ -2571,10 +2574,26 @@ export class StrandsAgent {
                 }
                 const maybeJson = (cb as unknown as { json?: unknown }).json;
                 if (maybeJson !== undefined) {
-                  resultData = maybeJson;
-                  break;
+                  fallbackResultData.push(maybeJson);
+                  continue;
                 }
+
+                const serializableBlock = cb as unknown as {
+                  toJSON?: () => unknown;
+                };
+                fallbackResultData.push(
+                  typeof serializableBlock.toJSON === "function"
+                    ? serializableBlock.toJSON()
+                    : cb,
+                );
               }
+            }
+
+            if (!matchedTextResult && fallbackResultData.length > 0) {
+              resultData =
+                fallbackResultData.length === 1
+                  ? fallbackResultData[0]
+                  : fallbackResultData;
             }
 
             if (!resultToolId) continue;
