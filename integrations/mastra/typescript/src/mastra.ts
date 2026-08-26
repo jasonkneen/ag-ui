@@ -483,6 +483,13 @@ interface MastraAgentStreamOptions {
    */
   onMessageId?: (messageId: string) => void;
   onTextPart?: (text: string) => void;
+  /**
+   * Raw assistant text arrived but is being held for a later boundary
+   * (`useProcessedFinalText`). Segment identity is decided from the state as it
+   * is when the text arrives, not as it is when the text is finally released:
+   * by then a tool call may have opened a boundary this text belongs before.
+   */
+  onTextBuffered?: () => void;
   onReasoningStart?: () => void;
   onReasoningPart?: (text: string) => void;
   onReasoningEnd?: () => void;
@@ -1389,6 +1396,18 @@ export class MastraAgent extends AbstractAgent {
     // Whether text has streamed since the last tool call on the current base id.
     // Back-to-back tool calls (parallel calls) must not burn a segment index.
     let textSinceLastToolCall = false;
+    // The id the currently buffered segment was assigned when its first raw
+    // delta arrived, held until that text is released. Only used under
+    // `useProcessedFinalText`; undefined means nothing is being held.
+    let bufferedSegmentMessageId: string | undefined;
+
+    // The id a segment starting now would carry.
+    const segmentMessageIdFor = (currentId: string) => {
+      const segmentIndex = continuationIndexByParentId.get(currentId) ?? 0;
+      return segmentIndex === 0
+        ? currentId
+        : MastraAgent.continuationMessageId(currentId, segmentIndex);
+    };
 
     const closeReasoning = () => {
       if (isReasoning && reasoningMessageId) {
@@ -1447,11 +1466,10 @@ export class MastraAgent extends AbstractAgent {
         // a fresh id (no tool call on it) keeps that id — including text that
         // legitimately precedes a tool call in the same message.
         const currentId = getMessageId();
-        const segmentIndex = continuationIndexByParentId.get(currentId) ?? 0;
+        // A held segment already chose its id, back when its text arrived.
         const textMessageId =
-          segmentIndex === 0
-            ? currentId
-            : MastraAgent.continuationMessageId(currentId, segmentIndex);
+          bufferedSegmentMessageId ?? segmentMessageIdFor(currentId);
+        bufferedSegmentMessageId = undefined;
         textSinceLastToolCall = true;
         subscriber.next({
           type: EventType.TEXT_MESSAGE_CHUNK,
@@ -1459,6 +1477,18 @@ export class MastraAgent extends AbstractAgent {
           messageId: textMessageId,
           delta: text,
         } as TextMessageChunkEvent);
+      },
+      onTextBuffered: () => {
+        /*
+         * Claim the id now, while the state still describes where this text sits.
+         *
+         * `textSinceLastToolCall` is deliberately not touched here. The release path sets it, and
+         * a tool call arriving between the buffered deltas and that release is the case the flag
+         * already handles correctly: the first boundary opens on it and a second consecutive tool
+         * call does not burn an index. Setting it here as well changed no observable behaviour and
+         * no test could distinguish it, so it is left out rather than shipped uncovered.
+         */
+        bufferedSegmentMessageId ??= segmentMessageIdFor(getMessageId());
       },
       onToolCallStart: (streamPart) => {
         closeReasoning();
@@ -2127,6 +2157,7 @@ export class MastraAgent extends AbstractAgent {
             // Hold deltas until a finish boundary — the processor-modified text
             // arrives via finish.payload.response.uiMessages.
             bufferedText += chunk.payload.text;
+            callbacks.onTextBuffered?.();
           } else {
             callbacks.onTextPart?.(chunk.payload.text);
           }
@@ -2875,6 +2906,7 @@ export class MastraAgent extends AbstractAgent {
     {
       onMessageId,
       onTextPart,
+      onTextBuffered,
       onReasoningStart,
       onReasoningPart,
       onReasoningEnd,
@@ -3023,6 +3055,7 @@ export class MastraAgent extends AbstractAgent {
             {
               onMessageId,
               onTextPart,
+              onTextBuffered,
               onReasoningStart,
               onReasoningPart,
               onReasoningEnd,
@@ -3100,6 +3133,7 @@ export class MastraAgent extends AbstractAgent {
             {
               onMessageId,
               onTextPart,
+              onTextBuffered,
               onReasoningStart,
               onReasoningPart,
               onReasoningEnd,

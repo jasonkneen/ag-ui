@@ -443,3 +443,64 @@ describe("assistant text segments across multiple tool calls", () => {
     expect(forwarded).toContain("unrelated segment");
   });
 });
+
+/**
+ * The same segmentation, with output processors on.
+ *
+ * `useProcessedFinalText: true` buffers `text-delta` chunks and emits the processed text at a
+ * finish boundary instead of as it streams. Both halves of the segmentation logic read state at
+ * the moment text is emitted, so deferring that call past the tool boundary reads it too late:
+ * the first segment picks up a boundary that had not opened when its text arrived, and
+ * `textSinceLastToolCall` is still false when the next tool call opens, so two boundaries collapse
+ * into one and later segments share an id.
+ */
+describe("assistant text segmentation with useProcessedFinalText", () => {
+  const assistantText = (text: string) => ({
+    response: {
+      uiMessages: [{ role: "assistant", content: [{ type: "text", text }] }],
+    },
+  });
+
+  /*
+   * The shape that actually bites: Mastra re-announces the same messageId across the step
+   * boundary, and the tool call lands before the buffered text is released. Both halves of the
+   * segmentation logic read state when text is emitted, and buffering moves that to `step-finish`
+   * — after the boundary has been counted. So the first segment picks up a boundary that had not
+   * opened when its text arrived, and `textSinceLastToolCall` is still false when the next tool
+   * call opens, so two boundaries collapse into one and later segments share an id.
+   */
+  it("gives each text segment its own id across two tool boundaries", async () => {
+    const agent = makeLocalMastraAgent({
+      useProcessedFinalText: true,
+      streamChunks: [
+        { type: "start", payload: { messageId: "base" } },
+        { type: "text-delta", payload: { text: "first" } },
+        {
+          type: "tool-call",
+          payload: { toolCallId: "call-1", toolName: "t1", args: {} },
+        },
+        { type: "step-finish", payload: assistantText("first") },
+        { type: "step-start", payload: { messageId: "base" } },
+        { type: "text-delta", payload: { text: "second" } },
+        {
+          type: "tool-call",
+          payload: { toolCallId: "call-2", toolName: "t2", args: {} },
+        },
+        { type: "step-finish", payload: assistantText("second") },
+        { type: "step-start", payload: { messageId: "base" } },
+        { type: "text-delta", payload: { text: "third" } },
+        { type: "finish", payload: assistantText("third") },
+      ],
+    });
+
+    const events = await collectEvents(agent, makeInput());
+    const ids = events
+      .filter((e) => e.type === EventType.TEXT_MESSAGE_CHUNK)
+      .map((e) => (e as any).messageId);
+
+    // One id per segment, none reused.
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+    expect(ids[0]).toBe("base");
+  });
+});
