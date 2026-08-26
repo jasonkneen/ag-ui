@@ -339,12 +339,31 @@ dependency is not even loaded for them.
 When it installs the middleware, `createStrandsApp` derives `credentials` from
 the origin policy it resolved rather than passing a fixed value, and
 `CreateStrandsAppOptions` offers no way to override the derivation. Credentials
-are enabled only for a policy that names at least one specific origin: a
-non-empty origin string other than `"*"`, an array with no `"*"` in it, or
-`true`. So `"https://app.tld"`, `["https://a.tld"]` and `true` emit
-`Access-Control-Allow-Credentials: true` on every response the middleware acts
-on, allowlist misses included, while `"*"`, `[]`, `["*"]` and
-`["*", "https://a.tld"]` emit no credentials header at all.
+are enabled only for a policy that names at least one specific site: a
+non-empty origin string that is neither `"*"` nor `"null"`, an array holding
+neither of those, or `true`. So `"https://app.tld"`, `["https://a.tld"]` and
+`true` emit `Access-Control-Allow-Credentials: true` on every response the
+middleware acts on, allowlist misses included, while `"*"`, `"null"`, `[]`,
+`["*"]`, `["*", "https://a.tld"]` and `["null", "https://a.tld"]` emit no
+credentials header at all.
+
+`"null"` is the Origin a browser sends from a sandboxed iframe, a `file://`
+page and some redirect chains. It names no site, so credentials granted against
+it are granted to anything that can present the header, which is why it is
+withheld for the same reason `"*"` is. The difference is that a browser refuses
+a literal wildcard paired with credentials outright, while it honours the
+`null` pairing, so this is the one of the two where the grant would have
+reached the caller. Unlike `"*"`, `"null"` does not collapse the array it sits
+in: the concrete entries beside it stay on the allowlist and a caller outside
+that list still misses. What they lose is the credentials header, since `cors`
+takes one `credentials` boolean for the whole policy.
+
+Both spellings are compared exactly. `cors` matches allowlist entries against
+the request's `Origin` with `===`, and a browser compares the
+`Access-Control-Allow-Origin` it receives against its own origin serialization
+byte for byte, so `"NULL"` or a trailing slash matches nothing on either side
+and grants nothing: a mis-spelled entry fails closed rather than slipping past
+the check.
 
 > **`corsOrigin: true` is the value to be careful with, not `"*"`.** `true`
 > reflects whatever `Origin` the request carried straight back in
@@ -364,10 +383,10 @@ on, allowlist misses included, while `"*"`, `[]`, `["*"]` and
 > suggested above for local development cannot carry cookies. Name the origins
 > explicitly when the browser has to send them.
 
-Both adapters now guard the credentials pairing the same way. Python's
+Both adapters guard the wildcard credentials pairing the same way. Python's
 `create_strands_app` computes
-`allow_credentials=bool(origins) and not is_wildcard`, and the derivation above
-is the TypeScript spelling of that same rule. What still differs is the
+`allow_credentials=bool(origins) and not is_wildcard`; widening that guard to
+`"null"` is a separate change on the Python side. What else differs is the
 default: Python adds `CORSMiddleware` to every app and falls back to
 `allow_origins=["*"]` whenever `origins` is omitted or empty, emitting a
 `FutureWarning` for that implicit wildcard rather than refusing it, while
@@ -379,6 +398,14 @@ until you ask for it.
 > middleware unconditionally and defaulted to `corsOrigin: "*"`, so every
 > browser origin was allowed. Deployments that relied on that implicit default
 > now have to pass `corsOrigin` explicitly. Explicit values are unaffected.
+>
+> **Compatibility break.** A policy that lists `"null"`, on its own or beside
+> other origins, no longer receives `Access-Control-Allow-Credentials: true`.
+> Such a policy previously got the header, and a browser honoured it, so a
+> sandboxed iframe or `file://` page could make a credentialed call. Cookies
+> and other credentials now have to come from a policy naming the site they
+> belong to. Nothing else about a `"null"` policy changes: the origin is still
+> matched and still admitted.
 
 Cross-origin policy is only one of two defenses here. Requests without a JSON
 `Content-Type` are refused with HTTP 415 before the agent runs, which blocks the

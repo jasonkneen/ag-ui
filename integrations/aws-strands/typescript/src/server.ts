@@ -390,27 +390,52 @@ function normalizeCorsOrigin(
 }
 
 /**
+ * Origin values that name no particular site, so credentials granted against
+ * them are granted to whoever can present them.
+ *
+ * `"*"` names every site. `"null"` is what a browser sends as its Origin from
+ * a sandboxed iframe, a `file://` page and some redirect chains: it identifies
+ * no site either, so any caller able to produce the header is inside a policy
+ * that lists it. Browsers reject `"*"` paired with credentials outright, but
+ * they accept the `"null"` pairing, so that grant is the one that actually
+ * reaches a client.
+ *
+ * Compared exactly, because that is the only spelling a browser can send:
+ * `cors` matches allowlist entries with `===` and a browser compares the
+ * allow-origin header against its own origin serialization byte for byte, so
+ * any other casing or a trailing slash matches nothing and grants nothing.
+ */
+const UNATTRIBUTABLE_ORIGINS = ["*", "null"];
+
+/**
  * Whether credentialed cross-origin requests may be allowed for `origin`.
  *
- * Only a concrete origin qualifies, whether given as a single string or a
- * list. `Access-Control-Allow-Origin: *`
- * together with `Access-Control-Allow-Credentials: true` is a pairing browsers
- * reject outright, and `origin: true` reflects whatever Origin the caller sent,
- * which would extend credentials to every site. The Python adapter applies the
- * same rule via `allow_credentials=bool(origins) and not is_wildcard`.
+ * Only an origin naming a specific site qualifies, whether given as a single
+ * string or a list: see {@link UNATTRIBUTABLE_ORIGINS} for the two spellings
+ * that name none. `origin: true` reflects whatever Origin the caller sent,
+ * which would extend credentials to every site. The Python adapter guards the
+ * wildcard the same way, via
+ * `allow_credentials=bool(origins) and not is_wildcard`; widening that guard
+ * to `"null"` is a separate change on the Python side.
  *
  * Call this on the output of {@link normalizeCorsOrigin}, so the wildcard
  * spellings have already collapsed to `"*"`.
  */
 function allowsCredentials(origin: string | string[] | boolean): boolean {
   // `false` turns the middleware off; `""` leaves no origin to grant
-  // credentials against. A literal `"*"` is the one value browsers refuse to
-  // pair with credentials at all.
-  if (typeof origin === "string") return origin !== "*" && origin !== "";
-  // A surviving array is a concrete allow-list; normalization has already
-  // collapsed the wildcard spelling. Kept as a guard rather than a bare
-  // `true` so calling this on an unnormalized value stays safe.
-  if (Array.isArray(origin)) return origin.length > 0 && !origin.includes("*");
+  // credentials against.
+  if (typeof origin === "string")
+    return origin !== "" && !UNATTRIBUTABLE_ORIGINS.includes(origin);
+  // A surviving array is an allow-list compared per caller; normalization has
+  // already collapsed the wildcard spelling, and the wildcard check is kept as
+  // a guard so calling this on an unnormalized value stays safe. `cors` takes
+  // one `credentials` boolean for the whole policy, so one unattributable
+  // entry costs the concrete entries beside it their credentials too.
+  if (Array.isArray(origin))
+    return (
+      origin.length > 0 &&
+      !origin.some((entry) => UNATTRIBUTABLE_ORIGINS.includes(entry))
+    );
   // `true` reflects the caller's Origin, so the header carries a concrete
   // origin and credentials are valid. Permissive, but it is what the caller
   // asked for, and withholding them would break deployments that rely on it.
