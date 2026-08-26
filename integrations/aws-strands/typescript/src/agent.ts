@@ -62,6 +62,437 @@ const LOG_PREFIX = "[@ag-ui/aws-strands]";
 const uuid = (): string => randomUUID();
 
 /**
+ * Terminal error code and fallback message for a forced stop.
+ *
+ * Both are matched literally by clients and by mock harnesses against the
+ * Python adapter's `RUN_ERROR`, so the two bridges spell them identically.
+ * Changing either here is a wire-contract change.
+ */
+const FORCE_STOP_ERROR_CODE = "STRANDS_FORCE_STOP";
+const FORCE_STOP_FALLBACK_MESSAGE = "The Strands agent stopped unexpectedly.";
+
+/**
+ * Abnormal terminal stop reasons, keyed by what the SDK reports and valued with
+ * the provider spelling the Python adapter puts on the wire.
+ *
+ * The TS SDK canonicalises provider stop reasons to camelCase (see
+ * `dist/src/models/bedrock.js`, which maps Bedrock's `content_filtered` to
+ * `contentFiltered`); Python forwards the provider spelling untouched. The
+ * hint event carries Python's spelling from both bridges so a client matches
+ * one value, not one per language. `StopReason` widens to `string`, so a model
+ * that hands the provider value straight through is keyed here too.
+ *
+ * A `Map` and not an object literal, because the key arrives from the provider:
+ * an object literal answers `toString` / `constructor` / `valueOf` /
+ * `__proto__` off `Object.prototype`, and an inherited function passes a
+ * truthiness guard and puts a `stop_reason` that is not a stop reason on the
+ * wire.
+ *
+ * `maxTokens` stays keyed so this is a literal mirror of Python's tuple, which
+ * lists `max_tokens`. The entry is dead on both bridges for the same reason:
+ * the layer under the adapter raises before a token-limit truncation can reach
+ * a terminal result (`MaxTokensError` from `Model.streamAggregated` here,
+ * `MaxTokensReachedException` from `event_loop` there).
+ *
+ * Any reason absent from the table carries no hint. That covers the normal
+ * `endTurn` and `toolUse`, the other stops Python's tuple has no entry for
+ * (`cancelled`, `stopSequence`, `interrupt` and `modelContextWindowExceeded`,
+ * the last of which Python's own `StopReason` does not spell at all) and a
+ * provider value forwarded untranslated such as Anthropic's `refusal`.
+ * Mirroring runs one way: where Python has no counterpart value, this stays
+ * silent rather than inventing one.
+ */
+const ABNORMAL_STOP_REASONS = new Map<string, string>([
+  ["maxTokens", "max_tokens"],
+  ["max_tokens", "max_tokens"],
+  ["guardrailIntervened", "guardrail_intervened"],
+  ["guardrail_intervened", "guardrail_intervened"],
+  ["contentFiltered", "content_filtered"],
+  ["content_filtered", "content_filtered"],
+]);
+
+/**
+ * SDK error names that must not be reported as a forced stop, keyed by
+ * `Error.name`.
+ *
+ * Python does not split this by exception type but by WHERE the exception was
+ * raised. On `strands-agents` 1.52.0, the release this taxonomy was verified
+ * against, `_handle_model_execution` yields `ForceStopEvent` for anything that
+ * escapes the model call itself once no hook has asked for a retry, so a
+ * provider failure raised inside that call reports as a forced stop. The two
+ * raises that happen AFTER the model call returned normally,
+ * `MaxTokensReachedException` and `StructuredOutputException`, are re-raised by
+ * `event_loop_cycle` without a `ForceStopEvent` and reach the Python adapter's
+ * outer handler, which reports `STRANDS_ERROR`. These are those two TS
+ * analogues, rethrown so they reach this adapter's outer handler and keep the
+ * same code.
+ *
+ * That first sentence is a statement about 1.52.0 and not about every release
+ * the Python sibling supports. On 1.15.0, 1.18.0 (what its `uv.lock` pins) and
+ * 1.20.0 the same `except` is gated behind an exhausted
+ * `ModelThrottledException`, and every other exception is re-raised with no
+ * `ForceStopEvent` at all, so a provider 5xx reports `STRANDS_ERROR` there
+ * while it reports `STRANDS_FORCE_STOP` here. This adapter carries no version
+ * branching for that and is not going to: it mirrors current Python. See
+ * `ARCHITECTURE.md` for the releases that were driven to establish it.
+ *
+ * `ContextWindowOverflowError` is deliberately absent even though Python lists
+ * `ContextWindowOverflowException` in the same re-raise tuple: providers raise
+ * it from inside the model call, where the force-stop handler catches it first.
+ * The TS SDK raises its counterpart from the provider too (`bedrock.js`,
+ * `anthropic.js` and `google/model.js` all raise it while translating a
+ * model-call failure), so the forced-stop default is the matching report.
+ *
+ * Matched on `name`, which the SDK sets explicitly in every constructor
+ * (`dist/src/errors.js`), rather than by `instanceof`: name matching survives a
+ * duplicated SDK copy in the dependency tree and needs no value import of a
+ * peer dependency. Never on a version string.
+ */
+const STREAM_ERROR_BYPASS_NAMES = new Set<string>([
+  "MaxTokensError",
+  "StructuredOutputError",
+]);
+
+/**
+ * `Error.name` when the thrown value carries a string one, else `undefined`.
+ *
+ * Total for every thrown value, for the same reason `_forceStopMessage` is.
+ * Inside `ForcedStop.record` it runs before anything is latched, so a throw
+ * escaping here would leave the outer handler reporting a provider failure as
+ * `ADAPTER_BUG`; it also runs inside `_isFrontendHaltSentinel`, where a throw
+ * would do the same from the frontend-halt window. Reading `name` can itself
+ * throw, from a getter that raises or from a `Proxy` whose `get` trap does. A
+ * name that cannot be read is treated as an absent one, which is the reading a
+ * value carrying no name already gets.
+ */
+function _errorName(e: unknown): string | undefined {
+  try {
+    const name = (e as { name?: unknown } | null | undefined)?.name;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when the thrown value carries a `cause`.
+ *
+ * Total for every thrown value, for the same reason `_errorName` is: reading
+ * `cause` can throw from a getter or a `Proxy` trap, and it is read inside the
+ * frontend-halt window, where an escaping throw reports a provider failure as
+ * `ADAPTER_BUG` and skips the closeout.
+ *
+ * An unreadable `cause` counts as PRESENT rather than absent, which is the
+ * opposite of how `_errorName` treats an unreadable name, and deliberately so:
+ * an absent `cause` is what identifies the halt sentinel, and the sentinel is
+ * SWALLOWED. Reading "cannot tell" as "absent" would turn a provider failure
+ * into a finished run. Reading it as "present" only costs a run that really
+ * did halt an extra `RUN_ERROR` it would not otherwise have had.
+ */
+function _carriesCause(e: unknown): boolean {
+  try {
+    return (e as { cause?: unknown } | null | undefined)?.cause !== undefined;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The wire message for a forced stop, derived from whatever was thrown.
+ *
+ * A throw carries no contract in JavaScript, so this is the one place that
+ * decides what a client reads. `null` and `undefined` are the two values whose
+ * `String()` form is a plausible-looking message that says nothing about the
+ * failure ("null", "undefined"), so they take the fallback the same way an
+ * empty message does. Every other value keeps its own text, including the
+ * string `"null"`, which is a message someone wrote.
+ *
+ * Python cannot reach this case at all: `raise None` is a TypeError there and
+ * its `force_stop_reason` is always `str(exception)`, so treating a thrown
+ * `null` as "no reason given" adds no cross-language wire difference.
+ *
+ * Total for every thrown value. Deriving the text can itself throw: `String()`
+ * on an object with a null prototype finds no `toString` to call, and an
+ * `Error` whose `message` is not a string has no `trim`. A throw escaping here
+ * would reach the outer handler and report a provider failure as `ADAPTER_BUG`,
+ * so a value whose text cannot be read takes the same fallback as an absent
+ * one.
+ */
+function _forceStopMessage(e: unknown): string {
+  if (e === null || e === undefined) return FORCE_STOP_FALLBACK_MESSAGE;
+  try {
+    return _errorMessage(e).trim() || FORCE_STOP_FALLBACK_MESSAGE;
+  } catch {
+    return FORCE_STOP_FALLBACK_MESSAGE;
+  }
+}
+
+/**
+ * True for the throw Strands uses to report a cycle that halted before the
+ * model produced a final assistant message.
+ *
+ * `Model.streamAggregated` raises a bare `ModelError` with no `cause` for that
+ * ("Stream ended without completing a message"), and it is the only throw the
+ * frontend-halt window may treat as expected flow. Everything else in that
+ * window is a real failure and has to stay visible:
+ *   - a dedicated SDK error carries its own `name` (`ModelThrottledError`,
+ *     `MaxTokensError`, `ContextWindowOverflowError`, ...);
+ *   - a provider failure re-raised by that same method arrives as `ModelError`
+ *     with the original error on `cause`, which the halt throw never carries.
+ *
+ * Deliberately not a check on the message text. `stop-reasons.test.ts` drives
+ * both directions a naive match gets wrong: a wrapped provider failure whose
+ * message happens to read like the sentinel is still reported, and a sentinel
+ * the SDK reworded is still swallowed. So a reworded SDK string cannot
+ * silently reopen the hole. A plain `Error` with no `cause` counts as the
+ * sentinel too, which keeps the lenient reading this window has always had for
+ * a throw that carries no taxonomy at all. A `ModelError` raised with neither a
+ * `cause` nor a distinguishing name (the Vercel provider has one such site) is
+ * indistinguishable from the sentinel by any means short of the message text,
+ * and is still swallowed here.
+ */
+function _isFrontendHaltSentinel(e: unknown): boolean {
+  const name = _errorName(e);
+  if (name !== "ModelError" && name !== "Error") return false;
+  return !_carriesCause(e);
+}
+
+/**
+ * The `stepName` for a node's STEP_STARTED / STEP_FINISHED pair.
+ *
+ * One function because the two events must spell it identically for a frontend
+ * to pair them (events.mdx §StepFinished), and both run paths emit both.
+ */
+function _stepName(ev: { nodeId?: string; nodeType?: string }): string {
+  return `${ev.nodeType ?? "agent"}:${ev.nodeId ?? "unknown"}`;
+}
+
+/** Hint event for a non-normal stop. Same name and payload shape as Python. */
+function _agentStopped(stopReason: string): BaseEvent {
+  return {
+    type: EventType.CUSTOM,
+    name: "AgentStopped",
+    value: { stop_reason: stopReason },
+  } as BaseEvent;
+}
+
+/**
+ * The single-agent path's terminal-failure report, mirroring Python's
+ * `force_stop` handling.
+ *
+ * `_runSingleAgent` is the only user, deliberately. The orchestrator path does
+ * NOT report a forced stop: `Node.stream` turns a node's provider failure into
+ * a FAILED `NodeResult` instead of a throw, so the only exceptions that escape
+ * a real `Graph` or `Swarm` are orchestration budget violations, which are not
+ * model stop reasons. That path keeps its outer handler's `STRANDS_ERROR`; see
+ * the comment on the stream in `_runOrchestrator`.
+ *
+ * What the two paths DO share is the abnormal-stop hint, which reads one
+ * `ABNORMAL_STOP_REASONS` table from both and reaches the wire identically on
+ * a real Graph.
+ *
+ * `label` is parameterised so the log line names the failing stream. The
+ * message closeout stays with the caller: the single-agent path closes
+ * reasoning before text, drains pending tool calls and appends to a messages
+ * snapshot.
+ */
+class ForcedStop {
+  /** Reason to report, once a failure has been recorded. */
+  private _message: string | undefined;
+
+  constructor(
+    private readonly _log: Logger,
+    /** Which stream failed, for the log line. */
+    private readonly _label: string,
+    private readonly _threadId: string,
+  ) {}
+
+  /** True once a failure has been recorded, i.e. this reporter owns the run's report. */
+  get pending(): boolean {
+    return this._message !== undefined;
+  }
+
+  /**
+   * Record `failure` as this run's forced stop, or rethrow it.
+   *
+   * A rethrow leaves the run to the caller's outer handler, which reports
+   * `STRANDS_ERROR`. It also exits before the caller's closeout, so a message
+   * left open stays open ahead of the terminal error. That is what the Python
+   * adapter does with the same failures: its bare `raise` leaves the loop
+   * before its own closeout block and lands on its outer handler, so the two
+   * bridges put the same events on the wire.
+   *
+   * A classification rethrow is the ONLY throw this method may make, because
+   * that is the only throw its caller knows how to read: it lets the throw skip
+   * the closeout. So the order below is load-bearing. The classification check
+   * runs first, the reason is latched next, and the log runs last inside its
+   * own `try`. A caller-supplied `Logger` is arbitrary code and can throw,
+   * `JSON.stringify` meeting a circular `cause` being enough; a throw escaping
+   * it would be mistaken for a classification rethrow and would discard the
+   * recorded provider failure. Latching before logging and swallowing a logger
+   * failure means neither can be lost.
+   *
+   * An adapter code defect (`TypeError` / `ReferenceError`) is not classified
+   * here. The caller checks for one itself, ahead of its frontend-halt swallow,
+   * which the check would otherwise reach first, so one never arrives here. A
+   * second copy of that check would be a guard nothing can drive.
+   *
+   * Nothing guards against a second `record` on the same run, deliberately:
+   * the call site `break`s out of its consume loop the moment one returns, so
+   * no later failure can reach this. Python does not guard either. It assigns
+   * `force_stop_reason` unconditionally on every `force_stop` event
+   * (`python/src/ag_ui_strands/agent.py`), so its last failure wins.
+   */
+  record(failure: unknown): void {
+    // The raises Python makes after its model call returned reach its outer
+    // handler instead of a ForceStopEvent, so their TS analogues reach the
+    // outer handler here too and keep its STRANDS_ERROR code.
+    if (STREAM_ERROR_BYPASS_NAMES.has(_errorName(failure) ?? "")) {
+      throw failure;
+    }
+    this._message = _forceStopMessage(failure);
+    try {
+      // The error object, not just its text: the outer handler this diverts
+      // traffic away from logs `error(prefix, e)`, which is what gives an
+      // operator the stack, the name and the `cause`.
+      this._log.error(
+        `${LOG_PREFIX} ${this._label} force-stopped ` +
+          `(threadId=${this._threadId}, reason=${this._message})`,
+        failure,
+      );
+    } catch {
+      // A logger that cannot write the line is not a reason to lose the run's
+      // terminal event. Nothing is re-logged here: the sink that just threw is
+      // the only one this reporter has.
+    }
+  }
+
+  /**
+   * The terminal events for the recorded failure.
+   *
+   * Emitted after the caller's own message closeout, so every message envelope
+   * a client saw opened is closed before the run ends. Step envelopes are not
+   * tracked here and are left exactly as the SDK's own node events paired
+   * them: a `STEP_STARTED` the SDK never closed stays open, on a failed run
+   * and on a healthy one alike. Harmless on a failed run, which is the one
+   * this method ends, since the client verifier checks nothing on `RUN_ERROR`.
+   * On a healthy run the same open step is a pre-existing protocol gap rather
+   * than a decision this reporter makes; see `ARCHITECTURE.md`.
+   *
+   * A forced stop is a failed run, not a short success, so the caller returns
+   * on these rather than falling through to STATE_SNAPSHOT and RUN_FINISHED.
+   */
+  *emit(): Generator<BaseEvent, void, void> {
+    if (this._message === undefined) return;
+    yield _runError(this._message, FORCE_STOP_ERROR_CODE);
+  }
+}
+
+/**
+ * Events the RAW fallback deliberately stays silent about.
+ *
+ * Two groups, both of which would be noise rather than new information:
+ *
+ * 1. Lifecycle/plumbing brackets. The TS SDK surfaces hook brackets the Python
+ *    `stream_async` generator never emits, so these are the TS counterpart of
+ *    Python's `init_event_loop` / `start_event_loop` / `start` skips: they carry
+ *    no payload of their own and only bracket work already reported by mapped
+ *    events.
+ *
+ * 2. Payload-carrying events whose payload is *already* on the wire under a
+ *    mapped AG-UI event. Forwarding these as RAW duplicates content the client
+ *    has seen — the same class of bug as Python re-emitting `ModelMessageEvent`
+ *    after the text has already streamed:
+ *      - `agentResultEvent`  — terminal result; already `RUN_FINISHED`.
+ *      - `modelMessageEvent` — the assembled assistant message, already streamed
+ *                              as `TEXT_MESSAGE_CONTENT` / `TOOL_CALL_*`.
+ *      - `toolResultEvent`   — already mapped from `afterToolCallEvent` to
+ *                              `TOOL_CALL_RESULT`.
+ *      - `messageAddedEvent` — framework-side history bookkeeping; the client's
+ *                              history comes from `MESSAGES_SNAPSHOT`.
+ *
+ * Deliberately NOT skipped — these carry information no mapped AG-UI event
+ * conveys, which is exactly what the RAW fallback exists for (issue #2291):
+ *   - `modelMetadataEvent`  — token usage and latency metrics, which the AG-UI
+ *                             event set has no equivalent for.
+ *   - `modelRedactionEvent` — a guardrail redaction notice. Losing it silently
+ *                             would leave a client unable to tell redacted
+ *                             output from an ordinary short answer.
+ *
+ * Everything else falls through to a RAW event.
+ */
+const RAW_SKIPPED_EVENT_KINDS = new Set<string>([
+  // 1. Lifecycle / plumbing brackets.
+  "initializedEvent",
+  "beforeInvocationEvent",
+  "afterInvocationEvent",
+  "beforeModelCallEvent",
+  "afterModelCallEvent",
+  "beforeToolsEvent",
+  "afterToolsEvent",
+  "beforeToolCallEvent",
+  "modelMessageStartEvent",
+  "modelMessageStopEvent",
+  // 2. Payloads already represented by a mapped AG-UI event.
+  "agentResultEvent",
+  "modelMessageEvent",
+  "toolResultEvent",
+  "messageAddedEvent",
+]);
+
+/**
+ * Context keys Strands hangs off its events that are never model output.
+ *
+ * `agent` is a live `LocalAgent` — system prompt, full message history, model
+ * configuration — and `invocationState` transitively holds the same. Hook events
+ * define a `toJSON()` that drops both, but the model-layer events that reach the
+ * RAW fallback after unwrapping (`modelMetadataEvent` and friends) do not, so
+ * the keys are stripped by name rather than trusted to `toJSON()`.
+ *
+ * Mirrors `_RAW_INVOCATION_STATE_KEYS` in the Python adapter.
+ */
+const RAW_STRIPPED_EVENT_KEYS = new Set<string>([
+  "agent",
+  "invocationState",
+  "requestState",
+]);
+
+/**
+ * Reduce a Strands event to a JSON-safe RAW payload, or `undefined` to drop it.
+ *
+ * Two passes, both mandatory:
+ *  1. Drop the context keys above, so no agent internals reach a client.
+ *  2. Round-trip through JSON, so what we emit is plain data an in-process
+ *     consumer cannot follow back to a live object.
+ *
+ * Anything that will not serialize is dropped rather than coerced. Coercing
+ * unserializable values to strings is precisely how an agent's internals would
+ * end up on the wire, so it is never an option here.
+ */
+function sanitizeRawEvent(event: unknown): unknown | undefined {
+  if (!event || typeof event !== "object") return undefined;
+
+  const payload: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(event as Record<string, unknown>)) {
+    if (RAW_STRIPPED_EVENT_KEYS.has(key)) continue;
+    payload[key] = value;
+  }
+  if (Object.keys(payload).length === 0) return undefined;
+
+  try {
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) return undefined;
+    const decoded = JSON.parse(serialized) as Record<string, unknown>;
+    // A nested `toJSON()` could reintroduce a stripped key; strip once more on
+    // the decoded, plain-data copy.
+    for (const key of RAW_STRIPPED_EVENT_KEYS) delete decoded[key];
+    return decoded;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Structural interface for a Strands multi-agent orchestrator (Graph/Swarm).
  * TypeScript-only: the Python SDK currently has no orchestrator equivalent.
  */
@@ -418,12 +849,22 @@ export function buildSnapshotMessages(
       out.push(assistant);
     } else {
       const toolCallId = (msg as { toolCallId?: string }).toolCallId ?? "";
-      out.push({
+      const { error, encryptedValue } = msg as {
+        error?: string;
+        encryptedValue?: string;
+      };
+      const tool = {
         id: msgId,
         role: "tool",
         content: _coerceText(msg.content),
         toolCallId,
-      } as AguiToolMessage);
+      } as AguiToolMessage;
+      // This is an AG-UI -> AG-UI rebuild of the client's own message, so
+      // preserve its error/encryptedValue on the snapshot echo instead of
+      // silently dropping the client's own fields.
+      if (error !== undefined) tool.error = error;
+      if (encryptedValue !== undefined) tool.encryptedValue = encryptedValue;
+      out.push(tool);
     }
   }
   return out;
@@ -529,7 +970,12 @@ async function _buildStrandsHistory(
             toolResult: {
               toolUseId: toolCallId,
               content: [_buildToolResultContent(msg.content)],
-              status: "success" as const,
+              // Carry the AG-UI failure signal onto Bedrock's toolResult status,
+              // so a client-reported tool failure is not asserted to the model as
+              // a success.
+              status: (msg as { error?: string }).error
+                ? ("error" as const)
+                : ("success" as const),
             },
           },
         ],
@@ -605,7 +1051,10 @@ export class StrandsAgent {
   private readonly _activeRunsByThread = new Set<string>();
   /** Outstanding AG-UI interrupt objects per thread, used to validate
    * incoming `RunAgentInput.resume[]` (interrupts.mdx rules 3-7). */
-  private readonly _pendingInterruptsByThread = new Map<string, Map<string, AguiInterrupt>>();
+  private readonly _pendingInterruptsByThread = new Map<
+    string,
+    Map<string, AguiInterrupt>
+  >();
   /** Fingerprint of last successfully-processed resume per thread (idempotency). */
   private readonly _lastResumeFingerprint = new Map<string, string>();
   /**
@@ -620,7 +1069,14 @@ export class StrandsAgent {
   private readonly _log: Logger;
 
   constructor(options: StrandsAgentOptions) {
-    const { agent, name, description = "", config = {}, plugins, agentsByThread } = options;
+    const {
+      agent,
+      name,
+      description = "",
+      config = {},
+      plugins,
+      agentsByThread,
+    } = options;
 
     this._agentsByThread = agentsByThread ?? new Map();
 
@@ -711,7 +1167,12 @@ export class StrandsAgent {
           `${LOG_PREFIX} buildStrandsSeed failed for thread ${threadId}: ${_errorMessage(e)}`,
           e,
         );
-        return { error: _runError("Failed to build conversation seed: " + _errorMessage(e), "SEED_BUILD_ERROR") };
+        return {
+          error: _runError(
+            "Failed to build conversation seed: " + _errorMessage(e),
+            "SEED_BUILD_ERROR",
+          ),
+        };
       }
     }
 
@@ -728,17 +1189,35 @@ export class StrandsAgent {
           )) as SessionManager | null | undefined;
         } catch (e) {
           const msg = _errorMessage(e);
-          this._log.error(`${LOG_PREFIX} sessionManagerProvider failed: ${msg}`, e);
-          return { error: _runError(`Failed to initialize session manager: ${msg}`, "SESSION_MANAGER_ERROR") };
+          this._log.error(
+            `${LOG_PREFIX} sessionManagerProvider failed: ${msg}`,
+            e,
+          );
+          return {
+            error: _runError(
+              `Failed to initialize session manager: ${msg}`,
+              "SESSION_MANAGER_ERROR",
+            ),
+          };
         }
         if (
           sessionManager != null &&
           !(sessionManager instanceof SessionManager) &&
-          typeof (sessionManager as { initAgent?: unknown }).initAgent !== "function"
+          typeof (sessionManager as { initAgent?: unknown }).initAgent !==
+            "function"
         ) {
-          const actual = (sessionManager as object)?.constructor?.name ?? typeof sessionManager;
-          this._log.error(`${LOG_PREFIX} sessionManagerProvider returned ${actual}; expected a SessionManager instance.`);
-          return { error: _runError(`sessionManagerProvider returned ${actual}; expected a SessionManager instance`, "SESSION_MANAGER_INVALID_TYPE") };
+          const actual =
+            (sessionManager as object)?.constructor?.name ??
+            typeof sessionManager;
+          this._log.error(
+            `${LOG_PREFIX} sessionManagerProvider returned ${actual}; expected a SessionManager instance.`,
+          );
+          return {
+            error: _runError(
+              `sessionManagerProvider returned ${actual}; expected a SessionManager instance`,
+              "SESSION_MANAGER_INVALID_TYPE",
+            ),
+          };
         }
         if (!sessionManager) {
           this._log.warn(
@@ -748,7 +1227,10 @@ export class StrandsAgent {
       }
       const effectiveSeed = sessionManager ? undefined : seedMessages;
       strandsAgent = new StrandsAgentCore(
-        this._buildThreadAgentConfig(sessionManager ?? undefined, effectiveSeed),
+        this._buildThreadAgentConfig(
+          sessionManager ?? undefined,
+          effectiveSeed,
+        ),
       );
       // Register interruptOnCall hooks on the per-thread agent.
       const behaviors = this.config.toolBehaviors;
@@ -765,7 +1247,12 @@ export class StrandsAgent {
                 }
                 const response = event.interrupt({
                   name: `${TOOL_APPROVAL_NAME_PREFIX}${toolName}`,
-                  reason: { tool_call: true, tool_name: toolName, tool_input: event.toolUse!.input ?? {}, tool_use_id: event.toolUse!.toolUseId },
+                  reason: {
+                    tool_call: true,
+                    tool_name: toolName,
+                    tool_input: event.toolUse!.input ?? {},
+                    tool_use_id: event.toolUse!.toolUseId,
+                  },
                 });
                 if (
                   response == null ||
@@ -891,7 +1378,12 @@ export class StrandsAgent {
         this._lastResumeFingerprint.get(threadId) === fingerprint
       ) {
         yield _runStarted(inputData);
-        yield { type: EventType.RUN_FINISHED, threadId: inputData.threadId, runId: inputData.runId, outcome: { type: "success" } };
+        yield {
+          type: EventType.RUN_FINISHED,
+          threadId: inputData.threadId,
+          runId: inputData.runId,
+          outcome: { type: "success" },
+        };
         return;
       }
 
@@ -1021,7 +1513,8 @@ export class StrandsAgent {
     const source = this._runRaw(inputData);
     const tracked = (async function* () {
       for await (const ev of source) {
-        if ((ev as { type: string }).type === EventType.RUN_ERROR) hadError = true;
+        if ((ev as { type: string }).type === EventType.RUN_ERROR)
+          hadError = true;
         yield ev;
       }
     })();
@@ -1058,7 +1551,7 @@ export class StrandsAgent {
     this._activeRunsByThread.add(threadId);
     try {
       if (this._orchestrator !== null) {
-        yield* this._runOrchestrator(inputData);
+        yield* this._runOrchestrator(inputData, threadId);
       } else {
         yield* this._runSingleAgent(inputData, threadId);
       }
@@ -1472,6 +1965,14 @@ export class StrandsAgent {
       // Captured here so the interrupt-variant RUN_FINISHED below can pull
       // `stopReason` and `interrupts[]` off it.
       let finalAgentResult: StrandsAgentResult | undefined;
+      // The shared terminal-failure report. The TS SDK has no ForceStopEvent,
+      // so the throw that Python's generic `except Exception` would have
+      // reported through one is the signal here. Recorded rather than
+      // rethrown so the stream teardown and the message/tool-call closeout
+      // below still run, as they do in Python after its `force_stop` event.
+      // The failures `record` rethrows instead are the ones Python also leaves
+      // to its outer handler, and they skip that closeout on both bridges.
+      const forcedStop = new ForcedStop(this._log, "Agent stream", threadId);
 
       try {
         while (true) {
@@ -1479,21 +1980,31 @@ export class StrandsAgent {
           try {
             next = await agentStream.next();
           } catch (streamErr) {
+            // A code defect in the adapter is neither a provider failure nor
+            // the halt sentinel, so it keeps its own classification whether or
+            // not a halt is armed. Checked before the halt swallow rather than
+            // left to `record`, which the swallow would otherwise reach first.
+            if (
+              streamErr instanceof TypeError ||
+              streamErr instanceof ReferenceError
+            ) {
+              throw streamErr;
+            }
             // Strands throws "Stream ended without completing a message" when
             // a frontend tool call halts the agent before the model emits a
-            // final assistant message. If we've already decided to halt,
-            // swallow the error — it's expected flow.
-            if (pendingHalt || haltEventStream) {
-              if (
-                streamErr instanceof TypeError ||
-                streamErr instanceof ReferenceError
-              ) {
-                throw streamErr;
-              }
+            // final assistant message. Once we have decided to halt, that
+            // throw is expected flow and the run finishes. A genuine provider
+            // failure in the same window is not, and must not be swallowed
+            // into a success.
+            if (
+              (pendingHalt || haltEventStream) &&
+              _isFrontendHaltSentinel(streamErr)
+            ) {
               haltEventStream = true;
               break;
             }
-            throw streamErr;
+            forcedStop.record(streamErr);
+            break;
           }
           if (next.done) {
             finalAgentResult = next.value as StrandsAgentResult | undefined;
@@ -1505,6 +2016,13 @@ export class StrandsAgent {
           // (type: 'modelStreamUpdateEvent', event: ModelStreamEvent) before
           // yielding them from `agent.stream()`. Unwrap once so the dispatch
           // below operates on the inner event shape.
+          // `contentBlockEvent` is the assembled form of deltas that have
+          // already streamed, so it must never reach the RAW fallback (see
+          // `isAssembledContentBlock`). The wrapper kind has to be captured
+          // BEFORE unwrapping, because unwrapping is exactly what erases it —
+          // the bare block's own `type` is `textBlock` / `reasoningBlock` /
+          // whatever the SDK adds next.
+          const isAssembledBlock = isAssembledContentBlock(next.value);
           const event = unwrapStrandsEvent(next.value);
           const kind = getEventKind(event);
 
@@ -1711,7 +2229,19 @@ export class StrandsAgent {
                 }
               }
             }
-            continue;
+
+            // Only the delta kinds handled above are consumed here. Anything
+            // else falls through to the RAW fallback: Bedrock citations reach
+            // the adapter as `citationsDelta` inside this event, so an
+            // unconditional continue is what kept them off the wire.
+            const handled: ReadonlyArray<string> = [
+              "textDelta",
+              "reasoningContentDelta",
+              "toolUseInputDelta",
+            ];
+            if (handled.includes((delta as { type: string }).type)) {
+              continue;
+            }
           }
 
           // Reasoning signature (verification token) — not exposed to UI.
@@ -2020,10 +2550,13 @@ export class StrandsAgent {
             // legitimate — emit an empty TOOL_CALL_RESULT so the UI still
             // renders a result card.
             let resultData: unknown = null;
+            const fallbackResultData: unknown[] = [];
+            let matchedTextResult = false;
             const contentBlocks = hookEvent.result?.content;
             if (Array.isArray(contentBlocks)) {
               for (const cb of contentBlocks) {
                 if (cb instanceof TextBlock) {
+                  matchedTextResult = true;
                   try {
                     resultData = JSON.parse(cb.text);
                   } catch {
@@ -2041,10 +2574,26 @@ export class StrandsAgent {
                 }
                 const maybeJson = (cb as unknown as { json?: unknown }).json;
                 if (maybeJson !== undefined) {
-                  resultData = maybeJson;
-                  break;
+                  fallbackResultData.push(maybeJson);
+                  continue;
                 }
+
+                const serializableBlock = cb as unknown as {
+                  toJSON?: () => unknown;
+                };
+                fallbackResultData.push(
+                  typeof serializableBlock.toJSON === "function"
+                    ? serializableBlock.toJSON()
+                    : cb,
+                );
               }
+            }
+
+            if (!matchedTextResult && fallbackResultData.length > 0) {
+              resultData =
+                fallbackResultData.length === 1
+                  ? fallbackResultData[0]
+                  : fallbackResultData;
             }
 
             if (!resultToolId) continue;
@@ -2185,7 +2734,9 @@ export class StrandsAgent {
             const data = stream.data;
             const tseToolName = currentToolUse?.name ?? "";
             const tseToolUseId = currentToolUse?.toolUseId;
-            const tseBehavior = tseToolName ? this.config.toolBehaviors?.[tseToolName] : undefined;
+            const tseBehavior = tseToolName
+              ? this.config.toolBehaviors?.[tseToolName]
+              : undefined;
 
             if (tseToolUseId && tseBehavior?.toolStreamEventHandler) {
               try {
@@ -2206,7 +2757,11 @@ export class StrandsAgent {
                 type: EventType.STATE_SNAPSHOT,
                 snapshot: (data as { state: Record<string, unknown> }).state,
               };
-            } else if (data && typeof data === "object" && A2UI_STREAM_KEY in data) {
+            } else if (
+              data &&
+              typeof data === "object" &&
+              A2UI_STREAM_KEY in data
+            ) {
               // A2UI sub-agent streaming: re-emit the generate_a2ui
               // tool's inner render_a2ui progress as synthetic TOOL_CALL events.
               // The a2ui middleware's streaming path keys its "building"
@@ -2235,7 +2790,10 @@ export class StrandsAgent {
                   delta: a2ui.delta,
                 };
               } else if (a2ui.kind === "end") {
-                yield { type: EventType.TOOL_CALL_END, toolCallId: a2ui.toolCallId };
+                yield {
+                  type: EventType.TOOL_CALL_END,
+                  toolCallId: a2ui.toolCallId,
+                };
               }
             }
             continue;
@@ -2253,17 +2811,13 @@ export class StrandsAgent {
           if (maEvent?.type === "beforeNodeCallEvent") {
             // stepName must match the paired afterNodeCallEvent below so
             // frontends can pair START/FINISH (events.mdx §StepFinished).
-            yield {
-              type: EventType.STEP_STARTED,
-              stepName: `${maEvent.nodeType ?? "agent"}:${maEvent.nodeId ?? "unknown"}`,
-            };
+            const stepName = _stepName(maEvent);
+            yield { type: EventType.STEP_STARTED, stepName };
             continue;
           }
           if (maEvent?.type === "afterNodeCallEvent") {
-            yield {
-              type: EventType.STEP_FINISHED,
-              stepName: `${maEvent.nodeType ?? "agent"}:${maEvent.nodeId ?? "unknown"}`,
-            };
+            const stepName = _stepName(maEvent);
+            yield { type: EventType.STEP_FINISHED, stepName };
             continue;
           }
           if (maEvent?.type === "multiAgentHandoffEvent") {
@@ -2282,8 +2836,76 @@ export class StrandsAgent {
             };
             continue;
           }
-          // Ignore events we don't translate (BeforeInvocationEvent,
-          // ModelStreamEventHook wrappers, etc.).
+
+          // Terminal `AgentResult`. Mirrors Python's `"result" in event`
+          // branch: a non-normal stop gets a hint event so a client can say
+          // why an answer is short or empty, instead of the run reading as an
+          // ordinary success. No `continue`: the RAW skip list below owns
+          // dropping the result itself, whose payload already streamed.
+          if (kind === "agentResultEvent") {
+            const stopReason = (event as { result?: { stopReason?: unknown } })
+              .result?.stopReason;
+            const hint =
+              typeof stopReason === "string"
+                ? ABNORMAL_STOP_REASONS.get(stopReason)
+                : undefined;
+            if (hint) {
+              // Python logs the terminal result at INFO. This `Logger` has no
+              // info level and `DEFAULT_LOGGER.debug` is a no-op, so logging an
+              // abnormal stop at debug would leave no server trace at all.
+              // `warn` is the lowest level the default logger actually emits,
+              // and a truncated or filtered answer is a warning. The normal
+              // stops keep the debug trace so an ordinary run stays quiet.
+              this._log.warn(
+                `${LOG_PREFIX} agent_result: threadId=${threadId}, ` +
+                  `stopReason=${String(stopReason)} (abnormal stop)`,
+              );
+              yield _agentStopped(hint);
+            } else {
+              this._log.debug(
+                `${LOG_PREFIX} agent_result: threadId=${threadId}, ` +
+                  `stopReason=${String(stopReason)}`,
+              );
+            }
+          }
+
+          // Terminal fallback: anything the dispatch above does not translate
+          // is forwarded verbatim as RAW rather than dropped without a trace
+          // (issue #2291) — provider extensions this adapter predates, Bedrock
+          // citations among them, arrive here. Mirrors the Python adapter's
+          // terminal `else`, and matches what every other streaming adapter
+          // (LangGraph, watsonx, a2a) already does. The lifecycle brackets in
+          // `RAW_SKIPPED_EVENT_KINDS` stay silent, as they do in Python.
+          if (kind && RAW_SKIPPED_EVENT_KINDS.has(kind)) continue;
+          // An assembled content block duplicates content already on the wire,
+          // whatever kind of block it turned out to be. Keyed on the wrapper
+          // rather than on a list of block names so a block type added by a
+          // future SDK release is covered the day it ships.
+          if (isAssembledBlock) {
+            this._log.debug(
+              `${LOG_PREFIX} Skipping assembled content block for RAW ` +
+                `forwarding; its content already streamed ` +
+                `(threadId=${inputData.threadId}, block=${kind ?? "unknown"})`,
+            );
+            continue;
+          }
+          const rawPayload = sanitizeRawEvent(event);
+          if (rawPayload === undefined) {
+            this._log.warn(
+              `${LOG_PREFIX} Dropping unserializable Strands event from RAW ` +
+                `forwarding (threadId=${inputData.threadId}, kind=${kind ?? "unknown"})`,
+            );
+            continue;
+          }
+          this._log.debug(
+            `${LOG_PREFIX} Unmapped Strands event forwarded as RAW ` +
+              `(threadId=${inputData.threadId}, kind=${kind ?? "unknown"})`,
+          );
+          yield {
+            type: EventType.RAW,
+            event: rawPayload,
+            source: "strands",
+          } as unknown as BaseEvent;
         }
       } finally {
         // Consumer bailed (client disconnect, frontend-tool halt, error).
@@ -2334,6 +2956,15 @@ export class StrandsAgent {
       // already emitted). Either way the verifier must see zero active calls.
       yield* _drainPendingToolCalls(toolCallsSeen);
 
+      // A forced stop is a failed run, not a short success, so it terminates
+      // here rather than falling through to STATE_SNAPSHOT and RUN_FINISHED.
+      // Same code and same message as Python, and in the same position
+      // relative to the closeout events above.
+      if (forcedStop.pending) {
+        yield* forcedStop.emit();
+        return;
+      }
+
       // Final state snapshot with `currentState` verbatim. Unlike the initial
       // snapshot this is not filtered — the initial filter exists only to
       // protect frontends that don't recognise the "tool" role.
@@ -2351,7 +2982,12 @@ export class StrandsAgent {
           for (const i of aguiInterrupts) interruptMap.set(i.id, i);
           this._pendingInterruptsByThread.set(threadId, interruptMap);
           this._lastResumeFingerprint.delete(threadId);
-          persistInterruptBookkeeping(strandsAgent, interruptMap, null, this._log);
+          persistInterruptBookkeeping(
+            strandsAgent,
+            interruptMap,
+            null,
+            this._log,
+          );
           // Strands' default SessionManager saves at the completed-invocation
           // boundary. An interrupt exits the native loop before that durable
           // snapshot is guaranteed, so explicitly checkpoint the restored
@@ -2629,6 +3265,7 @@ export class StrandsAgent {
    */
   private async *_runOrchestrator(
     inputData: RunAgentInput,
+    threadId: string,
   ): AsyncGenerator<BaseEvent, void, void> {
     yield _runStarted(inputData);
     try {
@@ -2668,6 +3305,36 @@ export class StrandsAgent {
       let reasoningMessageId: string | undefined;
 
       const orchestratorStream = this._orchestrator!.stream(prompt);
+      // A throw out of this stream reaches the outer handler below and is
+      // reported as STRANDS_ERROR, not under the forced-stop code the
+      // single-agent path uses, because the failures that get here are not
+      // model stop reasons.
+      //
+      // `Node.stream` (`multiagent/nodes.js`) wraps `handle()` in a try/catch
+      // and turns ANY throw out of a node into a FAILED `NodeResult`, then
+      // returns normally. A provider failure inside a Graph node therefore
+      // never escapes as an exception at all. What does escape a real `Graph`
+      // or `Swarm` is an orchestration budget violation: `maxSteps`
+      // ("max steps reached"), the wall-clock `timeout` and the per-node
+      // `nodeTimeout` each throw out of `stream()`. Reporting one of those as
+      // a forced stop would tell a client the model stopped the run when the
+      // orchestrator's own budget did.
+      //
+      // The abnormal-stop hint further down is a different signal and IS at
+      // parity with the single-agent path: it rides a node's terminal
+      // `agentResultEvent`, which a real Graph does deliver.
+      //
+      // The consequence is that a Graph whose node failed reports as a
+      // finished run with no error, which is a real gap this adapter does not
+      // close. The signals to close it already arrive here and are discarded:
+      // `nodeResultEvent` carries `result.error`, `afterNodeCallEvent` carries
+      // `.error` when the failure escaped the node, and `for await` drops the
+      // aggregate `MultiAgentResult` the stream returns on `{ done: true }`.
+      // The aggregate STATUS is the one signal that cannot simply be acted on:
+      // `_resolveStatus` (`multiagent/state.js`) marks it FAILED when ANY node
+      // failed, so a Graph that lost one parallel branch and answered from
+      // another is FAILED too. What a partially failed Graph owes a client is a
+      // design question, not missing plumbing. See `ARCHITECTURE.md`.
       try {
         for await (const rawEvent of orchestratorStream) {
           const event = unwrapStrandsEvent(rawEvent);
@@ -2677,10 +3344,8 @@ export class StrandsAgent {
             const ev = event as { nodeId?: string; nodeType?: string };
             // stepName must match the paired afterNodeCallEvent below so
             // frontends can pair START/FINISH (events.mdx §StepFinished).
-            yield {
-              type: EventType.STEP_STARTED,
-              stepName: `${ev.nodeType ?? "agent"}:${ev.nodeId ?? "unknown"}`,
-            };
+            const stepName = _stepName(ev);
+            yield { type: EventType.STEP_STARTED, stepName };
             continue;
           }
           if (kind === "afterNodeCallEvent") {
@@ -2702,10 +3367,8 @@ export class StrandsAgent {
               reasoningStarted = false;
               reasoningMessageId = undefined;
             }
-            yield {
-              type: EventType.STEP_FINISHED,
-              stepName: `${ev.nodeType ?? "agent"}:${ev.nodeId ?? "unknown"}`,
-            };
+            const stepName = _stepName(ev);
+            yield { type: EventType.STEP_FINISHED, stepName };
             continue;
           }
           if (kind === "multiAgentHandoffEvent") {
@@ -2728,12 +3391,49 @@ export class StrandsAgent {
           if (kind === "nodeStreamUpdateEvent") {
             // Inner event is the agent-level event emitted by the wrapped agent.
             const ev = event as {
+              nodeId?: string;
               inner?: { source?: string; event?: unknown };
             };
             const inner = ev.inner?.event
               ? unwrapStrandsEvent(ev.inner.event)
               : undefined;
-            if (getEventKind(inner) === "modelContentBlockDeltaEvent") {
+            const innerKind = getEventKind(inner);
+            // A node's terminal `AgentResult` is the only place a stop reason
+            // reaches this path: `Agent.stream()` yields an `agentResultEvent`,
+            // and `AgentNode.handle` wraps every event it yields in a
+            // `NodeStreamUpdateEvent` tagged `source: 'agent'`. A non-normal
+            // stop gets the same hint the single-agent path emits, so a client
+            // can say why an answer is short or empty instead of reading the
+            // node as an ordinary success.
+            if (innerKind === "agentResultEvent") {
+              const stopReason = (
+                inner as { result?: { stopReason?: unknown } }
+              ).result?.stopReason;
+              const hint =
+                typeof stopReason === "string"
+                  ? ABNORMAL_STOP_REASONS.get(stopReason)
+                  : undefined;
+              if (hint) {
+                // Same level as the single-agent path, and for the same
+                // reason: `DEFAULT_LOGGER.debug` is a no-op, so an abnormal
+                // stop logged at debug leaves no server trace at all, and a
+                // guardrailed or filtered answer is a warning. Normal stops
+                // keep the debug trace so an ordinary run stays quiet.
+                this._log.warn(
+                  `${LOG_PREFIX} node agent_result: threadId=${threadId}, ` +
+                    `nodeId=${ev.nodeId ?? "unknown"}, stopReason=${String(stopReason)} ` +
+                    `(abnormal stop)`,
+                );
+                yield _agentStopped(hint);
+              } else {
+                this._log.debug(
+                  `${LOG_PREFIX} node agent_result: threadId=${threadId}, ` +
+                    `nodeId=${ev.nodeId ?? "unknown"}, stopReason=${String(stopReason)}`,
+                );
+              }
+              continue;
+            }
+            if (innerKind === "modelContentBlockDeltaEvent") {
               const delta = (
                 inner as { delta?: { type?: string; text?: string } }
               ).delta;
@@ -2751,7 +3451,10 @@ export class StrandsAgent {
                   messageId,
                   delta: delta.text,
                 };
-              } else if (delta?.type === "reasoningContentDelta" && delta.text) {
+              } else if (
+                delta?.type === "reasoningContentDelta" &&
+                delta.text
+              ) {
                 if (!reasoningStarted) {
                   reasoningMessageId = uuid();
                   yield {
@@ -2971,9 +3674,10 @@ interface PersistedInterruptBookkeeping {
  * checked explicitly before trusting it. Anything that doesn't match is
  * treated as "nothing persisted" rather than thrown.
  */
-function loadPersistedInterruptBookkeeping(
-  strandsAgent: unknown,
-): { pending: Map<string, AguiInterrupt> | null; fingerprint: string | null } {
+function loadPersistedInterruptBookkeeping(strandsAgent: unknown): {
+  pending: Map<string, AguiInterrupt> | null;
+  fingerprint: string | null;
+} {
   try {
     const appState = (strandsAgent as { appState?: unknown })?.appState as
       | { get?: (key: string) => unknown }
@@ -3098,6 +3802,32 @@ function getEventKind(event: unknown): string | undefined {
     return typeof t === "string" ? t : undefined;
   }
   return undefined;
+}
+
+/**
+ * True if `event` is a `ContentBlockEvent` — an assembled content block.
+ *
+ * `Agent.stream()` yields one of these for EVERY completed content block: any
+ * value from `model.streamAggregated` that is not a `ModelStreamEvent` gets
+ * wrapped as `new ContentBlockEvent({ contentBlock })`. A content block is by
+ * construction the assembled form of deltas the adapter has *already* streamed
+ * — `textBlock` is the finished text of a turn that went out chunk by chunk as
+ * `TEXT_MESSAGE_CONTENT`, `reasoningBlock` the finished reasoning that went out
+ * as `REASONING_MESSAGE_CONTENT`.
+ *
+ * The dispatch chain translates only `toolUseBlock`, so with a terminal RAW
+ * fallback in place every other block kind would fall through and re-deliver
+ * the whole assistant message a second time, immediately after it streamed.
+ * That is the same duplication the Python adapter's explicit
+ * `ModelMessageEvent` skip prevents.
+ *
+ * Tested against the real `ContentBlockEvent` / `TextBlock` / `ReasoningBlock`
+ * classes rather than object literals — see `raw-content-block.test.ts`.
+ *
+ * Must be evaluated before `unwrapStrandsEvent`, which discards the wrapper.
+ */
+function isAssembledContentBlock(event: unknown): boolean {
+  return getEventKind(event) === "contentBlockEvent";
 }
 
 /**
@@ -3348,7 +4078,9 @@ export async function convertMessagesForStrandsSeed(
       pendingToolResults.push({
         toolResult: {
           toolUseId: toolCallId,
-          status: "success" as const,
+          status: (msg as { error?: string }).error
+            ? ("error" as const)
+            : ("success" as const),
           content: [{ text: textContent }],
         },
       });
@@ -3482,11 +4214,18 @@ function validateObjectPayloadPropertyTypes(
   for (const [field, fieldSchema] of Object.entries(
     properties as Record<string, unknown>,
   )) {
-    if (!(field in payload) || !fieldSchema || typeof fieldSchema !== "object") {
+    if (
+      !(field in payload) ||
+      !fieldSchema ||
+      typeof fieldSchema !== "object"
+    ) {
       continue;
     }
     const type = (fieldSchema as { type?: unknown }).type;
-    if (typeof type !== "string" || jsonSchemaTypeMatches(payload[field], type)) {
+    if (
+      typeof type !== "string" ||
+      jsonSchemaTypeMatches(payload[field], type)
+    ) {
       continue;
     }
     return `field '${field}' must be ${jsonSchemaTypeDescription(type)}.`;
@@ -3506,7 +4245,9 @@ function jsonSchemaTypeMatches(value: unknown, type: string): boolean {
     case "integer":
       return typeof value === "number" && Number.isInteger(value);
     case "object":
-      return value !== null && typeof value === "object" && !Array.isArray(value);
+      return (
+        value !== null && typeof value === "object" && !Array.isArray(value)
+      );
     case "array":
       return Array.isArray(value);
     case "null":

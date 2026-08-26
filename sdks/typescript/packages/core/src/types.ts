@@ -25,6 +25,7 @@ export const BaseMessageSchema = z.object({
   content: z.string().optional(),
   name: z.string().optional(),
   encryptedValue: z.string().optional(),
+  subagentRunId: z.string().optional(),
   metadata: OptionalMetadataSchema,
 });
 
@@ -152,6 +153,7 @@ export const ToolMessageSchema = z.object({
   toolCallId: z.string(),
   error: z.string().optional(),
   encryptedValue: z.string().optional(),
+  subagentRunId: z.string().optional(),
   metadata: OptionalMetadataSchema,
 });
 
@@ -160,6 +162,7 @@ export const ActivityMessageSchema = z.object({
   role: z.literal("activity"),
   activityType: z.string(),
   content: z.record(z.any()),
+  subagentRunId: z.string().optional(),
   metadata: OptionalMetadataSchema,
 });
 
@@ -168,6 +171,7 @@ export const ReasoningMessageSchema = z.object({
   role: z.literal("reasoning"),
   content: z.string(),
   encryptedValue: z.string().optional(),
+  subagentRunId: z.string().optional(),
   metadata: OptionalMetadataSchema,
 });
 
@@ -211,6 +215,13 @@ export const InterruptSchema = z.object({
   responseSchema: z.record(z.any()).optional(),
   expiresAt: z.string().optional(),
   metadata: z.record(z.any()).optional(),
+  // The subagent whose work raised this interrupt, when it was raised inside
+  // one — absent for a root-raised interrupt. Attribution lives on each
+  // interrupt rather than on RUN_FINISHED because one run can carry
+  // interrupts from several subagents. Lets a client render the approval
+  // request inside that subagent's group without correlating the legacy
+  // on_interrupt CUSTOM event by ordering.
+  subagentRunId: z.string().optional(),
 });
 
 export const ResumeEntrySchema = z.object({
@@ -226,7 +237,12 @@ export const RunAgentInputSchema = z.object({
   threadId: z.string(),
   runId: z.string(),
   parentRunId: z.string().optional(),
-  state: z.any(),
+  // Optional by contract: absent means "no state", and a bare null reads as
+  // absent — every consumer collapses the two, and .NET's representation cannot
+  // tell them apart, so omission is the one spelling all SDKs share. This is
+  // the coerce pattern (not metadata's reject) because hand-rolled clients
+  // sending "state": null plausibly exist. Nulls INSIDE state are values.
+  state: z.any().transform((v) => v ?? undefined),
   messages: z.array(MessageSchema),
   tools: z.array(ToolSchema),
   context: z.array(ContextSchema),
