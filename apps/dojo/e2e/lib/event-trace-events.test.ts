@@ -274,3 +274,136 @@ test("drops LangSmith tracing env metadata, whose presence varies by environment
     },
   ]);
 });
+
+// The App Context envelope the normalizer emits: APP_CONTEXT_PREFIX followed by
+// 2-space JSON. Real traces carry it as a LangChain system message nested in
+// `rawEvent`, which is the shape these fixtures reproduce.
+const appContextContent = (context: Record<string, unknown>) =>
+  `App Context:\n${JSON.stringify(context, null, 2)}`;
+
+const systemMessageTrace = (...contents: readonly string[]) => [
+  {
+    type: "STATE_SNAPSHOT",
+    rawEvent: {
+      data: contents.map((content) => ({ type: "system", content })),
+    },
+  },
+];
+
+const appContextTrace = (context: Record<string, unknown>) =>
+  systemMessageTrace(appContextContent(context));
+
+test("normalizes forwarded headers whatever casing reached the agent", () => {
+  // The producer selects forwarded headers by matching the `x-` prefix
+  // case-insensitively but emits each key verbatim, so the spelling that lands
+  // in the payload is not guaranteed to be lowercase. Each row carries
+  // different values so a value-passthrough bug cannot hide behind a shared one.
+  const spellings: Record<string, Record<string, string>> = {
+    lowercase: {
+      "x-forwarded-for": "::1",
+      "x-forwarded-host": "localhost:8989",
+      "x-forwarded-port": "8989",
+      "x-forwarded-proto": "http",
+    },
+    canonical: {
+      "X-Forwarded-For": "10.0.0.7",
+      "X-Forwarded-Host": "dojo.internal:3000",
+      "X-Forwarded-Port": "3000",
+      "X-Forwarded-Proto": "https",
+    },
+    mixed: {
+      "X-FORWARDED-for": "192.168.1.4",
+      "x-Forwarded-HOST": "ci-runner:9000",
+      "X-forwarded-PORT": "9000",
+      "x-FORWARDED-Proto": "https",
+    },
+  };
+  const expected = appContextTrace({
+    copilotkit_forwarded_headers: {
+      "x-forwarded-for": "<forwarded-for>",
+      "x-forwarded-host": "<forwarded-host>",
+      "x-forwarded-port": "<forwarded-port>",
+      "x-forwarded-proto": "<forwarded-proto>",
+    },
+  });
+
+  for (const [casing, copilotkit_forwarded_headers] of Object.entries(
+    spellings,
+  )) {
+    assert.deepStrictEqual(
+      normalizeEventTrace(appContextTrace({ copilotkit_forwarded_headers })),
+      expected,
+      `${casing} forwarded headers must normalize like the lowercase spelling`,
+    );
+  }
+});
+
+test("tokenizes forwarded headers without touching data owned elsewhere", () => {
+  // Only headers the token map names are known to vary by environment. An entry
+  // it does not name keeps its spelling and its value, as does a header-shaped
+  // key that belongs to the application rather than to the forwarded-header bag.
+  const normalized = normalizeEventTrace(
+    appContextTrace({
+      copilotkit_forwarded_headers: {
+        "X-Forwarded-For": "10.0.0.7",
+        // An unnamed entry keeps its value exactly, structure included.
+        "X-Dojo-Demo": { mode: "agentic-chat" },
+      },
+      "X-Forwarded-Proto": "app-owned",
+      recipe: { "x-forwarded-host": "app-owned" },
+    }),
+  );
+
+  assert.deepStrictEqual(
+    normalized,
+    appContextTrace({
+      copilotkit_forwarded_headers: {
+        "x-forwarded-for": "<forwarded-for>",
+        "X-Dojo-Demo": { mode: "agentic-chat" },
+      },
+      "X-Forwarded-Proto": "app-owned",
+      recipe: { "x-forwarded-host": "app-owned" },
+    }),
+  );
+});
+
+test("tokenizes a named header whatever type its value has", () => {
+  // A named header's value is environment-dependent whatever shape it arrives
+  // in, and a caller can supply the bag directly, so every JSON type is
+  // reachable. Asserting the rule across types rather than sampling one keeps
+  // substitution from being narrowed to a subset of them later.
+  const expected = appContextTrace({
+    copilotkit_forwarded_headers: { "x-forwarded-for": "<forwarded-for>" },
+  });
+
+  for (const value of ["::1", 8989, "", false, null, { hop: 1 }, ["::1"]]) {
+    assert.deepStrictEqual(
+      normalizeEventTrace(
+        appContextTrace({
+          copilotkit_forwarded_headers: { "X-Forwarded-For": value },
+        }),
+      ),
+      expected,
+      `value ${JSON.stringify(value)} must not survive tokenization`,
+    );
+  }
+});
+
+test("collapses two spellings of one forwarded header into a single entry", () => {
+  // Deliberate: both spellings are the same field, and how many hops spelled it
+  // is environment metadata like the values themselves. Order-insensitive,
+  // because both entries resolve to the same key and the same token.
+  const expected = appContextTrace({
+    copilotkit_forwarded_headers: { "x-forwarded-for": "<forwarded-for>" },
+  });
+
+  for (const copilotkit_forwarded_headers of [
+    { "X-Forwarded-For": "203.0.113.9", "x-forwarded-for": "::1" },
+    { "x-forwarded-for": "::1", "X-Forwarded-For": "203.0.113.9" },
+  ]) {
+    assert.deepStrictEqual(
+      normalizeEventTrace(appContextTrace({ copilotkit_forwarded_headers })),
+      expected,
+    );
+  }
+});

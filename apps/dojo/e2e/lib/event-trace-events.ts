@@ -49,6 +49,8 @@ const LANGCHAIN_MESSAGE_TYPES = new Set([
   "tool",
   "function",
 ]);
+// Keys MUST be lowercase: normalizeForwardedHeaders looks them up by the
+// lowercased header name, so a title-cased key here would never match.
 const FORWARDED_HEADER_TOKENS = new Map([
   ["x-forwarded-for", "<forwarded-for>"],
   ["x-forwarded-host", "<forwarded-host>"],
@@ -208,6 +210,32 @@ function isGeneratedIdentityField(
   );
 }
 
+// `copilotkit_forwarded_headers` keys carry whatever spelling reached the agent.
+// The producer builds the bag by matching the `x-` prefix case-insensitively and
+// then emits each key verbatim, and a caller can put the key in
+// `config.configurable` themselves, so nothing upstream promises lowercase. Field names are case-insensitive (RFC 9110
+// §5.1), so match on the lowercased name — an upstream spelling change must not
+// turn a stable trace into an environment-dependent one.
+//
+// An entry the map does not name keeps its spelling and its value. That set is
+// open — the producer forwards every `x-` header verbatim — so an unnamed one
+// carrying a per-request value (`x-request-id`, `x-amzn-trace-id`) would churn
+// every golden it appears in. The remedy is to name it in
+// FORWARDED_HEADER_TOKENS, not to widen the match. Two spellings of one named
+// header collapse into a single entry, which is correct — they are the same
+// field, and how many hops spelled it is environment metadata too.
+function normalizeForwardedHeaders(
+  headers: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(headers).map(([header, value]): [string, unknown] => {
+      const lowercasedHeader = header.toLowerCase();
+      const token = FORWARDED_HEADER_TOKENS.get(lowercasedHeader);
+      return token === undefined ? [header, value] : [lowercasedHeader, token];
+    }),
+  );
+}
+
 function normalizeAppContextContent(value: string) {
   if (!value.startsWith(APP_CONTEXT_PREFIX)) return value;
 
@@ -217,9 +245,11 @@ function normalizeAppContextContent(value: string) {
     const headers = Reflect.get(context, "copilotkit_forwarded_headers");
     if (typeof headers !== "object" || headers === null) return value;
 
-    for (const [header, token] of FORWARDED_HEADER_TOKENS) {
-      if (Object.hasOwn(headers, header)) Reflect.set(headers, header, token);
-    }
+    Reflect.set(
+      context,
+      "copilotkit_forwarded_headers",
+      normalizeForwardedHeaders(headers),
+    );
     return `${APP_CONTEXT_PREFIX}${JSON.stringify(context, null, 2)}`;
   } catch {
     // This is ordinary message content unless it is valid App Context JSON.
