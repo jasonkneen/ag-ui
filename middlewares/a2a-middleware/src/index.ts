@@ -162,7 +162,15 @@ export class A2AMiddlewareAgent extends AbstractAgent {
                 observer.error(error);
               };
 
-              const callProms = [...pendingA2ACalls].map((toolCallId) => {
+              /*
+               * `async` so the whole body is inside the promise boundary.
+               *
+               * A synchronous callback lets a throw escape before `Promise.all(callProms)` exists,
+               * so `.catch(failRun)` is not attached yet and there is nothing to turn it into a
+               * RUN_ERROR: the stream hangs and the caller sees an unhandled rejection instead of
+               * a failed run. Everything below is somebody else's JSON, so it has to fail inward.
+               */
+              const callProms = [...pendingA2ACalls].map(async (toolCallId) => {
                 const toolCallsFromMessages = this.messages
                   .filter((message) => message.role === "assistant")
                   .flatMap((message) => message.toolCalls || [])
@@ -170,25 +178,52 @@ export class A2AMiddlewareAgent extends AbstractAgent {
 
                 const toolArgs = toolCallsFromMessages[0]?.function.arguments;
                 if (!toolArgs) {
-                  return Promise.reject(
-                    new Error(
-                      `Tool arguments not found for tool call id ${toolCallId}`,
-                    ),
+                  throw new Error(
+                    `Tool arguments not found for tool call id ${toolCallId}`,
                   );
                 }
-                let parsed: any;
+                let parsed: unknown;
                 try {
                   parsed = JSON.parse(toolArgs);
                 } catch (error) {
-                  return Promise.reject(
-                    new Error(
-                      `Failed to parse tool arguments for tool call id ${toolCallId}: ` +
-                        `${(error as Error).message}`,
-                    ),
+                  throw new Error(
+                    `Failed to parse tool arguments for tool call id ${toolCallId}: ` +
+                      `${(error as Error).message}`,
                   );
                 }
-                const agentName = parsed.agentName;
-                const task = parsed.task;
+                /*
+                 * Parsing succeeding does not mean the arguments are usable. `null`, a number, a
+                 * string and an array are all valid JSON, and reading a field off any of them is
+                 * either a TypeError or a silent `undefined` handed to the agent lookup. Checked
+                 * here so the shape failure reads like the syntax failure above it.
+                 */
+                if (
+                  parsed === null ||
+                  typeof parsed !== "object" ||
+                  Array.isArray(parsed)
+                ) {
+                  throw new Error(
+                    `Tool arguments for tool call id ${toolCallId} are not a JSON object: ` +
+                      `got ${Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed}`,
+                  );
+                }
+                const { agentName, task } = parsed as {
+                  agentName?: unknown;
+                  task?: unknown;
+                };
+                if (typeof agentName !== "string" || agentName.length === 0) {
+                  throw new Error(
+                    `Tool arguments for tool call id ${toolCallId} are missing a valid "agentName"`,
+                  );
+                }
+                // The task is the message body sent to the agent, and `sendMessageToA2AAgent` takes
+                // a string. This was reachable before only because the parsed value was `any`: a
+                // number or an object went out as the message and the agent had to make sense of it.
+                if (typeof task !== "string") {
+                  throw new Error(
+                    `Tool arguments for tool call id ${toolCallId} are missing a valid "task"`,
+                  );
+                }
 
                 if (this.debug) {
                   console.debug("sending message to a2a agent", {
