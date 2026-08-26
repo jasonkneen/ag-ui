@@ -35,7 +35,6 @@ from strands import Agent as StrandsAgentCore
 from strands import ToolContext, tool
 from strands.agent.state import AgentState
 from strands.interrupt import Interrupt as StrandsInterrupt
-from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.hooks.registry import HookRegistry
 from strands.models.model import Model as StrandsModel
 from strands.session import FileSessionManager
@@ -53,6 +52,7 @@ from ag_ui_strands.session_reconcile import (
     AG_UI_WIRE_MAP_STATE_KEY,
 )
 from tests.interrupt_state_stub import InterruptStateStub
+from tests.hook_helpers import invoke_after_model_call, invoke_before_model_call
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -148,9 +148,9 @@ class _MockStrandsCore:
         """
         self.stream_prompts.append(prompt)
         self._interrupt_state.resume(prompt)
-        await self.hooks.invoke_callbacks_async(BeforeModelCallEvent(agent=self))
+        invoke_before_model_call(self.hooks, self)
         self.model_messages.append(copy.deepcopy(self.messages))
-        await self.hooks.invoke_callbacks_async(AfterModelCallEvent(agent=self))
+        invoke_after_model_call(self.hooks, self)
         async for event in self._stream_body(prompt):
             yield event
 

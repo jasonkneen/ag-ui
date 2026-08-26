@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from strands.agent.state import AgentState
-from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.hooks.registry import HookRegistry
 from strands.session import SessionManager
 
@@ -26,6 +25,7 @@ from ag_ui.core import (
 )
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
+from tests.hook_helpers import invoke_after_model_call, invoke_before_model_call
 
 
 def _mock_session_manager() -> MagicMock:
@@ -544,9 +544,9 @@ class _MockSessionAgentReal:
 
     async def stream_async(self, prompt):
         self.stream_prompts.append(prompt)
-        await self.hooks.invoke_callbacks_async(BeforeModelCallEvent(agent=self))
+        invoke_before_model_call(self.hooks, self)
         self.model_messages.append(copy.deepcopy(self.messages))
-        await self.hooks.invoke_callbacks_async(AfterModelCallEvent(agent=self))
+        invoke_after_model_call(self.hooks, self)
         return
         yield  # pragma: no cover
 

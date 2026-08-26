@@ -33,7 +33,6 @@ from unittest.mock import MagicMock
 import pytest
 from ag_ui.core import Context, EventType, RunAgentInput, Tool, UserMessage
 from strands.tools.registry import ToolRegistry
-from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.hooks.registry import HookRegistry
 
 from ag_ui_strands.a2ui_tool import (
@@ -48,6 +47,7 @@ from ag_ui_strands.a2ui_tool import (
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
 from tests.interrupt_state_stub import InterruptStateStub
+from tests.hook_helpers import invoke_after_model_call, invoke_before_model_call
 
 GENERATE_A2UI_TOOL_NAME = "generate_a2ui"
 RENDER_A2UI_TOOL_NAME = "render_a2ui"
@@ -486,13 +486,9 @@ def _build_agent(thread_id: str, stream_events: list, config=None) -> StrandsAge
     mock_inner.model_messages = []
 
     async def _stream(_msg):
-        await mock_inner.hooks.invoke_callbacks_async(
-            BeforeModelCallEvent(agent=mock_inner)
-        )
+        invoke_before_model_call(mock_inner.hooks, mock_inner)
         mock_inner.model_messages.append(copy.deepcopy(mock_inner.messages))
-        await mock_inner.hooks.invoke_callbacks_async(
-            AfterModelCallEvent(agent=mock_inner)
-        )
+        invoke_after_model_call(mock_inner.hooks, mock_inner)
         for event in stream_events:
             yield event
 

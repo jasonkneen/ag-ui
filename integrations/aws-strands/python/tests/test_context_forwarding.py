@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from strands import Agent
 from strands.agent.state import AgentState
-from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.hooks.registry import HookRegistry
 from strands.models.model import Model
 from strands.session.file_session_manager import FileSessionManager
@@ -41,6 +40,7 @@ except ImportError:
 
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
+from tests.hook_helpers import invoke_after_model_call, invoke_before_model_call
 
 
 class _CapturingModel(Model):
@@ -97,9 +97,9 @@ class _CapturingCore:
             self.messages.append({"role": "user", "content": [{"text": prompt}]})
         elif isinstance(prompt, list):
             self.messages.append({"role": "user", "content": prompt})
-        await self.hooks.invoke_callbacks_async(BeforeModelCallEvent(agent=self))
+        invoke_before_model_call(self.hooks, self)
         self.model_messages.append(copy.deepcopy(self.messages))
-        await self.hooks.invoke_callbacks_async(AfterModelCallEvent(agent=self))
+        invoke_after_model_call(self.hooks, self)
         if False:
             yield
 

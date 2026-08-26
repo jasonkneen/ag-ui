@@ -88,6 +88,30 @@ _MODEL_CONTEXT_BLOCK: ContextVar[str] = ContextVar(
 _MODEL_CONTEXT_HOOK_MARKER = "_ag_ui_transient_model_context_hook"
 _MODEL_CONTEXT_MUTATION_MARKER = "_ag_ui_transient_model_context_mutation"
 
+
+async def _stream_with_model_context(
+    stream: AsyncIterator[Any], context_block: str
+) -> AsyncIterator[Any]:
+    """Scope request context to one model-stream pull at a time.
+
+    The FastAPI endpoint deliberately runs every ``__anext__`` call in a fresh
+    task so disconnect cancellation cannot interrupt agent cleanup. A
+    ContextVar token therefore cannot be held across an adapter yield: the
+    later reset may run in a different task context. Set and restore around
+    each pull instead, before yielding the resulting event to the endpoint.
+    """
+    iterator = stream.__aiter__()
+    while True:
+        token = _MODEL_CONTEXT_BLOCK.set(context_block)
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        finally:
+            _MODEL_CONTEXT_BLOCK.reset(token)
+        yield event
+
+
 # Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
 # cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
 # tool receives this in place of a real answer and can treat it as a denial.
@@ -2255,7 +2279,6 @@ class StrandsAgent:
                   prompt = f"{context_block}\n\n{prompt}"
                   context_block = ""
 
-              context_token = _MODEL_CONTEXT_BLOCK.set(context_block)
               stream_kwargs = (
                   {"invocation_state": invocation_state}
                   if invocation_state is not None
@@ -2263,7 +2286,7 @@ class StrandsAgent:
               )
               stream = orchestrator.stream_async(prompt, **stream_kwargs)
               try:
-                  async for event in stream:
+                  async for event in _stream_with_model_context(stream, context_block):
                       if not isinstance(event, dict):
                           continue
                       event_type = event.get("type")
@@ -2367,7 +2390,6 @@ class StrandsAgent:
                               "orchestrator stream teardown failed", exc_info=True
                           )
                   _restore_orchestrator_context(orchestrator)
-                  _MODEL_CONTEXT_BLOCK.reset(context_token)
 
               for closing in _close_open_multiagent(nodes, open_steps):
                   yield closing
@@ -3621,10 +3643,11 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
-            context_token = _MODEL_CONTEXT_BLOCK.set(context_block)
             agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
-                async for event in agent_stream:
+                async for event in _stream_with_model_context(
+                    agent_stream, context_block
+                ):
                     # Capture the terminal ``AgentResult`` (always emitted last
                     # by ``stream_async``) so a native interrupt pause can be
                     # detected after the loop. Recorded first so it is never
@@ -4878,7 +4901,6 @@ class StrandsAgent:
                     logger.warning(f"Error closing agent stream: {e}")
                 finally:
                     _restore_transient_model_context(strands_agent)
-                    _MODEL_CONTEXT_BLOCK.reset(context_token)
 
             # Close reasoning if still open
             if reasoning_started:
