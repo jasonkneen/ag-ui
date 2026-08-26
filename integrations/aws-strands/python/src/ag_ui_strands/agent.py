@@ -705,11 +705,16 @@ _RAW_SUPPRESSED_KEYS = frozenset(
 )
 
 
-def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _sanitize_raw_event(
+    event: Dict[str, Any],
+    invocation_state: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Return a JSON-safe RAW payload for ``event``, or ``None`` to drop it.
 
-    Sanitizing is deliberately an allow-by-serializability filter, never a
-    coercion: nothing is stringified to force it through. Coercing (e.g.
+    Keys present in the per-run invocation state are removed because Strands
+    may merge them into otherwise public model events. Sanitizing is
+    deliberately an allow-by-serializability filter, never a coercion: nothing
+    is stringified to force it through. Coercing (e.g.
     ``json.dumps(..., default=str)``) would ship the ``repr`` of the live
     ``Agent`` — system prompt, conversation history, model configuration — to
     every connected client. A payload that will not encode is dropped instead.
@@ -721,6 +726,7 @@ def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         key: value
         for key, value in event.items()
         if key not in _RAW_INVOCATION_STATE_KEYS
+        and (invocation_state is None or key not in invocation_state)
     }
     if not payload:
         return None
@@ -1938,7 +1944,10 @@ class StrandsAgent:
         return responses or None
 
     async def _run_orchestrator(
-        self, input_data: RunAgentInput
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Any]:
         """Drive a multi-agent orchestrator and translate its event stream.
 
@@ -2035,7 +2044,12 @@ class StrandsAgent:
                       else _snapshot_orchestrator_nodes(orchestrator)
                   )
 
-              stream = orchestrator.stream_async(prompt)
+              stream_kwargs = (
+                  {"invocation_state": invocation_state}
+                  if invocation_state is not None
+                  else {}
+              )
+              stream = orchestrator.stream_async(prompt, **stream_kwargs)
               try:
                   async for event in stream:
                       if not isinstance(event, dict):
@@ -2198,8 +2212,30 @@ class StrandsAgent:
                 self._pending_interrupts_by_thread.pop(thread_id, None)
                 self._parked_orchestrators_by_thread.pop(thread_id, None)
 
-    async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
-        """Run the Strands agent and yield AG-UI events."""
+    async def run(
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        """Run the Strands agent and yield AG-UI events.
+
+        Args:
+            input_data: The AG-UI run request.
+            invocation_state: Optional request-scoped state copied before it is
+                forwarded to the underlying Strands invocation. The state is
+                available to hooks and tools but is not added to the model
+                context.
+        """
+
+        run_invocation_state = (
+            dict(invocation_state) if invocation_state is not None else None
+        )
+        stream_kwargs = (
+            {"invocation_state": run_invocation_state}
+            if run_invocation_state is not None
+            else {}
+        )
 
         if self._orchestrator is not None:
             # An orchestrator carries execution state on the instance and its
@@ -2254,7 +2290,10 @@ class StrandsAgent:
             # Close the delegate explicitly: when the consumer abandons this
             # generator, `async for` alone would leave the inner one suspended
             # until GC, so the orchestrator stream would keep running.
-            orchestrator_events = self._run_orchestrator(input_data)
+            orchestrator_events = self._run_orchestrator(
+                input_data,
+                invocation_state=run_invocation_state,
+            )
             try:
                 async for event in orchestrator_events:
                     yield event
@@ -3367,7 +3406,7 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
-            agent_stream = strands_agent.stream_async(resume_prompt)
+            agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
                 async for event in agent_stream:
                     # Capture the terminal ``AgentResult`` (always emitted last
@@ -4542,7 +4581,7 @@ class StrandsAgent:
                     # in ``endpoint.py`` (RunErrorEvent + break), costing the
                     # client its TEXT_MESSAGE_END, snapshots and RUN_FINISHED.
                     else:
-                        raw_payload = _sanitize_raw_event(event)
+                        raw_payload = _sanitize_raw_event(event, run_invocation_state)
                         if raw_payload is None:
                             continue
                         logger.debug(
