@@ -460,10 +460,44 @@ export function renderEntry(
 }
 
 // Fence-aware structural scan shared by every operation that interprets a
-// CHANGELOG's "## " headings. A "## " line inside a fenced code block (``` or
-// ~~~; a fence closes only on its own marker) is content, not a heading —
-// treating it as one would cause false skips, truncated summaries, or entries
-// inserted mid-example.
+// CHANGELOG's "## " headings. A "## " line inside a fenced code block is
+// content, not a heading — treating it as one would cause false skips,
+// truncated summaries, or entries inserted mid-example.
+//
+// Fences follow CommonMark (https://spec.commonmark.org/0.31.2/#fenced-code-blocks):
+// an opener is three or more backticks or tildes indented at most three spaces,
+// and it closes only on a line of the SAME character, at least as long as the
+// opener, followed by nothing but whitespace. Both halves of that rule matter.
+// A ``` line inside a ```` block is content, so tracking only the character
+// would leave the block "closed" and make a literal "## " line inside it read
+// as structural; and an info string is legal on an opener but not on a closer,
+// so accepting a suffix closes the block early with the same result. Info
+// strings are not otherwise validated (a backtick fence's info string may not
+// contain a backtick, which this treats as an opener anyway) — that only ever
+// costs a rejected fragment, never a truncated one.
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+type OpenFence = { char: string; length: number } | null;
+
+// Advances fence state by one line. `isFence` marks the opener and closer lines
+// themselves, which belong to the block rather than to the surrounding prose.
+function stepFence(
+  line: string,
+  open: OpenFence,
+): { open: OpenFence; isFence: boolean } {
+  const match = FENCE_RE.exec(line);
+  if (!match) return { open, isFence: false };
+  const [, marker, suffix] = match;
+  if (open === null) {
+    return { open: { char: marker[0], length: marker.length }, isFence: true };
+  }
+  const closes =
+    marker[0] === open.char &&
+    marker.length >= open.length &&
+    suffix.trim() === "";
+  return closes ? { open: null, isFence: true } : { open, isFence: false };
+}
+
 type ChangelogLine = {
   text: string;
   offset: number;
@@ -473,19 +507,16 @@ type ChangelogLine = {
 
 export function scanChangelogLines(content: string): ChangelogLine[] {
   const out: ChangelogLine[] = [];
-  let openFence: string | null = null;
+  let openFence: OpenFence = null;
   let offset = 0;
   for (const text of content.split("\n")) {
-    const fence = text.match(/^\s*(```|~~~)/)?.[1];
-    if (fence) {
-      if (openFence === null) openFence = fence;
-      else if (openFence === fence) openFence = null;
-    }
+    const step = stepFence(text, openFence);
+    openFence = step.open;
     out.push({
       text,
       offset,
-      isHeading: openFence === null && !fence && text.startsWith("## "),
-      inFence: openFence !== null || Boolean(fence),
+      isHeading: openFence === null && !step.isFence && text.startsWith("## "),
+      inFence: openFence !== null || step.isFence,
     });
     offset += text.length + 1;
   }
@@ -497,12 +528,9 @@ export function scanChangelogLines(content: string): ChangelogLine[] {
 // swallow everything after it, including the NEXT version's heading, so the
 // file would silently lose entries in both directions.
 export function hasUnclosedFence(text: string): boolean {
-  let open: string | null = null;
+  let open: OpenFence = null;
   for (const line of text.split("\n")) {
-    const marker = line.match(/^\s*(```|~~~)/)?.[1];
-    if (!marker) continue;
-    if (open === null) open = marker;
-    else if (open === marker) open = null;
+    open = stepFence(line, open).open;
   }
   return open !== null;
 }

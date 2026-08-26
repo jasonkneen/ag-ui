@@ -284,6 +284,79 @@ test("fenced '## ' lines are content, not headings, across all operations", () =
   );
 });
 
+test("fence tracking follows CommonMark on delimiter length and closers", () => {
+  // A four-backtick block is the only way to show a three-backtick example.
+  // Collapsing fences to three characters would treat the inner ``` as a real
+  // closer, so the literal "## " line below would read as a version boundary
+  // and truncate the entry — before Breaking changes.
+  const nested = [
+    "# Changelog",
+    "",
+    "## 0.2.0 — 2026-08-24",
+    "",
+    "````md",
+    "```",
+    "## Not a heading — inside the four-backtick block",
+    "````",
+    "",
+    "### Breaking changes",
+    "",
+    "None.",
+    "",
+  ].join("\n");
+  const nestedBody = findVersionEntry(nested, "0.2.0");
+  assert.ok(nestedBody !== null);
+  assert.match(nestedBody!, /### Breaking changes/);
+  assert.equal(
+    scanChangelogLines(nested).filter((l) => l.isHeading).length,
+    1,
+    "only the version heading is structural",
+  );
+
+  // Same, with tildes.
+  const tildes = [
+    "## 0.2.0 — 2026-08-24",
+    "",
+    "~~~~md",
+    "~~~",
+    "## Not a heading — inside the four-tilde block",
+    "~~~~",
+    "",
+    "### Breaking changes",
+    "",
+  ].join("\n");
+  assert.match(findVersionEntry(tildes, "0.2.0")!, /### Breaking changes/);
+
+  // An info string is legal on an opener but never on a closer, so "```js"
+  // must not close the block early.
+  const suffixed = [
+    "## 0.2.0 — 2026-08-24",
+    "",
+    "```md",
+    "```js",
+    "## Not a heading — the ```js line is content",
+    "```",
+    "",
+    "### Breaking changes",
+    "",
+  ].join("\n");
+  assert.match(findVersionEntry(suffixed, "0.2.0")!, /### Breaking changes/);
+
+  // A closer may carry trailing whitespace, and an opener may be indented up
+  // to three spaces — beyond that it is indented code, not a fence.
+  assert.equal(hasUnclosedFence("   ```\nx\n```   "), false);
+  assert.equal(hasUnclosedFence("    ```\nx"), false);
+
+  // A longer closer is valid; a shorter one is not.
+  assert.equal(hasUnclosedFence("```\nx\n`````"), false);
+  assert.equal(hasUnclosedFence("````\nx\n```"), true);
+  assert.equal(hasUnclosedFence("~~~~\nx\n~~~"), true);
+
+  // Fenced content is still left alone when demoting, whatever the fence width.
+  const demoted = demoteFragmentHeadings("````md\n# inside\n````\n# outside");
+  assert.equal(demoted, "````md\n# inside\n````\n#### outside");
+});
+
 // --- formatCommits / buildPrompt -------------------------------------------
 
 test("formatCommits drops release bookkeeping commits and keeps bodies", () => {

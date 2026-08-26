@@ -223,6 +223,105 @@ test("a '## ' line inside a fenced code block does not truncate the entry", () =
   }
 });
 
+// A hand-edited CHANGELOG may legitimately use a wider fence to show a
+// three-backtick example. Collapsing fences to three characters, or letting a
+// closer carry an info string, ends the block early — so a literal "## " line
+// inside it reads as the next version and publication truncates the entry,
+// potentially before Breaking changes. Cases follow CommonMark 0.31.2 §4.5.
+for (const { name, fence } of [
+  {
+    name: "four-backtick",
+    fence: ["````md", "```", "## Inside the block", "````"],
+  },
+  {
+    name: "four-tilde",
+    fence: ["~~~~md", "~~~", "## Inside the block", "~~~~"],
+  },
+  {
+    name: "closer with an info string",
+    fence: ["```md", "```js", "## Inside the block", "```"],
+  },
+  {
+    name: "three-space indented",
+    fence: ["   ```md", "## Inside the block", "   ```"],
+  },
+  {
+    // A tilde line neither opens nor closes a backtick block.
+    name: "backtick block containing a tilde line",
+    fence: ["```md", "~~~", "## Inside the block", "```"],
+  },
+]) {
+  test(`a ${name} fence does not truncate the entry`, () => {
+    const root = fixtureRoot();
+    try {
+      writeFileSync(
+        join(root, "integrations/mastra/CHANGELOG.md"),
+        [
+          "# Changelog",
+          "",
+          "## 0.2.0 — 2026-08-24",
+          "",
+          "- Docs example below.",
+          "",
+          ...fence,
+          "",
+          "### Breaking changes",
+          "",
+          "Removes `runAgent`.",
+          "",
+          "## 0.1.0 — 2026-07-01",
+          "",
+          "- Older entry.",
+          "",
+        ].join("\n"),
+      );
+      const r = runExtract(root, ["@ag-ui/mastra", "0.2.0"]);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /Inside the block/);
+      assert.match(r.stdout, /### Breaking changes/);
+      assert.match(r.stdout, /Removes `runAgent`/);
+      assert.doesNotMatch(r.stdout, /Older entry/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// The mirror of the cases above: four or more leading spaces is an indented
+// code block, not a fence. Treating it as one would open a block that never
+// closes, swallowing the next version's heading — so the entry would run to the
+// end of the file and publish the whole changelog as one release's notes.
+test("a four-space indented ``` does not open a fence and swallow later entries", () => {
+  const root = fixtureRoot();
+  try {
+    writeFileSync(
+      join(root, "integrations/mastra/CHANGELOG.md"),
+      [
+        "# Changelog",
+        "",
+        "## 0.2.0 — 2026-08-24",
+        "",
+        "- An indented code block, not a fence:",
+        "",
+        "    ```",
+        "    literal backticks",
+        "",
+        "## 0.1.0 — 2026-07-01",
+        "",
+        "- Older entry.",
+        "",
+      ].join("\n"),
+    );
+    const r = runExtract(root, ["@ag-ui/mastra", "0.2.0"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /literal backticks/);
+    assert.doesNotMatch(r.stdout, /Older entry/);
+    assert.doesNotMatch(r.stdout, /## 0\.1\.0/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("exits 3 for an unknown package, a missing file, and a missing version", () => {
   const root = fixtureRoot();
   try {

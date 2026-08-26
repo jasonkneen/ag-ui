@@ -64,26 +64,48 @@ def resolve_package_path(name: str) -> Path | None:
     return None
 
 
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# Fences follow CommonMark (https://spec.commonmark.org/0.31.2/#fenced-code-blocks):
+# an opener is three or more backticks or tildes indented at most three spaces,
+# and it closes only on a line of the SAME character, at least as long as the
+# opener, followed by nothing but whitespace. Both halves of that rule matter.
+# A ``` line inside a ```` block is content, so tracking only the character
+# would leave the block "closed" and make a literal `## ` line inside it read as
+# structural; and an info string is legal on an opener but not on a closer, so
+# accepting a suffix closes the block early with the same result. Either way the
+# entry silently truncates at that line. Must stay behaviourally identical to
+# stepFence() in generate-changelog-entries.ts: generation and publication have
+# to agree on where an entry ends.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _step_fence(
+    line: str, open_fence: tuple[str, int] | None
+) -> tuple[tuple[str, int] | None, bool]:
+    """Advance fence state by one line, returning (open_fence, is_fence).
+    `is_fence` marks the opener and closer lines themselves, which belong to the
+    block rather than to the surrounding prose."""
+    match = _FENCE_RE.match(line)
+    if not match:
+        return open_fence, False
+    marker, suffix = match.group(1), match.group(2)
+    if open_fence is None:
+        return (marker[0], len(marker)), True
+    char, length = open_fence
+    if marker[0] == char and len(marker) >= length and suffix.strip() == "":
+        return None, True
+    return open_fence, False
 
 
 def _scan_lines(content: str) -> list[tuple[str, bool]]:
     """Yield (line, is_heading) with fence awareness across the WHOLE file:
-    a `## ` line inside a fenced code block (``` or ~~~; a fence closes only
-    on its own marker) is content, not a heading. Tracking must start at line
-    one — a `## <version>` inside a fenced example ABOVE the real entry must
-    not be mistaken for it."""
+    a `## ` line inside a fenced code block is content, not a heading. Tracking
+    must start at line one — a `## <version>` inside a fenced example ABOVE the
+    real entry must not be mistaken for it."""
     out: list[tuple[str, bool]] = []
-    open_fence: str | None = None
+    open_fence: tuple[str, int] | None = None
     for line in content.split("\n"):
-        fence = _FENCE_RE.match(line)
-        if fence:
-            marker = fence.group(1)
-            if open_fence is None:
-                open_fence = marker
-            elif open_fence == marker:
-                open_fence = None
-        is_heading = open_fence is None and not fence and line.startswith("## ")
+        open_fence, is_fence = _step_fence(line, open_fence)
+        is_heading = open_fence is None and not is_fence and line.startswith("## ")
         out.append((line, is_heading))
     return out
 
@@ -110,18 +132,10 @@ def extract_entry(content: str, version: str) -> str | None:
 
 def demote_headings(body: str, levels: int) -> str:
     out: list[str] = []
-    open_fence: str | None = None
+    open_fence: tuple[str, int] | None = None
     for line in body.split("\n"):
-        fence = _FENCE_RE.match(line)
-        if fence:
-            marker = fence.group(1)
-            if open_fence is None:
-                open_fence = marker
-            elif open_fence == marker:
-                open_fence = None
-            out.append(line)
-            continue
-        if open_fence is None and re.match(r"^#{1,6} ", line):
+        open_fence, is_fence = _step_fence(line, open_fence)
+        if open_fence is None and not is_fence and re.match(r"^#{1,6} ", line):
             out.append("#" * levels + line)
         else:
             out.append(line)
