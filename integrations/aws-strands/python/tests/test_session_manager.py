@@ -1054,6 +1054,7 @@ class TestSessionFrontendToolReconciliation:
         block = _result_content(sm, "default", 1)[0]["toolResult"]
         assert block["content"] == [{"text": '{"approved": true}'}]
         assert block["status"] == "success"
+        assert instance.stream_prompts == ["do the next thing"]
         # Corrected, so the entry is pruned and cannot be re-collected later.
         assert (instance.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}) == {}
 

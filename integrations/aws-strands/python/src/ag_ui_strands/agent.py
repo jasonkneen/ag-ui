@@ -3034,7 +3034,9 @@ class StrandsAgent:
             # result is therefore absent from the map and still cannot re-enter
             # here — which is what scoping to the trailing ids was protecting.
             frontend_results: List[Dict[str, Any]] = []
-            for msg in (input_data.messages or []):
+            last_frontend_result_index: int | None = None
+            input_messages = input_data.messages or []
+            for msg_index, msg in enumerate(input_messages):
                 if getattr(msg, "role", None) != "tool":
                     continue
                 wire_id = getattr(msg, "tool_call_id", None)
@@ -3064,6 +3066,15 @@ class StrandsAgent:
                         "is_error": bool(getattr(msg, "error", None)),
                     }
                 )
+                last_frontend_result_index = msg_index
+
+            has_newer_user_message = (
+                last_frontend_result_index is not None
+                and any(
+                    getattr(msg, "role", None) == "user"
+                    for msg in input_messages[last_frontend_result_index + 1 :]
+                )
+            )
 
             # Translate the client's wire tool_call_id back to the native
             # toolUseId Strands persisted (they differ for frontend tools — see
@@ -3253,7 +3264,14 @@ class StrandsAgent:
                     getattr(strands_agent, "messages", None) or [],
                     only_ids=set(resolved_native_results),
                 )
-                resume_prompt = None if reconciled else user_message
+                # A non-trailing result can be repaired from native history, but
+                # a user message after it is still this run's new prompt. Passing
+                # None here would silently drop that newer turn.
+                resume_prompt = (
+                    None
+                    if reconciled and not has_newer_user_message
+                    else user_message
+                )
 
             # A client answering to an interrupt sends its responses
             # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
