@@ -741,7 +741,7 @@ class TestNestedDuplicateTaskCallIds(unittest.TestCase):
                 "langgraph_node": "tools",
                 "langgraph_checkpoint_ns": "tools:outer|tools:inner",
             },
-            "data": {"input": {"type": "tool_call", "name": "task", "id": "dup"}},
+            "data": {"input": {"type": "tool_call", "name": "task", "id": "dup", "args": {"subagent_type": "researcher"}}},
         })
         agent._capture_subagent_task_meta({
             "event": LangGraphEventTypes.OnToolStart.value,
@@ -785,7 +785,7 @@ class TestNestedDuplicateTaskCallIds(unittest.TestCase):
                 "langgraph_node": "tools",
                 "langgraph_checkpoint_ns": "tools:outer|tools:inner",
             },
-            "data": {"input": {"type": "tool_call", "name": "task", "id": "dup"}},
+            "data": {"input": {"type": "tool_call", "name": "task", "id": "dup", "args": {"subagent_type": "researcher"}}},
         })
         agent._capture_subagent_task_meta({
             "event": LangGraphEventTypes.OnToolStart.value,
@@ -982,6 +982,26 @@ class TestOrdinaryToolIsNotASubagentBoundary(unittest.TestCase):
         self.assertEqual(agent.active_run["current_subagent_run_id"], "tools:outer")
         self.assertNotIn("tools:ordinary-call", agent.active_run["active_subagents"])
 
+    def test_task_named_tool_without_subagent_type_excludes_its_segment(self):
+        from ag_ui_langgraph.agent import reconcile_subagents
+        agent = self._agent_inside_outer()
+        agent._capture_task_tool_dispatch({
+            "event": LangGraphEventTypes.OnChainStart,
+            "name": "tools",
+            "metadata": {
+                "langgraph_node": "tools",
+                "langgraph_checkpoint_ns": "tools:outer|tools:ordinary-task-call",
+            },
+            "data": {"input": {"type": "tool_call", "name": "task", "id": "ordinary-task", "args": {"description": "not deepagents"}}},
+        })
+        events = reconcile_subagents(
+            agent.active_run,
+            "tools:outer|tools:ordinary-task-call|model:inside-tool",
+            "researcher",
+            set(),
+        )
+        self.assertEqual([e.type for e in events], [])
+
     def test_a_task_dispatch_still_creates_the_nested_boundary(self):
         from ag_ui_langgraph.agent import reconcile_subagents
 
@@ -993,7 +1013,7 @@ class TestOrdinaryToolIsNotASubagentBoundary(unittest.TestCase):
                 "langgraph_node": "tools",
                 "langgraph_checkpoint_ns": "tools:outer|tools:inner",
             },
-            "data": {"input": {"type": "tool_call", "name": "task", "id": "t1"}},
+            "data": {"input": {"type": "tool_call", "name": "task", "id": "t1", "args": {"subagent_type": "researcher"}}},
         })
         events = reconcile_subagents(
             agent.active_run,

@@ -1122,7 +1122,7 @@ class TestRobustParentLinkJoin(unittest.TestCase):
             "run_id": run_id,
             "metadata": {"langgraph_node": "tools", "langgraph_checkpoint_ns": ns},
             "data": {"input": [
-                {"type": "tool_call", "id": c, "name": "task", "args": {}} for c in calls
+                {"type": "tool_call", "id": c, "name": "task", "args": {"subagent_type": "fixture"}} for c in calls
             ]},
         })
 
@@ -1438,4 +1438,3 @@ class TestEmitSubagentEventsOff(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

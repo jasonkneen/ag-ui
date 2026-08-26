@@ -1019,6 +1019,7 @@ class LangGraphAgent:
             c for c in candidates
             if isinstance(c, dict) and c.get("name") == "task" and isinstance(c.get("id"), str)
         ]
+        task_calls = [c for c in task_calls if _is_deepagents_task_call(c)]
         active_run = getattr(self, "active_run", None)
         if active_run is None:
             return
