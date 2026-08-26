@@ -330,6 +330,18 @@ def _interrupt_resume_error(message: str) -> "RunErrorEvent":
     )
 
 
+def _continuation_tool_name_error(tool_call_ids: list) -> "RunErrorEvent":
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message=(
+            "Cannot name the tool behind continuation tool result(s) "
+            f"{', '.join(tool_call_ids)}: absent from the input messages, from "
+            "the native session history, and from the wire->native map"
+        ),
+        code="CONTINUATION_TOOL_NAME_UNRESOLVED",
+    )
+
+
 def _preflight_resume_entries(
     agent: Any,
     resume_entries: Any,
@@ -1943,6 +1955,7 @@ class StrandsAgent:
                 # frontend-tool turn sends N results in one continuation run; the model
                 # must see every answer.
                 _result_parts: list[str] = []
+                _unresolved_result_ids: list[str] = []
                 for msg in reversed(input_data.messages):
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
@@ -1971,27 +1984,67 @@ class StrandsAgent:
                                 if isinstance(msg.content, str)
                                 else flatten_content_to_text(msg.content)
                             )
-                            if result_text and result_text.strip():
+                            # A client-reported failure carries its reason on
+                            # ``error``, and an empty ``content`` alongside it
+                            # is normal. Reading ``content`` alone announces
+                            # that failure to the model as "executed
+                            # successfully with no return value" — the same
+                            # inversion the toolResult ``status`` mapping
+                            # avoids on the native path, which this text
+                            # prompt replaces whenever replay and
+                            # reconciliation are both off.
+                            error_text = getattr(msg, "error", None)
+                            if error_text:
+                                if result_text and result_text.strip():
+                                    _result_parts.append(
+                                        f"{tool_name} failed: {error_text} "
+                                        f"(returned: {result_text})"
+                                    )
+                                else:
+                                    _result_parts.append(
+                                        f"{tool_name} failed: {error_text}"
+                                    )
+                            elif result_text and result_text.strip():
                                 _result_parts.append(f"{tool_name} returned: {result_text}")
                             else:
                                 _result_parts.append(
                                     f"{tool_name} executed successfully with no return value."
                                 )
+                        elif tool_name:
+                            # Named, but not client-declared: this result
+                            # belongs to a tool Strands ran itself, so the
+                            # model already has it in the native history and
+                            # the continuation prompt has nothing to carry.
+                            logger.debug(
+                                f"Skipping non-frontend tool result in the continuation "
+                                f"message: tool_name={tool_name}, "
+                                f"tool_call_id={msg.tool_call_id}"
+                            )
                         else:
-                            # Could not resolve this tool's name from input messages
-                            # or session history (e.g. a delta-only payload with no
-                            # assistant tool_calls). Skip it rather than guessing:
-                            # picking an arbitrary frontend tool would feed false
-                            # context to the LLM when several frontend tools exist.
-                            # Strands still has the real result in session history to
-                            # conclude the round-trip from.
+                            # Neither the input messages, nor the native
+                            # session history, nor the durable wire->native
+                            # map name this call. Guessing stays off the
+                            # table: with several frontend tools declared,
+                            # picking one feeds the model false context.
+                            # Collected here and raised as a run error below
+                            # rather than skipped — skipping is what left the
+                            # prompt empty, and an empty prompt is the re-fire
+                            # loop this derivation exists to prevent.
+                            _unresolved_result_ids.append(msg.tool_call_id)
                             logger.warning(
                                 f"Could not resolve tool name for tool_call_id={msg.tool_call_id} "
                                 f"from input messages or session history (delta-only payload). "
-                                f"Skipping this tool result in the continuation message."
+                                f"Failing the run instead of prompting the model with no result."
                             )
                     else:
                         break
+                if _unresolved_result_ids:
+                    # Fail closed: without a name there is no result context
+                    # to give the model, and invoking it with an empty prompt
+                    # is exactly how the same frontend tool gets re-fired
+                    # every run (issue #2376).
+                    yield _continuation_tool_name_error(list(reversed(_unresolved_result_ids)))
+                    return
                 user_message = "\n".join(reversed(_result_parts))
             elif input_data.messages:
                 for msg in reversed(input_data.messages):

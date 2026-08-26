@@ -333,6 +333,17 @@ def _frontend_tool(name: str) -> Tool:
     return Tool(name=name, description=f"{name} tool", parameters={})
 
 
+def _assert_continuation_name_error(events: list, tool_call_ids: list) -> None:
+    """An unnameable continuation result ends the run on a structured error
+    naming the offending ids, and never on a success outcome."""
+    errors = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert len(errors) == 1
+    assert errors[0].code == "CONTINUATION_TOOL_NAME_UNRESOLVED"
+    for tool_call_id in tool_call_ids:
+        assert tool_call_id in errors[0].message
+    assert not any(event.type == EventType.RUN_FINISHED for event in events)
+
+
 class TestFrontendToolContinuation:
     """Regression tests for the 'Hello' injection on delta-only frontend-tool
     continuation runs (PR #1761)."""
@@ -341,7 +352,11 @@ class TestFrontendToolContinuation:
     async def test_delta_only_continuation_does_not_inject_hello(self):
         """Session-manager path + delta-only trailing tool message + missing
         assistant tool_calls: ``stream_async`` must NOT receive ``"Hello"``,
-        and must not guess an arbitrary frontend tool when several exist."""
+        and must not guess an arbitrary frontend tool when several exist.
+
+        Both guarantees now hold in their strongest form: with no name
+        recoverable from anywhere, the run fails closed and the model is
+        never invoked at all, instead of being prompted with ``""``."""
         mock_session_manager = _mock_session_manager()
         provider = MagicMock(return_value=mock_session_manager)
         agent = _make_base_agent(session_manager_provider=provider)
@@ -354,14 +369,17 @@ class TestFrontendToolContinuation:
         instance = _MockSessionAgentWithHistory(mock_session_manager, messages=[])
         with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
             MockCore.return_value = instance
-            await _collect_events(agent, input_data)
+            events = await _collect_events(agent, input_data)
 
-        assert instance.stream_prompts == [""]
+        # The model is not prompted at all, which subsumes #1761's two
+        # guards; they are kept so the original regression stays visible.
+        assert instance.stream_prompts == []
         assert "Hello" not in instance.stream_prompts
         # No arbitrary frontend tool name leaked into the prompt.
         assert not any(
             "executed successfully" in (p or "") for p in instance.stream_prompts
         )
+        _assert_continuation_name_error(events, ["call-xyz"])
 
     @pytest.mark.asyncio
     async def test_delta_only_continuation_resolves_name_from_session_history(self):
@@ -463,9 +481,12 @@ class TestFrontendToolContinuation:
         ]
 
     @pytest.mark.asyncio
-    async def test_delta_only_continuation_keeps_degrading_when_wire_map_misses(self):
+    async def test_delta_only_continuation_fails_closed_when_wire_map_misses(self):
         """The wire map is a fallback, not a guess: an id it does not hold is
-        still skipped rather than matched to some other recorded call."""
+        never matched to some other recorded call. With no name there is no
+        result context to carry, so the run fails closed rather than calling
+        the model with ``""`` — that empty prompt is the original trigger for
+        re-firing the same frontend tool every run (#2376)."""
         mock_session_manager = _mock_session_manager()
         provider = MagicMock(return_value=mock_session_manager)
         agent = _make_base_agent(session_manager_provider=provider)
@@ -495,9 +516,10 @@ class TestFrontendToolContinuation:
 
         with patch("ag_ui_strands.agent.StrandsAgentCore") as MockCore:
             MockCore.return_value = instance
-            await _collect_events(agent, input_data)
+            events = await _collect_events(agent, input_data)
 
-        assert instance.stream_prompts == [""]
+        assert instance.stream_prompts == []
+        _assert_continuation_name_error(events, ["call-xyz"])
 
 
 class _MockSessionAgentReal:
@@ -754,6 +776,47 @@ class TestSessionFrontendToolReconciliation:
             config_kwargs={"replay_history_into_strands": False},
         )
         assert instance.stream_prompts == ['approve returned: {"approved": false}']
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param(
+                "denied by policy",
+                "approve failed: invalid id (returned: denied by policy)",
+                id="with-text",
+            ),
+            pytest.param("", "approve failed: invalid id", id="empty"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_client_failure_is_not_prompted_as_success_when_replay_is_disabled(
+        self, tmp_path, content, expected
+    ):
+        """With replay and reconciliation both off, the synthetic prompt is
+        the only channel to the model, and a failure whose body is empty is
+        the common shape. Deriving the prompt from ``content`` alone reports
+        it as "executed successfully with no return value" — the same
+        inversion the toolResult ``status`` mapping already prevents on the
+        native path."""
+        from strands.session.file_session_manager import FileSessionManager
+
+        sm = FileSessionManager(
+            session_id="thread-noreplay-err", storage_dir=str(tmp_path)
+        )
+        instance = await _run_session_continuation(
+            sm,
+            "default",
+            messages=[_payload_tool("wire-1", content, error="invalid id")],
+            tools=[_frontend_tool("approve")],
+            wire_map={"wire-1": "native-1"},
+            store=[
+                _store_tool_use("native-1", "approve"),
+                _store_placeholder("native-1"),
+            ],
+            config_kwargs={"replay_history_into_strands": False},
+        )
+        assert instance.stream_prompts == [expected]
+        assert "executed successfully" not in instance.stream_prompts[0]
 
     @pytest.mark.parametrize(
         "content", ["tool failed: invalid id", ""], ids=["with-text", "empty"]
