@@ -203,9 +203,10 @@ function scrubSecrets(text: string, ...urls: string[]): string {
  * Relaxing the address checks requires passing a custom policy to
  * `fetchUrlBytes`. No supported AG-UI-to-Strands conversion path currently
  * accepts one, so in practice the defaults are what a consumer gets. Even
- * under `allowPrivateNetworks`, link-local ranges and the cloud metadata
- * endpoints listed in `ALWAYS_BLOCKED_IPV4`/`ALWAYS_BLOCKED_IPV6` stay
- * blocked; that list covers the major providers rather than every provider.
+ * under `allowPrivateNetworks`, this-network, link-local ranges and the cloud
+ * metadata endpoints listed in `ALWAYS_BLOCKED_IPV4`/`ALWAYS_BLOCKED_IPV6`
+ * stay blocked; that list covers the major providers rather than every
+ * provider.
  */
 /** The NAT64 prefixes every deployment can be assumed to use. */
 const WELL_KNOWN_NAT64_PREFIX = "64:ff9b::/96"; // RFC 6052
@@ -450,6 +451,7 @@ const BLOCKED_IPV6 = [
 // services, and the individual addresses below are metadata endpoints outside
 // it. None is ever a legitimate source of URL content.
 const ALWAYS_BLOCKED_IPV4 = [
+  cidr("0.0.0.0/8"), // this-network is never a legitimate URL destination
   cidr("169.254.0.0/16"), // link-local, including 169.254.169.254 and 169.254.170.2
   cidr("100.100.100.200/32"), // Alibaba Cloud metadata
   cidr("192.0.0.192/32"), // Oracle Cloud metadata
@@ -552,8 +554,7 @@ function addressesToCheck(
   for (const { prefix } of nat64Prefixes(policy)) {
     if (!inCidr(ip.bytes, prefix)) continue;
     const translated = embeddedNat64Address(ip, prefix[1]);
-    // A candidate in 0.0.0.0/8 is not a real destination.
-    if (translated && translated.bytes[0] !== 0) embedded.push(translated);
+    if (translated) embedded.push(translated);
   }
   for (const { prefix, offset } of IPV4_EMBEDDING_PREFIXES) {
     if (!inCidr(ip.bytes, prefix)) continue;
@@ -599,8 +600,9 @@ function blockedAddress(
   // public one, so the embedded address carries the decision instead.
   const wrapperIsNat64 = isNat64(address, policy);
   for (const ip of addressesToCheck(address, policy)) {
-    // Cloud metadata and other link-local services are never legitimate URL
-    // content sources, even when an application opts into its private network.
+    // This-network, cloud metadata and other link-local services are never
+    // legitimate URL content sources, even when an application opts into its
+    // private network.
     if (isAlwaysBlocked(ip)) return ip;
     if (wrapperIsNat64 && ip === address) continue;
     if (!allowPrivateNetworks && isNonGlobal(ip)) return ip;
@@ -612,7 +614,11 @@ function blockedAddress(
 function isNat64(ip: IpAddress, policy: UrlFetchPolicy): boolean {
   return (
     ip.version === 6 &&
-    nat64Prefixes(policy).some(({ prefix }) => inCidr(ip.bytes, prefix))
+    nat64Prefixes(policy).some(
+      ({ prefix }) =>
+        inCidr(ip.bytes, prefix) &&
+        embeddedNat64Address(ip, prefix[1]) !== null,
+    )
   );
 }
 
@@ -898,6 +904,8 @@ function pinnedLookup(approved: IpAddress[]) {
   };
 }
 
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
 /**
  * Perform one request, reaching only `approved`.
  *
@@ -918,6 +926,22 @@ async function pinnedRequest(
   const agent = new mod.Agent({ keepAlive: false, maxSockets: 1 });
 
   return await new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const resolveOnce = (response: Response) => {
+      if (settled) return;
+      settled = true;
+      resolve(response);
+    };
+    const rejectOnce = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      agent.destroy();
+      reject(
+        error instanceof Error
+          ? error
+          : new UrlFetchUnavailableError("HTTP request failed"),
+      );
+    };
     const request = mod.request(
       {
         protocol: url.protocol,
@@ -932,34 +956,104 @@ async function pinnedRequest(
         // environment, so the socket cannot be routed somewhere unvalidated.
       },
       (message) => {
-        const headers = new Headers();
-        for (const [name, value] of Object.entries(message.headers)) {
-          if (value === undefined) continue;
-          for (const single of Array.isArray(value) ? value : [value]) {
-            headers.append(name, single);
-          }
-        }
-        const body = new ReadableStream<Uint8Array>({
-          start(controller) {
-            message.on("data", (chunk: Buffer) =>
-              controller.enqueue(new Uint8Array(chunk)),
-            );
-            message.on("end", () => controller.close());
-            message.on("error", (error) => controller.error(error));
-          },
-          cancel() {
+        try {
+          const status = message.statusCode;
+          if (status === undefined || status < 200 || status > 599) {
             message.destroy();
-          },
-        });
-        resolve(
-          new Response(body, {
-            status: message.statusCode ?? 0,
-            headers,
-          }),
-        );
+            rejectOnce(
+              new UrlFetchUnavailableError(
+                status === undefined
+                  ? "response carried no HTTP status"
+                  : `response carried unsupported HTTP status ${status}`,
+              ),
+            );
+            return;
+          }
+
+          const headers = new Headers();
+          for (const [name, value] of Object.entries(message.headers)) {
+            if (value === undefined) continue;
+            for (const single of Array.isArray(value) ? value : [value]) {
+              headers.append(name, single);
+            }
+          }
+
+          let body: ReadableStream<Uint8Array> | null = null;
+          if (NULL_BODY_STATUSES.has(status)) {
+            message.resume();
+          } else {
+            body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                let streamSettled = false;
+                const errorStream = (error: unknown) => {
+                  if (streamSettled) return;
+                  streamSettled = true;
+                  try {
+                    controller.error(error);
+                  } catch {
+                    message.destroy();
+                  }
+                };
+                message.on("data", (chunk: Buffer) => {
+                  if (streamSettled) return;
+                  try {
+                    controller.enqueue(new Uint8Array(chunk));
+                  } catch (error) {
+                    errorStream(error);
+                    message.destroy();
+                  }
+                });
+                message.on("end", () => {
+                  if (streamSettled) return;
+                  streamSettled = true;
+                  try {
+                    controller.close();
+                  } catch {
+                    message.destroy();
+                  }
+                });
+                message.on("error", errorStream);
+                message.on("aborted", () =>
+                  errorStream(
+                    new UrlFetchUnavailableError("response body was aborted"),
+                  ),
+                );
+              },
+              cancel() {
+                message.destroy();
+              },
+            });
+          }
+
+          resolveOnce(new Response(body, { status, headers }));
+        } catch {
+          message.destroy();
+          rejectOnce(
+            new UrlFetchUnavailableError(
+              "HTTP response could not be represented safely",
+            ),
+          );
+        }
       },
     );
-    request.on("error", reject);
+    request.once("error", rejectOnce);
+    request.once("upgrade", (_message, socket) => {
+      socket.destroy();
+      rejectOnce(
+        new UrlFetchUnavailableError(
+          "HTTP protocol upgrades are not supported",
+        ),
+      );
+    });
+    request.once("close", () => {
+      if (!settled) {
+        rejectOnce(
+          new UrlFetchUnavailableError(
+            "connection closed before an HTTP response was received",
+          ),
+        );
+      }
+    });
     request.setTimeout(policy.timeoutMs, () => {
       request.destroy(
         new UrlFetchUnavailableError(
