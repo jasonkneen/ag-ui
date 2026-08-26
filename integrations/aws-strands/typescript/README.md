@@ -109,8 +109,10 @@ const app = express();
 // endpoint's responses. Same-origin pages are unaffected: CORS governs
 // cross-origin requests only.
 // Add `cors` yourself only if a browser on another origin has to reach it.
-app.use(express.json({ limit: "50mb" }));
-addStrandsExpressEndpoint(app, aguiAgent, { path: "/invocations" });
+addStrandsExpressEndpoint(app, aguiAgent, {
+  path: "/invocations",
+  bodyParser: express.json({ limit: "50mb" }),
+});
 addPing(app, "/ping");
 app.listen(8080);
 ```
@@ -568,9 +570,14 @@ const app = await createStrandsApp(aguiAgent, {
 
 ```ts
 // Same option on the low-level helper, for an app you build yourself.
+import express from "express";
+import { addStrandsExpressEndpoint } from "@ag-ui/aws-strands/server";
+
+const app = express();
 addStrandsExpressEndpoint(app, aguiAgent, {
   path: "/invocations",
   auth: requireBearer,
+  bodyParser: express.json({ limit: "50mb" }),
 });
 ```
 
@@ -606,17 +613,20 @@ What the adapter guarantees around it:
   `next("router")` are Express control-flow signals rather than failures and are
   forwarded as such.
 - **`auth` runs before body parsing and before the request-boundary checks.**
-  `createStrandsApp` mounts the guard as a path-specific `POST` layer ahead of
-  its own `express.json()`, so an unauthenticated request is declined before
-  its body is read. A non-JSON `Content-Type` gets `401` rather than the `415`
-  it would get without a guard, and a body the JSON parser would reject gets
-  `401` rather than the parser's own `400`. Authenticating before telling an
+  `createStrandsApp` mounts the guard, `express.json()`, and the agent handler
+  in that order within one `POST` route. An unauthenticated request is declined
+  before its body is read, and `next("route")` skips the parser and agent
+  together. A non-JSON `Content-Type` gets `401` rather than the `415` it would
+  get without a guard, and a body the JSON parser would reject gets `401`
+  rather than the parser's own `400`. Authenticating before telling an
   anonymous caller anything about the request contract is the intended order;
   `415` and `400` still bite behind a guard that passes.
 
-  Mounting the endpoint yourself with `addStrandsExpressEndpoint` puts you in
-  charge of that ordering: register the endpoint before your own body parser,
-  or the parser will answer malformed bodies ahead of your guard.
+  With `addStrandsExpressEndpoint`, pass your parser through `bodyParser` as in
+  the example above. Do not put an app-wide body parser before the endpoint if
+  auth-before-parsing matters: Express always runs earlier app middleware
+  first. You can still mount an app-wide parser after the endpoint for other
+  routes.
 
 - **`/ping` and `/capabilities` stay open.** Health probes have to keep
   working, and the capabilities document is a static matrix of what this
@@ -686,8 +696,10 @@ import express from "express";
 import { addStrandsExpressEndpoint, addPing } from "@ag-ui/aws-strands/server";
 
 const app = express();
-app.use(express.json({ limit: "50mb" }));
-addStrandsExpressEndpoint(app, aguiAgent, { path: "/invocations" });
+addStrandsExpressEndpoint(app, aguiAgent, {
+  path: "/invocations",
+  bodyParser: express.json({ limit: "50mb" }),
+});
 addPing(app, "/ping");
 ```
 
@@ -698,6 +710,10 @@ and give it an explicit allowlist when you do.
 `addStrandsExpressEndpoint` takes the same
 [`auth`](#authenticating-the-agent-route) option as `createStrandsApp`, so the
 guard travels with the route rather than with the app you built around it.
+Pass `express.json()` (or another compatible request handler) as `bodyParser`
+to place it between that guard and the agent. Both entry points reject unknown
+option keys and invalid option value types during setup instead of silently
+discarding a misspelled or malformed security option.
 
 ## Development
 

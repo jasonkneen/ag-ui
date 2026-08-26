@@ -12,8 +12,6 @@ import {
   addPing,
   addCapabilities,
 } from "./endpoint";
-import { authGuard } from "./endpoint";
-import { resolveLogger } from "./logger";
 import type { StrandsAgent } from "./agent";
 import type {
   StrandsAguiCapabilitiesOverrides,
@@ -206,12 +204,6 @@ async function loadCors(): Promise<typeof import("cors")> {
 }
 
 /**
- * A CORS option that only means something once the middleware is installed,
- * passed with nothing to install it. Silently ignoring it would leave the
- * caller believing cross-origin access is configured, so name what was passed
- * and what it needs.
- */
-/**
  * Every key `CreateStrandsAppOptions` accepts. An unknown key is refused rather
  * than ignored: TypeScript's excess-property check only fires on object
  * literals in TypeScript, so a JavaScript caller, a spread, or an `any` can
@@ -230,22 +222,120 @@ const CREATE_STRANDS_APP_OPTION_KEYS = [
   "auth",
 ] as const;
 
-function assertKnownOptions(options: CreateStrandsAppOptions): void {
-  const known = new Set<string>(CREATE_STRANDS_APP_OPTION_KEYS);
-  const unknown = Object.keys(options).filter((key) => !known.has(key));
-  if (unknown.length === 0) {
-    return;
-  }
-  const plural = unknown.length === 1 ? "option" : "options";
-  throw new Error(
-    `createStrandsApp received unknown ${plural} ${unknown
-      .map((key) => `\`${key}\``)
-      .join(", ")}. A misspelled option would be ignored, and for a ` +
-      `security option that means silently running without it. Valid options ` +
-      `are ${CREATE_STRANDS_APP_OPTION_KEYS.map((key) => `\`${key}\``).join(", ")}.`,
+const CREATE_STRANDS_APP_OPTION_KEY_SET = new Set<string>(
+  CREATE_STRANDS_APP_OPTION_KEYS,
+);
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    Array.from(value).every((item) => typeof item === "string")
   );
 }
 
+function assertCreateStrandsAppOption(
+  option: string,
+  value: unknown,
+  valid: boolean,
+  expected: string,
+): void {
+  if (!valid) {
+    const received =
+      value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    throw new TypeError(
+      `createStrandsApp option \`${option}\` must be ${expected}; received ${received}.`,
+    );
+  }
+}
+
+function assertCreateStrandsAppOptions(
+  options: unknown,
+): asserts options is CreateStrandsAppOptions {
+  if (
+    typeof options !== "object" ||
+    options === null ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError("createStrandsApp options must be an object.");
+  }
+
+  const values = options as Record<string, unknown>;
+  const unknown = Object.keys(values).filter(
+    (key) => !CREATE_STRANDS_APP_OPTION_KEY_SET.has(key),
+  );
+  if (unknown.length > 0) {
+    const plural = unknown.length === 1 ? "option" : "options";
+    throw new Error(
+      `createStrandsApp received unknown ${plural} ${unknown
+        .map((key) => `\`${key}\``)
+        .join(", ")}. A misspelled option would be ignored, and for a ` +
+        `security option that means silently running without it. Valid options ` +
+        `are ${CREATE_STRANDS_APP_OPTION_KEYS.map((key) => `\`${key}\``).join(", ")}.`,
+    );
+  }
+
+  assertCreateStrandsAppOption(
+    "path",
+    values.path,
+    values.path === undefined || typeof values.path === "string",
+    "a string or undefined",
+  );
+  for (const option of ["pingPath", "capabilitiesPath"] as const) {
+    const value = values[option];
+    assertCreateStrandsAppOption(
+      option,
+      value,
+      value === undefined || value === null || typeof value === "string",
+      "a string, null, or undefined",
+    );
+  }
+  assertCreateStrandsAppOption(
+    "capabilities",
+    values.capabilities,
+    values.capabilities === undefined ||
+      (typeof values.capabilities === "object" &&
+        values.capabilities !== null &&
+        !Array.isArray(values.capabilities)),
+    "an object or undefined",
+  );
+  assertCreateStrandsAppOption(
+    "corsOrigin",
+    values.corsOrigin,
+    values.corsOrigin === undefined ||
+      typeof values.corsOrigin === "string" ||
+      typeof values.corsOrigin === "boolean" ||
+      isStringArray(values.corsOrigin),
+    "a string, boolean, string array, or undefined",
+  );
+  assertCreateStrandsAppOption(
+    "corsEnabled",
+    values.corsEnabled,
+    values.corsEnabled === undefined || typeof values.corsEnabled === "boolean",
+    "a boolean or undefined",
+  );
+  for (const option of ["allowMethods", "allowHeaders"] as const) {
+    const value = values[option];
+    assertCreateStrandsAppOption(
+      option,
+      value,
+      value === undefined || isStringArray(value),
+      "a string array or undefined",
+    );
+  }
+  assertCreateStrandsAppOption(
+    "auth",
+    values.auth,
+    values.auth === undefined || typeof values.auth === "function",
+    "a function or undefined",
+  );
+}
+
+/**
+ * A CORS option that only means something once the middleware is installed,
+ * passed with nothing to install it. Silently ignoring it would leave the
+ * caller believing cross-origin access is configured, so name what was passed
+ * and what it needs.
+ */
 function corsOptionsWithoutOrigin(names: string[]): string {
   return (
     `${names.join(", ")} ${names.length === 1 ? "was" : "were"} passed to ` +
@@ -332,7 +422,7 @@ export async function createStrandsApp(
   agent: StrandsAgent,
   options: CreateStrandsAppOptions = {},
 ): Promise<import("express").Express> {
-  assertKnownOptions(options);
+  assertCreateStrandsAppOptions(options);
 
   const {
     path = "/",
@@ -405,21 +495,18 @@ export async function createStrandsApp(
       }),
     );
   }
-  // Auth goes ahead of the body parser, not on the route. `express.json()` is
-  // app-wide, so a route-mounted guard would let an unauthenticated caller
-  // reach the parser first: malformed JSON would answer `400` from the parser
-  // with the guard never consulted, and a valid body would be buffered to the
-  // limit below before being rejected. Mounted as a path-specific POST layer
-  // so `next()` falls through to the parser and then the agent route, while
-  // `/ping` and `/capabilities` stay open.
-  if (auth) {
-    app.post(path, authGuard(auth, resolveLogger(agent.config.logger)));
-  }
-  app.use(express.json({ limit: "50mb" }));
+  // Keep auth, parsing, and dispatch in one route. Besides putting auth ahead
+  // of body parsing, one route makes Express control flow safe: `next("route")`
+  // skips the parser and agent together instead of falling through from an
+  // auth-only route into an unguarded copy of the agent endpoint.
+  const bodyParser = express.json({ limit: "50mb" });
+  addStrandsExpressEndpoint(app, agent, { path, auth, bodyParser });
 
-  // `auth` is deliberately not forwarded: it is already mounted above, and
-  // passing it again would run the caller's guard twice per request.
-  addStrandsExpressEndpoint(app, agent, { path });
+  // Preserve the factory's existing app-wide parsing for routes callers add
+  // to the returned app. The agent route above owns its parser and finishes
+  // before reaching this layer; a guard that deliberately calls
+  // `next("route")` may still hand a parsed body to a later fallback route.
+  app.use(bodyParser);
 
   if (pingPath) {
     addPing(app, pingPath);
