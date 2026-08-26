@@ -12,12 +12,13 @@ Two layers of coverage:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
-from ag_ui.core import EventType
+from ag_ui.core import Context, EventType
 from strands.models.model import Model
 
 from ag_ui_strands.agent import StrandsAgent
@@ -59,13 +60,13 @@ class FakeMessage:
 
 
 class FakeInput:
-    def __init__(self, messages=None, state=None, forwarded_props=None):
+    def __init__(self, messages=None, state=None, forwarded_props=None, context=None):
         self.thread_id = "test-thread"
         self.run_id = "test-run"
         self.state = state
         self.messages = messages or []
         self.tools = []
-        self.context = []
+        self.context = context or []
         self.forwarded_props = forwarded_props or {}
 
 
@@ -580,6 +581,23 @@ async def test_list_content_is_flattened_not_repr_ed():
     assert orchestrator.prompts == ["summarise this"]
 
 
+@pytest.mark.asyncio
+async def test_context_reaches_structural_orchestrator_task():
+    orchestrator = FakeOrchestrator([])
+
+    await collect(
+        make_agent(orchestrator),
+        FakeInput(
+            messages=[FakeMessage("user", "what tier?")],
+            context=[Context(description="account", value="premium")],
+        ),
+    )
+
+    assert orchestrator.prompts == [
+        "Context provided by the application:\n- account: premium\n\nwhat tier?"
+    ]
+
+
 class _ResumeEntry:
     """Resolved resume for the interrupt the fake orchestrators raise."""
 
@@ -843,6 +861,7 @@ class ScriptedModel(Model):
 
     def __init__(self, text: str):
         self._text = text
+        self.calls = []
 
     def get_config(self):
         return {}
@@ -854,6 +873,7 @@ class ScriptedModel(Model):
         raise NotImplementedError
 
     async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.calls.append(copy.deepcopy(messages))
         yield {"messageStart": {"role": "assistant"}}
         yield {"contentBlockStart": {"start": {}}}
         yield {"contentBlockDelta": {"delta": {"text": self._text}}}
@@ -909,6 +929,32 @@ async def test_real_graph_streams_through_the_adapter():
     )
     assert "Found it." in text
     assert "Final answer." in text
+
+
+@pytest.mark.asyncio
+async def test_real_graph_context_is_transient_at_each_leaf_model():
+    from strands import Agent
+    from strands.multiagent import GraphBuilder
+
+    model = ScriptedModel("Done.")
+    node = Agent(model=model, name="solo", callback_handler=None)
+    builder = GraphBuilder()
+    builder.add_node(node, "solo")
+    builder.set_entry_point("solo")
+
+    agent = StrandsAgent(builder.build(), name="multi_agent")
+    events = await collect(
+        agent,
+        FakeInput(
+            messages=[FakeMessage("user", "what tier?")],
+            context=[Context(description="account", value="premium")],
+        ),
+    )
+
+    assert EventType.RUN_ERROR not in [event.type for event in events]
+    assert "Context provided by the application" in repr(model.calls)
+    assert "account: premium" in repr(model.calls)
+    assert "account: premium" not in repr(node.messages)
 
 
 @pytest.mark.asyncio

@@ -12,11 +12,13 @@ import json
 import logging
 import types
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from strands import Agent as StrandsAgentCore
+from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.session import SessionManager
 from strands.types.interrupt import InterruptResponseContent
 
@@ -76,6 +78,15 @@ _WIRE_MAP_MAX = 512
 # It bounds abandoned entries (tool calls whose result never returns)
 # so state cannot grow without bound.
 _TOOL_CALL_MAP_MAX = 512
+
+# Request-scoped model context. A ContextVar keeps concurrent runs isolated;
+# the hook below injects it only for the model call and restores the durable
+# conversation immediately afterward.
+_MODEL_CONTEXT_BLOCK: ContextVar[str] = ContextVar(
+    "ag_ui_strands_model_context_block", default=""
+)
+_MODEL_CONTEXT_HOOK_MARKER = "_ag_ui_transient_model_context_hook"
+_MODEL_CONTEXT_MUTATION_MARKER = "_ag_ui_transient_model_context_mutation"
 
 # Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
 # cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
@@ -1747,13 +1758,19 @@ class StrandsInterruptHook:
         if not approved:
             event.cancel_tool = f"User denied approval for '{tool_name}'."
 
-# Prefix of the ``description`` the A2UI middleware (@ag-ui/a2ui-middleware,
-# A2UI_SCHEMA_CONTEXT_DESCRIPTION) stamps on the context entry carrying the
-# component catalog. That entry is consumed via the ``render_a2ui`` tool path
-# (host-resolved catalog + tool guidelines), NOT by dumping the raw schema into
-# the prompt — injecting it derails A2UI rendering. Matched by prefix so a
-# punctuation/version drift in the full string can't let the catalog leak in.
-_A2UI_SCHEMA_CONTEXT_PREFIX = "A2UI Component Schema"
+
+def _normalize_agui_context(context: Any) -> List[Dict[str, Any]]:
+    """Normalize wire context into JSON-compatible description/value pairs."""
+    normalized = []
+    for entry in context or []:
+        if isinstance(entry, dict):
+            description = entry.get("description", "")
+            value = entry.get("value", "")
+        else:
+            description = getattr(entry, "description", "") or ""
+            value = getattr(entry, "value", "") or ""
+        normalized.append({"description": description, "value": value})
+    return normalized
 
 
 def _format_agui_context(agui_context: List[Dict[str, Any]]) -> str:
@@ -1764,11 +1781,10 @@ def _format_agui_context(agui_context: List[Dict[str, Any]]) -> str:
     nothing surfaces it to the model — so context the app injects (e.g. via
     ``useCopilotReadable``) was invisible to the LLM. The A2UI component-schema
     entry is excluded (handled by the ``render_a2ui`` tool path)."""
+    _, regular_context = split_a2ui_schema_context(agui_context)
     lines: List[str] = []
-    for ctx in agui_context or []:
+    for ctx in regular_context:
         description = (ctx.get("description") or "").strip()
-        if description.startswith(_A2UI_SCHEMA_CONTEXT_PREFIX):
-            continue
         value = ctx.get("value")
         value_str = value if isinstance(value, str) else json.dumps(value)
         lines.append(f"- {description}: {value_str}" if description else f"- {value_str}")
@@ -1777,16 +1793,154 @@ def _format_agui_context(agui_context: List[Dict[str, Any]]) -> str:
     return "Context provided by the application:\n" + "\n".join(lines)
 
 
-def _prepend_context_message(
-    history: List[Dict[str, Any]], context_block: str
-) -> List[Dict[str, Any]]:
-    """Insert ``context_block`` as a SEPARATE leading user message. We do not
-    modify the existing last user message — request routing / fixtures key off
-    the latest user (and system) message content, so altering it changes agent
-    behaviour. A distinct leading message reaches the model without that risk."""
-    if not context_block:
-        return history
-    return [{"role": "user", "content": [{"text": context_block}]}, *history]
+def _a2ui_render_guide_description(tool_name: str) -> str:
+    """Exact context marker emitted by ``@ag-ui/a2ui-middleware``."""
+    return (
+        "A2UI render tool usage guide — how to call "
+        f"{tool_name} with valid arguments."
+    )
+
+
+def _without_a2ui_render_guides(context: list, tool_names: List[str]) -> list:
+    """Drop only usage guides for render tools replaced by this adapter."""
+    descriptions = {_a2ui_render_guide_description(name) for name in tool_names}
+    return [
+        entry
+        for entry in context
+        if (
+            entry.get("description")
+            if isinstance(entry, dict)
+            else getattr(entry, "description", None)
+        )
+        not in descriptions
+    ]
+
+
+class _TransientModelContextHook:
+    """Expose request context to the model without persisting it as history."""
+
+    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
+        registry.add_callback(BeforeModelCallEvent, self._before_model_call)
+        registry.add_callback(AfterModelCallEvent, self._after_model_call)
+
+    def _before_model_call(self, event: Any) -> None:
+        context_block = _MODEL_CONTEXT_BLOCK.get()
+        if not context_block:
+            return
+        if event.agent.__dict__.get(_MODEL_CONTEXT_MUTATION_MARKER) is not None:
+            raise RuntimeError("Transient AG-UI model context was not restored")
+
+        messages = event.agent.messages
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        context_message = {
+            "role": "user",
+            "content": [{"text": context_block}],
+        }
+
+        if latest_user_index is None:
+            messages.append(context_message)
+            setattr(
+                event.agent,
+                _MODEL_CONTEXT_MUTATION_MARKER,
+                ("insert", messages, len(messages) - 1, context_message),
+            )
+            return
+
+        latest_user = messages[latest_user_index]
+        content = latest_user.get("content")
+        if isinstance(content, list) and any("toolResult" in block for block in content):
+            latest_user["content"] = [{"text": context_block}, *content]
+            setattr(
+                event.agent,
+                _MODEL_CONTEXT_MUTATION_MARKER,
+                ("replace", latest_user, content),
+            )
+            return
+
+        # Keep the actual latest user turn byte-identical for model routers and
+        # fixtures that key off it, while placing live UI context immediately
+        # before that turn rather than at the start of stale history.
+        messages.insert(latest_user_index, context_message)
+        setattr(
+            event.agent,
+            _MODEL_CONTEXT_MUTATION_MARKER,
+            ("insert", messages, latest_user_index, context_message),
+        )
+
+    def _after_model_call(self, event: Any) -> None:
+        _restore_transient_model_context(event.agent)
+
+
+def _restore_transient_model_context(agent: Any) -> None:
+    """Undo an in-flight context mutation, including on stream cancellation."""
+    mutation = getattr(agent, "__dict__", {}).get(_MODEL_CONTEXT_MUTATION_MARKER)
+    if mutation is None:
+        return
+    kind = mutation[0]
+    if kind == "replace":
+        _, message, original_content = mutation
+        message["content"] = original_content
+    else:
+        _, messages, index, inserted = mutation
+        if index < len(messages) and messages[index] is inserted:
+            messages.pop(index)
+        else:
+            messages.remove(inserted)
+    delattr(agent, _MODEL_CONTEXT_MUTATION_MARKER)
+
+
+def _ensure_transient_context_hook(agent: Any) -> bool:
+    """Install the model-only context hook once on a Strands agent."""
+    if getattr(agent, _MODEL_CONTEXT_HOOK_MARKER, False) is True:
+        return True
+    hooks = getattr(agent, "hooks", None)
+    add_hook = getattr(hooks, "add_hook", None)
+    if not callable(add_hook):
+        return False
+    add_hook(_TransientModelContextHook())
+    setattr(agent, _MODEL_CONTEXT_HOOK_MARKER, True)
+    return True
+
+
+def _install_orchestrator_context_hooks(
+    orchestrator: Any, _depth: int = 0
+) -> int:
+    """Install transient context hooks on every leaf agent in an orchestrator."""
+    if _depth > _MAX_MULTIAGENT_NESTING:
+        return 0
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return 0
+    installed = 0
+    for node in nodes.values():
+        executor = getattr(node, "executor", None)
+        if _ensure_transient_context_hook(executor):
+            installed += 1
+        else:
+            installed += _install_orchestrator_context_hooks(executor, _depth + 1)
+    return installed
+
+
+def _restore_orchestrator_context(orchestrator: Any, _depth: int = 0) -> None:
+    """Restore transient context on every visible orchestrator leaf."""
+    if _depth > _MAX_MULTIAGENT_NESTING:
+        return
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return
+    for node in nodes.values():
+        executor = getattr(node, "executor", None)
+        if getattr(executor, _MODEL_CONTEXT_HOOK_MARKER, False) is True:
+            _restore_transient_model_context(executor)
+        else:
+            _restore_orchestrator_context(executor, _depth + 1)
 
 
 class StrandsAgent:
@@ -2084,6 +2238,24 @@ class StrandsAgent:
                       else _snapshot_orchestrator_nodes(orchestrator)
                   )
 
+              context_block = _format_agui_context(
+                  _normalize_agui_context(input_data.context)
+              )
+              installed_hooks = _install_orchestrator_context_hooks(orchestrator)
+              if context_block and installed_hooks == 0:
+                  if resume_prompt is not None:
+                      raise RuntimeError(
+                          "Orchestrator leaves do not expose hook registries for "
+                          "transient context during interrupt resume"
+                      )
+                  # Structural/custom orchestrators without visible leaf agents
+                  # can only receive context in their task input. Factory runs
+                  # are fresh and shared runs are rewound below, so this does not
+                  # outlive the run.
+                  prompt = f"{context_block}\n\n{prompt}"
+                  context_block = ""
+
+              context_token = _MODEL_CONTEXT_BLOCK.set(context_block)
               stream_kwargs = (
                   {"invocation_state": invocation_state}
                   if invocation_state is not None
@@ -2194,6 +2366,8 @@ class StrandsAgent:
                           logger.debug(
                               "orchestrator stream teardown failed", exc_info=True
                           )
+                  _restore_orchestrator_context(orchestrator)
+                  _MODEL_CONTEXT_BLOCK.reset(context_token)
 
               for closing in _close_open_multiagent(nodes, open_steps):
                   yield closing
@@ -2543,22 +2717,8 @@ class StrandsAgent:
         # langgraph integration where tools read ``runtime.state["copilotkit"]
         # ["context"]``. Stored as a plain list of ``{description, value}``
         # dicts to satisfy ``JSONSerializableDict`` validation.
-        agui_context = []
-        for ctx in (input_data.context or []):
-            if isinstance(ctx, dict):
-                agui_context.append(
-                    {
-                        "description": ctx.get("description", ""),
-                        "value": ctx.get("value", ""),
-                    }
-                )
-            else:
-                agui_context.append(
-                    {
-                        "description": getattr(ctx, "description", "") or "",
-                        "value": getattr(ctx, "value", "") or "",
-                    }
-                )
+        agui_context = _normalize_agui_context(input_data.context)
+        model_context = agui_context
         try:
             strands_agent.state.set("agui_context", agui_context)
         except Exception as e:
@@ -2639,6 +2799,16 @@ class StrandsAgent:
                     # Keep the proxy bookkeeping honest — the dropped render
                     # tool is no longer registered.
                     self._proxy_tool_names_by_thread.get(thread_id, set()).discard(name)
+                # The middleware also supplies a usage guide for the render
+                # proxy. Once that proxy is replaced with ``generate_a2ui``,
+                # the guide is stale and must reach neither the outer model nor
+                # the recovery subagent.
+                model_context = _without_a2ui_render_guides(
+                    agui_context, a2ui_plan["drop_tool_names"]
+                )
+                a2ui_ag_ui["context"] = _without_a2ui_render_guides(
+                    a2ui_regular_ctx, a2ui_plan["drop_tool_names"]
+                )
         except Exception as e:  # noqa: BLE001 — never crash the turn here
             # ERROR, not warning: the runtime explicitly requested injection
             # (injectA2UITool) and this turn runs without it.
@@ -3321,6 +3491,11 @@ class StrandsAgent:
             # below runs unconditionally after the other branches and layers
             # on top, rather than short-circuiting them.
             resume_prompt: str | List[Dict[str, Any]] | list[InterruptResponseContent] | None = user_message
+            context_block = _format_agui_context(model_context)
+            if context_block and not _ensure_transient_context_hook(strands_agent):
+                raise RuntimeError(
+                    "Strands agent does not expose a hook registry for transient context"
+                )
             if replay_history:
                 native_history = await asyncio.to_thread(
                     _build_strands_history,
@@ -3446,6 +3621,7 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
+            context_token = _MODEL_CONTEXT_BLOCK.set(context_block)
             agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
                 async for event in agent_stream:
@@ -4700,6 +4876,9 @@ class StrandsAgent:
                 except Exception as e:
                     # Log other errors but don't fail
                     logger.warning(f"Error closing agent stream: {e}")
+                finally:
+                    _restore_transient_model_context(strands_agent)
+                    _MODEL_CONTEXT_BLOCK.reset(context_token)
 
             # Close reasoning if still open
             if reasoning_started:
