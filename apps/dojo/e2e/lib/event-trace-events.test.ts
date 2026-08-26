@@ -293,6 +293,16 @@ const systemMessageTrace = (...contents: readonly string[]) => [
 const appContextTrace = (context: Record<string, unknown>) =>
   systemMessageTrace(appContextContent(context));
 
+// A bag the rewrite must always tokenize. Pairing it with a payload that must
+// come back untouched keeps those assertions from passing vacuously: a fixture
+// that stopped reaching the rewrite fails on this half.
+const CONTROL_BAG = {
+  copilotkit_forwarded_headers: { "X-Forwarded-For": "::1" },
+};
+const CONTROL_REWRITTEN = {
+  copilotkit_forwarded_headers: { "x-forwarded-for": "<forwarded-for>" },
+};
+
 test("normalizes forwarded headers whatever casing reached the agent", () => {
   // The producer selects forwarded headers by matching the `x-` prefix
   // case-insensitively but emits each key verbatim, so the spelling that lands
@@ -404,6 +414,37 @@ test("collapses two spellings of one forwarded header into a single entry", () =
     assert.deepStrictEqual(
       normalizeEventTrace(appContextTrace({ copilotkit_forwarded_headers })),
       expected,
+    );
+  }
+});
+
+test("rewrites a forwarded-header bag only when it is record-shaped", () => {
+  // Shapes a real trace carries, none of which the rewrite understands. The bag
+  // is absent whenever no `x-` header reached the agent, so undefined is the
+  // ordinary case rather than a malformed one — and `Object.entries(undefined)`
+  // throws. Reshaping a string or an array through `Object.entries` would
+  // corrupt it into `{"0": ...}`, so each must come back byte-for-byte.
+  const untouched = [
+    "Retrieve the recipe, then stop.",
+    // Compact JSON: the only row that can tell "returned verbatim" apart from
+    // "re-serialized", since every appContextContent row is already 2-space.
+    'App Context:\n{"copilotkit_forwarded_headers":false}',
+    "App Context:\nnull",
+    appContextContent({ other: 1 }),
+    appContextContent({ copilotkit_forwarded_headers: null }),
+    appContextContent({ copilotkit_forwarded_headers: "x-forwarded-for" }),
+    appContextContent({ copilotkit_forwarded_headers: ["x-forwarded-for"] }),
+    appContextContent({ copilotkit_forwarded_headers: 0 }),
+    appContextContent({ copilotkit_forwarded_headers: false }),
+  ];
+
+  for (const content of untouched) {
+    assert.deepStrictEqual(
+      normalizeEventTrace(
+        systemMessageTrace(content, appContextContent(CONTROL_BAG)),
+      ),
+      systemMessageTrace(content, appContextContent(CONTROL_REWRITTEN)),
+      content,
     );
   }
 });

@@ -210,6 +210,20 @@ function isGeneratedIdentityField(
   );
 }
 
+// The predicate, not an inline `typeof` chain, is what lets the callee declare
+// a `Record<string, unknown>` parameter at all: reading the bag through
+// `Reflect.get` hands back `any`, which satisfies any parameter type and let an
+// array through unchecked, while an inline chain over `unknown` narrows only as
+// far as `object` and would not typecheck at the call site.
+//
+// All three clauses are load-bearing at runtime, not just for narrowing:
+// `typeof null === "object"`, so dropping the null check makes this accept
+// `null`, and dropping the `typeof` check makes it accept a string — both of
+// which `Object.entries` then reshapes or throws on.
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // `copilotkit_forwarded_headers` keys carry whatever spelling reached the agent.
 // The producer builds the bag by matching the `x-` prefix case-insensitively and
 // then emits each key verbatim, and a caller can put the key in
@@ -241,15 +255,18 @@ function normalizeAppContextContent(value: string) {
 
   try {
     const context: unknown = JSON.parse(value.slice(APP_CONTEXT_PREFIX.length));
-    if (typeof context !== "object" || context === null) return value;
-    const headers = Reflect.get(context, "copilotkit_forwarded_headers");
-    if (typeof headers !== "object" || headers === null) return value;
+    if (!isPlainRecord(context)) return value;
+    const headers = context.copilotkit_forwarded_headers;
+    // Neither the presence nor the shape of this key is ours to assume: it is
+    // absent until an `x-` header arrives, and a caller can put any JSON value
+    // there. So this guard is what keeps `Object.entries(undefined)` from throwing
+    // on an everyday payload, and what keeps `Object.entries`/`Object.fromEntries`
+    // from reshaping a primitive or array bag into `{}` or `{"0": ...}`. Leave the
+    // whole content string untouched rather than re-serializing it, so a payload
+    // this rewrite does not understand survives byte-for-byte.
+    if (!isPlainRecord(headers)) return value;
 
-    Reflect.set(
-      context,
-      "copilotkit_forwarded_headers",
-      normalizeForwardedHeaders(headers),
-    );
+    context.copilotkit_forwarded_headers = normalizeForwardedHeaders(headers);
     return `${APP_CONTEXT_PREFIX}${JSON.stringify(context, null, 2)}`;
   } catch {
     // This is ordinary message content unless it is valid App Context JSON.
