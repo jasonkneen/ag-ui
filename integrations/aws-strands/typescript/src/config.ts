@@ -195,6 +195,10 @@ export interface StrandsAgentConfig {
    *     components; required for a real model to compose them.
    *   - `catalog` — inline catalog for catalog-aware (semantic) recovery.
    *   - `recovery` — attempt cap / retry-UI threshold.
+   *   - `toolDescription` sets the description advertised to the planner,
+   *     steering when it reaches for `generate_a2ui`.
+   *   - `defaultSurfaceId` is stamped when the sub-agent omits a surface id.
+   *   - `onA2UIAttempt` is a per-attempt recovery hook for host status/traces.
    */
   a2ui?: A2UIInjectConfig;
   /**

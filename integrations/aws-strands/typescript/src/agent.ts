@@ -588,6 +588,30 @@ function _coerceText(content: unknown): string {
 }
 
 /**
+ * Read an AG-UI tool message as the pair every consumer needs: the result body
+ * as text, and the client-reported failure when there is one.
+ *
+ * The native `toolResult` blocks and the synthetic continuation prompt both
+ * announce the same tool message to the model, so both read it through here.
+ * Reading `content` without `error` is how a failed frontend tool gets
+ * announced as a success, and deriving the two independently per path is how
+ * they drifted apart before.
+ */
+function _readToolResult(msg: unknown): {
+  text: string;
+  error?: string;
+  status: "success" | "error";
+} {
+  const raw = (msg ?? {}) as { content?: unknown; error?: unknown };
+  const error = raw.error ? String(raw.error) : undefined;
+  return {
+    text: _coerceText(raw.content),
+    ...(error ? { error } : {}),
+    status: error ? "error" : "success",
+  };
+}
+
+/**
  * Build a Strands `toolResult` content block from an AG-UI tool message body.
  *
  * AG-UI's wire shape requires `ToolMessage.content` to be a string. Frontends
@@ -973,9 +997,7 @@ async function _buildStrandsHistory(
               // Carry the AG-UI failure signal onto Bedrock's toolResult status,
               // so a client-reported tool failure is not asserted to the model as
               // a success.
-              status: (msg as { error?: string }).error
-                ? ("error" as const)
-                : ("success" as const),
+              status: _readToolResult(msg).status,
             },
           },
         ],
@@ -1718,19 +1740,43 @@ export class StrandsAgent {
       // message so the model understands the context.
       let userMessage: string | ContentBlock[] = "Hello";
       if (pendingToolResultIds.size > 0 && inputData.messages) {
+        // Collect EVERY trailing tool result, not just the last: a parallel
+        // frontend-tool turn resolves N results in one continuation run and
+        // the model has to see all of the answers.
+        const resultParts: string[] = [];
         for (let i = inputData.messages.length - 1; i >= 0; i--) {
           const msg = inputData.messages[i];
-          if (!msg) break;
-          if (msg.role === "tool") {
-            const toolCallId = (msg as { toolCallId?: string }).toolCallId;
-            if (toolCallId) {
-              const name = toolCallIdToName.get(toolCallId);
-              if (name && frontendToolNames.has(name)) {
-                userMessage = `${name} executed successfully with no return value.`;
-              }
-            }
-            break;
+          if (!msg || msg.role !== "tool") break;
+          const toolCallId = (msg as { toolCallId?: string }).toolCallId;
+          const name = toolCallId
+            ? toolCallIdToName.get(toolCallId)
+            : undefined;
+          if (!name || !frontendToolNames.has(name)) continue;
+          // Forward the ACTUAL result so the model can act on the human's
+          // decision (e.g. an approval resolving to `{"approved": false}`).
+          // Announcing a bare success here silently breaks HITL: the model is
+          // told the tool returned nothing and proceeds as though the human
+          // had approved. The synthetic acknowledgement is only for a result
+          // that is genuinely empty, and a client-reported failure carries its
+          // reason on `error` with an empty `content` alongside it, so reading
+          // `content` alone reports that failure as a success.
+          const { text, error } = _readToolResult(msg);
+          if (error) {
+            resultParts.push(
+              text.trim()
+                ? `${name} failed: ${error} (returned: ${text})`
+                : `${name} failed: ${error}`,
+            );
+          } else if (text.trim()) {
+            resultParts.push(`${name} returned: ${text}`);
+          } else {
+            resultParts.push(
+              `${name} executed successfully with no return value.`,
+            );
           }
+        }
+        if (resultParts.length > 0) {
+          userMessage = resultParts.reverse().join("\n");
         }
       } else if (inputData.messages) {
         for (let i = inputData.messages.length - 1; i >= 0; i--) {
@@ -4078,9 +4124,7 @@ export async function convertMessagesForStrandsSeed(
       pendingToolResults.push({
         toolResult: {
           toolUseId: toolCallId,
-          status: (msg as { error?: string }).error
-            ? ("error" as const)
-            : ("success" as const),
+          status: _readToolResult(msg).status,
           content: [{ text: textContent }],
         },
       });
