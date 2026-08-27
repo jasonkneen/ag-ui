@@ -49,7 +49,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
   - Emits `RunStartedEvent` before touching Strands.
   - Emits `RunFinishedEvent` when the stream ends normally.
   - Emits `RunErrorEvent` with `code="STRANDS_FORCE_STOP"` when Strands reported a forced stop, `FRONTEND_TOOL_IDENTITY_ERROR` when a frontend call lacks a safe native ID, and `code="STRANDS_ERROR"` from the outer exception handler for any other failure that escapes the run loop. The forced-stop error is emitted after the reasoning-message and text-message closeout and is the run's last event: a failed run emits no final `StateSnapshotEvent` and no `RunFinishedEvent` at all, so it never advertises a final state or a finish. It is not emitted after a tool-call closeout, because Python has none on this path: the `deferred_frontend_tool_ends` flush sits inside the `try` that consumes the stream, so the raise that ends the run skips it and a frontend tool call left open never gets its `ToolCallEndEvent`. TypeScript deliberately diverges there; see the tool-call bullet under SDK-Shape Differences.
-  - Those run-loop codes are not the whole set a client can receive. The request and interrupt preflight emit their own before the loop is entered (`INVALID_PAYLOAD`, `UNKNOWN_INTERRUPT_ID`, `PARTIAL_RESUME`, `INTERRUPT_EXPIRED`, `INTERRUPT_SESSION_REQUIRED`, `INTERRUPT_SESSION_CAPABILITY_ERROR`, `INTERRUPT_RECONCILIATION_ERROR`, `INTERRUPT_RESUME_ERROR`, `FRONTEND_TOOL_WAIT_STATE_ERROR`, `FRONTEND_TOOL_RESULT_DUPLICATE`, `FRONTEND_TOOL_RESULT_ALREADY_RECORDED`), and the transport emits `ENCODING_ERROR` when a payload cannot be encoded. Treat any list of codes in this document as the codes that clause is about, not as a closed enumeration.
+  - Those run-loop codes are not the whole set a client can receive. The request and interrupt preflight emit their own before the loop is entered (`INVALID_PAYLOAD`, `UNKNOWN_INTERRUPT_ID`, `PARTIAL_RESUME`, `INTERRUPT_EXPIRED`, `INTERRUPT_SESSION_REQUIRED`, `INTERRUPT_SESSION_CAPABILITY_ERROR`, `INTERRUPT_RECONCILIATION_ERROR`, `INTERRUPT_RESUME_ERROR`, `FRONTEND_TOOL_WAIT_STATE_ERROR`, `FRONTEND_TOOL_RESULT_DUPLICATE`, `FRONTEND_TOOL_RESULT_CONFLICT`), and the transport emits `ENCODING_ERROR` when a payload cannot be encoded. Treat any list of codes in this document as the codes that clause is about, not as a closed enumeration.
 - **Forced stops (`STRANDS_FORCE_STOP`)**
   - Strands reports a mid-cycle failure with a `force_stop` stream event (`ForceStopEvent`, payload `{"force_stop": True, "force_stop_reason": str(reason)}`). The adapter records the reason and keeps consuming the generator so Strands can raise the underlying exception and unwind cleanly, then emits `RunErrorEvent(code="STRANDS_FORCE_STOP")` carrying that reason, or `The Strands agent stopped unexpectedly.` when it is empty.
   - Which SDK failures arrive this way depends on where the exception is raised, not on its type (`strands/event_loop/event_loop.py`):
@@ -78,7 +78,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
   - Optionally rewrites the outgoing user prompt via `StrandsAgentConfig.state_context_builder`.
 - **History reconciliation**
   - When the cached per-thread `StrandsAgentCore` has no `session_manager`, the adapter rebuilds Strands' internal `messages` list from `RunAgentInput.messages` before each `stream_async` call. Tool calls are rendered as `toolUse` ContentBlocks on assistant turns and tool results as `toolResult` blocks on user turns, matching Strands' native shape.
-  - For legacy placeholder frontend tools, this fixes the "frontend tool loops forever" symptom: without reconciliation, Strands re-fires the same tool every turn because the result the frontend produced never reaches the LLM context. Explicit native waits resume from Strands' checkpoint instead.
+  - For legacy placeholder frontend tools (`continue_after_frontend_call=True`), this fixes the "frontend tool loops forever" symptom: without reconciliation, Strands re-fires the same tool every turn because the result the frontend produced never reaches the LLM context. Native waits resume from Strands' checkpoint instead.
   - With a `session_manager`, the adapter trusts the manager and falls back to passing only the latest user prompt as a string.
   - Toggle via `StrandsAgentConfig.replay_history_into_strands` (default `True`).
 - **Streaming text**
@@ -91,7 +91,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
     - Translates declarative `PredictStateMapping` entries into a `CustomEvent(name="PredictState")`.
     - Streams arguments through an optional async generator (`args_streamer`) so large payloads can be revealed progressively.
     - Emits `ToolCallStartEvent`, zero or more `ToolCallArgsEvent`, and `ToolCallEndEvent`.
-    - Uses Strands' native `toolUseId` as the AG-UI `tool_call_id` for frontend calls. Unconfigured frontend tools retain the legacy placeholder/halt path, explicit `True` retains placeholder/continue, and explicit `False` waits in a native Strands interrupt without changing the public `TOOL_CALL_*` lifecycle.
+    - Uses Strands' native `toolUseId` as the AG-UI `tool_call_id` for frontend calls. A frontend tool waits in a native Strands interrupt unless it is explicitly configured with `continue_after_frontend_call=True`, which retains the legacy placeholder/continue path. Waiting does not change the public `TOOL_CALL_*` lifecycle.
 - **Tool result handling**
   - Strands encodes tool results inside `"message"` events whose role is `"user"` and whose contents include `toolResult`. The adapter:
     - Parses the blob into Python objects, tolerating single quotes or malformed JSON.
@@ -100,8 +100,10 @@ This document explains how the AWS Strands integration inside `integrations/aws-
     - Honors `stop_streaming_after_result` by closing any active text message and halting the Strands stream early.
 - **Frontend tool awareness**
   - `input_data.tools` supplies the frontend tool registry. Their names are used to (a) avoid double-invoking tool results that were literally produced by the UI, and (b) stop the Strands run after the LLM has issued a UI-only instruction.
-  - In Python, explicit `continue_after_frontend_call=False` keeps the established client sequence: `TOOL_CALL_*`, successful `RUN_FINISHED`, then the client's ordinary `ToolMessage` on the next request. Frontend native interrupts are hidden, require no `resume[]`, and emit no duplicate `TOOL_CALL_RESULT`.
-  - Strands owns the active/answered checkpoint, partial response staging, mixed waits, and restart recovery. The adapter only translates matching `ToolMessage`s into native interrupt responses; it does not persist a parallel wait coordinator. Legacy placeholder reconciliation remains limited to unconfigured/`True` tools.
+  - In Python a waiting frontend tool emits `TOOL_CALL_*` as before and then finishes the run with a `RunFinishedInterruptOutcome`, so a client can tell a pause from a completion. The published `Interrupt` carries `reason="frontend_tool_call"`, the emitted `toolCallId`, and a `responseSchema` of `{content, error}`.
+  - There is one response mechanism with two spellings. `resume[]` addressing that interrupt id is canonical; a trailing `ToolMessage` whose `tool_call_id` matches is translated at the request boundary into exactly the same `ResumeEntry`, so the established client flow keeps working unchanged. Either way the client receives no duplicate `TOOL_CALL_RESULT` for its own result.
+  - Retries are idempotent. Re-sending an answer the checkpoint already holds verbatim is a no-op: the run neither resumes Strands nor re-invokes the model, and it reports the unchanged pause (or, once the wait has closed, plain success). A *different* answer for the same call fails with `FRONTEND_TOOL_RESULT_CONFLICT`.
+  - Strands owns the active/answered checkpoint, partial response staging, mixed waits, and restart recovery. The adapter persists only the `toolCallId` -> interrupt-id correlation the `ToolMessage` channel needs, alongside the existing resume fingerprint; it does not persist a parallel wait coordinator. Legacy placeholder reconciliation remains limited to `continue_after_frontend_call=True` tools.
   - Native IDs must be non-blank and transcript-unique. Missing, duplicate, or reused IDs fail with `FRONTEND_TOOL_IDENTITY_ERROR`, directing incompatible providers to upgrade or avoid parallel frontend calls. This frontend-wait mode is Python-specific; TypeScript parity is not part of this contract.
 - **Reasoning streaming**
   - When Strands yields events with `reasoningText` and `reasoning=true`, the adapter emits REASONING\_\* events.
@@ -136,7 +138,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
 `ToolBehavior` captures how the adapter should react:
 
 - `skip_messages_snapshot`: Suppresses the `MessagesSnapshotEvent` that would normally follow this tool's `TOOL_CALL_END` / `TOOL_CALL_RESULT` events. Use when `custom_result_handler` already emits its own snapshot and you want to avoid duplicates.
-- `continue_after_frontend_call`: For a configured frontend tool, `True` keeps the legacy placeholder stream alive; `False` parks the call in Strands' native interrupt checkpoint while preserving the existing AG-UI `ToolMessage` round-trip. An unconfigured tool retains the legacy halt behavior.
+- `continue_after_frontend_call`: `True` keeps the legacy placeholder stream alive after a frontend tool call. Absent configuration and an explicit `False` both park the call in Strands' native interrupt checkpoint, which is the default for frontend tools.
 - `stop_streaming_after_result`: Cuts off text streaming when the backend produced a decisive result.
 - `predict_state`: Iterable of `PredictStateMapping` objects that inform the UI how to project tool arguments into shared state before results arrive.
 - `args_streamer`: Async generator that controls how tool arguments are leaked into the transcript (e.g., chunk large JSON payloads).
@@ -255,7 +257,7 @@ The repository includes seven runnable FastAPI apps that showcase different feat
 | `shared_state.py`            | Collaborative recipe editor that streams server-side state.             | Uses `state_context_builder`, `state_from_args`, and `state_from_result` to keep the UI's recipe object synchronized.                |
 | `agentic_generative_ui.py`   | Predictive and reactive state updates for generative UI surfaces.       | Demonstrates `PredictStateMapping`, `custom_result_handler` emitting `StateDeltaEvent`s, and the `stop_streaming_after_result` flag. |
 | `agentic_chat_multimodal.py` | Multimodal image/document analysis with vision-capable model.           | No custom config; demonstrates automatic multimodal content conversion.                                                              |
-| `human_in_the_loop.py`       | Human-in-the-loop confirmation flow with frontend tools.                | Explicitly configures `generate_task_steps` with `continue_after_frontend_call=False`; the shared frontend remains unchanged.        |
+| `human_in_the_loop.py`       | Human-in-the-loop confirmation flow with frontend tools.                | Demonstrates the default frontend-tool wait: no `ToolBehavior` configured, shared frontend unchanged.                                |
 
 ### TypeScript (`typescript/examples/server/api/*.ts`)
 

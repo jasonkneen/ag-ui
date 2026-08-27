@@ -1,4 +1,4 @@
-"""HTTP contract for an explicitly waiting frontend tool."""
+"""HTTP contract for a frontend tool that waits on a native Strands interrupt."""
 
 from __future__ import annotations
 
@@ -8,7 +8,13 @@ from typing import Any
 
 import httpx
 import pytest
-from ag_ui.core import RunAgentInput, Tool, ToolMessage, UserMessage
+from ag_ui.core import (
+    ResumeEntry,
+    RunAgentInput,
+    Tool,
+    ToolMessage,
+    UserMessage,
+)
 from strands import Agent
 from strands.models.model import Model
 
@@ -64,9 +70,15 @@ class _WaitingToolModel(Model):
         yield {"messageStop": {"stopReason": "end_turn"}}
 
 
-def _input(*, run_id: str, messages: list[Any]) -> RunAgentInput:
+def _input(
+    *,
+    run_id: str,
+    messages: list[Any],
+    thread_id: str = "client-contract-thread",
+    resume: list[Any] | None = None,
+) -> RunAgentInput:
     return RunAgentInput(
-        thread_id="client-contract-thread",
+        thread_id=thread_id,
         run_id=run_id,
         state={},
         messages=messages,
@@ -82,6 +94,7 @@ def _input(*, run_id: str, messages: list[Any]) -> RunAgentInput:
         ],
         context=[],
         forwarded_props={},
+        resume=resume,
     )
 
 
@@ -107,18 +120,39 @@ async def _post(app: Any, input_data: RunAgentInput) -> list[dict[str, Any]]:
     return _decode_sse(response.text)
 
 
-@pytest.mark.asyncio
-async def test_false_mode_preserves_tool_message_endpoint_contract() -> None:
+def _adapter(behavior: ToolBehavior | None) -> tuple[StrandsAgent, _WaitingToolModel]:
     model = _WaitingToolModel()
     adapter = StrandsAgent(
         Agent(model=model, tools=[]),
         name="client-contract",
         config=StrandsAgentConfig(
-            tool_behaviors={
-                "client_wait": ToolBehavior(continue_after_frontend_call=False)
-            }
+            tool_behaviors={"client_wait": behavior} if behavior else {}
         ),
     )
+    return adapter, model
+
+
+def _finished(events: list[dict[str, Any]]) -> dict[str, Any]:
+    return next(event for event in events if event["type"] == "RUN_FINISHED")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "behavior",
+    [None, ToolBehavior(continue_after_frontend_call=False)],
+    ids=["unconfigured", "explicit-false"],
+)
+async def test_waiting_tool_reports_a_pause_and_resumes_from_a_tool_message(
+    behavior: ToolBehavior | None,
+) -> None:
+    """The default and an explicit ``False`` both wait, and both say so.
+
+    A run parked on a frontend wait finishes with an interrupt outcome carrying
+    the exact emitted ``toolCallId``, so the client can tell a pause from a
+    completion. Answering with an ordinary ``ToolMessage`` still works and
+    drives exactly one continuation.
+    """
+    adapter, model = _adapter(behavior)
     app = create_strands_app(adapter, path="/agent", ping_path=None)
 
     first = await _post(
@@ -134,12 +168,18 @@ async def test_false_mode_preserves_tool_message_endpoint_contract() -> None:
     assert first_types.count("TOOL_CALL_ARGS") == 1
     assert first_types.count("TOOL_CALL_END") == 1
     assert not any(event["type"] == "TOOL_CALL_RESULT" for event in first)
-    first_finished = next(event for event in first if event["type"] == "RUN_FINISHED")
-    assert first_finished["outcome"] == {"type": "success"}
+
     tool_call_id = next(
         event["toolCallId"] for event in first if event["type"] == "TOOL_CALL_START"
     )
     assert tool_call_id == "native-client-wait"
+
+    outcome = _finished(first)["outcome"]
+    assert outcome["type"] == "interrupt"
+    [interrupt] = outcome["interrupts"]
+    assert interrupt["reason"] == "frontend_tool_call"
+    assert interrupt["toolCallId"] == tool_call_id
+    assert interrupt["responseSchema"]["required"] == ["content"]
 
     second = await _post(
         app,
@@ -159,8 +199,97 @@ async def test_false_mode_preserves_tool_message_endpoint_contract() -> None:
     assert any(event.get("delta") == "continued" for event in second)
     assert not any(event["type"] == "TOOL_CALL_START" for event in second)
     assert not any(event["type"] == "TOOL_CALL_RESULT" for event in second)
-    second_finished = next(
-        event for event in second if event["type"] == "RUN_FINISHED"
+    assert _finished(second)["outcome"] == {"type": "success"}
+    assert '{"accepted":true}' in repr(model.seen_messages[-1])
+
+
+@pytest.mark.asyncio
+async def test_waiting_tool_resumes_through_the_canonical_resume_channel() -> None:
+    """``resume[]`` answers the published interrupt without a ``ToolMessage``."""
+    adapter, model = _adapter(None)
+    app = create_strands_app(adapter, path="/agent", ping_path=None)
+
+    first = await _post(
+        app,
+        _input(
+            run_id="run-1",
+            thread_id="canonical-resume-thread",
+            messages=[UserMessage(id="user-1", content="use the client tool")],
+        ),
     )
-    assert second_finished["outcome"] == {"type": "success"}
-    assert "{\"accepted\":true}" in repr(model.seen_messages[-1])
+    [interrupt] = _finished(first)["outcome"]["interrupts"]
+
+    second = await _post(
+        app,
+        _input(
+            run_id="run-2",
+            thread_id="canonical-resume-thread",
+            messages=[],
+            resume=[
+                ResumeEntry(
+                    interrupt_id=interrupt["id"],
+                    status="resolved",
+                    payload={"content": '{"accepted":true}', "error": False},
+                )
+            ],
+        ),
+    )
+
+    assert model.calls == 2
+    assert _finished(second)["outcome"] == {"type": "success"}
+    assert '{"accepted":true}' in repr(model.seen_messages[-1])
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_wait_reaches_the_model_as_a_failed_tool_call() -> None:
+    """A cancelled wait still closes the tool call, as an error."""
+    adapter, model = _adapter(None)
+    app = create_strands_app(adapter, path="/agent", ping_path=None)
+
+    first = await _post(
+        app,
+        _input(
+            run_id="run-1",
+            thread_id="cancel-thread",
+            messages=[UserMessage(id="user-1", content="use the client tool")],
+        ),
+    )
+    [interrupt] = _finished(first)["outcome"]["interrupts"]
+
+    second = await _post(
+        app,
+        _input(
+            run_id="run-2",
+            thread_id="cancel-thread",
+            messages=[],
+            resume=[
+                ResumeEntry(interrupt_id=interrupt["id"], status="cancelled")
+            ],
+        ),
+    )
+
+    assert model.calls == 2
+    assert _finished(second)["outcome"] == {"type": "success"}
+    transcript = repr(model.seen_messages[-1])
+    assert "cancelled by the client" in transcript
+    assert "'status': 'error'" in transcript
+
+
+@pytest.mark.asyncio
+async def test_continue_after_frontend_call_true_finishes_the_run() -> None:
+    """The opt-out keeps the legacy placeholder-and-continue contract."""
+    adapter, model = _adapter(ToolBehavior(continue_after_frontend_call=True))
+    app = create_strands_app(adapter, path="/agent", ping_path=None)
+
+    events = await _post(
+        app,
+        _input(
+            run_id="run-1",
+            thread_id="continue-thread",
+            messages=[UserMessage(id="user-1", content="use the client tool")],
+        ),
+    )
+
+    assert _finished(events)["outcome"] == {"type": "success"}
+    # The model runs straight on from the placeholder rather than pausing.
+    assert model.calls == 2

@@ -160,6 +160,25 @@ def _build(model: Model, config: StrandsAgentConfig | None = None) -> StrandsAge
     return StrandsAgent(Agent(model=model, tools=[]), name="halt-test-agent", config=config)
 
 
+async def _answer_frontend_call(
+    adapter: StrandsAgent, thread_id: str, tool_call_id: str, content: str
+) -> list:
+    """Answer the parked frontend call and collect the continuation turn."""
+    resume_input = RunAgentInput(
+        thread_id=thread_id,
+        run_id="r-2",
+        state={},
+        messages=[
+            UserMessage(id="u1", role="user", content="Could you duplicate my B4 cell?"),
+            ToolMessage(id="fe-result", tool_call_id=tool_call_id, content=content),
+        ],
+        tools=_frontend_tools(),
+        context=[],
+        forwarded_props={},
+    )
+    return [event async for event in adapter.run(resume_input)]
+
+
 @pytest.mark.asyncio
 async def test_halt_stops_the_strands_loop_after_one_model_cycle():
     """No model cycle may run after the halt latches."""
@@ -339,14 +358,22 @@ async def test_backend_result_in_a_halting_batch_still_reaches_the_client():
     events = await _collect(adapter, "t-mixed")
 
     started = [e.tool_call_name for e in events if e.type == EventType.TOOL_CALL_START]
-    results = [e.tool_call_id for e in events if e.type == EventType.TOOL_CALL_RESULT]
-
     assert started == ["get_cell", "run_script"]
+    assert model.calls == 1
+    # The batch is parked on the frontend wait, so the run reports a pause
+    # rather than a completion.
+    [finished] = [e for e in events if e.type == EventType.RUN_FINISHED]
+    assert finished.outcome.type == "interrupt"
+
+    resumed = await _answer_frontend_call(adapter, "t-mixed", "native-fe", "B4")
+
     # The backend result goes out; the frontend placeholder stays suppressed
     # (the client produces the real one) — so exactly one result, the backend's.
+    results = [
+        e.tool_call_id for e in resumed if e.type == EventType.TOOL_CALL_RESULT
+    ]
     assert results == ["native-be"]
-    assert model.calls == 1
-    assert any(e.type == EventType.RUN_FINISHED for e in events)
+    assert model.calls == 2
 
 
 @pytest.mark.asyncio
@@ -361,13 +388,20 @@ async def test_halting_batch_backend_result_lands_in_the_messages_snapshot():
     adapter = StrandsAgent(
         Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent"
     )
-    events = await _collect(adapter, "t-mixed-snapshot")
+    await _collect(adapter, "t-mixed-snapshot")
+    resumed = await _answer_frontend_call(
+        adapter, "t-mixed-snapshot", "native-fe", "B4"
+    )
 
-    final_snapshot = [e for e in events if e.type == EventType.MESSAGES_SNAPSHOT][-1]
+    final_snapshot = [
+        e for e in resumed if e.type == EventType.MESSAGES_SNAPSHOT
+    ][-1]
     tool_messages = [
         m for m in final_snapshot.messages if getattr(m, "role", None) == "tool"
     ]
-    assert [m.tool_call_id for m in tool_messages] == ["native-be"]
+    # The client's own frontend answer is seeded from the request; the backend
+    # result is the one the snapshot has to carry back.
+    assert [m.tool_call_id for m in tool_messages] == ["native-fe", "native-be"]
 
 
 @pytest.mark.asyncio
@@ -393,12 +427,18 @@ async def test_stop_streaming_after_result_survives_a_frontend_halt_in_the_batch
     adapter = StrandsAgent(
         Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent", config=config
     )
-    events = await _collect(adapter, "t-mixed-stop-streaming")
+    await _collect(adapter, "t-mixed-stop-streaming")
+    resumed = await _answer_frontend_call(
+        adapter, "t-mixed-stop-streaming", "native-fe", "B4"
+    )
 
-    results = [e.tool_call_id for e in events if e.type == EventType.TOOL_CALL_RESULT]
+    results = [
+        e.tool_call_id for e in resumed if e.type == EventType.TOOL_CALL_RESULT
+    ]
     assert results == ["native-be"]
+    # The stream halts on the backend result, so no further model cycle runs.
     assert model.calls == 1
-    assert any(e.type == EventType.RUN_FINISHED for e in events)
+    assert any(e.type == EventType.RUN_FINISHED for e in resumed)
 
 
 @pytest.mark.asyncio
@@ -420,9 +460,12 @@ async def test_state_from_result_fires_for_a_backend_tool_in_a_halting_batch():
     adapter = StrandsAgent(
         Agent(model=model, tools=[_backend_tool()]), name="halt-test-agent", config=config
     )
-    events = await _collect(adapter, "t-mixed-state")
+    await _collect(adapter, "t-mixed-state")
+    resumed = await _answer_frontend_call(
+        adapter, "t-mixed-state", "native-fe", "B4"
+    )
 
-    snapshots = [e.snapshot for e in events if e.type == EventType.STATE_SNAPSHOT]
+    snapshots = [e.snapshot for e in resumed if e.type == EventType.STATE_SNAPSHOT]
     assert any(s.get("tables") == ["orders", "customers"] for s in snapshots)
 
 
@@ -541,18 +584,17 @@ def _persisted_messages(sm: FileSessionManager, session_id: str) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_halted_turn_persists_tool_use_placeholder_and_wire_map(tmp_path):
-    """Stopping the loop must not cost the next run's reconcile inputs.
+async def test_paused_turn_persists_the_tool_use_without_a_placeholder(tmp_path):
+    """Stopping the loop must not cost the next run's resume inputs.
 
-    The reconcile overwrites a persisted placeholder ``toolResult``, keyed via
-    the wire->native map on agent state. Both are written before the halt
-    latches (``MessageAddedEvent`` drives ``append_message`` AND ``sync_agent``
-    — see ``SessionManager.register_hooks``), so halting keeps them. If Strands
-    ever stops syncing state on message-added, this test is the tripwire.
+    A frontend tool parked in a native wait writes no placeholder
+    ``toolResult`` at all: Strands holds the parked execution in its interrupt
+    checkpoint and produces the real result when the client answers. What the
+    store must keep is the assistant ``toolUse`` and a restorable checkpoint.
 
     Asserting EXACTLY one persisted ``toolUse`` also pins the other half: a
     drained loop persists the invisible retry calls too, leaving the store with
-    several unresolved placeholders the client was never asked about.
+    several unresolved calls the client was never asked about.
     """
     session_id = "s-halt"
     sm = FileSessionManager(session_id=session_id, storage_dir=str(tmp_path))
@@ -582,14 +624,13 @@ async def test_halted_turn_persists_tool_use_placeholder_and_wire_map(tmp_path):
     ]
 
     assert [t["name"] for t in tool_uses] == ["get_cell"]
-    assert len(placeholders) == 1
-    assert placeholders[0]["toolUseId"] == tool_uses[0]["toolUseId"]
+    assert placeholders == []
 
     persisted_agent = sm.read_agent(session_id, "default")
-    wire_map = persisted_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-    assert tool_uses[0]["toolUseId"] in wire_map.values(), (
-        "reconcile cannot locate the placeholder without the wire->native map"
-    )
+    assert persisted_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) in (None, {})
+    assert (persisted_agent._internal_state or {}).get("interrupt_state", {}).get(
+        "activated"
+    ) is True, "the parked checkpoint must survive for the next run to resume"
 
 
 @pytest.mark.asyncio
