@@ -37,6 +37,31 @@ describe("AbstractAgent — interrupt lifecycle enforcement", () => {
     ).resolves.toBeDefined();
   });
 
+  it("accepts a frontend-tool interrupt answered by its tool result message", async () => {
+    const agent = new StubAgent();
+    agent.messages = [
+      {
+        id: "m-1",
+        role: "tool",
+        content: "done",
+        toolCallId: "tool-call-1",
+      },
+    ];
+    agent.pendingInterrupts = [
+      { id: "int-1", reason: "frontend_tool_call", toolCallId: "tool-call-1" },
+    ];
+    await expect(agent.runAgent()).resolves.toBeDefined();
+    expect(agent.received?.resume).toBeUndefined();
+  });
+
+  it("still throws when a frontend-tool interrupt has no matching tool result", async () => {
+    const agent = new StubAgent();
+    agent.pendingInterrupts = [
+      { id: "int-1", reason: "frontend_tool_call", toolCallId: "tool-call-1" },
+    ];
+    await expect(agent.runAgent()).rejects.toThrow(/int-1/);
+  });
+
   it("throws AGUIError when pending interrupts exist but resume is missing", async () => {
     const agent = new StubAgent();
     agent.pendingInterrupts = [{ id: "int-1", reason: "tool_call" }];

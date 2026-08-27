@@ -6,6 +6,7 @@ import {
   BaseEvent,
   AgentCapabilities,
   Interrupt,
+  FRONTEND_TOOL_CALL_INTERRUPT_REASON,
 } from "@ag-ui/core";
 
 import {
@@ -418,7 +419,25 @@ export abstract class AbstractAgent {
   protected async onInitialize(input: RunAgentInput, subscribers: AgentSubscriber[]) {
     if (this.pendingInterrupts.length > 0) {
       const resumeIds = new Set((input.resume ?? []).map((r) => r.interruptId));
+      // A frontend-tool interrupt names the tool call the client was asked to
+      // run, and the client's ordinary tool result IS its answer — the agent
+      // translates that message into the same response an explicit resume
+      // entry would carry. Requiring `resume[]` as well would make the client
+      // send the answer twice.
+      const answeredToolCallIds = new Set(
+        input.messages
+          .filter((message) => message.role === "tool")
+          .map((message) => (message as { toolCallId: string }).toolCallId),
+      );
       const uncovered = this.pendingInterrupts
+        .filter(
+          (i) =>
+            !(
+              i.reason === FRONTEND_TOOL_CALL_INTERRUPT_REASON &&
+              i.toolCallId !== undefined &&
+              answeredToolCallIds.has(i.toolCallId)
+            ),
+        )
         .map((i) => i.id)
         .filter((id) => !resumeIds.has(id));
       if (uncovered.length > 0) {

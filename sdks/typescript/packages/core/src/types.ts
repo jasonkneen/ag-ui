@@ -207,6 +207,16 @@ export const ToolSchema = z.object({
   metadata: z.record(z.any()).optional(), // Arbitrary tool metadata (e.g. a2ui schema)
 });
 
+/**
+ * ``Interrupt.reason`` for a frontend tool parked server-side while the client
+ * runs it. The interrupt makes the pause visible so a client can persist or
+ * cancel it, and the interrupt's ``toolCallId`` is the call the client is being
+ * asked to run. Such an interrupt is answered either by an ordinary
+ * ``ToolMessage`` carrying that ``toolCallId`` or by an explicit ``resume[]``
+ * entry; both reach the agent as the same response.
+ */
+export const FRONTEND_TOOL_CALL_INTERRUPT_REASON = "frontend_tool_call";
+
 export const InterruptSchema = z.object({
   id: z.string(),
   reason: z.string(),
