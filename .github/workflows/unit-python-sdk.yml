@@ -236,23 +236,53 @@ jobs:
         # Scanning the whole manifest would also match [dependency-groups] or
         # [project.optional-dependencies], where a version has no bearing on what a
         # clean `pip install ag-ui-langgraph` resolves -- so the lane could report a
-        # floor it had tested while the wheel declared something else entirely.
+        # floor it had tested while the wheel declared something else.
         #
-        # Parsed with tomllib rather than grepped for two reasons. Equivalent
-        # spellings all work ("ag-ui-protocol>=0.1.21", "ag-ui-protocol >= 0.1.21",
-        # single-quoted TOML, a trailing environment marker), where an exact-match
-        # grep silently misses them. And a grep that matches nothing exits non-zero,
-        # which under `set -euo pipefail` kills this step at the assignment -- the
-        # no-floor branch below could never run, so the explicit error it exists to
-        # print was unreachable. Python exits 0 with empty output instead, which
-        # makes that branch live.
+        # Parsed with `packaging` -- the library that defines PEP 508 -- rather than
+        # grepped. A grep gets the easy case right and the rest silently wrong: it
+        # misses "ag-ui-protocol >= 0.1.21" and single-quoted TOML, mangles a
+        # prerelease floor into the wrong version, and cannot see an environment
+        # marker at all. It also exits non-zero on no match, which under
+        # `set -euo pipefail` killed this step at the assignment and made the
+        # no-floor branch below unreachable dead code.
+        #
+        # Handled: extras, an added upper bound, prerelease floors, and the
+        # underscore spelling of the name (canonicalize_name). Deliberately NOT
+        # handled, and failing closed with an explicit message rather than guessing:
+        # an environment marker, since this lane installs the floor unconditionally
+        # and so cannot honour one.
         #
         # The interpreter comes from uv (installed above) rather than the runner
-        # image, so this does not depend on which python3 the image happens to ship
-        # being new enough for tomllib.
+        # image, so this does not depend on the image's python3 being new enough for
+        # tomllib.
         run: |
           set -euo pipefail
-          floor=$(uv run --no-project python -c 'import re,tomllib;deps=tomllib.load(open("pyproject.toml","rb"))["project"]["dependencies"];print(next((m.group(1) for d in deps if (m:=re.match(r"^ag-ui-protocol\s*>=\s*([0-9][0-9.]*)",d))),""))')
+          floor=$(uv run --no-project --with packaging python -c '
+          import tomllib
+          from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
+          deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
+          for raw in deps:
+              req = Requirement(raw)
+              if canonicalize_name(req.name) != "ag-ui-protocol":
+                  continue
+              if req.marker is not None:
+                  print("UNSUPPORTED:the ag-ui-protocol requirement carries an environment marker (" + raw + "), which this lane cannot honour because it installs the floor unconditionally.")
+                  break
+              mins = [sp.version for sp in req.specifier if sp.operator == ">="]
+              if len(mins) != 1:
+                  print("UNSUPPORTED:expected exactly one >= specifier on ag-ui-protocol, got (" + raw + ").")
+                  break
+              print(mins[0])
+              break
+          ')
+          case "$floor" in
+            UNSUPPORTED:*)
+              echo "::error::${floor#UNSUPPORTED:}" \
+                   "Teach this lane that case rather than letting it test a floor the wheel does not declare."
+              exit 1
+              ;;
+          esac
           if [ -z "$floor" ]; then
             echo "::error::No \`ag-ui-protocol>=\` floor found in [project].dependencies." \
                  "This lane exists to test that floor, so it must not pass without one."
