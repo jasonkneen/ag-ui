@@ -307,7 +307,9 @@ function haveUv(): boolean {
   return !probe.error && probe.status === 0;
 }
 
-async function buildFixture(): Promise<string> {
+async function buildFixture(
+  { withDependent = false }: { withDependent?: boolean } = {},
+): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), "prepare-release-fixture-"));
   mkdirSync(join(root, "scripts/release"), { recursive: true });
   mkdirSync(join(root, "fixture-pkg"), { recursive: true });
@@ -357,7 +359,52 @@ async function buildFixture(): Promise<string> {
     stdio: "ignore",
   });
   assert.equal(seed.status, 0, "fixture `uv lock` seed failed");
+
+  // A second, UNRELEASED package that consumes the released one through a
+  // `[tool.uv.sources]` path override — the shape integrations/langgraph/python
+  // has while PNI-274 is open. Its lock embeds the released package's VERSION,
+  // so bumping the released package alone strands it.
+  if (withDependent) {
+    mkdirSync(join(root, "fixture-dep"), { recursive: true });
+    writeFileSync(
+      join(root, "fixture-dep/pyproject.toml"),
+      [
+        "[project]",
+        'name = "fixture_dep"',
+        'version = "9.9.9"',
+        'requires-python = ">=3.10"',
+        'dependencies = ["fixture_pkg"]',
+        "",
+        "[tool.uv.sources]",
+        'fixture_pkg = { path = "../fixture-pkg" }',
+        "",
+        "[build-system]",
+        'requires = ["hatchling"]',
+        'build-backend = "hatchling.build"',
+        "",
+      ].join("\n"),
+    );
+    const depSeed = spawnSync("uv", ["lock"], {
+      cwd: join(root, "fixture-dep"),
+      stdio: "ignore",
+    });
+    assert.equal(depSeed.status, 0, "dependent fixture `uv lock` seed failed");
+  }
+
   return root;
+}
+
+// The version some OTHER lock records for a package it pulls in from a local
+// directory. uv writes the path source as `directory = "<rel>"`, and the
+// embedded version goes stale the moment the released package is bumped.
+function pathDepVersion(lockPath: string, relDir: string): string | null {
+  const blocks = readFileSync(lockPath, "utf8").split("[[package]]");
+  for (const block of blocks) {
+    if (!block.includes(`source = { directory = "${relDir}" }`)) continue;
+    const match = block.match(/^version = "([^"]+)"/m);
+    if (match) return match[1];
+  }
+  return null;
 }
 
 function selfEntryVersion(lockPath: string): string | null {
@@ -445,3 +492,57 @@ test("a Python bump with no uv.lock reports only the manifest", {
 
   rmSync(root, { recursive: true, force: true });
 });
+
+// A released package can be consumed by another first-party package through a
+// `[tool.uv.sources]` path override. That consumer's uv.lock embeds the released
+// package's VERSION, so bumping the release alone leaves the consumer's lock
+// stale and the `uv lock --check` gate turns the release PR red in a package the
+// release did not even touch.
+//
+// This is the failure behind #2553: release/next bumped ag-ui-protocol
+// 0.1.20 -> 0.1.21 in sdks/python, and both the `lockfiles` and
+// `langgraph-python` jobs failed on integrations/langgraph/python/uv.lock —
+// which pins `ag-ui-protocol 0.1.20` from `directory = "../../../sdks/python"`.
+// Nothing was wrong with the PR; the bumper simply never relocked the consumer.
+test(
+  "a Python version bump re-locks packages that path-depend on the bumped one",
+  { timeout: 120_000, skip: haveUv() ? false : "uv not on PATH" },
+  async () => {
+    const root = await buildFixture({ withDependent: true });
+    const depLock = join(root, "fixture-dep/uv.lock");
+
+    assert.equal(
+      pathDepVersion(depLock, "../fixture-pkg"),
+      "0.1.0",
+      "dependent fixture seed lock",
+    );
+
+    const result = await runPrepareRelease(["--scope", "fixture-py", "--bump", "minor"], {
+      PREPARE_RELEASE_ROOT: root,
+    });
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+
+    // The regression: this stayed at 0.1.0, so `uv lock --check` failed here.
+    assert.equal(
+      pathDepVersion(depLock, "../fixture-pkg"),
+      "0.2.0",
+      "dependent uv.lock not re-locked",
+    );
+
+    // And it must be REPORTED, or the workflow never stages it — same failure
+    // mode as the released package's own lock.
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(
+      output.files,
+      // `files` is emitted sorted.
+      [
+        "fixture-dep/uv.lock",
+        "fixture-pkg/pyproject.toml",
+        "fixture-pkg/uv.lock",
+      ],
+      "dependent uv.lock missing from `files`",
+    );
+
+    rmSync(root, { recursive: true, force: true });
+  },
+);
