@@ -96,6 +96,9 @@ chat_client = OpenAIChatClient(
 # Agentic Chat - simple_agent
 add_agent_framework_fastapi_endpoint(app, simple_agent(chat_client), "/agentic_chat")
 
+# Agentic Chat Multimodal - simple_agent with a vision-capable model
+add_agent_framework_fastapi_endpoint(app, simple_agent(chat_client), "/agentic_chat_multimodal")
+
 # Backend Tool Rendering - weather_agent
 add_agent_framework_fastapi_endpoint(app, weather_agent(chat_client), "/backend_tool_rendering")
 
