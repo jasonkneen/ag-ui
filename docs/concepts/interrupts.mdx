@@ -175,17 +175,8 @@ other string is a valid extension.
 | Value | Semantics | Typical companion fields |
 | --- | --- | --- |
 | `tool_call` | Interrupt bound to a specific tool call awaiting decision. | `toolCallId` must be set. |
-| `frontend_tool_call` | Agent is paused waiting for the client to run a frontend tool it has already emitted. | `toolCallId` must be set. |
 | `input_required` | Agent needs structured input to continue. | `responseSchema` should be set. |
 | `confirmation` | Free-standing yes/no decision not bound to a tool. | `responseSchema` optional; boolean default. |
-
-`frontend_tool_call` makes an otherwise invisible pause visible, so a client can
-tell "finished" from "waiting on me" and can persist or cancel the wait. It is
-the one core reason a client may answer without `resume[]`: sending the ordinary
-`ToolMessage` for that `toolCallId` is an equivalent answer, and the agent
-translates it into the same response. Clients that enforce "every pending
-interrupt must be covered by `resume[]`" must treat a matching tool result as
-coverage.
 
 ### Custom reasons
 
@@ -438,7 +429,7 @@ Client response:
 | Framework | Package | Interrupt support |
 | --- | --- | --- |
 | LangGraph | `@ag-ui/langgraph` / `ag-ui-langgraph` | ✅ Accepts `RunAgentInput.resume[]`. Can emit `RunFinishedEvent.outcome = {type:"interrupt"}` — opt-in via `emitInterruptOutcome` / `emit_interrupt_outcome` (default off; legacy clients that resume via `command.resume` stop resuming once they see the structured outcome). Legacy `CustomEvent(name="on_interrupt")` emitted by default; disable via `enableLegacyOnInterruptEvent: false`. Subclass hooks available for custom HITL translation. |
-| AWS Strands | `@ag-ui/aws-strands` / `ag-ui-strands` | ✅ Forwards native Strands interrupts via `RunFinishedEvent.outcome`. In Python, a frontend tool the agent is waiting on is also reported this way, with `reason: "frontend_tool_call"` and the emitted `toolCallId`; it is answered either by `resume[]` or by the client's ordinary `ToolMessage` for that tool call. |
+| AWS Strands | `@ag-ui/aws-strands` | ✅ Forwards native Strands interrupts via `RunFinishedEvent.outcome`. |
 
 ## Related
 

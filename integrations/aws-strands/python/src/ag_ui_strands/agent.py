@@ -285,21 +285,6 @@ def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
             },
         )
 
-    if is_frontend_tool_interrupt(strands_interrupt):
-        # A frontend tool parked in a native wait is a first-class AG-UI
-        # interrupt: the run reports itself as paused, and the client may
-        # answer through ``resume[]`` or through the legacy ``ToolMessage``
-        # channel, which is translated onto this same payload contract.
-        tool_use_id, tool_name = parse_frontend_tool_reason(raw_reason)
-        return Interrupt(
-            id=s_id,
-            reason=FRONTEND_TOOL_INTERRUPT_REASON,
-            message=f"Waiting for the client to run {tool_name}.",
-            tool_call_id=tool_use_id,
-            response_schema=frontend_tool_response_schema(),
-            metadata={"tool_name": tool_name},
-        )
-
     return Interrupt(
         id=s_id,
         reason=name,
@@ -665,11 +650,10 @@ from .a2ui_tool import (
 )
 from .client_proxy_tool import (
     _is_proxy,
-    continues_after_frontend_call,
     sync_proxy_tools,
+    waits_for_frontend_call,
 )
 from .frontend_tool_interrupt import (
-    FRONTEND_TOOL_INTERRUPT_REASON,
     frontend_tool_response_schema,
     index_frontend_tool_interrupts,
     is_frontend_tool_interrupt,
@@ -1395,6 +1379,13 @@ def _persist_frontend_wait_bridge(
             return
         trimmed = dict(list(bridge.items())[-_FRONTEND_WAIT_BRIDGE_MAX:])
         set_fn(_FRONTEND_WAIT_BRIDGE_STATE_KEY, trimmed)
+        # Strands' own persistence hook has already run by the time a run can
+        # observe its terminal result, so flush explicitly or a fresh wrapper
+        # would not see this map and would treat a retry as fresh input.
+        session_manager = _get_strands_session_manager(strands_agent)
+        sync_agent = getattr(session_manager, "sync_agent", None)
+        if callable(sync_agent):
+            sync_agent(strands_agent)
     except Exception as e:  # noqa: BLE001 — persistence is best-effort
         logger.warning(f"Failed to persist frontend wait bridge: {e}")
 
@@ -2274,6 +2265,30 @@ class StrandsAgent:
             behavior and behavior.skip_messages_snapshot
         )
 
+    def _record_frontend_wait_bridge(
+        self,
+        strands_agent: Any,
+        thread_id: str,
+        native_interrupts: List[Any],
+    ) -> None:
+        """Remember which tool call each parked frontend wait belongs to.
+
+        The client answers a waiting frontend tool with an ordinary
+        ``ToolMessage``, which correlates by tool call rather than by interrupt
+        id. Persisting that correlation lets the translation survive a process
+        restart and lets an exact request retry be recognised as a replay.
+        """
+        bridge = dict(self._frontend_wait_bridge_by_thread.get(thread_id) or {})
+        added = False
+        for interrupt in native_interrupts:
+            if not is_frontend_tool_interrupt(interrupt):
+                continue
+            bridge[parse_frontend_tool_reason(interrupt.reason)] = interrupt.id
+            added = True
+        if added:
+            self._frontend_wait_bridge_by_thread[thread_id] = bridge
+            _persist_frontend_wait_bridge(strands_agent, bridge)
+
     def _record_pending_interrupts(
         self,
         strands_agent: Any,
@@ -2293,24 +2308,6 @@ class StrandsAgent:
             interrupt.id: interrupt for interrupt in ag_ui_interrupts
         }
         self._last_resume_fingerprint.pop(thread_id, None)
-
-        # A frontend wait is answerable through the legacy ``ToolMessage``
-        # channel as well, which correlates by tool call rather than by
-        # interrupt id. Persist that correlation so the translation survives a
-        # process restart and an exact request retry stays idempotent. Written
-        # before the bookkeeping flush below so one ``sync_agent`` covers both.
-        frontend_bridge = dict(
-            self._frontend_wait_bridge_by_thread.get(thread_id) or {}
-        )
-        for interrupt in ag_ui_interrupts:
-            if interrupt.reason == FRONTEND_TOOL_INTERRUPT_REASON and (
-                interrupt.tool_call_id
-            ):
-                frontend_bridge[interrupt.tool_call_id] = interrupt.id
-        if frontend_bridge:
-            self._frontend_wait_bridge_by_thread[thread_id] = frontend_bridge
-            _persist_frontend_wait_bridge(strands_agent, frontend_bridge)
-
         _persist_interrupt_bookkeeping(
             strands_agent,
             self._pending_interrupts_by_thread[thread_id],
@@ -2825,12 +2822,11 @@ class StrandsAgent:
                     )
         strands_agent = self._agents_by_thread[thread_id]
 
-        # A frontend tool parked in a native Strands wait is a first-class
-        # AG-UI interrupt: the run reports itself paused, and the canonical way
-        # to answer it is ``RunAgentInput.resume``. The established
-        # ``ToolMessage`` channel stays supported and is translated here into
-        # the very same ``ResumeEntry`` batch, so both spellings drive one
-        # resume mechanism rather than two state machines.
+        # A waiting frontend tool is answered by the client's ordinary
+        # ``ToolMessage``. That answer is translated here into the same
+        # ``ResumeEntry`` batch the adapter already uses for native interrupts,
+        # so one mechanism records every answer and the idempotency,
+        # validation and replay rules apply to both without a second copy.
         try:
             frontend_wait_interrupts = index_frontend_tool_interrupts(strands_agent)
         except ValueError as exc:
@@ -2929,8 +2925,9 @@ class StrandsAgent:
             replayed_resume_entries
         ):
             # Nothing new to submit. If the checkpoint still holds open waits,
-            # this is a retry of an already-applied partial response: report
-            # the unchanged pause instead of failing or re-running anything.
+            # this is a retry of an already-applied partial response: close the
+            # run exactly as the first delivery did, without failing or
+            # re-running anything. A wait that is still open keeps waiting.
             still_open = _open_native_interrupts(
                 getattr(interrupt_state, "interrupts", {})
             )
@@ -2940,14 +2937,21 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                 )
+                visible_still_open = [
+                    interrupt
+                    for interrupt in still_open.values()
+                    if not is_frontend_tool_interrupt(interrupt)
+                ]
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
-                    outcome=self._record_pending_interrupts(
-                        strands_agent,
-                        thread_id,
-                        list(still_open.values()),
+                    outcome=(
+                        self._record_pending_interrupts(
+                            strands_agent, thread_id, visible_still_open
+                        )
+                        if visible_still_open
+                        else RunFinishedSuccessOutcome(type="success")
                     ),
                 )
                 return
@@ -3238,7 +3242,7 @@ class StrandsAgent:
                         _resumed_tool_call_ids.add(ag_ui_interrupt.tool_call_id)
                     elif is_frontend_tool_interrupt(native_interrupt):
                         _resumed_tool_call_ids.add(
-                            parse_frontend_tool_reason(native_interrupt.reason)[0]
+                            parse_frontend_tool_reason(native_interrupt.reason)
                         )
 
             # Note: even when ALL entries are cancelled, we still forward the
@@ -3661,6 +3665,7 @@ class StrandsAgent:
             current_state = dict(input_data.state or {})  # Track state for final snapshot
             stop_text_streaming = False
             halt_event_stream = False
+            pending_halt = False
             # Frontend-tool ToolCallEnd ids are buffered here so the client's
             # "execute this frontend tool" signal is delayed until AFTER this
             # turn's backend tool results have been emitted. This prevents the
@@ -4341,9 +4346,26 @@ class StrandsAgent:
 
                     # Handle tool results from Strands for backend tool rendering
                     elif "message" in event and event["message"].get("role") == "user":
-                        # This message carries the batch's backend tool results.
-                        # The per-item loop below skips frontend placeholders,
-                        # since the client produces those results.
+                        # A deferred frontend-tool halt takes effect here — but
+                        # do NOT skip the message. In a parallel batch mixing a
+                        # frontend tool with backend tools, THIS message carries
+                        # the backend tools' real results, and dropping it loses
+                        # them permanently: the client's tool card never
+                        # resolves, the result never reaches MESSAGES_SNAPSHOT
+                        # (the only path into client-side history — the
+                        # TOOL_CALL_RESULT below is deliberately role-less and
+                        # is not history), and state_from_result /
+                        # custom_result_handler never fire. Consumers that
+                        # persist from the event stream then hold a transcript
+                        # whose toolUse has no toolResult, which the next run
+                        # replays straight to the model provider.
+                        #
+                        # Fall through instead: the per-item loop already skips
+                        # frontend placeholders (the client produces the real
+                        # result), so only genuine backend results go out. Stop
+                        # after the batch, before the next model cycle.
+                        if pending_halt:
+                            halt_event_stream = True
                         message_content = event["message"].get("content", [])
                         if not message_content or not isinstance(message_content, list):
                             continue
@@ -4594,7 +4616,7 @@ class StrandsAgent:
                         configured_behavior = self.config.tool_behaviors.get(tool_name)
                         is_native_frontend_wait = bool(
                             is_frontend_tool
-                            and not continues_after_frontend_call(configured_behavior)
+                            and waits_for_frontend_call(configured_behavior)
                         )
 
                         # Check if this is another cumulative update for the
@@ -4966,9 +4988,9 @@ class StrandsAgent:
 
                                     # Defer hand-off: for frontend tools, buffer the
                                     # ToolCallEnd instead of emitting it now. It is
-                                    # flushed after this turn's backend results.
-                                    # Backend tools and continue_after_frontend_call
-                                    # tools emit now.
+                                    # flushed after this turn's backend results (see
+                                    # the pending_halt handler). Backend tools and
+                                    # continue_after_frontend_call tools emit now.
                                     if is_frontend_tool and not (
                                         behavior and behavior.continue_after_frontend_call
                                     ):
@@ -5006,6 +5028,12 @@ class StrandsAgent:
                                         # tool call) carries a distinct id —
                                         # CopilotKit v2 dedupes by id.
                                         message_id = str(uuid.uuid4())
+
+                                    if is_frontend_tool and behavior is None:
+                                        logger.debug(
+                                            f"Deferring halt after frontend tool call: tool_name={tool_name}, tool_call_id={tool_use_id}, thread_id={input_data.thread_id}"
+                                        )
+                                        pending_halt = True
 
                                 elif is_pending:
                                     # Continuation turn — tool already resolved
@@ -5150,6 +5178,12 @@ class StrandsAgent:
                                             messages=list(snapshot_messages),
                                         )
                                         message_id = str(uuid.uuid4())
+
+                                    if is_frontend_tool and behavior is None:
+                                        logger.debug(
+                                            f"Deferring halt after frontend tool call: tool_name={tool_name}, tool_call_id={tool_use_id}, thread_id={input_data.thread_id}"
+                                        )
+                                        pending_halt = True
 
                     # Strands' ``ModelMessageEvent`` re-announces the assistant
                     # turn as a whole once the model finishes it. Every part of
@@ -5332,13 +5366,28 @@ class StrandsAgent:
 
             # If the run paused on a native Strands interrupt, surface it as an
             # AG-UI interrupt outcome so the client can collect a response and
-            # resume via ``RunAgentInput.resume`` next turn. A frontend tool
-            # parked in a native wait is one of those interrupts: a paused run
-            # never reports itself as finished.
+            # resume via ``RunAgentInput.resume`` next turn.
+            #
+            # A frontend tool parked in a native wait is deliberately NOT one of
+            # those. An AG-UI interrupt means the agent itself paused and is
+            # waiting on ``resume[]``; a waiting frontend tool is the ordinary
+            # tool-call round trip, answered by a ``ToolMessage``. Publishing it
+            # as an interrupt would make the two indistinguishable to a client,
+            # so a generic interrupt handler would fire on a tool card it does
+            # not own. Native waiting is how the adapter parks the call; it is
+            # not a change to what the client sees.
             native_interrupts = _extract_interrupts(strands_agent, terminal_result)
-            if native_interrupts:
+            self._record_frontend_wait_bridge(
+                strands_agent, thread_id, native_interrupts
+            )
+            visible_native_interrupts = [
+                interrupt
+                for interrupt in native_interrupts
+                if not is_frontend_tool_interrupt(interrupt)
+            ]
+            if visible_native_interrupts:
                 pending_interrupt_outcome = self._record_pending_interrupts(
-                    strands_agent, thread_id, native_interrupts
+                    strands_agent, thread_id, visible_native_interrupts
                 )
                 logger.debug(
                     f"Strands interrupt detected: thread_id={input_data.thread_id}, "

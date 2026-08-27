@@ -46,7 +46,6 @@ from ag_ui_strands.agent import (
     StrandsAgent,
 )
 from ag_ui_strands.client_proxy_tool import PROXY_RESULT_PLACEHOLDER
-from ag_ui_strands.frontend_tool_interrupt import FRONTEND_TOOL_INTERRUPT_REASON
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 from ag_ui_strands.session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
@@ -1686,13 +1685,7 @@ async def test_mixed_resume_batch_with_falsy_payload_and_tool_behaviors(
     finished1 = next(e for e in events1 if e.type == EventType.RUN_FINISHED)
     assert finished1.outcome is not None
     assert finished1.outcome.type == "interrupt"
-    # Unless the frontend tool continues immediately, the pause carries its
-    # wait alongside the server interrupt. This test resumes the server one.
-    interrupt_id = next(
-        interrupt.id
-        for interrupt in finished1.outcome.interrupts
-        if interrupt.reason != FRONTEND_TOOL_INTERRUPT_REASON
-    )
+    interrupt_id = finished1.outcome.interrupts[0].id
     fe_wire_id = next(
         e.tool_call_id
         for e in events1

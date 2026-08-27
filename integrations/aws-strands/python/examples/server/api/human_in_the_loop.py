@@ -8,9 +8,6 @@ adapter parks it in a native interrupt while preserving the normal
 frontend tool lifecycle, the user reviews and approves the plan in the
 UI, and the tool result is fed back to the agent on the next turn.
 
-No ``ToolBehavior`` is configured: waiting is the default for a
-frontend tool.
-
 No backend ``@tool`` stub. No agent-side AG-UI event emission.
 """
 
@@ -24,6 +21,7 @@ os.environ["OTEL_PYTHON_DISABLED_INSTRUMENTATIONS"] = "all"
 
 from strands import Agent
 from ag_ui_strands import StrandsAgent, create_strands_app
+from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
 from server.model_factory import create_model
 
 # Load environment variables from .env file
@@ -69,6 +67,13 @@ agui_agent = StrandsAgent(
     agent=strands_agent,
     name="human_in_the_loop",
     description="AWS Strands agent with human-in-the-loop task planning",
+    config=StrandsAgentConfig(
+        tool_behaviors={
+            "generate_task_steps": ToolBehavior(
+                continue_after_frontend_call=False
+            )
+        }
+    ),
 )
 
 app = create_strands_app(agui_agent, "/")

@@ -24,7 +24,7 @@ from ag_ui.core import (
     UserMessage,
 )
 from ag_ui_strands.agent import StrandsAgent
-from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
+from ag_ui_strands.config import StrandsAgentConfig
 from tests.hook_helpers import invoke_after_model_call, invoke_before_model_call
 
 
@@ -681,12 +681,7 @@ class TestWireToNativeMapCapture:
         # on. (Primary resolution path's data source.) Capture is gated on a
         # session manager being configured.
         agent = _make_base_agent(
-            session_manager_provider=MagicMock(return_value=_mock_session_manager()),
-            # The wire->native map is legacy-continuation provenance; a tool
-            # that waits natively carries its own identity and needs no map.
-            tool_behaviors={
-                "approve": ToolBehavior(continue_after_frontend_call=True)
-            },
+            session_manager_provider=MagicMock(return_value=_mock_session_manager())
         )
         input_data = RunAgentInput(
             thread_id="t-emit",
@@ -716,10 +711,7 @@ class TestWireToNativeMapCapture:
 
         monkeypatch.setattr(agent_mod, "_WIRE_MAP_MAX", 2)
         agent = _make_base_agent(
-            session_manager_provider=MagicMock(return_value=_mock_session_manager()),
-            tool_behaviors={
-                "approve": ToolBehavior(continue_after_frontend_call=True)
-            },
+            session_manager_provider=MagicMock(return_value=_mock_session_manager())
         )
         input_data = RunAgentInput(
             thread_id="t-cap",

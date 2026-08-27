@@ -84,7 +84,7 @@ async def test_waiting_proxy_interrupts_and_resumes_empty_result() -> None:
     assert first_result.stop_reason == "interrupt"
     [interrupt] = first_result.interrupts
     assert interrupt.name == FRONTEND_TOOL_INTERRUPT_NAME
-    assert interrupt.reason == frontend_tool_reason("native-115", "compat_tool")
+    assert interrupt.reason == frontend_tool_reason("native-115")
 
     resumed_events = [
         event

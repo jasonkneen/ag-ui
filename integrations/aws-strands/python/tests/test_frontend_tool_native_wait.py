@@ -22,10 +22,7 @@ from strands.session.file_session_manager import FileSessionManager
 
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
-from ag_ui_strands.frontend_tool_interrupt import (
-    FRONTEND_TOOL_INTERRUPT_REASON,
-    index_frontend_tool_interrupts,
-)
+from ag_ui_strands.frontend_tool_interrupt import index_frontend_tool_interrupts
 
 
 class _ParallelWaitModel(Model):
@@ -273,22 +270,6 @@ def _assert_success(events: Sequence[Any]) -> None:
     assert getattr(finished.outcome, "type", None) == "success"
 
 
-def _assert_paused_on(events: Sequence[Any], *tool_call_ids: str) -> list[Any]:
-    """A run parked on frontend waits reports those waits as its outcome."""
-    assert not any(event.type == EventType.RUN_ERROR for event in events)
-    [finished] = [
-        event for event in events if event.type == EventType.RUN_FINISHED
-    ]
-    assert finished.outcome.type == "interrupt"
-    frontend = [
-        interrupt
-        for interrupt in finished.outcome.interrupts
-        if interrupt.reason == FRONTEND_TOOL_INTERRUPT_REASON
-    ]
-    assert [interrupt.tool_call_id for interrupt in frontend] == list(tool_call_ids)
-    return finished.outcome.interrupts
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["unconfigured", "continue"])
 async def test_legacy_placeholder_modes_also_emit_native_tool_ids(mode: str) -> None:
@@ -369,7 +350,7 @@ async def test_completed_frontend_native_id_cannot_be_reused(
             messages=[UserMessage(id="user-1", content="call frontend tool")],
         ),
     )
-    _assert_paused_on(first, "native-reused")
+    _assert_success(first)
 
     resumed = await _collect(
         _adapter(model, tmp_path, thread_id),
@@ -407,7 +388,6 @@ def test_malformed_native_checkpoint_identity_fails_loudly() -> None:
                     reason={
                         "name": "ag_ui_frontend_tool_wait",
                         "tool_use_id": "native-id",
-                        "tool_name": "client_tool",
                     },
                 )
             },
@@ -423,7 +403,6 @@ def test_malformed_native_checkpoint_identity_fails_loudly() -> None:
                     reason={
                         "name": "ag_ui_frontend_tool_wait",
                         "tool_use_id": "native-id",
-                        "tool_name": "client_tool",
                     },
                 )
                 for interrupt_id in ("interrupt-1", "interrupt-2")
@@ -453,7 +432,7 @@ async def test_duplicate_client_results_fail_before_native_resume(
             messages=[UserMessage(id="user-1", content="call both tools")],
         ),
     )
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
 
     duplicate = await _collect(
         _adapter(model, tmp_path, thread_id),
@@ -506,7 +485,7 @@ async def test_native_resume_sync_failure_is_loud_and_never_finishes(
             messages=[UserMessage(id="user-1", content="call both tools")],
         ),
     )
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
 
     failed = await _collect(
         adapter,
@@ -546,7 +525,7 @@ async def test_partial_native_wait_survives_fresh_wrapper_and_continues_once(
         ),
     )
 
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
     assert model.calls == 1
     assert [
         event.tool_call_id
@@ -570,7 +549,7 @@ async def test_partial_native_wait_survives_fresh_wrapper_and_continues_once(
         ),
     )
 
-    _assert_paused_on(partial, "native-0")
+    _assert_success(partial)
     assert model.calls == 1
     partial_core = partial_adapter._agents_by_thread[thread_id]
     partial_interrupts = index_frontend_tool_interrupts(partial_core)
@@ -628,12 +607,11 @@ async def test_mixed_checkpoint_accepts_server_response_before_frontend_result(
     )
 
     assert model.calls == 1
-    interrupts = _assert_paused_on(first, "native-client")
-    [server_interrupt] = [
-        interrupt
-        for interrupt in interrupts
-        if interrupt.reason != FRONTEND_TOOL_INTERRUPT_REASON
+    [first_finished] = [
+        event for event in first if event.type == EventType.RUN_FINISHED
     ]
+    assert first_finished.outcome.type == "interrupt"
+    [server_interrupt] = first_finished.outcome.interrupts
     assert server_interrupt.reason == "server_approval"
 
     server_adapter = _adapter(
@@ -658,7 +636,7 @@ async def test_mixed_checkpoint_accepts_server_response_before_frontend_result(
         ),
     )
 
-    _assert_paused_on(server_only, "native-client")
+    _assert_success(server_only)
     assert model.calls == 1
 
     frontend_adapter = _adapter(
@@ -710,11 +688,7 @@ async def test_mixed_checkpoint_accepts_both_client_channels_in_one_request(
         ),
     )
     [finished] = [event for event in first if event.type == EventType.RUN_FINISHED]
-    [server_interrupt] = [
-        interrupt
-        for interrupt in finished.outcome.interrupts
-        if interrupt.reason != FRONTEND_TOOL_INTERRUPT_REASON
-    ]
+    [server_interrupt] = finished.outcome.interrupts
 
     resume_adapter = _adapter(
         model,
@@ -771,7 +745,7 @@ async def test_identical_partial_retry_is_a_successful_no_op(tmp_path: Path) -> 
             messages=[UserMessage(id="user-1", content="call both tools")],
         ),
     )
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
 
     partial_messages = [
         ToolMessage(id="second-result", tool_call_id="native-1", content="second-value")
@@ -780,7 +754,7 @@ async def test_identical_partial_retry_is_a_successful_no_op(tmp_path: Path) -> 
         _adapter(model, tmp_path, thread_id),
         _input(thread_id, run_id="run-2", messages=partial_messages),
     )
-    _assert_paused_on(partial, "native-0")
+    _assert_success(partial)
     assert model.calls == 1
 
     retry = await _collect(
@@ -788,7 +762,7 @@ async def test_identical_partial_retry_is_a_successful_no_op(tmp_path: Path) -> 
         _input(thread_id, run_id="run-2-retry", messages=partial_messages),
     )
 
-    _assert_paused_on(retry, "native-0")
+    _assert_success(retry)
     assert model.calls == 1
 
     retry_core = _adapter(model, tmp_path, thread_id)
@@ -824,7 +798,7 @@ async def test_identical_completed_retry_does_not_run_the_model_again(
             messages=[UserMessage(id="user-1", content="call both tools")],
         ),
     )
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
 
     final_messages = [
         ToolMessage(id="first-result", tool_call_id="native-0", content="first-value"),
@@ -937,7 +911,7 @@ async def test_full_history_completion_after_a_partial_answer_is_repeatable(
         _adapter(model, tmp_path, thread_id),
         _input(thread_id, run_id="run-1", messages=[user_turn]),
     )
-    _assert_paused_on(first, "native-0", "native-1")
+    _assert_success(first)
 
     second_result = ToolMessage(
         id="second-result", tool_call_id="native-1", content="second-value"
@@ -946,7 +920,7 @@ async def test_full_history_completion_after_a_partial_answer_is_repeatable(
         _adapter(model, tmp_path, thread_id),
         _input(thread_id, run_id="run-2", messages=[user_turn, second_result]),
     )
-    _assert_paused_on(partial, "native-0")
+    _assert_success(partial)
     assert model.calls == 1
 
     completing_messages = [

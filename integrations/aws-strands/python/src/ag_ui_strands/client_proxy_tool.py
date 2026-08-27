@@ -54,21 +54,23 @@ def _tool_spec(ag_ui_tool: AgUiTool) -> tuple[str, str, ToolSpec]:
     )
 
 
-def continues_after_frontend_call(behavior: "ToolBehavior | None") -> bool:
-    """Return whether a frontend tool continues immediately after its call.
+def waits_for_frontend_call(behavior: "ToolBehavior | None") -> bool:
+    """Return whether a frontend tool parks in a native Strands interrupt.
 
-    Only an explicit ``ToolBehavior(continue_after_frontend_call=True)`` keeps
-    the legacy placeholder-and-continue path. An absent configuration selects
-    the same native wait as an explicit ``False``, so applications that never
-    configured the tool get the waiting behaviour by default.
+    Waiting is what a human-in-the-loop tool needs: the agent stops until the
+    client answers. A plain frontend action — render something, change the
+    background — never answers, so waiting would strand the thread. The server
+    cannot tell those apart from the tool definition, so waiting stays an
+    explicit ``ToolBehavior(continue_after_frontend_call=False)`` opt-in and
+    an unconfigured tool keeps the legacy placeholder path.
     """
-    return behavior is not None and behavior.continue_after_frontend_call is True
+    return behavior is not None and behavior.continue_after_frontend_call is False
 
 
 def create_proxy_tool(
     ag_ui_tool: AgUiTool,
     *,
-    continue_after_frontend_call: bool = False,
+    continue_after_frontend_call: bool = True,
 ) -> AgentTool:
     """Convert an AG-UI ``Tool`` into a Strands ``PythonAgentTool``.
 
@@ -96,7 +98,7 @@ def create_proxy_tool(
             tool_use_id = tool_context.tool_use["toolUseId"]
             response = tool_context.interrupt(
                 FRONTEND_TOOL_INTERRUPT_NAME,
-                reason=frontend_tool_reason(tool_use_id, name),
+                reason=frontend_tool_reason(tool_use_id),
             )
             content, is_error = unwrap_frontend_tool_response(response)
             return {
@@ -188,7 +190,7 @@ def sync_proxy_tools(
         behavior = tool_behaviors.get(n) if tool_behaviors is not None else None
         proxy = create_proxy_tool(
             t,
-            continue_after_frontend_call=continues_after_frontend_call(behavior),
+            continue_after_frontend_call=not waits_for_frontend_call(behavior),
         )
         tool_registry.register_tool(proxy)
         current_proxy_names.add(n)

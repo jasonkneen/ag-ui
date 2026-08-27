@@ -54,7 +54,7 @@ async def _stream_tool(proxy, tool_use):
 class TestCreateProxyTool:
     def test_returns_python_agent_tool(self):
         ag_tool = _make_ag_ui_tool("my_tool", "A tool", {"type": "object", "properties": {"x": {"type": "string"}}})
-        proxy = create_proxy_tool(ag_tool, continue_after_frontend_call=True)
+        proxy = create_proxy_tool(ag_tool)
 
         assert isinstance(proxy, PythonAgentTool)
         assert proxy.tool_name == "my_tool"
@@ -65,30 +65,22 @@ class TestCreateProxyTool:
         }
 
     def test_marked_dynamic(self):
-        proxy = create_proxy_tool(
-            _make_ag_ui_tool("t"), continue_after_frontend_call=True
-        )
+        proxy = create_proxy_tool(_make_ag_ui_tool("t"))
         assert proxy.is_dynamic is True
 
     def test_marked_as_proxy(self):
-        proxy = create_proxy_tool(
-            _make_ag_ui_tool("t"), continue_after_frontend_call=True
-        )
+        proxy = create_proxy_tool(_make_ag_ui_tool("t"))
         assert getattr(proxy, _PROXY_MARKER) is True
         assert _is_proxy(proxy) is True
 
     def test_supports_hot_reload(self):
-        proxy = create_proxy_tool(
-            _make_ag_ui_tool("t"), continue_after_frontend_call=True
-        )
+        proxy = create_proxy_tool(_make_ag_ui_tool("t"))
         assert proxy.supports_hot_reload is True
 
 
 class TestProxyToolResult:
     def test_returns_success_with_placeholder(self):
-        proxy = create_proxy_tool(
-            _make_ag_ui_tool("bg"), continue_after_frontend_call=True
-        )
+        proxy = create_proxy_tool(_make_ag_ui_tool("bg"))
         tool_use = {"toolUseId": "abc-123", "name": "bg", "input": {"color": "red"}}
         result = proxy._tool_func(tool_use)
 
@@ -118,7 +110,6 @@ class TestProxyToolResult:
         assert interrupt.reason == {
             "name": "ag_ui_frontend_tool_wait",
             "tool_use_id": "native-wait-id",
-            "tool_name": "wait_for_client",
         }
 
 
@@ -145,12 +136,8 @@ class TestSyncProxyTools:
     def test_removes_stale_tools(self):
         registry = self._fresh_registry()
         # First, register two proxy tools
-        proxy_a = create_proxy_tool(
-            _make_ag_ui_tool("tool_a"), continue_after_frontend_call=True
-        )
-        proxy_b = create_proxy_tool(
-            _make_ag_ui_tool("tool_b"), continue_after_frontend_call=True
-        )
+        proxy_a = create_proxy_tool(_make_ag_ui_tool("tool_a"))
+        proxy_b = create_proxy_tool(_make_ag_ui_tool("tool_b"))
         registry.register_tool(proxy_a)
         registry.register_tool(proxy_b)
 
@@ -176,9 +163,7 @@ class TestSyncProxyTools:
 
     def test_removes_all_when_empty_list(self):
         registry = self._fresh_registry()
-        proxy = create_proxy_tool(
-            _make_ag_ui_tool("tool_x"), continue_after_frontend_call=True
-        )
+        proxy = create_proxy_tool(_make_ag_ui_tool("tool_x"))
         registry.register_tool(proxy)
 
         result = sync_proxy_tools(registry, [], {"tool_x"})
@@ -198,12 +183,11 @@ class TestSyncProxyTools:
         assert "t1" in registry.registry
 
     @pytest.mark.asyncio
-    async def test_only_explicit_true_keeps_the_legacy_placeholder_mode(self):
+    async def test_only_explicit_false_selects_native_interrupt_mode(self):
         registry = self._fresh_registry()
         tools = [
             _make_ag_ui_tool("unconfigured"),
             _make_ag_ui_tool("waiting"),
-            _make_ag_ui_tool("continuing"),
         ]
 
         sync_proxy_tools(
@@ -212,22 +196,16 @@ class TestSyncProxyTools:
             set(),
             tool_behaviors={
                 "waiting": ToolBehavior(continue_after_frontend_call=False),
-                "continuing": ToolBehavior(continue_after_frontend_call=True),
             },
         )
 
-        continuing_result = registry.registry["continuing"]._tool_func(
-            {"toolUseId": "legacy-id", "name": "continuing", "input": {}}
-        )
-        unconfigured_events = await _stream_tool(
-            registry.registry["unconfigured"],
-            {"toolUseId": "unconfigured-id", "name": "unconfigured", "input": {}},
+        unconfigured_result = registry.registry["unconfigured"]._tool_func(
+            {"toolUseId": "legacy-id", "name": "unconfigured", "input": {}}
         )
         waiting_events = await _stream_tool(
             registry.registry["waiting"],
             {"toolUseId": "waiting-id", "name": "waiting", "input": {}},
         )
 
-        assert continuing_result["content"] == [{"text": "Forwarded to client"}]
-        assert "tool_interrupt_event" in unconfigured_events[0]
+        assert unconfigured_result["content"] == [{"text": "Forwarded to client"}]
         assert "tool_interrupt_event" in waiting_events[0]

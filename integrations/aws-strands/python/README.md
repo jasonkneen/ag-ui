@@ -167,70 +167,35 @@ directly with `agent.run(input_data, invocation_state={...})`.
 
 ## Human-in-the-loop (native Strands interrupts)
 
-### Frontend tools wait on a native interrupt
+Python frontend tools explicitly configured with
+`ToolBehavior(continue_after_frontend_call=False)` wait in Strands' native
+interrupt checkpoint. This is an internal implementation detail; the AG-UI
+client contract remains `TOOL_CALL_*` -> successful `RUN_FINISHED` -> an
+ordinary `ToolMessage` on the next request. The client does not receive a
+frontend-tool interrupt outcome, does not send `resume[]`, and does not receive
+a duplicate `TOOL_CALL_RESULT` for its own result.
 
-A Python frontend tool waits in Strands' native interrupt checkpoint by
-default. Only `ToolBehavior(continue_after_frontend_call=True)` opts out and
-keeps the legacy placeholder-and-continue path; an absent configuration and an
-explicit `False` behave identically.
-
-A waiting call emits the usual `TOOL_CALL_START` / `TOOL_CALL_ARGS` /
-`TOOL_CALL_END`, and the run then finishes with an **interrupt** outcome rather
-than a success, so a client can tell a pause from a completion and can persist
-or cancel the wait:
-
-```jsonc
-{
-  "type": "RUN_FINISHED",
-  "outcome": {
-    "type": "interrupt",
-    "interrupts": [
-      {
-        "id": "v1:tool_call:tooluse_abc:...",
-        "reason": "frontend_tool_call",
-        "message": "Waiting for the client to run generate_task_steps.",
-        "toolCallId": "tooluse_abc",
-        "responseSchema": {
-          "type": "object",
-          "properties": { "content": { "type": "string" }, "error": { "type": "boolean" } },
-          "required": ["content"]
-        },
-        "metadata": { "tool_name": "generate_task_steps" }
-      }
-    ]
-  }
-}
-```
-
-There is **one** response mechanism, with two spellings:
-
-- **Canonical:** answer the interrupt in the next request's `resume[]` with
-  `ResumeEntry(interrupt_id=..., status="resolved", payload={"content": ..., "error": false})`.
-  `status="cancelled"` reaches the tool as a failed call.
-- **Compatibility:** send the client's ordinary trailing `ToolMessage` whose
-  `tool_call_id` matches the interrupt's `toolCallId`. The adapter translates it
-  at the request boundary into exactly the `ResumeEntry` above, so existing
-  clients keep working without change.
-
-Either way the client never receives a duplicate `TOOL_CALL_RESULT` for its own
-result.
+A waiting frontend tool is not an AG-UI interrupt. An interrupt means the agent
+itself paused and is waiting on `resume[]`; a waiting frontend tool is the
+ordinary tool-call round trip, and the run still finishes successfully so a
+generic interrupt handler does not fire on a tool card it does not own. Native
+waiting is only how the adapter parks the call.
 
 Retries are idempotent. Re-sending an answer the checkpoint already holds
-verbatim neither resumes Strands nor re-invokes the model: the run reports the
-unchanged pause, or plain success once the wait has closed. A *different*
-answer for the same call fails with `FRONTEND_TOOL_RESULT_CONFLICT`.
+verbatim neither resumes Strands nor re-invokes the model, including when a
+client replays its full history and repeats an answer alongside a new one. A
+*different* answer for the same call fails with
+`FRONTEND_TOOL_RESULT_CONFLICT`.
 
 Strands is the source of truth for active calls, answered calls, partial
 responses, mixed checkpoints, and restart recovery. The adapter reads that
-checkpoint to correlate answers by the native Strands `toolUseId`, which is
-also the AG-UI `tool_call_id`, and persists only the `toolCallId` -> interrupt
-id correlation the `ToolMessage` channel needs. Missing, blank, duplicate, or
-reused native IDs fail loudly; affected model providers should upgrade to a
+checkpoint only to correlate the client's `ToolMessage` by the native Strands
+`toolUseId`, which is also the AG-UI `tool_call_id`. Missing, blank, duplicate,
+or reused native IDs fail loudly; affected model providers should upgrade to a
 Strands/provider version that supplies stable IDs or avoid parallel frontend
-calls. This native frontend-wait bridge is currently Python-specific; it does
+calls. Unconfigured tools and explicit `True` retain the legacy placeholder
+path. This native frontend-wait bridge is currently Python-specific; it does
 not claim TypeScript parity.
-
-### Server-side tool interrupts
 
 Tools that pause with `tool_context.interrupt(...)` are bridged to the AG-UI
 interrupt round-trip:
@@ -243,8 +208,8 @@ interrupt round-trip:
   instead emit a `tool_call` approval interrupt with an `approved` response
   schema. Applies to server-executed tools only. For client-provided tools, gate
   execution in the client — define the tool with a `render` that calls `respond`,
-  not a `handler` — since the tool runs in the browser; the run has already
-  paused on that tool's own `frontend_tool_call` interrupt.
+  not a `handler` — since the tool runs in the browser and the adapter has already
+  finished the public AG-UI run.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
 payload=...)]`. Strands' resume gate is truthiness-based (`if
@@ -290,13 +255,14 @@ interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
 | Native-only pause and resume on the same live wrapper, process, and `thread_id` | Supported without a `SessionManager`; the cached per-thread Strands agent is the checkpoint.                                                                                                                                                                                                     |
 | Wrapper recreation or cross-process resume                                      | Requires a compatible durable `SessionManager` that restores the same session and stable Strands `agent_id`.                                                                                                                                                                                     |
 | Legacy placeholder proxy and native interrupt in the same checkpoint            | Requires `session_id` plus `session_repository.list_messages()` and `session_repository.update_message()`. Without a manager the run emits `INTERRUPT_SESSION_REQUIRED`; without those capabilities it emits `INTERRUPT_SESSION_CAPABILITY_ERROR`. The checkpoint is not advertised or consumed. |
-| Waiting frontend tools, alone or mixed with ordinary interrupts                 | Uses the native Strands checkpoint. Both answer channels feed `resume[]`. Partial batches are recorded and the run stays paused until Strands reports the checkpoint complete.                                                                                                                   |
+| Explicitly waiting frontend tools, alone or mixed with ordinary interrupts      | Uses the native Strands checkpoint. Frontend answers arrive as `ToolMessage`s; ordinary interrupt answers retain `resume[]`. Partial batches are passed through and remain paused until Strands reports the checkpoint complete.                                                                 |
 
 Submitted resume batches are validated before streaming or reconciliation.
 They must contain unique, non-blank, currently open interrupt ids. An
 ordinary-only checkpoint still requires every open interrupt in one batch. A
-checkpoint containing waiting frontend tools may be answered partially; Strands
-records the supplied responses and remains paused on its unanswered siblings. Malformed or unopened entries emit
+checkpoint containing explicitly waiting frontend tools may be answered
+partially; Strands records the supplied responses and remains paused on its
+unanswered siblings. Malformed or unopened entries emit
 `INTERRUPT_RESUME_ERROR`; incomplete ordinary-only batches emit
 `PARTIAL_RESUME`. These failures leave the checkpoint retryable. If
 reconciliation fails while a legacy proxy/native interrupt checkpoint is

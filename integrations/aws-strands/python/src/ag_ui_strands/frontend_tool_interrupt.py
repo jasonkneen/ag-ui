@@ -7,43 +7,32 @@ from typing import Any, Mapping
 FRONTEND_TOOL_INTERRUPT_NAME = "ag_ui_frontend_tool_wait"
 FRONTEND_TOOL_RESPONSE_KEY = "__ag_ui_frontend_tool_response__"
 
-#: ``Interrupt.reason`` published for a frontend tool parked in a native wait.
-FRONTEND_TOOL_INTERRUPT_REASON = "frontend_tool_call"
 
-
-def frontend_tool_reason(tool_use_id: str, tool_name: str) -> dict[str, str]:
-    """Tag a native interrupt with its canonical Strands tool-use identity."""
+def frontend_tool_reason(tool_use_id: str) -> dict[str, str]:
+    """Tag a native interrupt with its canonical Strands tool-use ID."""
     if not isinstance(tool_use_id, str) or not tool_use_id.strip():
         raise ValueError("frontend tool-use ID must be non-blank")
-    if not isinstance(tool_name, str) or not tool_name.strip():
-        raise ValueError("frontend tool name must be non-blank")
     return {
         "name": FRONTEND_TOOL_INTERRUPT_NAME,
         "tool_use_id": tool_use_id,
-        "tool_name": tool_name,
     }
 
 
-def parse_frontend_tool_reason(reason: Any) -> tuple[str, str]:
-    """Return ``(tool_use_id, tool_name)`` from one exact frontend-wait tag."""
-    if not isinstance(reason, Mapping) or set(reason) != {
-        "name",
-        "tool_use_id",
-        "tool_name",
-    }:
+def parse_frontend_tool_reason(reason: Any) -> str:
+    """Return the canonical tool-use ID from one exact frontend-wait tag."""
+    if not isinstance(reason, Mapping) or set(reason) != {"name", "tool_use_id"}:
         raise ValueError("malformed frontend tool interrupt reason")
     if reason["name"] != FRONTEND_TOOL_INTERRUPT_NAME:
         raise ValueError("not a frontend tool interrupt")
-    parsed = frontend_tool_reason(reason["tool_use_id"], reason["tool_name"])
-    return parsed["tool_use_id"], parsed["tool_name"]
+    return frontend_tool_reason(reason["tool_use_id"])["tool_use_id"]
 
 
 def frontend_tool_response_schema() -> dict[str, Any]:
-    """The canonical ``resume[]`` payload contract for a frontend wait.
+    """The payload contract for one frontend tool answer.
 
-    Published on the AG-UI ``Interrupt`` so a client can answer the wait through
-    the standard resume channel. The legacy ``ToolMessage`` channel is a
-    boundary translation onto exactly this shape.
+    A waiting frontend tool is answered by an ordinary ``ToolMessage``, which
+    the adapter translates into a resume entry carrying this shape. The schema
+    exists so that translated entry is validated like any other.
     """
     return {
         "type": "object",
@@ -77,9 +66,7 @@ def index_frontend_tool_interrupts(agent: Any) -> dict[str, Any]:
             raise ValueError("Strands interrupt key does not match its ID")
         if not is_frontend_tool_interrupt(interrupt):
             continue
-        tool_use_id, _tool_name = parse_frontend_tool_reason(
-            getattr(interrupt, "reason", None)
-        )
+        tool_use_id = parse_frontend_tool_reason(getattr(interrupt, "reason", None))
         if tool_use_id in indexed:
             raise ValueError(f"duplicate frontend tool-use ID: {tool_use_id}")
         indexed[tool_use_id] = interrupt
