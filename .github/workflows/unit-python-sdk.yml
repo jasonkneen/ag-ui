@@ -195,6 +195,91 @@ jobs:
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: ./.github/actions/assert-lockfiles-unchanged
 
+  # The locked langgraph-python lane above installs whatever uv.lock resolves, which
+  # sits at or above the floor pyproject.toml declares. That leaves the declared
+  # minimum asserted by nothing -- and for this package that gap has teeth.
+  #
+  # ag-ui-langgraph imports SubagentStartedEvent, SubagentFinishedEvent,
+  # SubagentErrorEvent and SubagentFinishedSuspendedOutcome from ag_ui.core. None of
+  # them exist below ag-ui-protocol 0.1.21, so a floor declared any lower ships a
+  # wheel that ImportErrors on a clean install while every CI lane stays green --
+  # exactly the hazard the [tool.uv.sources] override carried until PNI-274, and the
+  # reason removing that override has to come with a gate rather than a promise.
+  #
+  # This lane installs the floor itself. It reads the version out of the manifest
+  # rather than repeating it, so raising the declared minimum moves this lane with it
+  # and the two cannot drift apart.
+  langgraph-python-declared-floor:
+    name: langgraph-python-declared-floor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        # id so the lockfile assertion below can gate on this step's outcome. See
+        # that step for why !cancelled() alone is not enough.
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Read the declared ag-ui-protocol floor
+        id: floor
+        working-directory: integrations/langgraph/python
+        run: |
+          set -euo pipefail
+          floor=$(grep -oE '"ag-ui-protocol>=[0-9]+(\.[0-9]+)*"' pyproject.toml \
+            | grep -oE '[0-9]+(\.[0-9]+)*')
+          if [ -z "$floor" ]; then
+            echo "::error::No \`ag-ui-protocol>=\` floor found in pyproject.toml." \
+                 "This lane exists to test that floor, so it must not pass without one."
+            exit 1
+          fi
+          echo "version=$floor" >> "$GITHUB_OUTPUT"
+          echo "Declared floor: ag-ui-protocol==$floor"
+
+      - name: Install dependencies
+        working-directory: integrations/langgraph/python
+        run: uv sync --locked
+
+      - name: Downgrade to the declared floor
+        working-directory: integrations/langgraph/python
+        # The floor reaches the shell through the environment, not through template
+        # expansion. The value is read out of a file in the repository, so on a fork
+        # PR it is attacker-controllable, and expanding it inline would splice that
+        # content into the script itself.
+        env:
+          AG_UI_PROTOCOL_FLOOR: ${{ steps.floor.outputs.version }}
+        run: |
+          set -euo pipefail
+          uv pip install "ag-ui-protocol==${AG_UI_PROTOCOL_FLOOR}"
+          uv run --no-sync python -c \
+            "import importlib.metadata as m; print('ag-ui-protocol', m.version('ag-ui-protocol'))"
+
+      # Fails loudly and specifically if the floor predates a symbol the code imports,
+      # rather than surfacing it as an opaque ImportError partway through the suite.
+      - name: Assert the floor satisfies the subagent imports
+        working-directory: integrations/langgraph/python
+        run: |
+          set -euo pipefail
+          uv run --no-sync python -c "import ag_ui_langgraph"
+
+      - name: Run tests at the declared floor
+        working-directory: integrations/langgraph/python
+        run: uv run --no-sync python -m unittest discover tests -v
+
+      - name: Assert no lockfile was rewritten
+        # Same reasoning as the locked lane: this must run even when the tests fail,
+        # or a run that rewrote a lockfile and then went red would report only the
+        # test failure and lose this signal.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: ./.github/actions/assert-lockfiles-unchanged
+
   watsonx-python:
     runs-on: ubuntu-latest
 
