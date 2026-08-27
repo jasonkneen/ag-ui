@@ -59,7 +59,7 @@ dev = [
 
 [[package]]
 name = "ag-ui-protocol"
-version = "0.1.20"
+version = "0.1.21"
 source = { directory = "../../../sdks/python" }
 dependencies = [
     { name = "pydantic" },
