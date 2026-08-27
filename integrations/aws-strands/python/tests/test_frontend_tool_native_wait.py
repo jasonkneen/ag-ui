@@ -915,3 +915,73 @@ async def test_conflicting_retry_of_a_recorded_result_fails(tmp_path: Path) -> N
     [error] = [event for event in conflicting if event.type == EventType.RUN_ERROR]
     assert error.code == "FRONTEND_TOOL_RESULT_CONFLICT"
     assert model.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_full_history_completion_after_a_partial_answer_is_repeatable(
+    tmp_path: Path,
+) -> None:
+    """A client sends its whole history, so a completing request repeats answers.
+
+    The request that closes a partially-answered wait carries the result
+    already recorded alongside the new one. Only the new answer is forwarded to
+    Strands, but an exact HTTP retry of that request must still be recognised
+    as the same request: on the retry the wait is closed, so both results read
+    as new. Anything less makes a plain network retry fail.
+    """
+    thread_id = "full-history-completion-retry"
+    model = _ParallelWaitModel()
+    user_turn = UserMessage(id="user-1", content="call both tools")
+
+    first = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(thread_id, run_id="run-1", messages=[user_turn]),
+    )
+    _assert_paused_on(first, "native-0", "native-1")
+
+    second_result = ToolMessage(
+        id="second-result", tool_call_id="native-1", content="second-value"
+    )
+    partial = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(thread_id, run_id="run-2", messages=[user_turn, second_result]),
+    )
+    _assert_paused_on(partial, "native-0")
+    assert model.calls == 1
+
+    completing_messages = [
+        user_turn,
+        second_result,
+        ToolMessage(id="first-result", tool_call_id="native-0", content="first-value"),
+    ]
+    completed = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(thread_id, run_id="run-3", messages=completing_messages),
+    )
+    _assert_success(completed)
+    assert model.calls == 2
+
+    retry = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(thread_id, run_id="run-3-retry", messages=completing_messages),
+    )
+    _assert_success(retry)
+    assert model.calls == 2
+
+    divergent = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-3-divergent",
+            messages=[
+                user_turn,
+                second_result,
+                ToolMessage(
+                    id="first-result", tool_call_id="native-0", content="changed"
+                ),
+            ],
+        ),
+    )
+    [error] = [event for event in divergent if event.type == EventType.RUN_ERROR]
+    assert error.code == "FRONTEND_TOOL_RESULT_CONFLICT"
+    assert model.calls == 2

@@ -2961,6 +2961,19 @@ class StrandsAgent:
                 list(resume_entries) if resume_submitted else []
             ) + bridged_resume_entries
             resume_submitted = True
+
+        # The idempotency fingerprint has to describe the whole submitted
+        # request, not just the part this run forwards. A client sends its full
+        # message history, so a request completing a partial wait repeats the
+        # answers already recorded alongside the new ones. Those repeats are
+        # dropped here, but on an exact retry the checkpoint is closed and every
+        # answer reads as new — so the fingerprint stored on success must cover
+        # both, or the retry would not be recognised as the same request.
+        fingerprint_only_entries = [
+            entry
+            for entry in replayed_resume_entries
+            if entry not in bridged_resume_entries
+        ]
         pending_resume_interrupts = self._pending_interrupts_by_thread.get(thread_id)
         resume_fingerprint = self._last_resume_fingerprint.get(thread_id)
         if resume_submitted and (
@@ -3023,7 +3036,9 @@ class StrandsAgent:
                 thread_id=input_data.thread_id,
                 run_id=input_data.run_id,
             )
-            fingerprint = _resume_fingerprint(resume_entries)
+            fingerprint = _resume_fingerprint(
+                resume_entries + fingerprint_only_entries
+            )
             if resume_fingerprint == fingerprint:
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
@@ -5342,7 +5357,9 @@ class StrandsAgent:
             else:
                 # Store fingerprint for idempotency only after successful processing
                 if resume_entries:
-                    fp = _resume_fingerprint(resume_entries)
+                    fp = _resume_fingerprint(
+                        resume_entries + fingerprint_only_entries
+                    )
                     self._pending_interrupts_by_thread.pop(thread_id, None)
                     self._last_resume_fingerprint[thread_id] = fp
                     _persist_interrupt_bookkeeping(strands_agent, None, fp)
