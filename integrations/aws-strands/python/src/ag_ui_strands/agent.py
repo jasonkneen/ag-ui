@@ -15,11 +15,13 @@ import types
 import typing
 import uuid
 import weakref
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from strands import Agent as StrandsAgentCore
+from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
 from strands.session import SessionManager
 from strands.types.interrupt import InterruptResponseContent
 
@@ -328,6 +330,39 @@ _WIRE_MAP_MAX = 512
 # It bounds abandoned entries (tool calls whose result never returns)
 # so state cannot grow without bound.
 _TOOL_CALL_MAP_MAX = 512
+
+# Request-scoped model context. A ContextVar keeps concurrent runs isolated;
+# the hook below injects it only for the model call and restores the durable
+# conversation immediately afterward.
+_MODEL_CONTEXT_BLOCK: ContextVar[str] = ContextVar(
+    "ag_ui_strands_model_context_block", default=""
+)
+_MODEL_CONTEXT_HOOK_MARKER = "_ag_ui_transient_model_context_hook"
+_MODEL_CONTEXT_MUTATION_MARKER = "_ag_ui_transient_model_context_mutation"
+
+
+async def _stream_with_model_context(
+    stream: AsyncIterator[Any], context_block: str
+) -> AsyncIterator[Any]:
+    """Scope request context to one model-stream pull at a time.
+
+    The FastAPI endpoint deliberately runs every ``__anext__`` call in a fresh
+    task so disconnect cancellation cannot interrupt agent cleanup. A
+    ContextVar token therefore cannot be held across an adapter yield: the
+    later reset may run in a different task context. Set and restore around
+    each pull instead, before yielding the resulting event to the endpoint.
+    """
+    iterator = stream.__aiter__()
+    while True:
+        token = _MODEL_CONTEXT_BLOCK.set(context_block)
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        finally:
+            _MODEL_CONTEXT_BLOCK.reset(token)
+        yield event
+
 
 # Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
 # cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
@@ -957,11 +992,16 @@ _RAW_SUPPRESSED_KEYS = frozenset(
 )
 
 
-def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _sanitize_raw_event(
+    event: Dict[str, Any],
+    invocation_state: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Return a JSON-safe RAW payload for ``event``, or ``None`` to drop it.
 
-    Sanitizing is deliberately an allow-by-serializability filter, never a
-    coercion: nothing is stringified to force it through. Coercing (e.g.
+    Keys present in the per-run invocation state are removed because Strands
+    may merge them into otherwise public model events. Sanitizing is
+    deliberately an allow-by-serializability filter, never a coercion: nothing
+    is stringified to force it through. Coercing (e.g.
     ``json.dumps(..., default=str)``) would ship the ``repr`` of the live
     ``Agent`` — system prompt, conversation history, model configuration — to
     every connected client. A payload that will not encode is dropped instead.
@@ -973,6 +1013,7 @@ def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         key: value
         for key, value in event.items()
         if key not in _RAW_INVOCATION_STATE_KEYS
+        and (invocation_state is None or key not in invocation_state)
     }
     if not payload:
         return None
@@ -988,6 +1029,73 @@ def _sanitize_raw_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             f"(keys={sorted(payload)}): {exc}"
         )
         return None
+
+
+def _extract_tool_result_data(result_content: Any) -> Any:
+    """Extract a meaningful value from Strands tool-result content.
+
+    Text blocks keep their established unwrapped representation and last-block
+    precedence. JSON blocks are unwrapped to match the TypeScript adapter. Media
+    blocks retain their wrapper (``image`` / ``document`` / ``video``) so the
+    payload type survives conversion to AG-UI's string-only result field.
+    """
+    if not isinstance(result_content, list):
+        return None
+
+    fallback_results = []
+    text_result = None
+    text_found = False
+    for content_item in result_content:
+        if not isinstance(content_item, dict):
+            continue
+
+        if "text" in content_item:
+            text_found = True
+            text_content = content_item["text"]
+            try:
+                text_result = json.loads(text_content)
+            except (json.JSONDecodeError, TypeError):
+                if isinstance(text_content, str):
+                    try:
+                        text_result = json.loads(text_content.replace("'", '"'))
+                    except (json.JSONDecodeError, TypeError):
+                        text_result = text_content
+                else:
+                    text_result = text_content
+            continue
+
+        if "json" in content_item:
+            fallback_results.append(content_item["json"])
+        else:
+            # Strands media blocks are already JSON-shaped dicts. Unknown
+            # non-text blocks are kept too, for forward compatibility.
+            fallback_results.append(content_item)
+
+    if text_found:
+        return text_result
+    if len(fallback_results) == 1:
+        return fallback_results[0]
+    return fallback_results or None
+
+
+def _serialize_tool_result_data(result_data: Any) -> str:
+    """Serialize a tool result for the AG-UI string field.
+
+    Strands represents inline media bytes as ``bytes``. TypeScript's SDK
+    ``toJSON`` method base64-encodes them, so do the same here to keep both
+    adapters wire-compatible. ``None`` represents a genuinely empty result.
+    """
+    if result_data is None:
+        return ""
+
+    def encode_bytes(value: Any) -> str:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(value)).decode("ascii")
+        raise TypeError(
+            f"Object of type {type(value).__name__} is not JSON serializable"
+        )
+
+    return json.dumps(result_data, default=encode_bytes)
 
 
 async def _forward_inner_agent_events(
@@ -1236,7 +1344,8 @@ def _build_strands_history(
                 )
                 if has_media:
                     blocks = convert_agui_content_to_strands(
-                        content, url_fetch_policy, fetch_budget
+                        content, url_fetch_policy, fetch_budget,
+                        message_id=getattr(msg, "id", None),
                     )
                     if isinstance(blocks, list) and blocks:
                         out.append({"role": "user", "content": blocks})
@@ -1926,6 +2035,189 @@ class StrandsInterruptHook:
             event.cancel_tool = f"User denied approval for '{tool_name}'."
 
 
+def _normalize_agui_context(context: Any) -> List[Dict[str, Any]]:
+    """Normalize wire context into JSON-compatible description/value pairs."""
+    normalized = []
+    for entry in context or []:
+        if isinstance(entry, dict):
+            description = entry.get("description", "")
+            value = entry.get("value", "")
+        else:
+            description = getattr(entry, "description", "") or ""
+            value = getattr(entry, "value", "") or ""
+        normalized.append({"description": description, "value": value})
+    return normalized
+
+
+def _format_agui_context(agui_context: List[Dict[str, Any]]) -> str:
+    """Render application-provided ``RunAgentInput.context`` as a text block for
+    the model prompt.
+
+    ``agui_context`` is stored on ``strands_agent.state`` for tools to read, but
+    nothing surfaces it to the model — so context the app injects (e.g. via
+    ``useCopilotReadable``) was invisible to the LLM. The A2UI component-schema
+    entry is excluded (handled by the ``render_a2ui`` tool path)."""
+    _, regular_context = split_a2ui_schema_context(agui_context)
+    lines: List[str] = []
+    for ctx in regular_context:
+        description = (ctx.get("description") or "").strip()
+        value = ctx.get("value")
+        value_str = value if isinstance(value, str) else json.dumps(value)
+        lines.append(f"- {description}: {value_str}" if description else f"- {value_str}")
+    if not lines:
+        return ""
+    return "Context provided by the application:\n" + "\n".join(lines)
+
+
+def _a2ui_render_guide_description(tool_name: str) -> str:
+    """Exact context marker emitted by ``@ag-ui/a2ui-middleware``."""
+    return (
+        "A2UI render tool usage guide — how to call "
+        f"{tool_name} with valid arguments."
+    )
+
+
+def _without_a2ui_render_guides(context: list, tool_names: List[str]) -> list:
+    """Drop only usage guides for render tools replaced by this adapter."""
+    descriptions = {_a2ui_render_guide_description(name) for name in tool_names}
+    return [
+        entry
+        for entry in context
+        if (
+            entry.get("description")
+            if isinstance(entry, dict)
+            else getattr(entry, "description", None)
+        )
+        not in descriptions
+    ]
+
+
+class _TransientModelContextHook:
+    """Expose request context to the model without persisting it as history."""
+
+    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
+        registry.add_callback(BeforeModelCallEvent, self._before_model_call)
+        registry.add_callback(AfterModelCallEvent, self._after_model_call)
+
+    def _before_model_call(self, event: Any) -> None:
+        context_block = _MODEL_CONTEXT_BLOCK.get()
+        if not context_block:
+            return
+        if event.agent.__dict__.get(_MODEL_CONTEXT_MUTATION_MARKER) is not None:
+            raise RuntimeError("Transient AG-UI model context was not restored")
+
+        messages = event.agent.messages
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        context_message = {
+            "role": "user",
+            "content": [{"text": context_block}],
+        }
+
+        if latest_user_index is None:
+            messages.append(context_message)
+            setattr(
+                event.agent,
+                _MODEL_CONTEXT_MUTATION_MARKER,
+                ("insert", messages, len(messages) - 1, context_message),
+            )
+            return
+
+        latest_user = messages[latest_user_index]
+        content = latest_user.get("content")
+        if isinstance(content, list) and any("toolResult" in block for block in content):
+            latest_user["content"] = [{"text": context_block}, *content]
+            setattr(
+                event.agent,
+                _MODEL_CONTEXT_MUTATION_MARKER,
+                ("replace", latest_user, content),
+            )
+            return
+
+        # Keep the actual latest user turn byte-identical for model routers and
+        # fixtures that key off it, while placing live UI context immediately
+        # before that turn rather than at the start of stale history.
+        messages.insert(latest_user_index, context_message)
+        setattr(
+            event.agent,
+            _MODEL_CONTEXT_MUTATION_MARKER,
+            ("insert", messages, latest_user_index, context_message),
+        )
+
+    def _after_model_call(self, event: Any) -> None:
+        _restore_transient_model_context(event.agent)
+
+
+def _restore_transient_model_context(agent: Any) -> None:
+    """Undo an in-flight context mutation, including on stream cancellation."""
+    mutation = getattr(agent, "__dict__", {}).get(_MODEL_CONTEXT_MUTATION_MARKER)
+    if mutation is None:
+        return
+    kind = mutation[0]
+    if kind == "replace":
+        _, message, original_content = mutation
+        message["content"] = original_content
+    else:
+        _, messages, index, inserted = mutation
+        if index < len(messages) and messages[index] is inserted:
+            messages.pop(index)
+        else:
+            messages.remove(inserted)
+    delattr(agent, _MODEL_CONTEXT_MUTATION_MARKER)
+
+
+def _ensure_transient_context_hook(agent: Any) -> bool:
+    """Install the model-only context hook once on a Strands agent."""
+    if getattr(agent, _MODEL_CONTEXT_HOOK_MARKER, False) is True:
+        return True
+    hooks = getattr(agent, "hooks", None)
+    add_hook = getattr(hooks, "add_hook", None)
+    if not callable(add_hook):
+        return False
+    add_hook(_TransientModelContextHook())
+    setattr(agent, _MODEL_CONTEXT_HOOK_MARKER, True)
+    return True
+
+
+def _install_orchestrator_context_hooks(
+    orchestrator: Any, _depth: int = 0
+) -> int:
+    """Install transient context hooks on every leaf agent in an orchestrator."""
+    if _depth > _MAX_MULTIAGENT_NESTING:
+        return 0
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return 0
+    installed = 0
+    for node in nodes.values():
+        executor = getattr(node, "executor", None)
+        if _ensure_transient_context_hook(executor):
+            installed += 1
+        else:
+            installed += _install_orchestrator_context_hooks(executor, _depth + 1)
+    return installed
+
+
+def _restore_orchestrator_context(orchestrator: Any, _depth: int = 0) -> None:
+    """Restore transient context on every visible orchestrator leaf."""
+    if _depth > _MAX_MULTIAGENT_NESTING:
+        return
+    nodes = getattr(orchestrator, "nodes", None)
+    if not isinstance(nodes, dict):
+        return
+    for node in nodes.values():
+        executor = getattr(node, "executor", None)
+        if getattr(executor, _MODEL_CONTEXT_HOOK_MARKER, False) is True:
+            _restore_transient_model_context(executor)
+        else:
+            _restore_orchestrator_context(executor, _depth + 1)
+
 
 class StrandsAgent:
     """AWS Strands Agent wrapper for AG-UI integration."""
@@ -2146,7 +2438,10 @@ class StrandsAgent:
         return responses or None
 
     async def _run_orchestrator(
-        self, input_data: RunAgentInput
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Any]:
         """Drive a multi-agent orchestrator and translate its event stream.
 
@@ -2243,9 +2538,31 @@ class StrandsAgent:
                       else _snapshot_orchestrator_nodes(orchestrator)
                   )
 
-              stream = orchestrator.stream_async(prompt)
+              context_block = _format_agui_context(
+                  _normalize_agui_context(input_data.context)
+              )
+              installed_hooks = _install_orchestrator_context_hooks(orchestrator)
+              if context_block and installed_hooks == 0:
+                  if resume_prompt is not None:
+                      raise RuntimeError(
+                          "Orchestrator leaves do not expose hook registries for "
+                          "transient context during interrupt resume"
+                      )
+                  # Structural/custom orchestrators without visible leaf agents
+                  # can only receive context in their task input. Factory runs
+                  # are fresh and shared runs are rewound below, so this does not
+                  # outlive the run.
+                  prompt = f"{context_block}\n\n{prompt}"
+                  context_block = ""
+
+              stream_kwargs = (
+                  {"invocation_state": invocation_state}
+                  if invocation_state is not None
+                  else {}
+              )
+              stream = orchestrator.stream_async(prompt, **stream_kwargs)
               try:
-                  async for event in stream:
+                  async for event in _stream_with_model_context(stream, context_block):
                       if not isinstance(event, dict):
                           continue
                       event_type = event.get("type")
@@ -2348,6 +2665,7 @@ class StrandsAgent:
                           logger.debug(
                               "orchestrator stream teardown failed", exc_info=True
                           )
+                  _restore_orchestrator_context(orchestrator)
 
               for closing in _close_open_multiagent(nodes, open_steps):
                   yield closing
@@ -2432,8 +2750,30 @@ class StrandsAgent:
             ", ".join(still_missing),
         )
 
-    async def run(self, input_data: RunAgentInput) -> AsyncIterator[Any]:
-        """Run the Strands agent and yield AG-UI events."""
+    async def run(
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        """Run the Strands agent and yield AG-UI events.
+
+        Args:
+            input_data: The AG-UI run request.
+            invocation_state: Optional request-scoped state copied before it is
+                forwarded to the underlying Strands invocation. The state is
+                available to hooks and tools but is not added to the model
+                context.
+        """
+
+        run_invocation_state = (
+            dict(invocation_state) if invocation_state is not None else None
+        )
+        stream_kwargs = (
+            {"invocation_state": run_invocation_state}
+            if run_invocation_state is not None
+            else {}
+        )
 
         if self._orchestrator is not None:
             # An orchestrator carries execution state on the instance and its
@@ -2488,7 +2828,10 @@ class StrandsAgent:
             # Close the delegate explicitly: when the consumer abandons this
             # generator, `async for` alone would leave the inner one suspended
             # until GC, so the orchestrator stream would keep running.
-            orchestrator_events = self._run_orchestrator(input_data)
+            orchestrator_events = self._run_orchestrator(
+                input_data,
+                invocation_state=run_invocation_state,
+            )
             try:
                 async for event in orchestrator_events:
                     yield event
@@ -2733,22 +3076,8 @@ class StrandsAgent:
         # langgraph integration where tools read ``runtime.state["copilotkit"]
         # ["context"]``. Stored as a plain list of ``{description, value}``
         # dicts to satisfy ``JSONSerializableDict`` validation.
-        agui_context = []
-        for ctx in (input_data.context or []):
-            if isinstance(ctx, dict):
-                agui_context.append(
-                    {
-                        "description": ctx.get("description", ""),
-                        "value": ctx.get("value", ""),
-                    }
-                )
-            else:
-                agui_context.append(
-                    {
-                        "description": getattr(ctx, "description", "") or "",
-                        "value": getattr(ctx, "value", "") or "",
-                    }
-                )
+        agui_context = _normalize_agui_context(input_data.context)
+        model_context = agui_context
         try:
             strands_agent.state.set("agui_context", agui_context)
         except Exception as e:
@@ -2829,6 +3158,16 @@ class StrandsAgent:
                     # Keep the proxy bookkeeping honest — the dropped render
                     # tool is no longer registered.
                     self._proxy_tool_names_by_thread.get(thread_id, set()).discard(name)
+                # The middleware also supplies a usage guide for the render
+                # proxy. Once that proxy is replaced with ``generate_a2ui``,
+                # the guide is stale and must reach neither the outer model nor
+                # the recovery subagent.
+                model_context = _without_a2ui_render_guides(
+                    agui_context, a2ui_plan["drop_tool_names"]
+                )
+                a2ui_ag_ui["context"] = _without_a2ui_render_guides(
+                    a2ui_regular_ctx, a2ui_plan["drop_tool_names"]
+                )
         except Exception as e:  # noqa: BLE001 — never crash the turn here
             # ERROR, not warning: the runtime explicitly requested injection
             # (injectA2UITool) and this turn runs without it.
@@ -3245,6 +3584,7 @@ class StrandsAgent:
                                     convert_agui_content_to_strands,
                                     msg.content,
                                     self.config.url_fetch_policy,
+                                    message_id=getattr(msg, "id", None),
                                 )
                                 if not user_message:
                                     # All content blocks failed conversion — fall back to text
@@ -3355,17 +3695,34 @@ class StrandsAgent:
                             exc_info=True,
                         )
 
-            # Scope to the TRAILING tool results (this continuation's just-
-            # returned results). ``pending_tool_result_ids`` holds those ids;
-            # without this, a multi-turn continuation re-sends already-reconciled
-            # historical results, which can never be re-corrected and would force
-            # the legacy fallback every turn.
+            # Scope: this continuation's just-returned results, plus any earlier
+            # frontend call whose placeholder is still uncorrected.
+            #
+            # ``pending_tool_result_ids`` holds the TRAILING ids only (it is built
+            # by a reversed scan that stops at the first non-tool message). On its
+            # own it misses a result the client delivers on a LATER turn, with a
+            # user message after it: that result never reaches reconciliation and
+            # the persisted toolResult keeps ``PROXY_RESULT_PLACEHOLDER`` forever.
+            #
+            # A live entry in ``wire_to_native`` is the second admission signal,
+            # and it is safe precisely because of how that map is maintained below:
+            # entries are dropped once their placeholder is actually corrected, and
+            # kept only so a later turn can retry. An already-reconciled historical
+            # result is therefore absent from the map and still cannot re-enter
+            # here — which is what scoping to the trailing ids was protecting.
             frontend_results: List[Dict[str, Any]] = []
-            for msg in (input_data.messages or []):
+            last_frontend_result_index: int | None = None
+            input_messages = input_data.messages or []
+            for msg_index, msg in enumerate(input_messages):
                 if getattr(msg, "role", None) != "tool":
                     continue
                 wire_id = getattr(msg, "tool_call_id", None)
-                if not wire_id or wire_id not in pending_tool_result_ids:
+                if not wire_id:
+                    continue
+                if (
+                    wire_id not in pending_tool_result_ids
+                    and wire_id not in wire_to_native
+                ):
                     continue
                 name = _tool_call_id_to_name.get(wire_id)
                 if name not in frontend_tool_names and wire_id not in wire_to_native:
@@ -3386,6 +3743,15 @@ class StrandsAgent:
                         "is_error": bool(getattr(msg, "error", None)),
                     }
                 )
+                last_frontend_result_index = msg_index
+
+            has_newer_user_message = (
+                last_frontend_result_index is not None
+                and any(
+                    getattr(msg, "role", None) == "user"
+                    for msg in input_messages[last_frontend_result_index + 1 :]
+                )
+            )
 
             # Translate the client's wire tool_call_id back to the native
             # toolUseId Strands persisted (they differ for frontend tools — see
@@ -3484,6 +3850,11 @@ class StrandsAgent:
             # below runs unconditionally after the other branches and layers
             # on top, rather than short-circuiting them.
             resume_prompt: str | List[Dict[str, Any]] | list[InterruptResponseContent] | None = user_message
+            context_block = _format_agui_context(model_context)
+            if context_block and not _ensure_transient_context_hook(strands_agent):
+                raise RuntimeError(
+                    "Strands agent does not expose a hook registry for transient context"
+                )
             if replay_history:
                 native_history = await asyncio.to_thread(
                     _build_strands_history,
@@ -3575,7 +3946,14 @@ class StrandsAgent:
                     getattr(strands_agent, "messages", None) or [],
                     only_ids=set(resolved_native_results),
                 )
-                resume_prompt = None if reconciled else user_message
+                # A non-trailing result can be repaired from native history, but
+                # a user message after it is still this run's new prompt. Passing
+                # None here would silently drop that newer turn.
+                resume_prompt = (
+                    None
+                    if reconciled and not has_newer_user_message
+                    else user_message
+                )
 
             # A client answering to an interrupt sends its responses
             # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
@@ -3602,9 +3980,11 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
-            agent_stream = strands_agent.stream_async(resume_prompt)
+            agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
-                async for event in agent_stream:
+                async for event in _stream_with_model_context(
+                    agent_stream, context_block
+                ):
                     # Capture the terminal ``AgentResult`` (always emitted last
                     # by ``stream_async``) so a native interrupt pause can be
                     # detected after the loop. Recorded first so it is never
@@ -3959,26 +4339,9 @@ class StrandsAgent:
                             result_tool_id = tool_result.get("toolUseId")
                             result_content = tool_result.get("content", [])
 
-                            result_data = None
-                            if result_content and isinstance(result_content, list):
-                                for content_item in result_content:
-                                    if (
-                                        isinstance(content_item, dict)
-                                        and "text" in content_item
-                                    ):
-                                        text_content = content_item["text"]
-                                        try:
-                                            result_data = json.loads(text_content)
-                                        except json.JSONDecodeError:
-                                            try:
-                                                json_text = text_content.replace(
-                                                    "'", '"'
-                                                )
-                                                result_data = json.loads(json_text)
-                                            except Exception:
-                                                result_data = text_content
+                            result_data = _extract_tool_result_data(result_content)
 
-                            if not result_tool_id or result_data is None:
+                            if not result_tool_id:
                                 continue
 
                             # Direct lookup works for backend tools (keyed by Strands ID).
@@ -4042,7 +4405,9 @@ class StrandsAgent:
                             # A fresh message ID is used so CopilotKit creates a proper standalone
                             # ToolMessage and closes the spinner correctly.
                             tool_result_message_id = str(uuid.uuid4())
-                            tool_result_content = json.dumps(result_data)
+                            tool_result_content = _serialize_tool_result_data(
+                                result_data
+                            )
                             yield ToolCallResultEvent(
                                 type=EventType.TOOL_CALL_RESULT,
                                 tool_call_id=result_tool_id,
@@ -4792,7 +5157,7 @@ class StrandsAgent:
                     # in ``endpoint.py`` (RunErrorEvent + break), costing the
                     # client its TEXT_MESSAGE_END, snapshots and RUN_FINISHED.
                     else:
-                        raw_payload = _sanitize_raw_event(event)
+                        raw_payload = _sanitize_raw_event(event, run_invocation_state)
                         if raw_payload is None:
                             continue
                         logger.debug(
@@ -4871,6 +5236,8 @@ class StrandsAgent:
                 except Exception as e:
                     # Log other errors but don't fail
                     logger.warning(f"Error closing agent stream: {e}")
+                finally:
+                    _restore_transient_model_context(strands_agent)
 
             # Close reasoning if still open
             if reasoning_started:

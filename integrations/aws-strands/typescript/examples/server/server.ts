@@ -13,6 +13,7 @@ import {
   addPing,
   addCapabilities,
 } from "@ag-ui/aws-strands/server";
+import { corsPolicyFromEnv } from "./cors";
 import { createModel } from "./model-factory";
 import { createA2UIDynamicSchemaAgent } from "./api/a2ui-dynamic-schema";
 import { createA2UIFixedSchemaAgent } from "./api/a2ui-fixed-schema";
@@ -32,7 +33,10 @@ function mountAgent(
 
 async function main(): Promise<void> {
   const app = express();
-  app.use(cors({ origin: true, credentials: true }));
+  // Browser origins allowed to read this server's responses, from
+  // `CORS_ALLOW_ORIGINS`. See ./cors.ts for what the variable accepts.
+  const corsPolicy = corsPolicyFromEnv();
+  app.use(cors({ origin: corsPolicy.origin }));
   app.use(express.json({ limit: "4mb" }));
   addPing(app, "/ping");
   addCapabilities(app, "/capabilities");
@@ -386,6 +390,7 @@ Do not respond with plain text — always use the tool.`,
   const host = process.env.HOST ?? "0.0.0.0";
   app.listen(port, host, () => {
     console.log(`TS strands server listening on ${host}:${port}`);
+    console.log(`Browser origins allowed: ${corsPolicy.description}`);
   });
 }
 
