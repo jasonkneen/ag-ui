@@ -231,12 +231,30 @@ jobs:
       - name: Read the declared ag-ui-protocol floor
         id: floor
         working-directory: integrations/langgraph/python
+        # Reads [project].dependencies specifically. That table is what becomes the
+        # built wheel's Requires-Dist, and it is the floor this lane exists to test.
+        # Scanning the whole manifest would also match [dependency-groups] or
+        # [project.optional-dependencies], where a version has no bearing on what a
+        # clean `pip install ag-ui-langgraph` resolves -- so the lane could report a
+        # floor it had tested while the wheel declared something else entirely.
+        #
+        # Parsed with tomllib rather than grepped for two reasons. Equivalent
+        # spellings all work ("ag-ui-protocol>=0.1.21", "ag-ui-protocol >= 0.1.21",
+        # single-quoted TOML, a trailing environment marker), where an exact-match
+        # grep silently misses them. And a grep that matches nothing exits non-zero,
+        # which under `set -euo pipefail` kills this step at the assignment -- the
+        # no-floor branch below could never run, so the explicit error it exists to
+        # print was unreachable. Python exits 0 with empty output instead, which
+        # makes that branch live.
+        #
+        # The interpreter comes from uv (installed above) rather than the runner
+        # image, so this does not depend on which python3 the image happens to ship
+        # being new enough for tomllib.
         run: |
           set -euo pipefail
-          floor=$(grep -oE '"ag-ui-protocol>=[0-9]+(\.[0-9]+)*"' pyproject.toml \
-            | grep -oE '[0-9]+(\.[0-9]+)*')
+          floor=$(uv run --no-project python -c 'import re,tomllib;deps=tomllib.load(open("pyproject.toml","rb"))["project"]["dependencies"];print(next((m.group(1) for d in deps if (m:=re.match(r"^ag-ui-protocol\s*>=\s*([0-9][0-9.]*)",d))),""))')
           if [ -z "$floor" ]; then
-            echo "::error::No \`ag-ui-protocol>=\` floor found in pyproject.toml." \
+            echo "::error::No \`ag-ui-protocol>=\` floor found in [project].dependencies." \
                  "This lane exists to test that floor, so it must not pass without one."
             exit 1
           fi
