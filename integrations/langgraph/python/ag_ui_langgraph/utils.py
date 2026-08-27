@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import TypeAdapter
 from pydantic_core import PydanticSerializationError
 from typing import List, Any, Dict, NamedTuple, Union
+from collections.abc import Mapping
 from dataclasses import is_dataclass, asdict, fields
 from datetime import date, datetime
 
@@ -1887,7 +1888,17 @@ def resolve_encrypted_reasoning_content(chunk: Any) -> str | None:
     - `redacted_thinking` blocks with encrypted `data` (redacted chain-of-thought)
     """
     content = _dual_get(chunk, "content") if chunk is not None else None
-    if not content or not isinstance(content, list) or not content or not content[0]:
+    # `Mapping`, not a truthiness check: the next line dereferences
+    # `content[0].get(...)`, and `list[str]` is a first-class LangChain content
+    # shape, so a chunk of ["hello"] raised AttributeError straight out of a
+    # function that runs per streamed chunk in `_handle_single_event` with no
+    # enclosing try. Rule 1 of the malformed-input contract, on the streaming
+    # leg. `Mapping` rather than `dict` because the old check accepted any
+    # duck-typed mapping through `.get`, and narrowing to `dict` would silently
+    # drop the mapping-backed blocks some providers return; `Mapping` still
+    # excludes `str`, which is the shape that crashed. The sibling
+    # `resolve_reasoning_content` already guards its own block read.
+    if not isinstance(content, list) or not content or not isinstance(content[0], Mapping):
         return None
 
     # Anthropic redacted_thinking block: { type: "redacted_thinking", data: "..." }
