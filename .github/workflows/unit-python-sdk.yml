@@ -247,10 +247,20 @@ jobs:
         # no-floor branch below unreachable dead code.
         #
         # Handled: extras, an added upper bound, prerelease floors, and the
-        # underscore spelling of the name (canonicalize_name). Deliberately NOT
-        # handled, and failing closed with an explicit message rather than guessing:
-        # an environment marker, since this lane installs the floor unconditionally
-        # and so cannot honour one.
+        # underscore spelling of the name (canonicalize_name).
+        #
+        # Everything else fails CLOSED with an explicit message rather than guessing,
+        # because every way of guessing wrong here produces the same silent outcome —
+        # a lane that reports testing a floor the wheel does not declare. The rule is
+        # one unambiguous floor or nothing: exactly one requirement naming this
+        # distribution, no environment marker on it, exactly one `>=` in it.
+        #
+        # The multiple-requirements case is the subtle one. PEP 621 permits
+        # `ag-ui-protocol` to appear more than once with different markers, each
+        # becoming its own Requires-Dist, in which case the effective floor is
+        # whichever marker matches the installing interpreter. Taking the first match
+        # would silently ignore the rest — including a marker this lane would
+        # otherwise have rejected.
         #
         # The interpreter comes from uv (installed above) rather than the runner
         # image, so this does not depend on the image's python3 being new enough for
@@ -262,19 +272,19 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.utils import canonicalize_name
           deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
-          for raw in deps:
-              req = Requirement(raw)
-              if canonicalize_name(req.name) != "ag-ui-protocol":
-                  continue
+          reqs = [r for r in map(Requirement, deps) if canonicalize_name(r.name) == "ag-ui-protocol"]
+          if len(reqs) > 1:
+              print("UNSUPPORTED:found " + str(len(reqs)) + " ag-ui-protocol requirements (" + "; ".join(str(r) for r in reqs) + "). PEP 621 permits that, but the effective floor then depends on markers this lane cannot evaluate.")
+          elif len(reqs) == 1:
+              req = reqs[0]
               if req.marker is not None:
-                  print("UNSUPPORTED:the ag-ui-protocol requirement carries an environment marker (" + raw + "), which this lane cannot honour because it installs the floor unconditionally.")
-                  break
-              mins = [sp.version for sp in req.specifier if sp.operator == ">="]
-              if len(mins) != 1:
-                  print("UNSUPPORTED:expected exactly one >= specifier on ag-ui-protocol, got (" + raw + ").")
-                  break
-              print(mins[0])
-              break
+                  print("UNSUPPORTED:the ag-ui-protocol requirement carries an environment marker (" + str(req) + "), which this lane cannot honour because it installs the floor unconditionally.")
+              else:
+                  mins = [sp.version for sp in req.specifier if sp.operator == ">="]
+                  if len(mins) != 1:
+                      print("UNSUPPORTED:expected exactly one >= specifier on ag-ui-protocol, got (" + str(req) + ").")
+                  else:
+                      print(mins[0])
           ')
           case "$floor" in
             UNSUPPORTED:*)
