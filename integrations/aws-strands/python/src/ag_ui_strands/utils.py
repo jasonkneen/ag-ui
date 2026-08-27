@@ -176,6 +176,41 @@ class _FetchBudget:
         self.bytes_read += read
 
 
+@dataclass
+class _FetchAllowance:
+    """What one fetch has left to spend, its redirect hops included.
+
+    :class:`_FetchBudget` bounds a whole run.  This bounds one fetch inside
+    it, and it stays live across the redirect chain: the body of every hop and
+    the body of the final response draw down the same allowance, so neither
+    ``max_bytes`` nor the run's remaining time restarts at a redirect.
+    """
+
+    policy: Optional[UrlFetchPolicy] = None
+    budget: Optional[_FetchBudget] = None
+    bytes_read: int = 0
+
+    def __post_init__(self) -> None:
+        self.policy = self.policy or DEFAULT_URL_FETCH_POLICY
+        self.budget = self.budget if self.budget is not None else _FetchBudget(self.policy)
+
+    def remaining_seconds(self) -> float:
+        return self.budget.remaining_seconds()
+
+    def remaining_bytes(self) -> int:
+        return max(
+            0,
+            min(
+                self.policy.max_bytes - self.bytes_read,
+                self.budget.remaining_bytes(),
+            ),
+        )
+
+    def account(self, read: int) -> None:
+        self.bytes_read += read
+        self.budget.account(read)
+
+
 def _is_blocked_address(
     ip: "ipaddress._BaseAddress", allow_private_networks: bool = False
 ) -> bool:
@@ -354,9 +389,9 @@ class _PolicyHTTPSHandler(urllib.request.HTTPSHandler):
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-applies the fetch policy and the run's ceilings to every redirect."""
 
-    def __init__(self, policy: UrlFetchPolicy, budget: _FetchBudget):
+    def __init__(self, policy: UrlFetchPolicy, allowance: _FetchAllowance):
         self._policy = policy
-        self._budget = budget
+        self._allowance = allowance
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _validate_fetch_url(newurl, self._policy)
@@ -377,22 +412,24 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
         next hop the timeout the previous one was given, so on its own the
         ceilings bound nothing but the final response.
         """
-        remaining = self._budget.remaining_seconds()
+        remaining = self._allowance.remaining_seconds()
         if remaining <= 0:
             fp.close()
             raise UrlFetchPolicyError(
                 f"run exceeded its {self._policy.max_total_seconds} second "
                 "total fetch time"
             )
-        # The next hop gets what is left of the run, not another full timeout.
+        # A starting point only; the drain refreshes this once it knows how
+        # much of the clock it spent.
         req.timeout = min(self._policy.timeout, remaining)
-        cap = min(self._policy.max_bytes, self._budget.remaining_bytes())
-        bounded = _BudgetedRedirectBody(fp, cap, self._budget)
+        bounded = _BudgetedRedirectBody(fp, req, self._policy, self._allowance)
         try:
             return super().http_error_302(req, bounded, code, msg, headers)
-        except UrlFetchPolicyError:
+        finally:
+            # Nothing past this point reads this hop's response, on any exit.
+            # The success path has already closed it and closing twice is safe,
+            # which keeps every failure covered without naming them.
             fp.close()
-            raise
 
     # urllib binds these aliases to its own ``http_error_302``, so each one has
     # to be re-pointed for a hop of that code to reach the override above.
@@ -408,7 +445,7 @@ if hasattr(urllib.request.HTTPRedirectHandler, "http_error_308"):
     _PolicyRedirectHandler.http_error_308 = _PolicyRedirectHandler._follow_redirect
 
 
-def _open_url(url: str, timeout: float, policy: UrlFetchPolicy, budget: _FetchBudget):
+def _open_url(url: str, timeout: float, policy: UrlFetchPolicy, allowance: _FetchAllowance):
     """Open *url* with policy checks and address pinning on every hop.
 
     The opener is assembled by hand rather than with
@@ -424,7 +461,7 @@ def _open_url(url: str, timeout: float, policy: UrlFetchPolicy, budget: _FetchBu
     for handler in (
         _PolicyHTTPHandler(policy),
         _PolicyHTTPSHandler(policy),
-        _PolicyRedirectHandler(policy, budget),
+        _PolicyRedirectHandler(policy, allowance),
         urllib.request.HTTPDefaultErrorHandler(),
         urllib.request.HTTPErrorProcessor(),
         # Turns an unhandled scheme into a clear URLError instead of a None
@@ -445,7 +482,7 @@ def _open_url(url: str, timeout: float, policy: UrlFetchPolicy, budget: _FetchBu
 _READ_CHUNK_BYTES = 64 * 1024
 
 
-def _read_within_budget(resp, cap: int, budget: _FetchBudget) -> bytes:
+def _read_within_budget(resp, cap: int, allowance: _FetchAllowance) -> bytes:
     """Read at most *cap* bytes, giving up if the run runs out of time.
 
     Reading in chunks is what makes ``max_total_seconds`` enforceable: the
@@ -465,16 +502,16 @@ def _read_within_budget(resp, cap: int, budget: _FetchBudget) -> bytes:
     chunks: List[bytes] = []
     read_total = 0
     while read_total <= cap:
-        if budget.remaining_seconds() <= 0:
+        if allowance.remaining_seconds() <= 0:
             raise UrlFetchPolicyError(
-                f"run exceeded its {budget.policy.max_total_seconds} second "
+                f"run exceeded its {allowance.policy.max_total_seconds} second "
                 "total fetch time"
             )
         chunk = read_chunk(min(_READ_CHUNK_BYTES, cap + 1 - read_total))
         if not chunk:
             break
         read_total += len(chunk)
-        budget.account(len(chunk))
+        allowance.account(len(chunk))
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -488,20 +525,32 @@ class _BudgetedRedirectBody:
     truncated body no one would look at.
     """
 
-    def __init__(self, fp, cap: int, budget: _FetchBudget):
+    def __init__(self, fp, req, policy: UrlFetchPolicy, allowance: _FetchAllowance):
         self._fp = fp
-        self._cap = cap
-        self._budget = budget
+        self._req = req
+        self._policy = policy
+        self._allowance = allowance
 
     def read(self, amt: Optional[int] = None) -> bytes:
-        limit = self._cap if amt is None else min(self._cap, amt)
-        data = _read_within_budget(self._fp, limit, self._budget)
+        limit = self._allowance.remaining_bytes()
+        if amt is not None:
+            limit = min(limit, amt)
+        data = _read_within_budget(self._fp, limit, self._allowance)
         if len(data) > limit:
             raise UrlFetchPolicyError(
                 f"redirect response body exceeds the {limit} byte limit left "
-                "in this run"
+                "in this fetch"
             )
-        self._cap -= len(data)
+        # urllib opens the next hop immediately after this drain, so the
+        # timeout it will use has to be taken now: taken any earlier, it would
+        # not account for the time the drain itself just spent.
+        remaining = self._allowance.remaining_seconds()
+        if remaining <= 0:
+            raise UrlFetchPolicyError(
+                f"run exceeded its {self._policy.max_total_seconds} second "
+                "total fetch time"
+            )
+        self._req.timeout = min(self._policy.timeout, remaining)
         return data
 
     def __getattr__(self, name):
@@ -557,11 +606,14 @@ def _fetch_url_bytes(
             parts.scheme, parts.netloc, encoded_path,
             encoded_query, parts.fragment,
         ))
+        allowance = _FetchAllowance(policy, budget)
         # Never wait past the run deadline for a fetch that has stalled.
-        timeout = min(policy.timeout, budget.remaining_seconds())
-        cap = min(policy.max_bytes, budget.remaining_bytes())
-        with _open_url(safe_url, timeout, policy, budget) as resp:
-            data = _read_within_budget(resp, cap, budget)
+        timeout = min(policy.timeout, allowance.remaining_seconds())
+        with _open_url(safe_url, timeout, policy, allowance) as resp:
+            # Taken here rather than before the open: any redirect hop has
+            # already drawn on the allowance by now.
+            cap = allowance.remaining_bytes()
+            data = _read_within_budget(resp, cap, allowance)
         if len(data) > cap:
             logger.error(
                 "Refusing to fetch URL (url_id=%s): response exceeds the %d byte limit",
