@@ -15,7 +15,7 @@ import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from strands import Agent as StrandsAgentCore
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
@@ -365,6 +365,59 @@ def _interrupt_resume_error(message: str) -> "RunErrorEvent":
         message=message,
         code="INTERRUPT_RESUME_ERROR",
     )
+
+
+class _FrontendToolIdentityError(ValueError):
+    """A frontend call cannot be correlated through Strands' native ID."""
+
+
+def _missing_frontend_tool_identity_error(
+    tool_name: str,
+) -> _FrontendToolIdentityError:
+    return _FrontendToolIdentityError(
+        f"Frontend tool {tool_name!r} requires a non-empty, unique native "
+        "toolUseId from Strands. Upgrade the Strands model provider or use "
+        "one that supplies stable tool-use IDs."
+    )
+
+
+def _duplicate_frontend_tool_identity_error(
+    native_tool_use_id: str,
+) -> _FrontendToolIdentityError:
+    return _FrontendToolIdentityError(
+        "Frontend tools require a non-empty, unique native toolUseId for each "
+        f"call, but Strands reused {native_tool_use_id!r}. Upgrade the Strands "
+        "model provider or avoid parallel frontend calls with that provider."
+    )
+
+
+def _reused_frontend_tool_identity_error(
+    native_tool_use_id: str,
+) -> _FrontendToolIdentityError:
+    return _FrontendToolIdentityError(
+        "Frontend tools require a transcript-unique native toolUseId, but "
+        f"Strands reused {native_tool_use_id!r} from prior thread history. "
+        "Upgrade the Strands model provider or use one that supplies stable "
+        "tool-use IDs."
+    )
+
+
+def _native_assistant_tool_call_ids(messages: Sequence[Any]) -> set[str]:
+    """Return native tool-use IDs already present in Strands history."""
+    tool_call_ids: set[str] = set()
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        for block in message.get("content") or []:
+            tool_use = block.get("toolUse") if isinstance(block, Mapping) else None
+            tool_call_id = (
+                tool_use.get("toolUseId")
+                if isinstance(tool_use, Mapping)
+                else None
+            )
+            if isinstance(tool_call_id, str) and tool_call_id:
+                tool_call_ids.add(tool_call_id)
+    return tool_call_ids
 
 
 def _continuation_tool_name_error(tool_call_ids: list) -> "RunErrorEvent":
@@ -3723,6 +3776,9 @@ class StrandsAgent:
                 if len(remaining) != len(wire_to_native):
                     strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
 
+            prior_tool_call_ids = _native_assistant_tool_call_ids(
+                getattr(strands_agent, "messages", None) or []
+            )
             agent_stream = strands_agent.stream_async(resume_prompt, **stream_kwargs)
             try:
                 async for event in _stream_with_model_context(
@@ -4324,12 +4380,38 @@ class StrandsAgent:
                             and configured_behavior.continue_after_frontend_call is False
                         )
 
-                        # Check if we've already seen this tool (by Strands' internal ID)
+                        # Check if this is another cumulative update for the
+                        # same call before applying cross-call uniqueness.
                         existing_entry = None
+                        ended_frontend_entry = False
                         for tid, data in tool_calls_seen.items():
                             if data.get("strands_tool_id") == strands_tool_id:
+                                if (
+                                    is_frontend_tool
+                                    and data.get("end_emitted")
+                                ):
+                                    ended_frontend_entry = True
+                                    break
                                 existing_entry = tid
                                 break
+
+                        if is_frontend_tool:
+                            if (
+                                not isinstance(strands_tool_id, str)
+                                or not strands_tool_id.strip()
+                            ):
+                                raise _missing_frontend_tool_identity_error(tool_name)
+                            if ended_frontend_entry:
+                                raise _duplicate_frontend_tool_identity_error(
+                                    strands_tool_id
+                                )
+                            if (
+                                existing_entry is None
+                                and strands_tool_id in prior_tool_call_ids
+                            ):
+                                raise _reused_frontend_tool_identity_error(
+                                    strands_tool_id
+                                )
 
                         if existing_entry:
                             # Reuse the existing ID
@@ -5102,6 +5184,12 @@ class StrandsAgent:
                     outcome=RunFinishedSuccessOutcome(type="success"),
                 )
 
+        except _FrontendToolIdentityError as e:
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message=str(e),
+                code="FRONTEND_TOOL_IDENTITY_ERROR",
+            )
         except Exception as e:
             import traceback
 

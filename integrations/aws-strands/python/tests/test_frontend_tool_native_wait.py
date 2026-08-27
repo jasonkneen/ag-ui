@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
@@ -105,6 +106,88 @@ class _MixedWaitModel(_ParallelWaitModel):
         yield {"contentBlockDelta": {"delta": {"text": "mixed continued"}}}
         yield {"contentBlockStop": {}}
         yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+class _InvalidIdentityModel(_ParallelWaitModel):
+    """Emit frontend calls with caller-selected native IDs."""
+
+    def __init__(self, native_ids: Sequence[str | None]) -> None:
+        super().__init__()
+        self.native_ids = native_ids
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.calls += 1
+        self.seen_messages.append(copy.deepcopy(messages))
+        yield {"messageStart": {"role": "assistant"}}
+        for index, native_id in enumerate(self.native_ids):
+            yield {
+                "contentBlockStart": {
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": native_id,
+                            "name": _tools()[index].name,
+                        }
+                    }
+                }
+            }
+            yield {
+                "contentBlockDelta": {
+                    "delta": {"toolUse": {"input": '{"value":"requested"}'}}
+                }
+            }
+            yield {"contentBlockStop": {}}
+        yield {"messageStop": {"stopReason": "tool_use"}}
+
+
+class _ReusedIdentityModel(_ParallelWaitModel):
+    """Reuse one completed frontend tool-use ID on the following model turn."""
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        self.calls += 1
+        self.seen_messages.append(copy.deepcopy(messages))
+        yield {"messageStart": {"role": "assistant"}}
+        if self.calls <= 2:
+            yield {
+                "contentBlockStart": {
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "native-reused",
+                            "name": "first_client_tool",
+                        }
+                    }
+                }
+            }
+            yield {
+                "contentBlockDelta": {
+                    "delta": {"toolUse": {"input": '{"value":"requested"}'}}
+                }
+            }
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+            return
+        yield {"contentBlockDelta": {"delta": {"text": "continued"}}}
+        yield {"contentBlockStop": {}}
+        yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+class _FailAnsweredInterruptSyncManager(FileSessionManager):
+    """Fail once after Strands has accepted a native interrupt response."""
+
+    def __init__(self, *, failure_counter: dict[str, int], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.failure_counter = failure_counter
+
+    def sync_agent(self, agent: Any) -> None:
+        state = getattr(agent, "_interrupt_state", None)
+        interrupts = getattr(state, "interrupts", {})
+        has_answered = any(
+            getattr(interrupt, "response", None) is not None
+            for interrupt in interrupts.values()
+        )
+        if has_answered and self.failure_counter["count"] == 0:
+            self.failure_counter["count"] += 1
+            raise RuntimeError("native frontend wait sync failed")
+        super().sync_agent(agent)
 
 
 @tool(name="server_approval", description="Approve server work", context=True)
@@ -219,6 +302,210 @@ async def test_legacy_placeholder_modes_also_emit_native_tool_ids(mode: str) -> 
         for event in events
         if event.type == EventType.TOOL_CALL_START
     ] == ["native-0", "native-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("native_ids", "message_fragment"),
+    [
+        ((None,), "non-empty"),
+        (("   ",), "non-empty"),
+        (("native-duplicate", "native-duplicate"), "unique"),
+    ],
+    ids=["missing", "blank", "duplicate"],
+)
+async def test_invalid_frontend_native_ids_fail_before_handoff(
+    tmp_path: Path,
+    native_ids: Sequence[str | None],
+    message_fragment: str,
+) -> None:
+    thread_id = f"invalid-native-id-{message_fragment}"
+    events = await _collect(
+        _adapter(_InvalidIdentityModel(native_ids), tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-1",
+            messages=[UserMessage(id="user-1", content="call frontend tools")],
+        ),
+    )
+
+    [error] = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert error.code == "FRONTEND_TOOL_IDENTITY_ERROR"
+    assert message_fragment in error.message
+    assert EventType.TOOL_CALL_END not in [event.type for event in events]
+    assert EventType.RUN_FINISHED not in [event.type for event in events]
+
+
+@pytest.mark.asyncio
+async def test_completed_frontend_native_id_cannot_be_reused(
+    tmp_path: Path,
+) -> None:
+    thread_id = "reused-native-id"
+    model = _ReusedIdentityModel()
+    first = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-1",
+            messages=[UserMessage(id="user-1", content="call frontend tool")],
+        ),
+    )
+    _assert_success(first)
+
+    resumed = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="result-1",
+                    tool_call_id="native-reused",
+                    content="client-value",
+                )
+            ],
+        ),
+    )
+
+    [error] = [event for event in resumed if event.type == EventType.RUN_ERROR]
+    assert error.code == "FRONTEND_TOOL_IDENTITY_ERROR"
+    assert "reused" in error.message
+    assert EventType.TOOL_CALL_END not in [event.type for event in resumed]
+    assert EventType.RUN_FINISHED not in [event.type for event in resumed]
+
+
+def test_malformed_native_checkpoint_identity_fails_loudly() -> None:
+    malformed_mapping = SimpleNamespace(
+        _interrupt_state=SimpleNamespace(activated=True, interrupts=[])
+    )
+    mismatched_id = SimpleNamespace(
+        _interrupt_state=SimpleNamespace(
+            activated=True,
+            interrupts={
+                "checkpoint-id": SimpleNamespace(
+                    id="different-id",
+                    name="ag_ui_frontend_tool_wait",
+                    reason={
+                        "name": "ag_ui_frontend_tool_wait",
+                        "tool_use_id": "native-id",
+                    },
+                )
+            },
+        )
+    )
+    duplicate_tool_id = SimpleNamespace(
+        _interrupt_state=SimpleNamespace(
+            activated=True,
+            interrupts={
+                interrupt_id: SimpleNamespace(
+                    id=interrupt_id,
+                    name="ag_ui_frontend_tool_wait",
+                    reason={
+                        "name": "ag_ui_frontend_tool_wait",
+                        "tool_use_id": "native-id",
+                    },
+                )
+                for interrupt_id in ("interrupt-1", "interrupt-2")
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="malformed Strands interrupt checkpoint"):
+        index_frontend_tool_interrupts(malformed_mapping)
+    with pytest.raises(ValueError, match="key does not match"):
+        index_frontend_tool_interrupts(mismatched_id)
+    with pytest.raises(ValueError, match="duplicate frontend tool-use ID"):
+        index_frontend_tool_interrupts(duplicate_tool_id)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_client_results_fail_before_native_resume(
+    tmp_path: Path,
+) -> None:
+    thread_id = "duplicate-client-results"
+    model = _ParallelWaitModel()
+    first = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-1",
+            messages=[UserMessage(id="user-1", content="call both tools")],
+        ),
+    )
+    _assert_success(first)
+
+    duplicate = await _collect(
+        _adapter(model, tmp_path, thread_id),
+        _input(
+            thread_id,
+            run_id="run-2",
+            messages=[
+                ToolMessage(id="result-1", tool_call_id="native-0", content="one"),
+                ToolMessage(id="result-2", tool_call_id="native-0", content="two"),
+            ],
+        ),
+    )
+
+    [error] = [event for event in duplicate if event.type == EventType.RUN_ERROR]
+    assert error.code == "FRONTEND_TOOL_RESULT_DUPLICATE"
+    assert model.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_native_resume_sync_failure_is_loud_and_never_finishes(
+    tmp_path: Path,
+) -> None:
+    thread_id = "native-resume-sync-failure"
+    model = _ParallelWaitModel()
+    failure_counter = {"count": 0}
+
+    async def session_manager_provider(_input_data: RunAgentInput):
+        return _FailAnsweredInterruptSyncManager(
+            session_id=thread_id,
+            storage_dir=str(tmp_path),
+            failure_counter=failure_counter,
+        )
+
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[], agent_id="sync-failure-agent"),
+        name="sync-failure",
+        config=StrandsAgentConfig(
+            session_manager_provider=session_manager_provider,
+            tool_behaviors={
+                tool.name: ToolBehavior(continue_after_frontend_call=False)
+                for tool in _tools()
+            },
+        ),
+    )
+    first = await _collect(
+        adapter,
+        _input(
+            thread_id,
+            run_id="run-1",
+            messages=[UserMessage(id="user-1", content="call both tools")],
+        ),
+    )
+    _assert_success(first)
+
+    failed = await _collect(
+        adapter,
+        _input(
+            thread_id,
+            run_id="run-2",
+            messages=[
+                ToolMessage(
+                    id="result-1",
+                    tool_call_id="native-0",
+                    content="client-value",
+                )
+            ],
+        ),
+    )
+
+    [error] = [event for event in failed if event.type == EventType.RUN_ERROR]
+    assert "native frontend wait sync failed" in error.message
+    assert EventType.RUN_FINISHED not in [event.type for event in failed]
+    assert failure_counter == {"count": 1}
 
 
 @pytest.mark.asyncio
