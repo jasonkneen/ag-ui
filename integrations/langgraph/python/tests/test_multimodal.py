@@ -3774,6 +3774,85 @@ class TestMalformedInputContract(unittest.TestCase):
         self.assertEqual(second.content, first.content)
 
 
+class TestOverridableCallsOnOffWireValues(unittest.TestCase):
+    """Rule 1 of the malformed-input contract, for values that are the RIGHT
+    type but not the built-in one.
+
+    A `str`/`dict` arriving off the wire may be a SUBCLASS, and every method
+    the converter calls on it — ``strip``, ``startswith``, ``split``, ``get``
+    — is overridable. An override that raises escapes the whole
+    MESSAGES_SNAPSHOT, which is the failure the contract's first rule exists
+    to prevent, reached through a door an ``isinstance`` check holds open.
+
+    These cases live here rather than in ``cross-runtime-parity-cases.json``
+    because a subclass is not expressible in JSON, and because they are
+    Python-only: TypeScript strings and objects are primitives with no
+    equivalent hazard. The converter answers them by normalizing through the
+    BASE operations (``str.strip``, ``dict.get``), which both bypass the
+    override and return a built-in, so everything downstream is a built-in
+    method on a built-in value.
+    """
+
+    def test_str_subclass_that_raises_from_its_overrides_still_converts(self):
+        class Hostile(str):
+            def strip(self, *args):
+                raise RuntimeError("strip exploded")
+
+            def startswith(self, *args):
+                raise RuntimeError("startswith exploded")
+
+            def split(self, *args, **kwargs):
+                raise RuntimeError("split exploded")
+
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "image_url", "image_url": Hostile("  data:image/png;base64,QUJD  ")},
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertIsInstance(agui_content[0].source, InputContentDataSource)
+        self.assertEqual(agui_content[0].source.value, "QUJD")
+        self.assertEqual(agui_content[0].source.mime_type, "image/png")
+
+    def test_str_subclass_in_the_nested_url_slot_still_converts(self):
+        class Hostile(str):
+            def strip(self, *args):
+                raise RuntimeError("strip exploded")
+
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "image_url", "image_url": {"url": Hostile("https://example.com/a.png")}},
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertEqual(agui_content[0].source.value, "https://example.com/a.png")
+
+    def test_dict_subclass_that_raises_from_get_still_converts(self):
+        class Hostile(dict):
+            def get(self, *args, **kwargs):
+                raise RuntimeError("get exploded")
+
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "image_url", "image_url": Hostile(url="https://example.com/a.png")},
+        ])
+
+        self.assertEqual(len(agui_content), 1)
+        self.assertEqual(agui_content[0].source.value, "https://example.com/a.png")
+
+    def test_a_hostile_subclass_costs_only_its_own_block(self):
+        """Rule 3: even when the hostile value is unusable, the blocks around
+        it convert."""
+        class Hostile(str):
+            def strip(self, *args):
+                raise RuntimeError("strip exploded")
+
+        agui_content = convert_langchain_multimodal_to_agui([
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": Hostile("   ")}},
+            {"type": "text", "text": "after"},
+        ])
+
+        self.assertEqual([c.text for c in agui_content], ["before", "after"])
+
+
 class TestCrossRuntimeParityTable(unittest.TestCase):
     """The cross-runtime parity table — the mechanism that makes DRIFT fail a test.
 

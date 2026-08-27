@@ -294,13 +294,32 @@ def _incoming_image_url(payload: Any) -> str | None:
     Mirrors the `item.image_url` read in the TypeScript adapter's
     `convertLangchainMultimodalToAgui`, which skips the same blocks.
     """
-    if isinstance(payload, str):
-        return payload or None
-    if isinstance(payload, dict):
-        url = payload.get("url")
-        if isinstance(url, str) and url:
-            return url
-    return None
+    url = payload if isinstance(payload, str) else None
+    if url is None and isinstance(payload, dict):
+        # `dict.get`, not `payload.get`, for the same reason `str.strip` is
+        # spelled that way below: a dict SUBCLASS off the wire can override
+        # `.get` and raise from it, and an exception here escapes the whole
+        # MESSAGES_SNAPSHOT.
+        candidate = dict.get(payload, "url")
+        url = candidate if isinstance(candidate, str) else None
+    if url is None:
+        return None
+
+    # `str.strip`, not `url.strip()`, and the reason is not style. It does two
+    # jobs at once:
+    #
+    # 1. Whitespace is the side door into the empty-value defect this function
+    #    already rejects. A url of "   " is truthy, so a bare falsiness check
+    #    lets it through to mint an attachment pointing at nothing, and a
+    #    LEADING space on "  data:image/png;base64,…" is worse than that: the
+    #    caller's `startswith("data:")` says False, so a base64 payload is
+    #    filed as a remote url the client then tries to fetch.
+    # 2. It returns a plain `str` even for a `str` SUBCLASS, so every operation
+    #    the caller runs downstream — startswith, split — is a built-in on a
+    #    built-in. A subclass arriving off the wire cannot override its way
+    #    into an exception that escapes MESSAGES_SNAPSHOT, which is rule 1 of
+    #    the malformed-input contract.
+    return str.strip(url) or None
 
 
 def _supplied_filename(
@@ -476,6 +495,13 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                     # `_read_incoming_media_block` already rejects on the
                     # standard-block path, where an empty `data`/`base64` drops the
                     # block. This branch was the one place that kept it.
+                    # No `.strip()` here, deliberately: `_incoming_image_url`
+                    # already stripped the whole url, so a payload that is
+                    # nothing but whitespace has ALREADY become the empty
+                    # string by the time it reaches this guard. A payload with
+                    # INTERNAL whitespace keeps it, which is correct —
+                    # MIME-wrapped base64 legitimately carries newlines and
+                    # both atob and b64decode ignore them.
                     if not data:
                         logger.warning(
                             "Dropping image_url block: data URL carries no payload"
@@ -496,9 +522,17 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                     # answers "image" for both "" and "image/png" — so this only
                     # stops an unusable MIME type from being recorded, it does not
                     # retype anything.
-                    mime_type = (
+                    # The `or` guard treats a MIME-less "data:;base64,…" as
+                    # absent. "data:   ;base64,…" is the same thing wearing
+                    # whitespace: present-but-blank, and unusable for the same
+                    # reason. Note this collapses a BLANK mediatype only — a
+                    # padded but real one keeps its padding, which the
+                    # cross-runtime parity table pins because the TypeScript
+                    # adapter records it verbatim too.
+                    raw_mime = (
                         header.split(":")[1].split(";")[0] if ":" in header else ""
-                    ) or "image/png"
+                    )
+                    mime_type = (raw_mime if raw_mime.strip() else "") or "image/png"
 
                     # The MIME type this adapter put in the data URL on the way out
                     # is enough to recover the modality on the way back.
