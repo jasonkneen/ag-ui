@@ -253,7 +253,16 @@ jobs:
         # because every way of guessing wrong here produces the same silent outcome —
         # a lane that reports testing a floor the wheel does not declare. The rule is
         # one unambiguous floor or nothing: exactly one requirement naming this
-        # distribution, no environment marker on it, exactly one `>=` in it.
+        # distribution, no environment marker on it, exactly one `>=` in it, and that
+        # `>=` version actually permitted by the requirement as a whole.
+        #
+        # That last check is the semantic one, and it subsumes guessing from structure:
+        # ">=0.1.21,!=0.1.21" passes every structural test above while excluding the
+        # very version it names. Asking `specifier.contains()` whether the floor we are
+        # about to install is one the wheel would accept answers the question directly.
+        # Note it must allow prereleases, or a legitimate ">=0.1.22rc1" floor would be
+        # rejected as not satisfying itself. A plain exclusion of some LATER release,
+        # ">=0.1.21,!=0.1.23", stays valid and still yields 0.1.21.
         #
         # The multiple-requirements case is the subtle one. PEP 621 permits
         # `ag-ui-protocol` to appear more than once with different markers, each
@@ -283,6 +292,8 @@ jobs:
                   mins = [sp.version for sp in req.specifier if sp.operator == ">="]
                   if len(mins) != 1:
                       print("UNSUPPORTED:expected exactly one >= specifier on ag-ui-protocol, got (" + str(req) + ").")
+                  elif not req.specifier.contains(mins[0], prereleases=True):
+                      print("UNSUPPORTED:the >= floor " + mins[0] + " is itself excluded by the rest of the requirement (" + str(req) + "), so installing it would violate the Requires-Dist of the wheel itself.")
                   else:
                       print(mins[0])
           ')
