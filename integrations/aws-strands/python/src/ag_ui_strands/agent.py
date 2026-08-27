@@ -383,6 +383,8 @@ def _preflight_resume_entries(
     agent: Any,
     resume_entries: Any,
     pending_ag_ui: dict[str, Any] | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> "RunErrorEvent | None":
     """Validate the complete submitted resume batch without mutating state."""
     interrupt_state = getattr(agent, "_interrupt_state", None)
@@ -424,7 +426,7 @@ def _preflight_resume_entries(
             )
 
     missing_ids = set(addressable) - seen_ids
-    if missing_ids:
+    if missing_ids and not allow_partial:
         return RunErrorEvent(
             type=EventType.RUN_ERROR,
             message=(
@@ -566,6 +568,11 @@ from .a2ui_tool import (
     plan_a2ui_injection,
 )
 from .client_proxy_tool import _is_proxy, sync_proxy_tools
+from .frontend_tool_interrupt import (
+    index_frontend_tool_interrupts,
+    is_frontend_tool_interrupt,
+    wrap_frontend_tool_response,
+)
 from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     AG_UI_WIRE_MAP_STATE_KEY,
@@ -2619,6 +2626,50 @@ class StrandsAgent:
                     )
         strands_agent = self._agents_by_thread[thread_id]
 
+        # Frontend wait responses keep the established AG-UI ToolMessage
+        # contract. Correlation comes directly from Strands' native checkpoint;
+        # the adapter does not persist a second active-wait record.
+        try:
+            frontend_wait_interrupts = index_frontend_tool_interrupts(strands_agent)
+        except ValueError as exc:
+            ev_started, ev_error = _error_events(
+                input_data,
+                str(exc),
+                "FRONTEND_TOOL_WAIT_STATE_ERROR",
+            )
+            yield ev_started
+            yield ev_error
+            return
+
+        frontend_wait_messages: dict[str, ToolMessage] = {}
+        if frontend_wait_interrupts:
+            for message in reversed(input_data.messages or []):
+                if getattr(message, "role", None) != "tool":
+                    break
+                tool_call_id = getattr(message, "tool_call_id", None)
+                if tool_call_id not in frontend_wait_interrupts:
+                    continue
+                if tool_call_id in frontend_wait_messages:
+                    ev_started, ev_error = _error_events(
+                        input_data,
+                        f"Duplicate frontend tool result: {tool_call_id}",
+                        "FRONTEND_TOOL_RESULT_DUPLICATE",
+                    )
+                    yield ev_started
+                    yield ev_error
+                    return
+                native_interrupt = frontend_wait_interrupts[tool_call_id]
+                if _native_interrupt_is_answered(native_interrupt):
+                    ev_started, ev_error = _error_events(
+                        input_data,
+                        f"Frontend tool result is already recorded: {tool_call_id}",
+                        "FRONTEND_TOOL_RESULT_ALREADY_RECORDED",
+                    )
+                    yield ev_started
+                    yield ev_error
+                    return
+                frontend_wait_messages[tool_call_id] = message
+
         # A submitted resume must be validated before any adapter mutation
         # (context writes, proxy synchronization, history reconciliation, or
         # metadata pruning). Strands otherwise applies entries one at a time,
@@ -2652,6 +2703,7 @@ class StrandsAgent:
                 strands_agent,
                 resume_entries,
                 pending_resume_interrupts,
+                allow_partial=bool(frontend_wait_interrupts),
             )
             if resume_error is not None:
                 yield RunStartedEvent(
@@ -2669,6 +2721,7 @@ class StrandsAgent:
         # discard the tool use and tool results parked behind it.
         if (
             not resume_submitted
+            and not frontend_wait_messages
             and getattr(interrupt_state, "activated", False) is True
         ):
             ev_started, ev_error = _error_events(
@@ -2752,6 +2805,7 @@ class StrandsAgent:
                 strands_agent.tool_registry,
                 input_data.tools,
                 self._proxy_tool_names_by_thread.get(thread_id, set()),
+                tool_behaviors=self.config.tool_behaviors,
             )
             self._proxy_tool_names_by_thread[thread_id] = proxy_names
         elif self._proxy_tool_names_by_thread.get(thread_id):
@@ -2760,6 +2814,7 @@ class StrandsAgent:
                 strands_agent.tool_registry,
                 [],
                 self._proxy_tool_names_by_thread[thread_id],
+                tool_behaviors=self.config.tool_behaviors,
             )
             self._proxy_tool_names_by_thread[thread_id] = set()
 
@@ -2849,6 +2904,28 @@ class StrandsAgent:
         _resumed_tool_call_ids: set = set()
         resume_entries: list[ResumeEntry] = list(resume_entries or [])
 
+        if frontend_wait_messages:
+            _resume_prompt = []
+            for tool_call_id, message in frontend_wait_messages.items():
+                content = (
+                    message.content
+                    if isinstance(message.content, str)
+                    else flatten_content_to_text(message.content)
+                )
+                native_interrupt = frontend_wait_interrupts[tool_call_id]
+                _resume_prompt.append(
+                    {
+                        "interruptResponse": {
+                            "interruptId": native_interrupt.id,
+                            "response": wrap_frontend_tool_response(
+                                content or "",
+                                is_error=bool(getattr(message, "error", None)),
+                            ),
+                        }
+                    }
+                )
+                _resumed_tool_call_ids.add(tool_call_id)
+
         if resume_entries:
             interrupt_state = getattr(strands_agent, "_interrupt_state", None)
             pending_ag_ui = pending_resume_interrupts or {}
@@ -2886,7 +2963,9 @@ class StrandsAgent:
                 f"Resuming interrupted run: thread_id={input_data.thread_id}, "
                 f"interrupt_responses={interrupt_responses}"
             )
-            _resume_prompt: list | None = interrupt_responses
+            if _resume_prompt is None:
+                _resume_prompt = []
+            _resume_prompt.extend(interrupt_responses)
             # Bookkeeping is cleared only after successful processing below so
             # reconciliation failures leave the checkpoint retryable.
 
@@ -3487,6 +3566,7 @@ class StrandsAgent:
             # placeholder plus a synthetic "tool returned: X" message.
             replay_history = (
                 self.config.replay_history_into_strands and session_manager is None
+                and _resume_prompt is None
             )
             # A native-only live checkpoint needs no repository access. Exact
             # proxy placeholders do, including when the client result is void.
@@ -3625,7 +3705,7 @@ class StrandsAgent:
             # and drive the stream with it — this runs after (and takes
             # precedence over) every branch above, since a resume batch may
             # still carry a fresh frontend tool result that needed reconciling.
-            if resume_submitted:
+            if resume_submitted or frontend_wait_messages:
                 resume_prompt = _resume_prompt
 
             # Drop only the entries whose placeholder was actually corrected
@@ -4234,9 +4314,15 @@ class StrandsAgent:
                         strands_tool_id = tool_use.get("toolUseId")
                         _raw_in = tool_use.get("input", "")
 
-                        # Generate unique ID for frontend tools (to avoid ID conflicts across requests)
-                        # Use Strands' ID for backend tools (so result lookup works)
+                        # Frontend tools use Strands' native identity on the
+                        # AG-UI wire in every behavior mode.
                         is_frontend_tool = tool_name in frontend_tool_names
+                        configured_behavior = self.config.tool_behaviors.get(tool_name)
+                        is_native_frontend_wait = bool(
+                            is_frontend_tool
+                            and configured_behavior is not None
+                            and configured_behavior.continue_after_frontend_call is False
+                        )
 
                         # Check if we've already seen this tool (by Strands' internal ID)
                         existing_entry = None
@@ -4249,19 +4335,21 @@ class StrandsAgent:
                             # Reuse the existing ID
                             tool_use_id = existing_entry
                         elif is_frontend_tool:
-                            # Generate new UUID for frontend tools
-                            tool_use_id = str(uuid.uuid4())
-                            # Record wire id -> Strands native id on the agent's
-                            # SESSION STATE so a later continuation run — even on
-                            # a different process — can reconcile the persisted
-                            # placeholder (keyed by the native id) with the real
-                            # client result (which arrives keyed by the wire id).
+                            tool_use_id = strands_tool_id
+                            # Keep the pre-existing legacy placeholder
+                            # provenance for unconfigured/True tools. Native
+                            # waits do not produce a proxy placeholder and do
+                            # not participate in reconciliation.
                             # Strands persists agent state durably at end of run.
                             # Only maintained when a session manager is actually
                             # active for this agent (matching the continuation
                             # read/prune gate); otherwise it would never be read.
-                            if strands_tool_id and _get_strands_session_manager(
-                                strands_agent
+                            if (
+                                not is_native_frontend_wait
+                                and strands_tool_id
+                                and _get_strands_session_manager(
+                                    strands_agent
+                                )
                             ):
                                 _wire_map = dict(
                                     strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY)
@@ -4356,11 +4444,9 @@ class StrandsAgent:
                                 strands_agent.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
                                 or {}
                             )
-                            # Key by the NATIVE ``toolUseId`` — that is what
-                            # arrives on ``toolResult``. For backend tools
-                            # this equals ``tool_use_id``; for frontend tools
-                            # ``tool_use_id`` is a fresh wire UUID while
-                            # ``strands_tool_id`` is native.
+                            # Key by the native ``toolUseId`` — that is what
+                            # arrives on ``toolResult`` and is also the AG-UI
+                            # wire identity for frontend calls.
                             _tc_key = strands_tool_id or tool_use_id
                             _tc_meta[_tc_key] = {
                                 "name": tool_name,
@@ -4625,7 +4711,7 @@ class StrandsAgent:
                                     if is_frontend_tool and not (
                                         behavior
                                         and behavior.continue_after_frontend_call
-                                    ):
+                                    ) and behavior is None:
                                         logger.debug(
                                             f"Deferring halt after frontend tool call: tool_name={tool_name}, tool_call_id={tool_use_id}, thread_id={input_data.thread_id}"
                                         )
@@ -4777,7 +4863,7 @@ class StrandsAgent:
                                     if is_frontend_tool and not (
                                         behavior
                                         and behavior.continue_after_frontend_call
-                                    ):
+                                    ) and behavior is None:
                                         logger.debug(
                                             f"Deferring halt after frontend tool call: tool_name={tool_name}, tool_call_id={tool_use_id}, thread_id={input_data.thread_id}"
                                         )
@@ -4966,10 +5052,15 @@ class StrandsAgent:
             # AG-UI interrupt outcome so the client can collect a response and
             # resume via ``RunAgentInput.resume`` next turn.
             native_interrupts = _extract_interrupts(strands_agent, terminal_result)
-            if native_interrupts:
+            visible_native_interrupts = [
+                interrupt
+                for interrupt in native_interrupts
+                if not is_frontend_tool_interrupt(interrupt)
+            ]
+            if visible_native_interrupts:
                 ag_ui_interrupts = [
                     _strands_interrupt_to_agui(interrupt)
-                    for interrupt in native_interrupts
+                    for interrupt in visible_native_interrupts
                 ]
                 pending_interrupt_outcome = RunFinishedInterruptOutcome(
                     type="interrupt",
