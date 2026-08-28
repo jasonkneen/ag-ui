@@ -18,7 +18,17 @@ import weakref
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Container,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from strands import Agent as StrandsAgentCore
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
@@ -320,11 +330,11 @@ def _extract_agent_kwargs(
     return kwargs, unreadable, template_owned
 
 
-# Upper bound on the per-agent wire->native map held in session state. Bounds
-# growth from frontend calls that never receive a client result (abandoned HITL)
-# and so are never consumed/pruned. Generous — a thread rarely has this many
-# outstanding frontend calls at once.
-_WIRE_MAP_MAX = 512
+# Upper bound on the per-agent frontend-call id store held in session state.
+# Bounds growth from frontend calls that never receive a client result
+# (abandoned HITL) and so are never consumed/pruned. Generous: a thread rarely
+# has this many outstanding frontend calls at once.
+_FRONTEND_CALL_IDS_MAX = 512
 
 # Upper bound on the per-agent tool-call metadata map held in session state.
 # It bounds abandoned entries (tool calls whose result never returns)
@@ -697,13 +707,39 @@ def _native_assistant_tool_call_ids(messages: Sequence[Any]) -> set[str]:
     return tool_call_ids
 
 
+def _native_tool_names_by_id(
+    messages: Sequence[Any], tool_use_ids: Container[str]
+) -> dict[str, str]:
+    """Map each of *tool_use_ids* to the name Strands history records for it.
+
+    Returns a name only for the ids it finds. An id missing from the result is
+    one the caller cannot reason about, which callers must treat as a failure
+    rather than as nothing to do.
+    """
+    names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        for block in message.get("content") or []:
+            tool_use = block.get("toolUse") if isinstance(block, Mapping) else None
+            if not isinstance(tool_use, Mapping):
+                continue
+            tool_use_id = tool_use.get("toolUseId")
+            if not isinstance(tool_use_id, str) or tool_use_id not in tool_use_ids:
+                continue
+            name = tool_use.get("name")
+            if isinstance(name, str) and name:
+                names[tool_use_id] = name
+    return names
+
+
 def _continuation_tool_name_error(tool_call_ids: list) -> "RunErrorEvent":
     return RunErrorEvent(
         type=EventType.RUN_ERROR,
         message=(
             "Cannot name the tool behind continuation tool result(s) "
-            f"{', '.join(tool_call_ids)}: absent from the input messages, from "
-            "the native session history, and from the wire->native map"
+            f"{', '.join(tool_call_ids)}: absent from the input messages and "
+            "from the native session history"
         ),
         code="CONTINUATION_TOOL_NAME_UNRESOLVED",
     )
@@ -902,6 +938,7 @@ from .a2ui_tool import (
 )
 from .client_proxy_tool import (
     _is_proxy,
+    registered_proxy_names,
     sync_proxy_tools,
     waits_for_frontend_call,
 )
@@ -913,13 +950,13 @@ from .frontend_tool_interrupt import (
     wrap_frontend_tool_response,
 )
 from .session_reconcile import (
+    AG_UI_FRONTEND_CALL_IDS_STATE_KEY,
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
-    AG_UI_WIRE_MAP_STATE_KEY,
+    recorded_frontend_call_ids,
     _supports_repository_reconciliation,
     active_proxy_placeholder_ids,
     has_placeholder_results,
     reconcile_frontend_tool_results,
-    resolve_native_ids,
 )
 from .config import (
     StrandsAgentConfig,
@@ -3446,24 +3483,38 @@ class StrandsAgent:
         except Exception as e:
             logger.warning(f"Failed to set agui_context on strands_agent.state: {e}")
 
-        # Sync proxy tools from client-defined tools
+        # Sync proxy tools from client-defined tools. A proxy parked in a live
+        # frontend-tool interrupt is exempt from removal: Strands is about to
+        # resume that tool, and an absent registry entry turns the client's
+        # answer into a "tool not found" failure the model then re-fires.
+        parked_names_by_id = (
+            _native_tool_names_by_id(
+                getattr(strands_agent, "messages", None) or [],
+                frontend_wait_interrupts,
+            )
+            if frontend_wait_interrupts
+            else {}
+        )
+        parked_proxy_names = set(parked_names_by_id.values())
         if input_data.tools:
             proxy_names = sync_proxy_tools(
                 strands_agent.tool_registry,
                 input_data.tools,
                 self._proxy_tool_names_by_thread.get(thread_id, set()),
                 tool_behaviors=self.config.tool_behaviors,
+                exempt_names=parked_proxy_names,
             )
             self._proxy_tool_names_by_thread[thread_id] = proxy_names
         elif self._proxy_tool_names_by_thread.get(thread_id):
-            # Remove all stale proxy tools when no tools are sent
-            sync_proxy_tools(
+            # Drop the stale proxy tools when no tools are sent, except any the
+            # exemption above protects.
+            self._proxy_tool_names_by_thread[thread_id] = sync_proxy_tools(
                 strands_agent.tool_registry,
                 [],
                 self._proxy_tool_names_by_thread[thread_id],
                 tool_behaviors=self.config.tool_behaviors,
+                exempt_names=parked_proxy_names,
             )
-            self._proxy_tool_names_by_thread[thread_id] = set()
 
         # A2UI auto-injection. When the runtime forwards
         # ``injectA2UITool`` (or the host opts in via ``config.a2ui``), register
@@ -3541,6 +3592,53 @@ class StrandsAgent:
                 e,
                 exc_info=True,
             )
+
+        # Proxy registrations are per-process, so a restart between turns leaves
+        # a parked wait with nothing to resume into. Strands would report the
+        # tool missing, hand the model that error in place of the client's
+        # answer, and still finish the run as a success. Refuse instead: the
+        # caller only has to re-declare the tool.
+        #
+        # Placed after A2UI injection, which drops registrations of its own, and
+        # tested against the registry's own proxies, so neither a native tool
+        # holding the same name nor this thread's per-process bookkeeping can
+        # stand in for the tool Strands has to resume. Cancelling is not exempt:
+        # a cancelled entry still carries a response that Strands delivers into
+        # the tool body (see the resume translation below), so it fails the same
+        # silent way an answer would.
+        registered_proxies = registered_proxy_names(strands_agent.tool_registry)
+        unregistered_parked = sorted(
+            name for name in parked_proxy_names if name not in registered_proxies
+        )
+        # A parked call whose tool this history cannot name is equally
+        # unresumable, and silently skipping it here would let exactly the
+        # failure above through the gate meant to catch it.
+        unnamed_parked = sorted(
+            set(frontend_wait_interrupts) - set(parked_names_by_id)
+        )
+        if unregistered_parked or unnamed_parked:
+            reasons = []
+            if unregistered_parked:
+                reasons.append(
+                    f"{', '.join(unregistered_parked)} not registered; send "
+                    "the tool definitions in RunAgentInput.tools"
+                )
+            if unnamed_parked:
+                reasons.append(
+                    f"the tool behind call {', '.join(unnamed_parked)} is "
+                    "absent from this thread's history"
+                )
+            ev_started, ev_error = _error_events(
+                input_data,
+                (
+                    "Cannot resume the frontend tool calls waiting on this "
+                    f"thread: {'; '.join(reasons)}."
+                ),
+                "FRONTEND_TOOL_NOT_REGISTERED",
+            )
+            yield ev_started
+            yield ev_error
+            return
 
         # ── Interrupt resume handling ──────────────────────────────────────
         # If the client is resuming an interrupted run, validate the
@@ -3669,6 +3767,14 @@ class StrandsAgent:
                     )
                     if tool_name:
                         frontend_tool_names.add(tool_name)
+            # Every proxy in the registry is client-executed by construction,
+            # whether or not this turn re-declared it. A proxy kept for a parked
+            # checkpoint is still offered to the model, so leaving it out here
+            # files a re-fire as a backend call: the adapter would answer it
+            # itself and park an interrupt the client is never told about. Read
+            # the registry rather than this thread's bookkeeping, which is
+            # per-process and empty on a recreated wrapper.
+            frontend_tool_names |= registered_proxies
 
             # Collect tool_call_ids that already have results in the message history
             # so we suppress duplicate TOOL_CALL_START events only for those specific calls
@@ -3784,21 +3890,21 @@ class StrandsAgent:
                     last_msg_had_tool_calls = False
                     strands_messages.append(strands_msg)
 
-            # The durable wire->native map recorded at emission, read back from
+            # The ids of the frontend calls this adapter emitted, read back from
             # session state (restored from the store on a fresh process). Read
             # here rather than at the reconciliation block below because the
-            # continuation-message derivation needs it too: on a delta-only
-            # payload the tool result arrives under the wire id, while the tool
-            # name is only known under the native one.
-            wire_to_native: Dict[str, str] = {}
+            # continuation-message derivation needs it too: it is the only
+            # signal of who executed a tool result on a delta-only payload.
+            # Kept in persisted order, which the emission-time size cap relies
+            # on to drop the oldest entries first.
+            client_call_ids: list[str] = []
             reconciliation_setup_error: Exception | None = None
             if session_manager is not None:
                 try:
-                    wire_to_native = (
-                        strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY) or {}
-                    )
+                    client_call_ids = recorded_frontend_call_ids(strands_agent)
                 except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
                     reconciliation_setup_error = e
+            client_executed_ids = set(client_call_ids)
 
             # Build a lookup of tool_call_id -> tool_name from the input messages
             # directly (the assistant message in Run 2 already carries the name).
@@ -3844,28 +3950,19 @@ class StrandsAgent:
                 for msg in reversed(input_data.messages):
                     if msg.role == "tool" and hasattr(msg, "tool_call_id"):
                         tool_name = _tool_call_id_to_name.get(msg.tool_call_id)
-                        # An entry in the durable wire->native map is only ever
-                        # recorded when a frontend tool call is emitted, so its
-                        # presence proves this result came from a client-executed
-                        # tool. A backend tool never has one: its wire id IS the
-                        # native id.
-                        _native_id = wire_to_native.get(msg.tool_call_id)
-                        if tool_name is None and _native_id:
-                            # A frontend tool is emitted under a fresh wire id, so
-                            # the name recovered from native session history above is
-                            # keyed by the native ``toolUseId`` instead. Translate
-                            # through the durable map and retry. Kept as a fallback
-                            # rather than translating up front: when the assistant
-                            # message IS in the payload the lookup is already keyed
-                            # by the wire id.
-                            tool_name = _tool_call_id_to_name.get(_native_id)
+                        # An id is only recorded when a placeholder-mode
+                        # frontend tool call is emitted, so its presence proves
+                        # this result came from a client-executed tool. A backend
+                        # tool never has one, and neither does a native wait,
+                        # which writes no placeholder to reconcile.
+                        _client_executed = msg.tool_call_id in client_executed_ids
                         # Provenance is either signal, not membership alone: a
                         # continuation that declares no tools (``tools: []``) still
                         # carries a real frontend result, and reading membership
                         # alone would file it as a backend result and hand the model
                         # an empty prompt — the very loop this derivation prevents.
                         _is_frontend_result = bool(tool_name) and (
-                            tool_name in frontend_tool_names or bool(_native_id)
+                            tool_name in frontend_tool_names or _client_executed
                         )
                         if _is_frontend_result:
                             # Forward the ACTUAL result so the model can act on the
@@ -3908,7 +4005,7 @@ class StrandsAgent:
                                 )
                         elif tool_name:
                             # Named, but neither signal says frontend: not in
-                            # the current declarations and no wire-map entry.
+                            # the current declarations and no recorded id.
                             # That is a tool Strands ran itself, so the model
                             # already has it in the native history and the
                             # continuation prompt has nothing to carry.
@@ -3918,9 +4015,8 @@ class StrandsAgent:
                                 f"tool_call_id={msg.tool_call_id}"
                             )
                         else:
-                            # Neither the input messages, nor the native
-                            # session history, nor the durable wire->native
-                            # map name this call. Guessing stays off the
+                            # Neither the input messages nor the native session
+                            # history name this call. Guessing stays off the
                             # table: with several frontend tools declared,
                             # picking one feeds the model false context.
                             # Collected here and raised as a run error below
@@ -4039,8 +4135,8 @@ class StrandsAgent:
             # continuation run and are used to reconcile the session-persisted
             # "Forwarded to client" placeholder. A tool result is a frontend
             # result when its tool name is client-declared, or (for delta-only
-            # payloads that omit the assistant message) when its wire id was
-            # recorded in the wire->native map when the call was emitted.
+            # payloads that omit the assistant message) when its id was recorded
+            # as a frontend call at emission.
             # The durable per-``toolUseId`` call metadata map recorded at
             # emission (see the ``current_tool_use`` handler). On a RESUME
             # run this is the ONLY source of ``{name, args, input,
@@ -4076,28 +4172,35 @@ class StrandsAgent:
             # user message after it: that result never reaches reconciliation and
             # the persisted toolResult keeps ``PROXY_RESULT_PLACEHOLDER`` forever.
             #
-            # A live entry in ``wire_to_native`` is the second admission signal,
-            # and it is safe precisely because of how that map is maintained below:
-            # entries are dropped once their placeholder is actually corrected, and
-            # kept only so a later turn can retry. An already-reconciled historical
-            # result is therefore absent from the map and still cannot re-enter
-            # here — which is what scoping to the trailing ids was protecting.
+            # A live entry in ``client_executed_ids`` is the second admission
+            # signal. It is safe because of how that store is maintained below:
+            # ids are dropped once their placeholder is actually corrected, and
+            # kept only so a later turn can retry, so an already-reconciled
+            # result cannot re-enter here. That is what scoping to the trailing
+            # ids was protecting. With reconciliation off
+            # (``replay_history_into_strands=False``) nothing is ever corrected
+            # and so nothing is pruned; historical results keep re-entering, and
+            # the legacy continuation path they fall to is the same one they
+            # took on the turn they arrived.
             frontend_results: List[Dict[str, Any]] = []
             last_frontend_result_index: int | None = None
             input_messages = input_data.messages or []
             for msg_index, msg in enumerate(input_messages):
                 if getattr(msg, "role", None) != "tool":
                     continue
-                wire_id = getattr(msg, "tool_call_id", None)
-                if not wire_id:
+                tool_call_id = getattr(msg, "tool_call_id", None)
+                if not tool_call_id:
                     continue
                 if (
-                    wire_id not in pending_tool_result_ids
-                    and wire_id not in wire_to_native
+                    tool_call_id not in pending_tool_result_ids
+                    and tool_call_id not in client_executed_ids
                 ):
                     continue
-                name = _tool_call_id_to_name.get(wire_id)
-                if name not in frontend_tool_names and wire_id not in wire_to_native:
+                name = _tool_call_id_to_name.get(tool_call_id)
+                if (
+                    name not in frontend_tool_names
+                    and tool_call_id not in client_executed_ids
+                ):
                     continue
                 content = msg.content
                 text = (
@@ -4107,7 +4210,7 @@ class StrandsAgent:
                 )
                 frontend_results.append(
                     {
-                        "wire_id": wire_id,
+                        "tool_call_id": tool_call_id,
                         "text": text or "",
                         # Carry the client's failure signal alongside the text so
                         # reconciliation can stamp the persisted toolResult status
@@ -4125,17 +4228,16 @@ class StrandsAgent:
                 )
             )
 
-            # Translate the client's wire tool_call_id back to the native
-            # toolUseId Strands persisted (they differ for frontend tools — see
-            # the fresh-uuid assignment in the streaming loop). Only reconcile
-            # when there is at least one NON-EMPTY frontend result: a void tool
-            # returns nothing, and the synthetic "executed successfully with no
-            # return value" continuation message conveys that better than an
-            # empty toolResult. A failed void result is the exception: it must
-            # reconcile so its status replaces the proxy's hardcoded success.
-            # When reconciling, void placeholders in the same
-            # turn are still cleared (to "") so the literal "Forwarded to client"
-            # is never fed to the model.
+            # Reconcile only results whose call this adapter emitted: a
+            # persisted placeholder exists for those alone, and correcting
+            # anything else would be guesswork. Only reconcile when there is at
+            # least one NON-EMPTY frontend result: a void tool returns nothing,
+            # and the synthetic "executed successfully with no return value"
+            # continuation message conveys that better than an empty toolResult.
+            # A failed void result is the exception: it must reconcile so its
+            # status replaces the proxy's hardcoded success. When reconciling,
+            # void placeholders in the same turn are still cleared (to "") so the
+            # literal "Forwarded to client" is never fed to the model.
             resolved_native_results: Dict[str, Tuple[str, bool]] = {}
             corrected_native_ids: set[str] = set()
             has_nonvoid_frontend_result = any(
@@ -4145,12 +4247,11 @@ class StrandsAgent:
                 self.config.replay_history_into_strands
                 or (resume_submitted and bool(active_proxy_native_ids))
             ):
-                try:
-                    resolved_native_results = resolve_native_ids(
-                        wire_to_native, frontend_results
-                    )
-                except Exception as e:  # noqa: BLE001 - handled below by checkpoint state
-                    reconciliation_setup_error = e
+                resolved_native_results = {
+                    result["tool_call_id"]: (result["text"], result["is_error"])
+                    for result in frontend_results
+                    if result["tool_call_id"] in client_executed_ids
+                }
 
             if reconciliation_setup_error is not None:
                 if has_active_interrupt:
@@ -4296,8 +4397,8 @@ class StrandsAgent:
                     yield _interrupt_reconciliation_error()
                     return
                 # Continue from the corrected native history only when every
-                # NON-EMPTY frontend result this turn resolved to a native id
-                # (i.e. was present in the wire->native map) AND none of those
+                # NON-EMPTY frontend result this turn was admitted (i.e. its
+                # call id was recorded at emission) AND none of those
                 # placeholders remain uncleared. The scan is scoped to this
                 # turn's results so a stale placeholder from a prior (e.g. void)
                 # turn doesn't force the legacy path. Any shortfall means
@@ -4338,20 +4439,23 @@ class StrandsAgent:
             if resume_submitted:
                 resume_prompt = _resume_prompt
 
-            # Drop only the entries whose placeholder was actually corrected
-            # this turn — they won't recur. Entries that were NOT corrected
-            # (unresolved, or a reconcile that raised) are kept so a later turn
-            # can retry; pruning them would strand the persisted placeholder
-            # forever. (Genuinely-abandoned entries are bounded by the size cap
-            # applied at emission.)
-            if wire_to_native and corrected_native_ids:
-                remaining = {
-                    wire: native
-                    for wire, native in wire_to_native.items()
-                    if native not in corrected_native_ids
-                }
-                if len(remaining) != len(wire_to_native):
-                    strands_agent.state.set(AG_UI_WIRE_MAP_STATE_KEY, remaining)
+            # Drop only the ids whose placeholder was actually corrected this
+            # turn; they won't recur. Ids that were NOT corrected (unresolved,
+            # or a reconcile that raised) are kept so a later turn can retry;
+            # pruning them would strand the persisted placeholder forever.
+            # (Genuinely-abandoned ids are bounded by the size cap applied at
+            # emission.) Order is preserved so that cap keeps dropping oldest
+            # first.
+            if client_call_ids and corrected_native_ids:
+                remaining = [
+                    call_id
+                    for call_id in client_call_ids
+                    if call_id not in corrected_native_ids
+                ]
+                if len(remaining) != len(client_call_ids):
+                    strands_agent.state.set(
+                        AG_UI_FRONTEND_CALL_IDS_STATE_KEY, remaining
+                    )
 
             prior_tool_call_ids = _native_assistant_tool_call_ids(
                 getattr(strands_agent, "messages", None) or []
@@ -4385,7 +4489,7 @@ class StrandsAgent:
                     # and MessageAddedEvent synced agent state (see
                     # SessionManager.register_hooks), so the next run's
                     # reconcile still finds a placeholder to overwrite and the
-                    # wire->native map to key it by.
+                    # recorded call id that admits it.
                     if halt_event_stream:
                         break
 
@@ -4720,9 +4824,10 @@ class StrandsAgent:
                             if not result_tool_id:
                                 continue
 
-                            # Direct lookup works for backend tools (keyed by Strands ID).
-                            # Frontend tools are keyed by a generated UUID, so we fall back
-                            # to scanning by strands_tool_id when the direct lookup misses.
+                            # Every call is keyed by Strands' own tool-use ID.
+                            # The scan by strands_tool_id is the fallback for a
+                            # result whose direct lookup misses (e.g. an entry
+                            # first seen under a partial event).
                             call_info = tool_calls_seen.get(result_tool_id, {})
                             if not call_info:
                                 for _tid, _data in tool_calls_seen.items():
@@ -4892,8 +4997,7 @@ class StrandsAgent:
                                 break
 
                         # Prune the persisted tool-call meta map for entries
-                        # whose native id (or ``strands_tool_id`` for frontend
-                        # tools stored under a wire key) was just consumed.
+                        # whose tool-use id was just consumed.
                         # The emission-time size cap (``_TOOL_CALL_MAP_MAX``) is
                         # only a backstop for abandoned entries.
                         if (
@@ -5005,26 +5109,23 @@ class StrandsAgent:
                             if (
                                 not is_native_frontend_wait
                                 and strands_tool_id
-                                and _get_strands_session_manager(
+                                and _get_strands_session_manager(strands_agent)
+                            ):
+                                _call_ids = recorded_frontend_call_ids(
                                     strands_agent
                                 )
-                            ):
-                                _wire_map = dict(
-                                    strands_agent.state.get(AG_UI_WIRE_MAP_STATE_KEY)
-                                    or {}
-                                )
-                                _wire_map[tool_use_id] = strands_tool_id
-                                # Bound growth: entries for frontend calls that
+                                if tool_use_id not in _call_ids:
+                                    _call_ids.append(tool_use_id)
+                                # Bound growth: ids for frontend calls that
                                 # never get a client result (abandoned/dismissed
                                 # HITL) are never consumed/pruned. Keep only the
-                                # most-recent ``_WIRE_MAP_MAX`` (insertion order).
-                                if len(_wire_map) > _WIRE_MAP_MAX:
-                                    for _stale in list(_wire_map)[
-                                        : len(_wire_map) - _WIRE_MAP_MAX
-                                    ]:
-                                        _wire_map.pop(_stale, None)
+                                # most-recent ``_FRONTEND_CALL_IDS_MAX``.
+                                if len(_call_ids) > _FRONTEND_CALL_IDS_MAX:
+                                    del _call_ids[
+                                        : len(_call_ids) - _FRONTEND_CALL_IDS_MAX
+                                    ]
                                 strands_agent.state.set(
-                                    AG_UI_WIRE_MAP_STATE_KEY, _wire_map
+                                    AG_UI_FRONTEND_CALL_IDS_STATE_KEY, _call_ids
                                 )
                         else:
                             # Use Strands' ID for backend tools
