@@ -644,6 +644,60 @@ def _interrupt_resume_error(message: str) -> "RunErrorEvent":
     )
 
 
+CUSTOM_HOOK_ERROR = "hook_error"
+CUSTOM_HOOK_ERROR_PROMPT_TOOL = "__prompt__"
+
+
+def _hook_error(hook: str, tool: str, error: Exception) -> "CustomEvent":
+    """Report a developer-supplied callback failure on the wire.
+
+    The event NAME and the payload KEYS mirror the TypeScript bridge exactly so
+    a client handles one shape across both languages. Three things about the
+    surrounding behaviour are deliberately not identical:
+
+    - ``hook`` carries each language's own spelling of the callback the
+      developer configured, so this reports ``state_from_args`` where
+      TypeScript reports ``stateFromArgs``. Emitting TypeScript's spelling here
+      would name a callback that does not exist in a Python config.
+    - ``tool_stream_event_handler`` is reported here and only logged in
+      TypeScript, so Python emits from nine sites and TypeScript from eight.
+      It is also the one hook dispatched per streamed chunk, so its report is
+      deduplicated to once per tool call.
+    - After ``args_streamer`` throws, Python emits the full arguments as a
+      fallback delta and completes the tool call; TypeScript emits no fallback
+      and returns. That one predates this event and is left alone, because
+      changing it would change what a throwing hook does to the run.
+
+    ``tool`` is the tool whose ``ToolBehavior`` declared the hook, and
+    ``CUSTOM_HOOK_ERROR_PROMPT_TOOL`` for ``state_context_builder``, which runs
+    outside any tool call. Tool names are passed through unvalidated, so a tool
+    named ``__prompt__`` would be indistinguishable from the builder. Reserving
+    the name is not worth a validation failure inside a hint event.
+
+    ``session_manager_provider`` is not reported here. Its failure is caught
+    too, but it is not swallowed: the run ends with a ``RunErrorEvent``, so
+    there is nothing left for a hint event to add.
+
+    The message is written to the run's event stream verbatim, so a hook whose
+    exceptions embed connection strings or paths puts them in front of whoever
+    is reading that stream. TypeScript has always behaved this way and neither
+    side gates it.
+
+    A hook failure does not end the run. What the hook itself was for is lost,
+    which is the pre-existing behaviour this event makes visible rather than
+    changes: a failed ``state_from_*`` leaves the state un-updated, and a failed
+    ``args_streamer`` falls back to one full-arguments delta. The traceback
+    lives in the log, at eight of the nine sites: ``args_streamer`` logs without
+    ``exc_info``, so a failure there leaves none anywhere.
+    """
+
+    return CustomEvent(
+        type=EventType.CUSTOM,
+        name=CUSTOM_HOOK_ERROR,
+        value={"hook": hook, "tool": tool, "error": str(error)},
+    )
+
+
 class _FrontendToolIdentityError(ValueError):
     """A frontend call cannot be correlated through Strands' native ID."""
 
@@ -3985,6 +4039,7 @@ class StrandsAgent:
                 except Exception as e:
                     # If the builder fails, keep the original message
                     logger.warning(f"State context builder failed: {e}", exc_info=True)
+                    yield _hook_error("state_context_builder", CUSTOM_HOOK_ERROR_PROMPT_TOOL, e)
 
             # Generate unique message ID
             message_id = str(uuid.uuid4())
@@ -3994,6 +4049,10 @@ class StrandsAgent:
             # the wire. Tool calls use it only when no snapshot will expose the
             # tool-call AssistantMessage id.
             last_emitted_text_message_id: str | None = None
+            # ``tool_stream_event_handler`` runs once per streamed chunk, so a
+            # handler that throws throws on every chunk. The log stays per
+            # chunk; the wire event is reported once per tool call.
+            reported_stream_handler_failures: set[tuple[str, str]] = set()
             tool_calls_seen = {}
             # Tool calls made by a sub-agent running as a tool (issue #2304).
             # Kept separate from ``tool_calls_seen`` so inner calls never take
@@ -4256,6 +4315,11 @@ class StrandsAgent:
                             except Exception as e:
                                 logger.warning(
                                     f"state_context_builder failed: {e}", exc_info=True
+                                )
+                                yield _hook_error(
+                                    "state_context_builder",
+                                    CUSTOM_HOOK_ERROR_PROMPT_TOOL,
+                                    e,
                                 )
                             break
                 preserve_live_interrupt_history = (
@@ -4661,6 +4725,19 @@ class StrandsAgent:
                                         f"tool_stream_event_handler failed for {_tse_tool_name}: {_tse_exc}",
                                         exc_info=True,
                                     )
+                                    # Keyed on the tool as well as the call: an
+                                    # absent id is dropped before dispatch, but
+                                    # an empty one is not, and two different
+                                    # tools carrying it produce reports that are
+                                    # not interchangeable.
+                                    _tse_key = (_tse_tool_name, str(_tse_tool_use_id))
+                                    if _tse_key not in reported_stream_handler_failures:
+                                        reported_stream_handler_failures.add(_tse_key)
+                                        yield _hook_error(
+                                            "tool_stream_event_handler",
+                                            _tse_tool_name,
+                                            _tse_exc,
+                                        )
                             elif isinstance(stream_data, dict) and "state" in stream_data:
                                 # Default behaviour: emit state snapshot when tool yields {"state": ...}
                                 yield StateSnapshotEvent(
@@ -4843,6 +4920,7 @@ class StrandsAgent:
                                         f"state_from_result failed for {tool_name}: {e}",
                                         exc_info=True,
                                     )
+                                    yield _hook_error("state_from_result", tool_name, e)
 
                             if behavior and behavior.custom_result_handler:
                                 try:
@@ -4856,6 +4934,7 @@ class StrandsAgent:
                                         f"custom_result_handler failed for {tool_name}: {e}",
                                         exc_info=True,
                                     )
+                                    yield _hook_error("custom_result_handler", tool_name, e)
 
                             if behavior and behavior.stop_streaming_after_result:
                                 stop_text_streaming = True
@@ -5322,6 +5401,7 @@ class StrandsAgent:
                                                 f"state_from_args failed for {tool_name}: {e}",
                                                 exc_info=True,
                                             )
+                                            yield _hook_error("state_from_args", tool_name, e)
 
                                     # Defer hand-off: for frontend tools, buffer the
                                     # ToolCallEnd instead of emitting it now. It is
@@ -5373,10 +5453,14 @@ class StrandsAgent:
                                         pending_halt = True
 
                                 elif is_pending:
-                                    # Continuation turn — tool already resolved
-                                    # in conversation history. Don't re-emit any
-                                    # wire events but still let state callbacks
-                                    # fire so derived state stays consistent.
+                                    # Continuation turn: the tool is already
+                                    # resolved in conversation history, so none
+                                    # of the TOOL_CALL_* events are re-emitted.
+                                    # State callbacks still fire so derived
+                                    # state stays consistent, and what they
+                                    # produce does reach the wire: a snapshot
+                                    # when one succeeds, a hook_error when one
+                                    # throws.
                                     if behavior and behavior.state_from_args:
                                         try:
                                             snapshot = await maybe_await(
@@ -5393,6 +5477,7 @@ class StrandsAgent:
                                                 f"state_from_args failed for {tool_name}: {e}",
                                                 exc_info=True,
                                             )
+                                            yield _hook_error("state_from_args", tool_name, e)
                                 else:
                                     # Legacy path: behavior.args_streamer is
                                     # configured. Emit the full burst at
@@ -5415,6 +5500,7 @@ class StrandsAgent:
                                                 f"state_from_args failed for {tool_name}: {e}",
                                                 exc_info=True,
                                             )
+                                            yield _hook_error("state_from_args", tool_name, e)
 
                                     if behavior:
                                         predict_state_payload = [
@@ -5481,6 +5567,7 @@ class StrandsAgent:
                                         logger.warning(
                                             f"args_streamer failed for {tool_name}, falling back to full args: {e}"
                                         )
+                                        yield _hook_error("args_streamer", tool_name, e)
                                         yield ToolCallArgsEvent(
                                             type=EventType.TOOL_CALL_ARGS,
                                             tool_call_id=tool_use_id,
