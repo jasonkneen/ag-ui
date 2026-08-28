@@ -591,6 +591,7 @@ export const agentsIntegrations = {
         {
           agentic_chat: "agentic-chat",
           agentic_chat_reasoning: "agentic-chat-reasoning",
+          agentic_chat_citations: "agentic-chat-citations",
           agentic_chat_multimodal: "agentic-chat-multimodal",
           // v1 page reuses the agentic-chat endpoint (menu advertises the
           // feature; this mapping was missing).
@@ -642,6 +643,7 @@ export const agentsIntegrations = {
         {
           agentic_chat: "agentic-chat",
           agentic_chat_reasoning: "agentic-chat-reasoning",
+          agentic_chat_citations: "agentic-chat-citations",
           agentic_chat_multimodal: "agentic-chat-multimodal",
           v1_agentic_chat: "agentic-chat",
           backend_tool_rendering: "backend-tool-rendering",

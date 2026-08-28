@@ -49,6 +49,7 @@ It exposes:
 | --------------------------- | ---------------------------------------------- |
 | `/agentic-chat`             | Frontend tool demo                             |
 | `/agentic-chat-reasoning`   | Reasoning / thinking event streaming           |
+| `/agentic-chat-citations`   | Answers carrying the sources they came from    |
 | `/agentic-chat-multimodal`  | Multimodal image / document analysis           |
 | `/backend-tool-rendering`   | Backend tool rendering demo                    |
 | `/shared-state`             | Shared recipe state                            |
