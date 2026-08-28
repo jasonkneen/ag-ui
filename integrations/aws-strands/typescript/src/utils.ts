@@ -907,6 +907,21 @@ function pinnedLookup(approved: IpAddress[]) {
 const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 
 /**
+ * Escape a literal `%` that does not begin a valid `%XX` escape.
+ *
+ * The URL parser already percent-encodes spaces and non-ASCII in the path and
+ * query, so those need no help here, and it leaves existing escapes alone so a
+ * presigned URL keeps the `%2F` and `%3D` its signature was computed over.
+ * What it does not repair is a `%` from a name like `50%.txt`, which would go
+ * on the wire as an invalid request target. Only `%` is rewritten, so the
+ * result cannot grow an authority delimiter and the component stays within the
+ * URL it came from.
+ */
+function escapeBarePercent(component: string): string {
+  return component.replace(/%(?![0-9A-Fa-f]{2})/g, "%25");
+}
+
+/**
  * Perform one request, reaching only `approved`.
  *
  * A fresh agent with keep-alive disabled is used for every hop. A pooled socket
@@ -947,7 +962,10 @@ async function pinnedRequest(
         protocol: url.protocol,
         hostname: url.hostname,
         port: url.port === "" ? (secure ? 443 : 80) : Number(url.port),
-        path: `${url.pathname}${url.search}`,
+        // Built from the components of the target validation just cleared, and
+        // after that validation, so the repair cannot reach the host, the port
+        // or the addresses `lookup` is pinned to.
+        path: `${escapeBarePercent(url.pathname)}${escapeBarePercent(url.search)}`,
         method: "GET",
         lookup: pinnedLookup(approved) as never,
         agent,

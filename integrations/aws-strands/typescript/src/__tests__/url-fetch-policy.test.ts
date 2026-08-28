@@ -2415,3 +2415,101 @@ describe("URL fetch policy: transport binding", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// What the server actually receives as the request target
+// ---------------------------------------------------------------------------
+
+describe("URL fetch policy: request target encoding", () => {
+  /** A listener that records the request target it was actually asked for. */
+  async function recordingListener(respond?: (path: string) => string | null) {
+    const targets: string[] = [];
+    const server = http.createServer((req, res) => {
+      const target = req.url ?? "";
+      targets.push(target);
+      const location = respond?.(target);
+      if (location) {
+        res.writeHead(302, { location });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const { port } = server.address() as AddressInfo;
+    return {
+      port,
+      targets,
+      close: () => new Promise<void>((r) => server.close(() => r())),
+    };
+  }
+
+  /**
+   * Fetch `pathAndQuery` off a real socket and return the targets the server
+   * read off the request line.
+   *
+   * The real transport is used, since a stub standing in for the socket layer
+   * would assert how a string was formatted rather than what went on the wire.
+   * Loopback is the approved address, hence the opt-in.
+   */
+  async function targetsSeenFor(
+    pathAndQuery: string,
+    respond?: (path: string) => string | null,
+  ): Promise<string[]> {
+    const listener = await recordingListener(respond);
+    try {
+      mockDns("127.0.0.1");
+      const bytes = await fetchUrlBytes(
+        `http://pinned.example:${listener.port}${pathAndQuery}`,
+        makeLog(),
+        policy({ allowPrivateNetworks: true, timeoutMs: 1500 }),
+      );
+
+      expect(bytes && Buffer.from(bytes).toString()).toBe("ok");
+      return listener.targets;
+    } finally {
+      await listener.close();
+    }
+  }
+
+  it.each([
+    ["a space in the path", "/holiday photo.png", "/holiday%20photo.png"],
+    ["non-ASCII in the path", "/文件.txt", "/%E6%96%87%E4%BB%B6.txt"],
+    [
+      "a space and non-ASCII in the query",
+      "/report?name=q1 summary&city=東京",
+      "/report?name=q1%20summary&city=%E6%9D%B1%E4%BA%AC",
+    ],
+    ["a bare percent in the path", "/50%.txt", "/50%25.txt"],
+    [
+      "a bare percent in the query",
+      "/receipt?off=50%&x=1",
+      "/receipt?off=50%25&x=1",
+    ],
+    [
+      "an already-encoded path that must not be encoded twice",
+      "/already%20encoded%2Fname.txt",
+      "/already%20encoded%2Fname.txt",
+    ],
+    [
+      "a presigned query whose escapes must survive",
+      "/o.bin?X-Amz-Credential=AKIA%2F20240101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=9f%2Bb%3D%3D",
+      "/o.bin?X-Amz-Credential=AKIA%2F20240101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=9f%2Bb%3D%3D",
+    ],
+  ])("sends %s", async (_label, requested, expected) => {
+    expect(await targetsSeenFor(requested)).toEqual([expected]);
+  });
+
+  it("repairs a bare percent on a redirect hop too", async () => {
+    // The hop is only reachable through the redirect, so a repair applied once
+    // to the URL the caller passed would leave this one raw.
+    const targets = await targetsSeenFor("/start", (path) =>
+      path === "/start" ? "/rebate 50%.txt" : null,
+    );
+
+    expect(targets).toEqual(["/start", "/rebate%2050%25.txt"]);
+  });
+});

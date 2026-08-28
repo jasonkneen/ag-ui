@@ -428,10 +428,11 @@ const NULL_ORIGIN = "null";
  * request rather than one for the whole policy, so the named site keeps its
  * credentials and only the null caller is refused.
  *
- * The Python adapter has the policy half of this, via
- * `allow_credentials=bool(origins) and not is_wildcard`; widening it to
- * `"null"` is a separate change on the Python side, and Starlette decides
- * credentials per policy rather than per request.
+ * The Python adapter refuses the same two values, via
+ * `allow_credentials=bool(origins) and not {"*", "null"}.intersection(...)`,
+ * but has only this half: Starlette takes one `allow_credentials` for the
+ * whole policy, so a list holding `"null"` there loses credentials for every
+ * origin beside it.
  *
  * Call this on the output of {@link normalizeCorsOrigin}, so the wildcard
  * spellings have already collapsed to `"*"`.

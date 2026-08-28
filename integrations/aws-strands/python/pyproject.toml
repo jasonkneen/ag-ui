@@ -11,6 +11,7 @@ dependencies = [
     "ag-ui-a2ui-toolkit>=0.0.4",
     "ag-ui-protocol>=0.1.19",
     "fastapi>=0.115.12",
+    "pydantic>=2.11.2",
     "strands-agents>=1.15.0",
 ]
 
