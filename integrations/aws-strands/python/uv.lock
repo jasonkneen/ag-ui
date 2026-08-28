@@ -31,6 +31,7 @@ dependencies = [
     { name = "ag-ui-a2ui-toolkit" },
     { name = "ag-ui-protocol" },
     { name = "fastapi" },
+    { name = "pydantic" },
     { name = "strands-agents" },
 ]
 
@@ -47,6 +48,7 @@ requires-dist = [
     { name = "ag-ui-a2ui-toolkit", specifier = ">=0.0.4" },
     { name = "ag-ui-protocol", specifier = ">=0.1.19" },
     { name = "fastapi", specifier = ">=0.115.12" },
+    { name = "pydantic", specifier = ">=2.11.2" },
     { name = "strands-agents", specifier = ">=1.15.0" },
 ]
 
