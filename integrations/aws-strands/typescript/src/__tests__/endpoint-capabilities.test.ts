@@ -96,7 +96,10 @@ describe("addCapabilities", () => {
 });
 
 describe("capabilitiesFor / addCapabilities { agent }", () => {
-  function makeAgent(emitChunkEvents: boolean): StrandsAgent {
+  function makeAgent(
+    emitChunkEvents: boolean,
+    emitMessagesSnapshot?: boolean,
+  ): StrandsAgent {
     return new StrandsAgent({
       agent: {
         model: {},
@@ -110,7 +113,10 @@ describe("capabilitiesFor / addCapabilities { agent }", () => {
         sessionManager: undefined,
       } as unknown as import("@strands-agents/sdk").Agent,
       name: "cap",
-      config: { emitChunkEvents },
+      config: {
+        emitChunkEvents,
+        ...(emitMessagesSnapshot !== undefined && { emitMessagesSnapshot }),
+      },
     });
   }
 
@@ -132,6 +138,41 @@ describe("capabilitiesFor / addCapabilities { agent }", () => {
     expect(caps.events.TEXT_MESSAGE_CHUNK).toBe(false);
     expect(caps.events.TEXT_MESSAGE_START).toBe(true);
     expect(caps.events.TEXT_MESSAGE_END).toBe(true);
+  });
+
+  it("advertises citations except where nothing can carry the last one", () => {
+    // The closing citation rides TEXT_MESSAGE_END, and the snapshot message
+    // carries the list either way. Chunk mode drops the END; turning snapshots
+    // off as well leaves it nowhere to go.
+    expect(capabilitiesFor(makeAgent(false)).features.citations).toBe(true);
+    expect(capabilitiesFor(makeAgent(true)).features.citations).toBe(true);
+    expect(capabilitiesFor(makeAgent(false, false)).features.citations).toBe(
+      true,
+    );
+    expect(capabilitiesFor(makeAgent(true, false)).features.citations).toBe(
+      false,
+    );
+  });
+
+  it("serves citations:false for a plain config literal, not just a StrandsAgent", async () => {
+    // The derivation reads `emitMessagesSnapshot`, so `addCapabilities`'s own
+    // parameter type has to admit it. When it did not, this literal was a
+    // TS2353 excess-property error and the derivation was unreachable through
+    // the documented form.
+    const { port, close } = await startApp((app) =>
+      addCapabilities(app, "/capabilities", {
+        agent: {
+          config: { emitChunkEvents: true, emitMessagesSnapshot: false },
+        },
+      }),
+    );
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/capabilities`);
+      const body = await res.json();
+      expect(body.features.citations).toBe(false);
+    } finally {
+      await close();
+    }
   });
 
   it("addCapabilities({ agent }) serves the derived matrix", async () => {

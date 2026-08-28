@@ -15,6 +15,9 @@ export {
 } from "./client-proxy-tool";
 export type { StrandsToolRegistry } from "./client-proxy-tool";
 
+export { CITATIONS_METADATA_KEY } from "./citations";
+export type { AguiCitation, AguiCitationLocation } from "./citations";
+
 export { convertAguiContentToStrands, flattenContentToText } from "./utils";
 
 export {

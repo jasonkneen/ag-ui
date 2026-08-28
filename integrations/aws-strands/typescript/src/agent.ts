@@ -46,6 +46,13 @@ import {
   type ToolCallContext,
   type ToolResultContext,
 } from "./config";
+import {
+  CitationAccumulator,
+  citationMetadata,
+  copyCitationMetadata,
+  discardOrphanCitations,
+  jsonRoundTrip,
+} from "./citations";
 import { isProxyTool, syncProxyTools } from "./client-proxy-tool";
 import {
   planA2UIInjection,
@@ -1012,6 +1019,24 @@ function* _drainPendingToolCalls(
  * Used to seed the running ``MessagesSnapshotEvent`` payload so each snapshot
  * carries the full thread history.
  */
+/**
+ * The message's own metadata, when it is something the wire can carry.
+ *
+ * `buildSnapshotMessages` is handed unvalidated objects and coerces every other
+ * field it reads, so metadata gets the same treatment: anything that is not a
+ * plain object is dropped rather than forwarded.
+ */
+function _carriedMetadata(msg: unknown): Record<string, unknown> | undefined {
+  const metadata = (msg as { metadata?: unknown } | null)?.metadata;
+  if (typeof metadata !== "object" || metadata === null) return undefined;
+  if (Array.isArray(metadata)) return undefined;
+  // Copied, not referenced: the rebuilt message is retained and re-emitted in
+  // every later snapshot, so handing back the caller's object would alias the
+  // client's own input into all of them. A value that will not encode is
+  // dropped rather than carried, matching the citation path.
+  return jsonRoundTrip(metadata as Record<string, unknown>);
+}
+
 export function buildSnapshotMessages(
   input_messages: AguiMessage[],
 ): AguiMessage[] {
@@ -1021,11 +1046,14 @@ export function buildSnapshotMessages(
     if (role !== "user" && role !== "assistant" && role !== "tool") continue;
     const msgId = _coerceId((msg as { id?: string }).id);
     if (role === "user") {
-      out.push({
+      const user: AguiUserMessage = {
         id: msgId,
         role: "user",
         content: _coerceText(msg.content),
-      } as AguiUserMessage);
+      };
+      const userMetadata = _carriedMetadata(msg);
+      if (userMetadata) user.metadata = userMetadata;
+      out.push(user);
     } else if (role === "assistant") {
       const rawToolCalls = (msg as { toolCalls?: AguiToolCall[] }).toolCalls;
       let toolCalls: AguiToolCall[] | undefined;
@@ -1050,6 +1078,12 @@ export function buildSnapshotMessages(
         content: _coerceText(msg.content),
       };
       if (toolCalls) assistant.toolCalls = toolCalls;
+      // Same reason the tool branch below preserves error/encryptedValue: this
+      // is an AG-UI -> AG-UI rebuild of the client's own message, and a
+      // snapshot REPLACES what the client assembled. Dropping metadata here
+      // erases the previous turn's citations the moment turn two starts.
+      const assistantMetadata = _carriedMetadata(msg);
+      if (assistantMetadata) assistant.metadata = assistantMetadata;
       out.push(assistant);
     } else {
       const toolCallId = (msg as { toolCallId?: string }).toolCallId ?? "";
@@ -1068,6 +1102,8 @@ export function buildSnapshotMessages(
       // silently dropping the client's own fields.
       if (error !== undefined) tool.error = error;
       if (encryptedValue !== undefined) tool.encryptedValue = encryptedValue;
+      const toolMetadata = _carriedMetadata(msg);
+      if (toolMetadata) tool.metadata = toolMetadata;
       out.push(tool);
     }
   }
@@ -1776,7 +1812,7 @@ export class StrandsAgent {
       }
     })();
     if (this.config.emitChunkEvents) {
-      yield* collapseToChunkEvents(tracked);
+      yield* collapseToChunkEvents(tracked, this._log);
     } else {
       yield* tracked;
     }
@@ -2094,6 +2130,11 @@ export class StrandsAgent {
       let messageId = uuid();
       let messageStarted = false;
       let accumulatedText = "";
+      // Citations belong to the message that was open when they arrived, so
+      // this is drained at every message boundary. It counts its own text
+      // offset rather than reading `accumulatedText`, which is reset only when
+      // message snapshots are being emitted.
+      const citations = new CitationAccumulator(this._log);
       const toolCallsSeen = new Map<string, SeenToolCall>();
       const currentState: Record<string, unknown> = {
         ...((inputData.state ?? {}) as object),
@@ -2336,13 +2377,29 @@ export class StrandsAgent {
                 messageStarted = true;
               }
               accumulatedText += delta.text;
+              citations.advance(delta.text);
               yield {
                 type: EventType.TEXT_MESSAGE_CONTENT,
                 messageId,
                 delta: delta.text,
+                // Citations reach the client on the next text delta after they
+                // arrive, so a reader sees its sources while the answer is
+                // still streaming rather than only once the message closes.
+                ...citationMetadata(citations.pending()),
               };
               continue;
             }
+
+            // A citation, held until the message it annotates publishes it. It
+            // is recorded against the text emitted so far, which is the only
+            // positional information available: the citation itself locates a
+            // span in the SOURCE document and says nothing about where in the
+            // answer it belongs.
+            //
+            // Consuming it here is also what stops citations being forwarded as
+            // RAW. That fallback is for events this adapter does not map, and
+            // this one is now mapped.
+            if (citations.add(delta)) continue;
 
             // Reasoning/thinking text streaming.
             if (delta.type === "reasoningContentDelta") {
@@ -2439,13 +2496,28 @@ export class StrandsAgent {
                 if (useStreaming) {
                   // Close any open assistant text turn so the snapshot order
                   // matches the wire-event order and message_id can rotate.
+                  if (!messageStarted) {
+                    discardOrphanCitations(
+                      citations,
+                      `threadId=${inputData.threadId}`,
+                      this._log,
+                    );
+                  }
                   if (messageStarted) {
-                    yield { type: EventType.TEXT_MESSAGE_END, messageId };
+                    const closingCitations = citations.take();
+                    yield {
+                      type: EventType.TEXT_MESSAGE_END,
+                      messageId,
+                      ...citationMetadata(closingCitations),
+                    };
                     if (emitMessagesSnapshot && accumulatedText) {
                       snapshotMessages.push({
                         id: messageId,
                         role: "assistant",
                         content: accumulatedText,
+                        ...citationMetadata(
+                          copyCitationMetadata(closingCitations, this._log),
+                        ),
                       } as AguiAssistantMessage);
                       accumulatedText = "";
                       yield {
@@ -2727,6 +2799,7 @@ export class StrandsAgent {
                   setAccumulatedText: (v: string) => {
                     accumulatedText = v;
                   },
+                  citations,
                   snapshotMessages,
                   emitMessagesSnapshot,
                   toolCallsSeen,
@@ -2788,6 +2861,7 @@ export class StrandsAgent {
               setAccumulatedText: (v: string) => {
                 accumulatedText = v;
               },
+              citations,
               snapshotMessages,
               emitMessagesSnapshot,
               toolCallsSeen,
@@ -2981,8 +3055,20 @@ export class StrandsAgent {
 
             if (behavior?.stopStreamingAfterResult) {
               stopTextStreaming = true;
+              if (!messageStarted) {
+                discardOrphanCitations(
+                  citations,
+                  `threadId=${inputData.threadId}`,
+                  this._log,
+                );
+              }
               if (messageStarted) {
-                yield { type: EventType.TEXT_MESSAGE_END, messageId };
+                const closingCitations = citations.take();
+                yield {
+                  type: EventType.TEXT_MESSAGE_END,
+                  messageId,
+                  ...citationMetadata(closingCitations),
+                };
                 messageStarted = false;
                 // Splice point 4 of 4 (early-exit): commit accumulated
                 // assistant text into the snapshot.
@@ -2991,6 +3077,9 @@ export class StrandsAgent {
                     id: messageId,
                     role: "assistant",
                     content: accumulatedText,
+                    ...citationMetadata(
+                      copyCitationMetadata(closingCitations, this._log),
+                    ),
                   } as AguiAssistantMessage);
                   accumulatedText = "";
                   yield {
@@ -3152,11 +3241,13 @@ export class StrandsAgent {
 
           // Terminal fallback: anything the dispatch above does not translate
           // is forwarded verbatim as RAW rather than dropped without a trace
-          // (issue #2291) — provider extensions this adapter predates, Bedrock
-          // citations among them, arrive here. Mirrors the Python adapter's
-          // terminal `else`, and matches what every other streaming adapter
-          // (LangGraph, watsonx, a2a) already does. The lifecycle brackets in
-          // `RAW_SKIPPED_EVENT_KINDS` stay silent, as they do in Python.
+          // (issue #2291). Provider extensions this adapter predates arrive
+          // here. Bedrock citations no longer do: the delta branch above maps
+          // them onto the message they annotate, so they are no longer among
+          // the events this adapter has no branch for. Mirrors the Python
+          // adapter's terminal `else`, and matches what every other streaming
+          // adapter (LangGraph, watsonx, a2a) already does. The lifecycle
+          // brackets in `RAW_SKIPPED_EVENT_KINDS` stay silent, as in Python.
           if (kind && RAW_SKIPPED_EVENT_KINDS.has(kind)) continue;
           // An assembled content block duplicates content already on the wire,
           // whatever kind of block it turned out to be. Keyed on the wrapper
@@ -3212,8 +3303,22 @@ export class StrandsAgent {
         yield { type: EventType.REASONING_END, messageId: reasoningMessageId! };
       }
 
+      // A turn that cited without producing any text has nothing to attach
+      // them to, so they are dropped loudly rather than carried forward.
+      if (!messageStarted) {
+        discardOrphanCitations(
+          citations,
+          `threadId=${inputData.threadId}`,
+          this._log,
+        );
+      }
       if (messageStarted) {
-        yield { type: EventType.TEXT_MESSAGE_END, messageId };
+        const closingCitations = citations.take();
+        yield {
+          type: EventType.TEXT_MESSAGE_END,
+          messageId,
+          ...citationMetadata(closingCitations),
+        };
         // Splice point 4 of 4 (terminal): commit the final assistant text
         // turn into the snapshot.
         if (emitMessagesSnapshot && accumulatedText) {
@@ -3221,6 +3326,9 @@ export class StrandsAgent {
             id: messageId,
             role: "assistant",
             content: accumulatedText,
+            ...citationMetadata(
+              copyCitationMetadata(closingCitations, this._log),
+            ),
           } as AguiAssistantMessage);
           accumulatedText = "";
           yield {
@@ -3344,6 +3452,7 @@ export class StrandsAgent {
     setMessageStarted: (v: boolean) => void;
     getAccumulatedText: () => string;
     setAccumulatedText: (v: string) => void;
+    citations: CitationAccumulator;
     snapshotMessages: AguiMessage[];
     emitMessagesSnapshot: boolean;
     toolCallsSeen: Map<string, SeenToolCall>;
@@ -3437,14 +3546,29 @@ export class StrandsAgent {
 
     // Close any open assistant text turn and commit its content to the
     // snapshot before rotating message_id.
+    if (!ctx.getMessageStarted()) {
+      discardOrphanCitations(
+        ctx.citations,
+        `threadId=${ctx.inputData.threadId}`,
+        this._log,
+      );
+    }
     if (ctx.getMessageStarted()) {
-      yield { type: EventType.TEXT_MESSAGE_END, messageId: ctx.getMessageId() };
+      const closingCitations = ctx.citations.take();
+      yield {
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: ctx.getMessageId(),
+        ...citationMetadata(closingCitations),
+      };
       const acc = ctx.getAccumulatedText();
       if (ctx.emitMessagesSnapshot && acc) {
         ctx.snapshotMessages.push({
           id: ctx.getMessageId(),
           role: "assistant",
           content: acc,
+          ...citationMetadata(
+            copyCitationMetadata(closingCitations, this._log),
+          ),
         } as AguiAssistantMessage);
         ctx.setAccumulatedText("");
         yield {
@@ -3584,6 +3708,16 @@ export class StrandsAgent {
       let messageStarted = false;
       let reasoningStarted = false;
       let reasoningMessageId: string | undefined;
+      // This path has no message snapshot to fall back on, so the citations of
+      // a node's answer only reach the client through its own message events.
+      //
+      // One accumulator, not one per node, because this path already gives the
+      // whole orchestrator run a single rotating message id rather than a
+      // message per node. Citations follow the message they annotate, so they
+      // follow that. The Python adapter keys both per node, which is the
+      // pre-existing orchestrator drift between the two bridges rather than
+      // anything citations introduce.
+      const citations = new CitationAccumulator(this._log);
 
       const orchestratorStream = this._orchestrator!.stream(prompt);
       // A throw out of this stream reaches the outer handler below and is
@@ -3631,8 +3765,19 @@ export class StrandsAgent {
           }
           if (kind === "afterNodeCallEvent") {
             const ev = event as { nodeId?: string; nodeType?: string };
+            if (!messageStarted) {
+              discardOrphanCitations(
+                citations,
+                `threadId=${inputData.threadId}`,
+                this._log,
+              );
+            }
             if (messageStarted) {
-              yield { type: EventType.TEXT_MESSAGE_END, messageId };
+              yield {
+                type: EventType.TEXT_MESSAGE_END,
+                messageId,
+                ...citationMetadata(citations.take()),
+              };
               messageStarted = false;
               messageId = uuid();
             }
@@ -3727,11 +3872,16 @@ export class StrandsAgent {
                   };
                   messageStarted = true;
                 }
+                citations.advance(delta.text);
                 yield {
                   type: EventType.TEXT_MESSAGE_CONTENT,
                   messageId,
                   delta: delta.text,
+                  ...citationMetadata(citations.pending()),
                 };
+              } else if (citations.add(delta)) {
+                // Held until this node's message publishes it, same as the
+                // single-agent path.
               } else if (
                 delta?.type === "reasoningContentDelta" &&
                 delta.text
@@ -3767,8 +3917,19 @@ export class StrandsAgent {
         }
       }
 
+      if (!messageStarted) {
+        discardOrphanCitations(
+          citations,
+          `threadId=${inputData.threadId}`,
+          this._log,
+        );
+      }
       if (messageStarted) {
-        yield { type: EventType.TEXT_MESSAGE_END, messageId };
+        yield {
+          type: EventType.TEXT_MESSAGE_END,
+          messageId,
+          ...citationMetadata(citations.take()),
+        };
       }
       if (reasoningStarted) {
         yield {
@@ -4195,7 +4356,9 @@ function unwrapStrandsEvent(event: unknown): unknown {
  */
 async function* collapseToChunkEvents(
   source: AsyncGenerator<BaseEvent, void, void>,
+  log: Logger = DEFAULT_LOGGER,
 ): AsyncGenerator<BaseEvent, void, void> {
+  let droppedEndMetadata = false;
   for await (const event of source) {
     switch (event.type) {
       case EventType.TEXT_MESSAGE_START: {
@@ -4204,6 +4367,7 @@ async function* collapseToChunkEvents(
           type: EventType.TEXT_MESSAGE_CHUNK,
           messageId: e.messageId,
           role: e.role,
+          ...(event.metadata !== undefined && { metadata: event.metadata }),
         } as BaseEvent;
         break;
       }
@@ -4213,10 +4377,32 @@ async function* collapseToChunkEvents(
           type: EventType.TEXT_MESSAGE_CHUNK,
           messageId: e.messageId,
           delta: e.delta,
+          // Rebuilding the event drops anything not copied across, and metadata
+          // merges into the message rather than describing the envelope, so it
+          // has to travel. The dropped END below is why a citation arriving
+          // after the last text delta only reaches a chunk-mode client through
+          // the MESSAGES_SNAPSHOT.
+          ...(event.metadata !== undefined && { metadata: event.metadata }),
         } as BaseEvent;
         break;
       }
       case EventType.TEXT_MESSAGE_END:
+        // Dropped by design: the client transformer closes the message itself.
+        // Metadata that only ever rode the END goes with it, which for a
+        // trailing citation means the message snapshot is the only carrier
+        // left. Warned about once per stream rather than in silence, because
+        // this is otherwise the only citation-loss path in the adapter that
+        // says nothing. `capabilitiesFor` reports `features.citations: false`
+        // when snapshots are off too, since then nothing carries it at all.
+        if (event.metadata !== undefined && !droppedEndMetadata) {
+          droppedEndMetadata = true;
+          log.warn(
+            `${LOG_PREFIX} emitChunkEvents drops TEXT_MESSAGE_END, and with ` +
+              `it metadata that rode only that event. A trailing citation ` +
+              `reaches the client through MESSAGES_SNAPSHOT instead, or not ` +
+              `at all when emitMessagesSnapshot is off.`,
+          );
+        }
         break;
       case EventType.TOOL_CALL_START: {
         const e = event as {

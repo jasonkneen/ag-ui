@@ -551,6 +551,16 @@ export interface StrandsAguiCapabilities {
     protobuf: boolean;
     /** Multiple sequential runs in one HTTP stream. One run per POST. */
     multipleRunsPerStream: boolean;
+    /**
+     * Model citations reach the client under the `citations` key of the
+     * annotated assistant message's metadata.
+     *
+     * False in one configuration, which {@link capabilitiesFor} derives: chunk
+     * events replace `TEXT_MESSAGE_END`, which is where a citation arriving
+     * after the last text delta travels, and with message snapshots also off
+     * there is nothing left to carry it.
+     */
+    citations: boolean;
   };
 }
 
@@ -596,6 +606,7 @@ export const DEFAULT_CAPABILITIES: StrandsAguiCapabilities = {
     stateDelta: false,
     protobuf: true,
     multipleRunsPerStream: false,
+    citations: true,
   },
 };
 
@@ -646,10 +657,21 @@ function mergeCapabilities(
  * matrix reflects what the client will actually observe.
  */
 export function capabilitiesFor(
-  agent: { config: { emitChunkEvents?: boolean } },
+  agent: {
+    config: { emitChunkEvents?: boolean; emitMessagesSnapshot?: boolean };
+  },
   overrides?: StrandsAguiCapabilitiesOverrides,
 ): StrandsAguiCapabilities {
   const base = mergeCapabilities(overrides);
+  // Chunk mode drops TEXT_MESSAGE_END, so a citation arriving after the last
+  // text delta rides the message snapshot instead. Turn both off and it has
+  // nowhere left to go, which is a capability the client does not have.
+  if (
+    agent.config.emitChunkEvents &&
+    agent.config.emitMessagesSnapshot === false
+  ) {
+    base.features.citations = false;
+  }
   if (agent.config.emitChunkEvents) {
     base.events.TEXT_MESSAGE_START = false;
     base.events.TEXT_MESSAGE_CONTENT = false;
@@ -684,7 +706,12 @@ export function addCapabilities(
   capabilities?:
     | StrandsAguiCapabilitiesOverrides
     | {
-        agent: { config: { emitChunkEvents?: boolean } };
+        agent: {
+          config: {
+            emitChunkEvents?: boolean;
+            emitMessagesSnapshot?: boolean;
+          };
+        };
         overrides?: StrandsAguiCapabilitiesOverrides;
       },
 ): void {
