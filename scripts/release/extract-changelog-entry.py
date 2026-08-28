@@ -67,14 +67,24 @@ def resolve_package_path(name: str) -> Path | None:
 # Fences follow CommonMark (https://spec.commonmark.org/0.31.2/#fenced-code-blocks):
 # an opener is three or more backticks or tildes indented at most three spaces,
 # and it closes only on a line of the SAME character, at least as long as the
-# opener, followed by nothing but whitespace. Both halves of that rule matter.
-# A ``` line inside a ```` block is content, so tracking only the character
-# would leave the block "closed" and make a literal `## ` line inside it read as
-# structural; and an info string is legal on an opener but not on a closer, so
-# accepting a suffix closes the block early with the same result. Either way the
-# entry silently truncates at that line. Must stay behaviourally identical to
-# stepFence() in generate-changelog-entries.ts: generation and publication have
-# to agree on where an entry ends.
+# opener, followed by nothing but whitespace. An opener may carry an info
+# string, but a backtick fence's info string may not contain a backtick.
+#
+# Every clause of that rule is load-bearing here, because getting any of them
+# wrong moves where an entry ends:
+#   - A ``` line inside a ```` block is content. Tracking only the delimiter
+#     character would leave the block "closed", so a literal `## ` line inside
+#     it reads as structural and the entry TRUNCATES there.
+#   - An info string is legal on an opener but never on a closer. Accepting a
+#     suffix as a closer ends the block early, with the same result.
+#   - A backtick-containing info string means the line is ordinary text, not an
+#     opener. Treating it as one opens a block that never closes, which
+#     swallows the next version's heading — so the entry OVER-RUNS instead,
+#     publishing older releases' notes as part of this one.
+#
+# Must stay behaviourally identical to stepFence() in
+# generate-changelog-entries.ts: generation and publication have to agree on
+# where an entry ends.
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
@@ -89,6 +99,10 @@ def _step_fence(
         return open_fence, False
     marker, suffix = match.group(1), match.group(2)
     if open_fence is None:
+        # A backtick in a backtick fence's info string makes the line text, not
+        # an opener; tildes carry no such restriction.
+        if marker[0] == "`" and "`" in suffix:
+            return open_fence, False
         return (marker[0], len(marker)), True
     char, length = open_fence
     if marker[0] == char and len(marker) >= length and suffix.strip() == "":

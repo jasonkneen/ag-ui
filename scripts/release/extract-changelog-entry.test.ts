@@ -322,6 +322,78 @@ test("a four-space indented ``` does not open a fence and swallow later entries"
   }
 });
 
+// CommonMark: a backtick fence's info string may not contain a backtick, so
+// such a line is ordinary text. Treating it as an opener starts a block that
+// never closes, which swallows the NEXT version's heading — the entry then runs
+// to end of file and publishes older releases' notes as part of this one. The
+// mirror of the truncation cases above, and it reaches a hand-edited changelog.
+test("a backtick in a backtick fence's info string does not open a fence", () => {
+  const root = fixtureRoot();
+  try {
+    writeFileSync(
+      join(root, "integrations/mastra/CHANGELOG.md"),
+      [
+        "# Changelog",
+        "",
+        "## 0.2.0 — 2026-08-24",
+        "",
+        "current",
+        "```lang`bad",
+        "literal",
+        "## 0.1.0 — 2026-07-01",
+        "",
+        "- Older entry.",
+        "",
+      ].join("\n"),
+    );
+    const r = runExtract(root, ["@ag-ui/mastra", "0.2.0"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /current/);
+    assert.match(r.stdout, /literal/);
+    // The 0.1.0 heading ends the entry, so neither it nor its notes leak in.
+    assert.doesNotMatch(r.stdout, /## 0\.1\.0/);
+    assert.doesNotMatch(r.stdout, /Older entry/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The restriction is backtick-only: a tilde fence's info string may contain a
+// backtick, so this one IS a fence and must still shield the heading inside it.
+test("a backtick in a tilde fence's info string still opens a fence", () => {
+  const root = fixtureRoot();
+  try {
+    writeFileSync(
+      join(root, "integrations/mastra/CHANGELOG.md"),
+      [
+        "# Changelog",
+        "",
+        "## 0.2.0 — 2026-08-24",
+        "",
+        "~~~lang`ok",
+        "## Inside the block",
+        "~~~",
+        "",
+        "### Breaking changes",
+        "",
+        "Removes `runAgent`.",
+        "",
+        "## 0.1.0 — 2026-07-01",
+        "",
+        "- Older entry.",
+        "",
+      ].join("\n"),
+    );
+    const r = runExtract(root, ["@ag-ui/mastra", "0.2.0"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Inside the block/);
+    assert.match(r.stdout, /### Breaking changes/);
+    assert.doesNotMatch(r.stdout, /Older entry/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("exits 3 for an unknown package, a missing file, and a missing version", () => {
   const root = fixtureRoot();
   try {

@@ -467,14 +467,20 @@ export function renderEntry(
 // Fences follow CommonMark (https://spec.commonmark.org/0.31.2/#fenced-code-blocks):
 // an opener is three or more backticks or tildes indented at most three spaces,
 // and it closes only on a line of the SAME character, at least as long as the
-// opener, followed by nothing but whitespace. Both halves of that rule matter.
-// A ``` line inside a ```` block is content, so tracking only the character
-// would leave the block "closed" and make a literal "## " line inside it read
-// as structural; and an info string is legal on an opener but not on a closer,
-// so accepting a suffix closes the block early with the same result. Info
-// strings are not otherwise validated (a backtick fence's info string may not
-// contain a backtick, which this treats as an opener anyway) — that only ever
-// costs a rejected fragment, never a truncated one.
+// opener, followed by nothing but whitespace. An opener may carry an info
+// string, but a backtick fence's info string may not contain a backtick.
+//
+// Every clause of that rule is load-bearing here, because getting any of them
+// wrong moves where an entry ends:
+//   - A ``` line inside a ```` block is content. Tracking only the delimiter
+//     character would leave the block "closed", so a literal "## " line inside
+//     it reads as structural and the entry TRUNCATES there.
+//   - An info string is legal on an opener but never on a closer. Accepting a
+//     suffix as a closer ends the block early, with the same result.
+//   - A backtick-containing info string means the line is ordinary text, not an
+//     opener. Treating it as one opens a block that never closes, which
+//     swallows the next version's heading — so the entry OVER-RUNS instead,
+//     publishing older releases' notes as part of this one.
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
 type OpenFence = { char: string; length: number } | null;
@@ -489,6 +495,10 @@ function stepFence(
   if (!match) return { open, isFence: false };
   const [, marker, suffix] = match;
   if (open === null) {
+    // A backtick in a backtick fence's info string makes the line text, not an
+    // opener; tildes carry no such restriction.
+    if (marker[0] === "`" && suffix.includes("`"))
+      return { open, isFence: false };
     return { open: { char: marker[0], length: marker.length }, isFence: true };
   }
   const closes =

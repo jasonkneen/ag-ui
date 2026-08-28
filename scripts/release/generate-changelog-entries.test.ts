@@ -357,6 +357,55 @@ test("fence tracking follows CommonMark on delimiter length and closers", () => 
   assert.equal(demoted, "````md\n# inside\n````\n#### outside");
 });
 
+// The mirror of the cases above. A backtick fence's info string may not contain
+// a backtick, so such a line is ordinary text. Treating it as an opener starts a
+// block that never closes, which swallows the NEXT version's heading — the entry
+// then OVER-RUNS to end of file instead of truncating, carrying older releases'
+// notes into this one.
+test("a backtick in a backtick fence's info string does not open a fence", () => {
+  const content = [
+    "# Changelog",
+    "",
+    "## 0.2.0 — 2026-08-24",
+    "",
+    "current",
+    "```lang`bad",
+    "literal",
+    "## 0.1.0 — 2026-07-01",
+    "",
+    "- Older entry.",
+    "",
+  ].join("\n");
+
+  // The 0.1.0 heading is structural, so it ends the 0.2.0 entry.
+  const body = findVersionEntry(content, "0.2.0");
+  assert.ok(body !== null);
+  assert.match(body!, /current/);
+  assert.match(body!, /literal/);
+  assert.doesNotMatch(body!, /Older entry/);
+  assert.doesNotMatch(body!, /## 0\.1\.0/);
+  assert.equal(
+    scanChangelogLines(content).filter((l) => l.isHeading).length,
+    2,
+    "both version headings stay structural",
+  );
+
+  // Such a line neither opens nor closes anything...
+  assert.equal(hasUnclosedFence("```lang`bad\nliteral"), false);
+  // ...but the restriction is backtick-only: a tilde fence's info string may
+  // contain one, so this DOES open a block, left dangling here.
+  assert.equal(hasUnclosedFence("~~~lang`ok\nliteral"), true);
+  assert.equal(hasUnclosedFence("~~~lang`ok\nliteral\n~~~"), false);
+  // A plain info string still opens a backtick fence.
+  assert.equal(hasUnclosedFence("```lang\nliteral"), true);
+
+  // And demotion leaves the text alone rather than shielding it as code.
+  assert.equal(
+    demoteFragmentHeadings("```lang`bad\n# outside"),
+    "```lang`bad\n#### outside",
+  );
+});
+
 // --- formatCommits / buildPrompt -------------------------------------------
 
 test("formatCommits drops release bookkeeping commits and keeps bodies", () => {
