@@ -396,8 +396,17 @@ def _agui_media_from_standard_block(item: Dict[str, Any]):
 # `convertLangchainMultimodalToAgui`. The two must not drift.
 
 
-def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[AGUIContentItem]:
+def convert_langchain_multimodal_to_agui(content: Union[str, List[Union[str, Dict[str, Any]]]]) -> List[AGUIContentItem]:
     """Convert LangChain's multimodal content to AG-UI format.
+
+    Plain string entries are preserved in place as text. LangChain declares
+    message content as ``str | list[str | dict]``, so a string sitting beside the
+    blocks is content rather than a malformed block, and dropping it lost the
+    user's words. A bare string ARGUMENT is normalized to a one-entry list as a
+    defensive convenience for direct callers — a str is itself iterable, so
+    walking one would shred it into a content item per character. The production
+    caller (:func:`langchain_messages_to_agui`) only routes list content here and
+    converts bare-string message content itself.
 
     ``image_url`` blocks are converted with the appropriate source type (data or
     URL) and to the media class their MIME type names — ``image_url`` is the
@@ -417,9 +426,25 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
     exception here does not degrade one attachment — it escapes the conversion
     and costs the client every message in the thread.
     """
+    if isinstance(content, str):
+        content = [content]
+    elif not isinstance(content, list):
+        # Rule 2, one level further out than the `else` at the end of this loop:
+        # the whole content value, not one of its items. A dict reaching here
+        # would otherwise be walked as a sequence of its own KEY NAMES.
+        logger.warning(
+            "Dropping content: not a str or list (%s)", _describe_type(content)
+        )
+        return []
+
     agui_content: List[AGUIContentItem] = []
     for item in content:
-        if isinstance(item, dict):
+        if isinstance(item, str):
+            agui_content.append(TextInputContent(
+                type="text",
+                text=item
+            ))
+        elif isinstance(item, dict):
             # Read ONCE, into a local. `item.get("type") in _AGUI_MEDIA_CLASSES`
             # below raises `TypeError: unhashable type` for a `type` that is a
             # list or a dict — a rule-1 violation that takes the whole snapshot
@@ -538,10 +563,12 @@ def convert_langchain_multimodal_to_agui(content: List[Dict[str, Any]]) -> List[
                 )
         else:
             # Same rule, one level out. A content list relayed by the LangGraph
-            # server can carry a JSON `null`, a bare string, or a number where a
+            # server can carry a JSON `null`, a number, or a nested list where a
             # block is expected. `.get` on one of those would raise out of the
             # whole message list, so this loop never called it — but it said
-            # nothing either. The TypeScript adapter already warns here.
+            # nothing either. The TypeScript adapter already warns here. A bare
+            # string is NOT one of these — LangChain accepts one as content, and
+            # the branch at the top of the loop keeps it.
             logger.warning(
                 "Dropping content block: not a dict (%s)", _describe_type(item)
             )

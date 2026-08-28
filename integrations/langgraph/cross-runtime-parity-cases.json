@@ -802,13 +802,13 @@
     {
       "id": "inbound/non-object-entry/bare-string",
       "direction": "inbound",
-      "axis": "malformed",
-      "why": "a bare string where a block is expected",
+      "axis": "wellformed",
+      "why": "a bare string entry is text content, not a malformed block",
       "content": ["just a string"],
       "expect": {
-        "kept": [],
-        "dropped": 1,
-        "loggedDrops": 1
+        "kept": [{ "kind": "text", "text": "just a string" }],
+        "dropped": 0,
+        "loggedDrops": 0
       }
     },
     {

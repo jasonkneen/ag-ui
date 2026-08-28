@@ -1134,13 +1134,27 @@ function incomingImageUrl(payload: unknown): string | undefined {
  * MESSAGES_SNAPSHOT — a block kind missing here is an attachment that vanishes
  * from a reopened thread.
  */
-function convertLangchainMultimodalToAgui(content: IncomingMediaBlock[]): InputContent[] {
+function convertLangchainMultimodalToAgui(content: (IncomingMediaBlock | string)[]): InputContent[] {
   const aguiContent: InputContent[] = [];
 
   for (const item of content) {
-    // A content array relayed by the LangGraph server can carry a JSON `null`
-    // (or a bare string) where a block is expected, and `item.type` on one of
-    // those aborts the conversion of every OTHER block and every other message.
+    // A plain string entry is CONTENT, not a malformed block. LangChain types
+    // message content as `str | list[str | dict]` and folds a bare entry in as
+    // text — `convert_to_openai_messages(["hello", {type: "text", text: " world"}])`
+    // sends the model `"hello\n world"` — so dropping it loses the user's own
+    // words rather than discarding junk. Mirrors the `isinstance(item, str)`
+    // branch in the Python adapter.
+    if (typeof item === "string") {
+      aguiContent.push({
+        type: "text",
+        text: item,
+      });
+      continue;
+    }
+
+    // A content array relayed by the LangGraph server can carry a JSON `null`, a
+    // number, or a nested array where a block is expected, and `item.type` on one
+    // of those aborts the conversion of every OTHER block and every other message.
     // One unusable block is dropped like any other unusable block.
     if (!item || typeof item !== "object") {
       console.warn("[convertLangchainMultimodalToAgui] Dropping content block: not an object");
