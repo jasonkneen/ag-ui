@@ -69,8 +69,12 @@ export const ADK_A2UI_INJECT_AGENTS: string[] = ["a2ui_dynamic_schema"];
 // `generate_a2ui` injected alongside them. Injection is applied per-agent here
 // (NOT integration-wide) and these agents are excluded from the runtime-level
 // a2ui config in route.ts to avoid double-applying the middleware.
+// `a2ui_advanced` runs the SAME backend agent as `a2ui_dynamic_schema` (the
+// demo is frontend-only: a custom progress renderer plus action handlers), so
+// it needs the same per-agent injection.
 export const STRANDS_A2UI_INJECT_AGENTS: string[] = [
   "a2ui_dynamic_schema",
+  "a2ui_advanced",
   "a2ui_recovery",
 ];
 
@@ -111,6 +115,7 @@ export const agentsIntegrations = {
         new PydanticAIAgent({ url: `${envVars.pydanticAIUrl}/${path}` }),
       {
         agentic_chat: "agentic_chat",
+        agentic_chat_multimodal: "agentic_chat_multimodal",
         agentic_generative_ui: "agentic_generative_ui",
         human_in_the_loop: "human_in_the_loop",
         // TODO: Re-enable this once production builds no longer break
@@ -419,6 +424,7 @@ export const agentsIntegrations = {
         new LlamaIndexAgent({ url: `${envVars.llamaIndexUrl}/${path}/run` }),
       {
         agentic_chat: "agentic_chat",
+        agentic_chat_multimodal: "agentic_chat_multimodal",
         human_in_the_loop: "human_in_the_loop",
         agentic_generative_ui: "agentic_generative_ui",
         shared_state: "shared_state",
@@ -465,12 +471,23 @@ export const agentsIntegrations = {
         new HttpAgent({ url: `${envVars.agentFrameworkPythonUrl}/${path}` }),
       {
         agentic_chat: "agentic_chat",
+        agentic_chat_multimodal: "agentic_chat_multimodal",
         backend_tool_rendering: "backend_tool_rendering",
         human_in_the_loop: "human_in_the_loop",
         agentic_generative_ui: "agentic_generative_ui",
         shared_state: "shared_state",
         tool_based_generative_ui: "tool_based_generative_ui",
         predictive_state_updates: "predictive_state_updates",
+        // A2UI: generate_a2ui is auto-injected and handled server-side by the MAF
+        // Python adapter (plan_a2ui_injection → subagent + recovery), driven by the
+        // runtime forwarding injectA2UITool (see the copilotkit route). No client-side
+        // tool injection or per-agent middleware, so these are plain HttpAgents.
+        // Fixed-schema needs no generation tool — its search tools return the surface
+        // envelope directly and simply never emit a generate_a2ui call.
+        a2ui_fixed_schema: "a2ui_fixed_schema",
+        a2ui_dynamic_schema: "a2ui_dynamic_schema",
+        a2ui_advanced: "a2ui_advanced",
+        a2ui_recovery: "a2ui_recovery",
       },
     ),
 
@@ -572,11 +589,17 @@ export const agentsIntegrations = {
           backend_tool_rendering: "backend-tool-rendering",
           agentic_generative_ui: "agentic-generative-ui",
           shared_state: "shared-state",
+          predictive_state_updates: "predictive-state-updates",
+          tool_based_generative_ui: "tool-based-generative-ui",
+          interrupt: "interrupt",
+          multi_agent: "multi-agent",
           // A2UI dynamic/recovery: plain Strands agents with no a2ui wiring;
           // they get per-agent `generate_a2ui` injection below. fixed_schema
           // wires its own backend tools, so it is NOT in the inject whitelist.
           a2ui_dynamic_schema: "a2ui-dynamic-schema",
           a2ui_fixed_schema: "a2ui-fixed-schema",
+          // Advanced reuses the dynamic-schema backend; the demo is frontend-only.
+          a2ui_advanced: "a2ui-dynamic-schema",
           a2ui_recovery: "a2ui-recovery",
         },
       ),
@@ -612,11 +635,16 @@ export const agentsIntegrations = {
           backend_tool_rendering: "backend-tool-rendering",
           agentic_generative_ui: "agentic-generative-ui",
           shared_state: "shared-state",
+          predictive_state_updates: "predictive-state-updates",
           tool_based_generative_ui: "tool-based-generative-ui",
+          interrupt: "interrupt",
+          multi_agent: "multi-agent",
           // A2UI dynamic/recovery are auto-injected per-agent below;
           // fixed_schema wires its own backend tools (no injection).
           a2ui_dynamic_schema: "a2ui-dynamic-schema",
           a2ui_fixed_schema: "a2ui-fixed-schema",
+          // Advanced reuses the dynamic-schema backend; the demo is frontend-only.
+          a2ui_advanced: "a2ui-dynamic-schema",
           a2ui_recovery: "a2ui-recovery",
         },
       ),
@@ -636,6 +664,7 @@ export const agentsIntegrations = {
   ag2: async () =>
     mapAgents((path) => new Ag2Agent({ url: `${envVars.ag2Url}/${path}` }), {
       agentic_chat: "agentic_chat",
+      agentic_chat_multimodal: "agentic_chat_multimodal",
       backend_tool_rendering: "backend_tool_rendering",
       human_in_the_loop: "human_in_the_loop",
       agentic_generative_ui: "agentic_generative_ui",
