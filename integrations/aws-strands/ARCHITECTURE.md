@@ -266,9 +266,9 @@ The TypeScript package ships the same seven Python examples under the matching f
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tool-based-generative-ui.ts` | Frontend-rendered tool (haiku card) auto-registered as a proxy tool — exercises the `TOOL_CALL_*` stream the dojo's `tool_based_generative_ui` page consumes. No Python equivalent. |
 
-Each file is self-contained and can be run standalone (`pnpm <name>` from `examples/`). `examples/server/server.ts` is a "dojo" that mounts all eight at the paths the Python reference server uses, so both implementations can be driven by the same curl payloads.
+Each file exports a factory that builds its agent, and most also run standalone (`pnpm <name>` from `examples/`). `examples/server/server.ts` is a "dojo" that calls those factories and mounts every demo at the paths the Python reference server uses, so both implementations can be driven by the same curl payloads. Wherever the dojo shows a backend file for a demo, that file is the one answering it. Two pages show none: `v1_agentic_chat` and `a2ui_advanced` are frontend variants that reuse another demo's endpoint, and the content generator finds no file of their own to display.
 
-Both example sets double as integration tests: they exercise every built-in hook so regressions surface quickly during manual QA.
+Both example sets double as integration tests, exercising every built-in hook. On the TypeScript side `examples/server/demo-agents.test.ts` pins the contracts the dojo pages depend on, and the dojo's Playwright suites drive the rest.
 
 ---
 

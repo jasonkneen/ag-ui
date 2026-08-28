@@ -397,7 +397,9 @@ function normalizeCorsOrigin(
  * together with `Access-Control-Allow-Credentials: true` is a pairing browsers
  * reject outright, and `origin: true` reflects whatever Origin the caller sent,
  * which would extend credentials to every site. The Python adapter applies the
- * same rule via `allow_credentials=bool(origins) and not is_wildcard`.
+ * same rule for the wildcard, and additionally withholds credentials for the
+ * literal `"null"` origin, which names no site. This does not yet, so the two
+ * differ on that one value.
  *
  * Call this on the output of {@link normalizeCorsOrigin}, so the wildcard
  * spellings have already collapsed to `"*"`.
