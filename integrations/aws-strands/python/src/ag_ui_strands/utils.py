@@ -776,8 +776,15 @@ def create_strands_app(
             preserve the legacy ``["*"]`` fallback. Pass the exact origins your
             frontend is served from, e.g. ``["http://localhost:3000"]``, or pass
             ``["*"]`` to explicitly acknowledge wildcard CORS. Credentials are
-            only enabled for explicit, non-wildcard origins — a wildcard origin
-            can never be combined with ``allow_credentials=True``.
+            only enabled for explicit origins that name a site: neither ``"*"``,
+            which names every site, nor ``"null"``, which names none, is ever
+            combined with ``allow_credentials=True``.
+
+            Pass this even when the app is mounted inside another that already
+            restricts origins. The mounted middleware answers first, so a
+            wildcard here replies ``Access-Control-Allow-Origin: *`` to an
+            origin the parent would have refused, and the parent then adds its
+            own ``Access-Control-Allow-Credentials`` header on the way out.
         auth: Optional FastAPI dependency callable used to authenticate requests
             to the agent endpoint. It should raise
             :class:`fastapi.HTTPException` to reject a request, e.g.::
@@ -822,11 +829,14 @@ def create_strands_app(
     if cors_enabled is not False:
         from fastapi.middleware.cors import CORSMiddleware
         cors_origins = origins or ["*"]
-        is_wildcard = "*" in cors_origins
+        # "*" names every site and "null" names none, so credentials granted
+        # for either are granted to anyone who can produce the header. Browsers
+        # refuse the wildcard pair outright but accept the null one.
+        unattributable = {"*", "null"}.intersection(cors_origins)
         app.add_middleware(
             CORSMiddleware,
             allow_origins=cors_origins,
-            allow_credentials=bool(origins) and not is_wildcard,
+            allow_credentials=bool(origins) and not unattributable,
             allow_methods=allow_methods if allow_methods is not None else ["*"],
             allow_headers=allow_headers if allow_headers is not None else ["*"],
         )
