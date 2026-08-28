@@ -324,4 +324,39 @@ describe("auto-injected A2UI generation options (config.a2ui)", () => {
       warn.mockRestore();
     }
   });
+
+  it("contains an async onA2UIAttempt hook that rejects", async () => {
+    // The callback type is `=> void`, which an async function also satisfies,
+    // so a rejected hook promise would escape the synchronous try/catch and
+    // surface as an unhandled rejection instead of being contained.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const model = new DynamicA2UIFakeModel();
+      const events = await runDynamicA2UI(model, {
+        a2ui: {
+          onA2UIAttempt: async () => {
+            throw new Error("async hook boom");
+          },
+        },
+      });
+
+      expectCompletedRun(events, "async-throwing-hook run");
+      const ops = a2uiOperationsOf(events);
+      expect(ops.find((op) => op.createSurface)?.createSurface.surfaceId).toBe(
+        "s1",
+      );
+      expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(
+        /onA2UIAttempt hook threw on attempt 1.*async hook boom/,
+      );
+      // Give any escaped rejection a turn of the loop to be reported.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      warn.mockRestore();
+    }
+  });
 });

@@ -165,14 +165,20 @@ export function getA2UITools<TModel = Model>(
   // leave the failure countable rather than silent.
   const onAttempt = onA2UIAttempt
     ? (record: A2UIAttemptRecord) => {
-        try {
-          onA2UIAttempt(record);
-        } catch (err) {
+        const reportHookError = (err: unknown) => {
           DEFAULT_LOGGER.warn(
             `[@ag-ui/aws-strands] A2UI onA2UIAttempt hook threw on attempt ${
               record.attempt
             }; ignoring: ${err instanceof Error ? err.message : String(err)}`,
           );
+        };
+        // The callback type is `=> void`, which TypeScript also satisfies with
+        // an async function, so a rejected hook promise would otherwise escape
+        // as an unhandled rejection rather than being contained here.
+        try {
+          void Promise.resolve(onA2UIAttempt(record)).catch(reportHookError);
+        } catch (err) {
+          reportHookError(err);
         }
       }
     : undefined;
