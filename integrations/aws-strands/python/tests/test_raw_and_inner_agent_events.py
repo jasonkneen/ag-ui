@@ -116,6 +116,12 @@ CITATION = {
     "location": {"documentChar": {"documentIndex": 0, "start": 10, "end": 26}},
 }
 
+BEDROCK_METADATA = {
+    "usage": {"inputTokens": 67, "outputTokens": 324, "totalTokens": 391},
+    "metrics": {"latencyMs": 5199},
+    "trace": {"guardrail": {"actionReason": "Guardrail blocked."}},
+}
+
 
 def _find_citation_payload(event: Any) -> Optional[dict]:
     """Locate the citation payload in a RAW event, whatever shape it arrives in.
@@ -301,6 +307,23 @@ async def test_bedrock_citation_event_is_emitted_as_raw():
     event, payload = located[0]
     assert event.source == "strands"
     assert payload == CITATION
+
+
+@pytest.mark.asyncio
+async def test_bedrock_metadata_event_is_emitted_as_raw():
+    """Usage and guardrail metadata must reach the wire instead of being dropped."""
+    strands_agent = StrandsAgentCore(
+        model=ScriptedModel([_text_turn("Guardrail response.") + [{"metadata": BEDROCK_METADATA}]]),
+        callback_handler=None,
+    )
+
+    events = await _collect(_wrap(strands_agent))
+    _assert_stream_encodes(events)
+
+    raw_events = [event for event in events if event.type == EventType.RAW]
+    assert len(raw_events) == 1
+    assert raw_events[0].source == "strands"
+    assert raw_events[0].event == {"event": {"metadata": BEDROCK_METADATA}}
 
 
 @pytest.mark.asyncio
