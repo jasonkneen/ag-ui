@@ -2354,6 +2354,58 @@ export class StrandsAgent {
         }
       }
 
+      // Replay disabled, cold agent, continuation run: the seed already ends
+      // with the user-role toolResult turn, so handing the synthetic
+      // continuation prompt to `stream()` would have Strands append a SECOND
+      // user message. The provider-bound roles become user -> assistant ->
+      // user -> user, which Bedrock refuses for failing role alternation.
+      // Folding the prompt into the turn that is already there keeps the
+      // continuation as one user turn carrying both the toolResult block and
+      // the prompt. Only reached on the opt-out; the documented default
+      // returns above with `invokeArgs = undefined`.
+      if (
+        !replayHistory &&
+        resumeEntries.length === 0 &&
+        typeof invokeArgs === "string"
+      ) {
+        const seeded = (strandsAgent as { messages?: unknown[] }).messages;
+        const tail = seeded?.[seeded.length - 1] as
+          | { role?: string; content?: unknown[] }
+          | undefined;
+        const tailCarriesToolResult =
+          tail?.role === "user" &&
+          Array.isArray(tail.content) &&
+          tail.content.some((b) => {
+            // Seeded history arrives as ContentBlock INSTANCES, which carry a
+            // `type` discriminant; the plain-object form carries the key
+            // itself. Both shapes reach here depending on the path.
+            const block = b as { toolResult?: unknown; type?: string };
+            return (
+              block?.toolResult !== undefined ||
+              block?.type === "toolResultBlock"
+            );
+          });
+        if (tailCarriesToolResult) {
+          // Rebuilt from the serialized form so the appended text block is a
+          // real instance like the ones already there; Bedrock's formatter
+          // dispatches on `block.type`, which only instances carry.
+          const tailData = (
+            tail as unknown as { toJSON?: () => { content?: unknown[] } }
+          ).toJSON?.() ?? { content: tail!.content };
+          (strandsAgent as { messages: unknown[] }).messages = [
+            ...seeded!.slice(0, -1),
+            StrandsMessage.fromMessageData({
+              role: "user",
+              content: [
+                ...((tailData.content ?? []) as never[]),
+                { text: invokeArgs } as never,
+              ] as never,
+            }),
+          ];
+          invokeArgs = undefined;
+        }
+      }
+
       this._log.debug(
         `${LOG_PREFIX} Starting agent run: threadId=${inputData.threadId}, runId=${inputData.runId}, ` +
           `pendingToolResultIds=${JSON.stringify([...pendingToolResultIds])}, ` +
@@ -4526,25 +4578,18 @@ export async function convertMessagesForStrandsSeed(
       const toolCallId = (msg as { toolCallId?: string }).toolCallId;
       if (!toolCallId || !pendingToolCalls || !pendingToolCalls.has(toolCallId))
         continue;
-      const rawContent: unknown = (msg as { content?: unknown }).content;
-      const textContent =
-        typeof rawContent === "string"
-          ? rawContent
-          : Array.isArray(rawContent)
-            ? (rawContent as unknown[])
-                .map((c) =>
-                  c && typeof c === "object" && "text" in (c as object)
-                    ? ((c as { text?: string }).text ?? "")
-                    : "",
-                )
-                .join("")
-            : "";
       pendingToolResults ??= [];
       pendingToolResults.push({
         toolResult: {
           toolUseId: toolCallId,
           status: _readToolResult(msg).status,
-          content: [{ text: textContent }],
+          // Through the same builder the replay path uses. Hand-rolling the
+          // text here sent a render-only tool's empty result as a blank block,
+          // which the provider rejects; the builder substitutes the non-empty
+          // acknowledgement instead.
+          content: [
+            _buildToolResultContent((msg as { content?: unknown }).content),
+          ],
         },
       });
       continue;
