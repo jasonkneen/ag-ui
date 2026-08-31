@@ -73,22 +73,39 @@ describe("Concurrent runs on same thread → THREAD_BUSY", () => {
       agent as unknown as { _agentsByThread: Map<string, unknown> }
     )._agentsByThread.set("thread-1", stub);
 
-    const input: RunAgentInput = minimalRunInput({ threadId: "thread-1" });
+    // Same thread, since that collision is the point, but distinct run ids so
+    // the refusal's own correlation is distinguishable from the incumbent's.
+    const held: RunAgentInput = minimalRunInput({
+      threadId: "thread-1",
+      runId: "run-held",
+    });
+    const refused: RunAgentInput = minimalRunInput({
+      threadId: "thread-1",
+      runId: "run-refused",
+    });
 
     // Kick off the first run and pull its first event so we know it has
     // registered itself as active before we start the second.
-    const firstIter = agent.run(input);
+    const firstIter = agent.run(held);
     const firstStarted = (await firstIter.next()).value as
       | BaseEvent
       | undefined;
     expect(firstStarted?.type).toBe(EventType.RUN_STARTED);
 
     // Now the second run on the same thread should short-circuit.
-    const secondEvents = await collectEvents(agent.run(input));
+    const secondEvents = await collectEvents(agent.run(refused));
     expect(secondEvents.map((e) => e.type)).toEqual([
       EventType.RUN_STARTED,
       EventType.RUN_ERROR,
     ]);
+    // Correlation ids belong to the REFUSED request, not to the run holding
+    // the thread: a client can only match the error to what it just sent.
+    const started = secondEvents[0] as unknown as {
+      threadId: string;
+      runId: string;
+    };
+    expect(started.threadId).toBe("thread-1");
+    expect(started.runId).toBe("run-refused");
     const err = secondEvents[1] as unknown as { code: string; message: string };
     expect(err.code).toBe("THREAD_BUSY");
     // Pinned in full: the Python adapter emits this string verbatim, and a

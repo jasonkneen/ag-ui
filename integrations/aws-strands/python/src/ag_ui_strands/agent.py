@@ -2689,6 +2689,23 @@ class StrandsAgent:
             interrupts=ag_ui_interrupts,
         )
 
+    def _resume_answers_pending_interrupt(
+        self, input_data: RunAgentInput, thread_id: str
+    ) -> bool:
+        """Whether this run answers an interrupt this thread is parked at.
+
+        The same rule :meth:`_orchestrator_resume_prompt` applies, asked before
+        the run starts: a resume naming only stale or unknown ids answers
+        nothing, so it must not reach a parked orchestrator.
+        """
+        pending = self._pending_interrupts_by_thread.get(thread_id) or {}
+        if not pending:
+            return False
+        return any(
+            getattr(entry, "interrupt_id", None) in pending
+            for entry in (getattr(input_data, "resume", None) or [])
+        )
+
     def _orchestrator_resume_prompt(
         self, input_data: RunAgentInput, thread_id: str
     ) -> "List[Dict[str, Any]] | None":
@@ -3128,23 +3145,36 @@ class StrandsAgent:
             # thread can collide, and `run` already refused that. A shared
             # instance cannot be multiplexed at all, so ANY overlapping run is
             # refused here, whatever its thread.
+            request_thread = input_data.thread_id or "default"
             orchestrator_thread = (
-                (input_data.thread_id or "default")
+                request_thread
                 if self._orchestrator_factory is not None
                 else _SHARED_ORCHESTRATOR_RUN_KEY
             )
-            # A shared instance parked mid-execution for one thread must not
-            # be handed to anybody else, nor re-entered by a fresh run on its
-            # own thread: it is still sitting at its interrupt.
-            parked_threads = (
-                set(self._parked_orchestrators_by_thread)
-                if self._orchestrator_factory is None
-                else set()
-            )
-            is_resume = bool(getattr(input_data, "resume", None))
-            blocked_by_park = bool(parked_threads) and not (
-                is_resume and (input_data.thread_id or "default") in parked_threads
-            )
+            if self._orchestrator_factory is None:
+                # A shared instance parked mid-execution for one thread must
+                # not be handed to anybody else, nor re-entered by a fresh run
+                # on its own thread: it is still sitting at its interrupt.
+                parked_threads = set(self._parked_orchestrators_by_thread)
+                may_proceed = (
+                    bool(getattr(input_data, "resume", None))
+                    and request_thread in parked_threads
+                )
+            else:
+                # A factory builds its own instance per run, so only this
+                # thread's parked one is at stake. Anything but a resume that
+                # actually answers its interrupt would run on a fresh instance
+                # whose teardown drops the checkpoint, losing the paused
+                # conversation for good.
+                parked_threads = (
+                    {request_thread}
+                    if request_thread in self._parked_orchestrators_by_thread
+                    else set()
+                )
+                may_proceed = self._resume_answers_pending_interrupt(
+                    input_data, request_thread
+                )
+            blocked_by_park = bool(parked_threads) and not may_proceed
 
             if orchestrator_thread in self._active_orchestrator_runs or blocked_by_park:
                 yield RunStartedEvent(

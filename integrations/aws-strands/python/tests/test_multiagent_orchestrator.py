@@ -1507,6 +1507,142 @@ async def test_the_paused_orchestrator_is_released_once_the_run_completes():
     assert len(built) == before + 1
 
 
+class _StaleResumeEntry:
+    """Resume naming an interrupt no thread ever raised."""
+
+    interrupt_id = "never-raised"
+    status = "resolved"
+    payload = {"approved": True}
+
+
+def _interrupting_factory():
+    """Factory building orchestrators that interrupt, plus the build log."""
+    built: list[FakeOrchestrator] = []
+
+    def build():
+        orchestrator = FakeOrchestrator(
+            [
+                {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+                {
+                    "type": "multiagent_node_interrupt",
+                    "node_id": "a",
+                    "interrupts": [NativeInterrupt()],
+                },
+            ]
+        )
+        built.append(orchestrator)
+        return orchestrator
+
+    return build, built
+
+
+def _completes(node_id: str = "a") -> list:
+    return [
+        {"type": "multiagent_node_start", "node_id": node_id, "node_type": "agent"},
+        {"type": "multiagent_node_stop", "node_id": node_id},
+    ]
+
+
+async def _answers(agent: StrandsAgent, paused: FakeOrchestrator) -> None:
+    """Resume the parked instance and assert the answer reached it."""
+    paused.events = _completes()
+    resume = FakeInput()
+    resume.resume = [_ResumeEntry()]
+    events = await collect(agent, resume)
+
+    # Success rather than interrupt: the answer carried the run to the end
+    # instead of parking it at a second interrupt.
+    assert events[-1].type == EventType.RUN_FINISHED
+    assert events[-1].outcome is not None
+    assert events[-1].outcome.type == "success"
+    assert paused.prompts[-1] == [
+        {
+            "interruptResponse": {
+                "interruptId": "i1",
+                "response": {"response": {"approved": True}},
+            }
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resume_entries",
+    [None, [_StaleResumeEntry()]],
+    ids=["fresh-run", "stale-resume"],
+)
+async def test_a_parked_factory_refuses_a_run_that_answers_nothing(resume_entries):
+    # A factory instance parked at an interrupt is the only place its answer
+    # can go. Both a fresh run and a resume whose ids are all stale used to be
+    # let through, build a new instance, and pop the checkpoint on teardown,
+    # losing the paused conversation.
+    build, built = _interrupting_factory()
+    agent = StrandsAgent(build, name="multi_agent")
+
+    await collect(agent, FakeInput(messages=[FakeMessage("user", "first")]))
+    paused = built[-1]
+    assert agent._parked_orchestrators_by_thread["test-thread"].orchestrator is paused
+
+    builds_before = len(built)
+    second = FakeInput(messages=[FakeMessage("user", "second")])
+    if resume_entries is not None:
+        second.resume = resume_entries
+    events = await collect(agent, second)
+
+    assert [e.type for e in events] == [EventType.RUN_STARTED, EventType.RUN_ERROR]
+    assert events[-1].code == "THREAD_BUSY"
+    assert events[-1].message == (
+        'This orchestrator is paused at an interrupt on thread "test-thread". '
+        "Answer that interrupt before starting another run."
+    )
+
+    # Refused before _run_orchestrator, so nothing was built and no teardown
+    # ran: the checkpoint is exactly as the pause left it.
+    assert len(built) == builds_before
+    assert agent._parked_orchestrators_by_thread["test-thread"].orchestrator is paused
+    assert set(agent._pending_interrupts_by_thread["test-thread"]) == {"i1"}
+
+    # Proof the checkpoint is still usable, not merely still present.
+    await _answers(agent, paused)
+    assert built[-1] is paused
+
+
+@pytest.mark.asyncio
+async def test_a_parked_factory_lets_the_matching_resume_through():
+    build, built = _interrupting_factory()
+    agent = StrandsAgent(build, name="multi_agent")
+
+    await collect(agent, FakeInput(messages=[FakeMessage("user", "first")]))
+    paused = built[-1]
+
+    await _answers(agent, paused)
+
+    assert built[-1] is paused
+    assert not agent._parked_orchestrators_by_thread.get("test-thread")
+
+
+@pytest.mark.asyncio
+async def test_a_parked_factory_does_not_block_another_thread():
+    # A factory builds per run, so one thread's pause is not the other's
+    # problem. Only a shared instance blocks every thread.
+    build, built = _interrupting_factory()
+    agent = StrandsAgent(build, name="multi_agent")
+
+    first = FakeInput(messages=[FakeMessage("user", "first")])
+    first.thread_id = "thread-a"
+    await collect(agent, first)
+    paused = built[-1]
+
+    other = FakeInput(messages=[FakeMessage("user", "second")])
+    other.thread_id = "thread-b"
+    events = await collect(agent, other)
+
+    assert events[-1].type == EventType.RUN_FINISHED
+    assert built[-1] is not paused
+    assert agent._parked_orchestrators_by_thread["thread-a"].orchestrator is paused
+    assert agent._parked_orchestrators_by_thread["thread-b"].orchestrator is built[-1]
+
+
 @pytest.mark.asyncio
 async def test_an_interrupted_run_does_not_rewind_the_conversation():
     # Rewinding a paused instance would discard the state its resume needs.
