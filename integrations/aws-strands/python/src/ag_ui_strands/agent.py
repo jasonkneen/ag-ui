@@ -1474,6 +1474,34 @@ def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
     return out
 
 
+def _continuation_result_line(
+    tool_name: str, result_text: Any, error_text: Any
+) -> str:
+    """One line of the continuation prompt: the tool, and what came back.
+
+    Forwards the ACTUAL result so the model can act on the human's decision
+    (e.g. an approval resolving to ``{"approved": false}``). Announcing a bare
+    success would silently break HITL: the model is told the tool returned
+    nothing and proceeds as though the human had approved. The synthetic
+    acknowledgement is only for a result that is genuinely empty, and a
+    client-reported failure carries its reason with an empty body alongside it,
+    so reading the body alone reports that failure as a success.
+
+    Shared by every place a client answer has to be SAID rather than persisted,
+    so the same answer reaches the model in the same words whichever prompt
+    carries it. The persisted wording of the same answer omits the name, because
+    there a ``toolResult`` block is already attached to the call it answers.
+    """
+    text = result_text if isinstance(result_text, str) else ""
+    if error_text:
+        if text.strip():
+            return f"{tool_name} failed: {error_text} (returned: {text})"
+        return f"{tool_name} failed: {error_text}"
+    if text.strip():
+        return f"{tool_name} returned: {text}"
+    return f"{tool_name} executed successfully with no return value."
+
+
 def _build_strands_history(
     input_messages: List[Any],
     url_fetch_policy: "UrlFetchPolicy | None" = None,
@@ -1490,10 +1518,17 @@ def _build_strands_history(
     Every URL content source in *input_messages* is fetched under
     *url_fetch_policy* and shares one budget, so the ceilings bound the whole
     history rather than each attachment separately.
+
+    Orphan tool results are dropped, as the seed conversion drops them: a
+    ``toolResult`` no ``toolUse`` in the replayed history answers is a history
+    real providers reject, so replaying one turns a turn the continuation prompt
+    could still have carried into a generic provider failure.
     """
     out: List[Dict[str, Any]] = []
     fetch_budget = _FetchBudget(url_fetch_policy)
     pending_tool_results: List[Dict[str, Any]] = []
+    # Every ``toolUse`` id the history built so far offers a result a home.
+    offered_tool_use_ids: set[str] = set()
 
     def flush_tool_results() -> None:
         if not pending_tool_results:
@@ -1504,10 +1539,18 @@ def _build_strands_history(
     for msg in input_messages or []:
         role = getattr(msg, "role", None)
         if role == "tool":
+            tool_call_id = getattr(msg, "tool_call_id", "") or ""
+            if tool_call_id not in offered_tool_use_ids:
+                logger.warning(
+                    "History replay dropped a tool result no replayed tool call "
+                    "answers: tool_call_id=%s",
+                    tool_call_id,
+                )
+                continue
             pending_tool_results.append(
                 {
                     "toolResult": {
-                        "toolUseId": getattr(msg, "tool_call_id", "") or "",
+                        "toolUseId": tool_call_id,
                         "content": [{"text": _coerce_text(msg.content)}],
                         # Carry the AG-UI failure signal onto Bedrock's toolResult status,
                         # so a client-reported tool failure is not asserted to the model as
@@ -1566,6 +1609,8 @@ def _build_strands_history(
                         }
                     }
                 )
+                if tc.id:
+                    offered_tool_use_ids.add(tc.id)
             if not blocks:
                 blocks = [{"text": ""}]
             out.append({"role": "assistant", "content": blocks})
@@ -4041,22 +4086,11 @@ class StrandsAgent:
                             # prompt replaces whenever replay and
                             # reconciliation are both off.
                             error_text = getattr(msg, "error", None)
-                            if error_text:
-                                if result_text and result_text.strip():
-                                    _result_parts.append(
-                                        f"{tool_name} failed: {error_text} "
-                                        f"(returned: {result_text})"
-                                    )
-                                else:
-                                    _result_parts.append(
-                                        f"{tool_name} failed: {error_text}"
-                                    )
-                            elif result_text and result_text.strip():
-                                _result_parts.append(f"{tool_name} returned: {result_text}")
-                            else:
-                                _result_parts.append(
-                                    f"{tool_name} executed successfully with no return value."
+                            _result_parts.append(
+                                _continuation_result_line(
+                                    tool_name, result_text, error_text
                                 )
+                            )
                         elif tool_name:
                             # Named, but neither signal says frontend: not in
                             # the current declarations and no recorded id.
@@ -4273,8 +4307,11 @@ class StrandsAgent:
                         "text": text or "",
                         # Carry the client's failure signal alongside the text so
                         # reconciliation can stamp the persisted toolResult status
-                        # too, not just its content.
+                        # too, not just its content. The reason itself rides
+                        # along for the prompt carry below, which has to SAY the
+                        # failure rather than persist it.
                         "is_error": bool(getattr(msg, "error", None)),
+                        "error": getattr(msg, "error", None),
                     }
                 )
                 last_frontend_result_index = msg_index
@@ -4383,6 +4420,9 @@ class StrandsAgent:
             # below runs unconditionally after the other branches and layers
             # on top, rather than short-circuiting them.
             resume_prompt: str | List[Dict[str, Any]] | list[InterruptResponseContent] | None = user_message
+            # Client answers the native history does not carry, so the prompt
+            # has to. Filled in by whichever branch below settles it.
+            uncarried_result_ids: list[str] = []
             context_block = _format_agui_context(model_context)
             if context_block and not _ensure_transient_context_hook(strands_agent):
                 raise RuntimeError(
@@ -4460,6 +4500,43 @@ class StrandsAgent:
                     )
                     yield _interrupt_reconciliation_error()
                     return
+                # Every admitted result the attempt left alone. An empty set
+                # answers "nothing was declined", not "the history is clean":
+                # nothing admitted means nothing could have been corrected.
+                declined_native_ids = sorted(
+                    native_id
+                    for native_id in resolved_native_results
+                    if native_id not in corrected_native_ids
+                )
+                if declined_native_ids:
+                    # Said out loud. A decline leaves the client's answer where
+                    # only the continuation prompt can reach the model with it,
+                    # and both of the ways that carry can fail are silent
+                    # otherwise.
+                    logger.warning(
+                        "Frontend tool result reconciliation corrected nothing for "
+                        "native ids %s; the client's answer has to reach the model "
+                        "through the continuation prompt instead",
+                        declined_native_ids,
+                    )
+                if resume_submitted:
+                    # A resume drives Strands with its interrupt responses, so it
+                    # has no continuation prompt to fall back on, and a decline
+                    # here leaves the uncorrected placeholder as what the model
+                    # reads for the client's answer. Refused, like the pre-write
+                    # gates above, rather than answered with a stub. Later than
+                    # those gates by necessity: only the attempt itself says a
+                    # correction declined.
+                    if declined_native_ids:
+                        logger.error(
+                            "Active interrupt tool result reconciliation failed: "
+                            "no correction landed for native ids %s",
+                            declined_native_ids,
+                        )
+                        yield _interrupt_reconciliation_error()
+                        return
+                else:
+                    uncarried_result_ids = declined_native_ids
                 # Continue from the corrected native history only when every
                 # NON-EMPTY frontend result this turn was admitted (i.e. its
                 # call id was recorded at emission) AND none of those
@@ -4492,6 +4569,47 @@ class StrandsAgent:
                     if reconciled and not has_newer_user_message
                     else user_message
                 )
+
+            # A user message after the results is this run's prompt, which means
+            # the trailing derivation above produced nothing and the answers
+            # reach the model through neither the history nor the prompt. Carried
+            # ahead of the user's own text rather than dropped: dropping is what
+            # leaves the model to re-fire the call it is already being answered
+            # about. Every result named here is one no correction landed for, so
+            # nothing is told twice.
+            if not resume_submitted and has_newer_user_message and uncarried_result_ids:
+                _carried = set(uncarried_result_ids)
+                _carry_lines: list[str] = []
+                for result in frontend_results:
+                    if result["tool_call_id"] not in _carried:
+                        continue
+                    carried_name = _tool_call_id_to_name.get(result["tool_call_id"])
+                    if not carried_name:
+                        # Nothing names the call, and an answer that has to be
+                        # SAID cannot be phrased without the name. Left out
+                        # rather than guessed at: guessing feeds the model false
+                        # context.
+                        logger.warning(
+                            "Could not resolve tool name for tool_call_id=%s; the "
+                            "client's answer is not carried into the continuation "
+                            "prompt",
+                            result["tool_call_id"],
+                        )
+                        continue
+                    _carry_lines.append(
+                        _continuation_result_line(
+                            carried_name, result["text"], result["error"]
+                        )
+                    )
+                if _carry_lines:
+                    _preamble = "\n".join(_carry_lines)
+                    if isinstance(resume_prompt, str):
+                        resume_prompt = f"{_preamble}\n{resume_prompt}"
+                    else:
+                        resume_prompt = [
+                            {"text": _preamble},
+                            *(resume_prompt or []),
+                        ]
 
             # A client answering to an interrupt sends its responses
             # in ``RunAgentInput.resume`` (as per the AG-UI interrupt round-trip),
