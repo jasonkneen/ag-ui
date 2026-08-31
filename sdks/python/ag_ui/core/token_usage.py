@@ -34,9 +34,18 @@ _COUNT_KEYS: Tuple[str, ...] = (
 )
 
 
-def _num(value: Any) -> Optional[int]:
+# The largest count that survives every binding's wire representation: proto
+# `int64` and C# `long?`. Python ints are unbounded, so a provider (or a bad
+# cast upstream of one) can hand over a number that simply cannot be encoded;
+# it is rejected here, at the producer, rather than becoming an encoder crash
+# mid-stream.
+_MAX_TOKEN_COUNT = 2**63 - 1
+
+
+def _normalize_number(value: Any) -> Optional[int]:
     """
-    Accept a value only if it is a real, finite, non-negative whole number.
+    Accept a value only if it is a real, finite, non-negative whole number that
+    fits the wire, and return it as an ``int``.
 
     Providers do hand over strings, ``None``s and ``NaN``s in their usage
     metadata, and a bad value must not reach the wire: consumers validate every
@@ -58,9 +67,22 @@ def _num(value: Any) -> Optional[int]:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
+
+    # Integers are settled BEFORE any float check, and never converted to one.
+    # ``math.isfinite`` coerces its argument to a float and raises
+    # ``OverflowError`` on a large int — ``math.isfinite(10**1000)`` does — so
+    # checking finiteness first would abort the run from inside the very guard
+    # whose job is to render bad metadata harmless. An int is finite by
+    # construction; the only questions are sign and range.
+    if isinstance(value, int):
+        return value if 0 <= value <= _MAX_TOKEN_COUNT else None
+
     if not math.isfinite(value):  # NaN, +Infinity, -Infinity
         return None
-    if value < 0 or int(value) != value:
+    # Range before ``int()``: bounding first keeps the conversion cheap and
+    # keeps a 1e300 from being materialised as a 300-digit integer just to be
+    # thrown away.
+    if value < 0 or value > _MAX_TOKEN_COUNT or int(value) != value:
         return None
     return int(value)
 
@@ -135,11 +157,11 @@ def token_usage_from_langchain_metadata(
 
     return _build_entry(
         {
-            "input_tokens": _num(_prop(usage_metadata, "input_tokens")),
-            "output_tokens": _num(_prop(usage_metadata, "output_tokens")),
-            "total_tokens": _num(_prop(usage_metadata, "total_tokens")),
-            "reasoning_tokens": _num(_prop(output_details, "reasoning")),
-            "cached_input_tokens": _num(_prop(input_details, "cache_read")),
+            "input_tokens": _normalize_number(_prop(usage_metadata, "input_tokens")),
+            "output_tokens": _normalize_number(_prop(usage_metadata, "output_tokens")),
+            "total_tokens": _normalize_number(_prop(usage_metadata, "total_tokens")),
+            "reasoning_tokens": _normalize_number(_prop(output_details, "reasoning")),
+            "cached_input_tokens": _normalize_number(_prop(input_details, "cache_read")),
         },
         provider,
         model,

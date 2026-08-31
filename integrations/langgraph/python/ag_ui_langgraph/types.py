@@ -245,6 +245,13 @@ RunMetadata = TypedDict("RunMetadata", {
     # separate — aggregation is the SDK's job (aggregate_token_usage), shared
     # with the TypeScript producer so both languages emit the same shape.
     "usage": NotRequired[List[TokenUsage]],
+    # LangGraph run ids of the model calls that already contributed a usage
+    # entry. Usage arrives on TWO channels and a call can use either or both:
+    # the final OnChatModelStream chunk, and the aggregated OnChatModelEnd
+    # output. A streaming provider reports it on both, under the SAME run id —
+    # so without this set, every streamed call would be counted twice. The
+    # model-end fallback consults it; the streaming path only populates it.
+    "usage_run_ids": NotRequired[Set[Optional[str]]],
 })
 
 # run_id -> lane -> in-flight message/tool-call record. The inner "lane" key is

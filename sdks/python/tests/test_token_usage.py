@@ -126,6 +126,51 @@ class TokenUsageGuardTest(unittest.TestCase):
         self.assertEqual(usage.input_tokens, 12)
         self.assertIsInstance(usage.input_tokens, int)
 
+    def test_an_integer_too_large_to_be_a_float_is_dropped_not_raised(self):
+        """Regression: the guard used ``math.isfinite`` first, which coerces to
+        float and raises ``OverflowError`` on a large int
+        (``math.isfinite(10**1000)``). A provider count big enough to trip that
+        aborted the run from inside the guard whose whole job is to make bad
+        metadata harmless — the worst possible failure mode for this code."""
+        usage = token_usage_from_langchain_metadata(
+            {"input_tokens": 10**1000, "output_tokens": 5}
+        )
+        self.assertIsNone(usage.input_tokens)
+        self.assertEqual(usage.output_tokens, 5)
+
+    def test_a_huge_integer_in_every_slot_is_dropped_not_raised(self):
+        """Every count field, including the nested detail ones, goes through
+        the same guard — so every one of them must survive the value."""
+        self.assertIsNone(
+            token_usage_from_langchain_metadata(
+                {
+                    "input_tokens": 10**400,
+                    "output_tokens": -(10**400),
+                    "total_tokens": 10**1000,
+                    "output_token_details": {"reasoning": 10**500},
+                    "input_token_details": {"cache_read": 10**600},
+                },
+                provider="openai",
+            )
+        )
+
+    def test_counts_beyond_the_int64_wire_range_are_dropped(self):
+        """Counts are ``int64`` on the proto transport and ``long?`` in C#. A
+        Python int has no such bound, so a value past it is rejected at the
+        producer rather than becoming an encoder crash mid-stream."""
+        usage = token_usage_from_langchain_metadata(
+            {"input_tokens": 2**63, "output_tokens": 2**63 - 1}
+        )
+        self.assertIsNone(usage.input_tokens)
+        self.assertEqual(usage.output_tokens, 2**63 - 1)
+
+    def test_a_float_beyond_the_wire_range_is_dropped(self):
+        usage = token_usage_from_langchain_metadata(
+            {"input_tokens": 1e300, "output_tokens": 2}
+        )
+        self.assertIsNone(usage.input_tokens)
+        self.assertEqual(usage.output_tokens, 2)
+
     def test_guards_nested_detail_fields(self):
         usage = token_usage_from_langchain_metadata(
             {

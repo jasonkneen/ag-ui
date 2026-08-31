@@ -27,7 +27,9 @@ import unittest
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from langchain_core.messages import AIMessageChunk
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from ag_ui.core import EventType, RunAgentInput
 
@@ -76,6 +78,106 @@ def _chunk_event(
         "parent_ids": [],
         "tags": [],
     }
+
+
+def _model_end_event(
+    *,
+    usage_metadata: Any = None,
+    run_id: str = "run1",
+    provider: Optional[str] = "openai",
+    model: Optional[str] = "gpt-4o",
+    node: str = "model",
+    output_as_dict: bool = False,
+):
+    """An ``on_chat_model_end`` event carrying the aggregated output message.
+
+    This is the only channel a non-streaming model uses — it emits no
+    ``on_chat_model_stream`` event at all.
+    """
+    if output_as_dict:
+        output: Any = {"usage_metadata": usage_metadata}
+    else:
+        output = AIMessage(content="hi")
+        output.usage_metadata = usage_metadata
+
+    metadata = {"langgraph_node": node}
+    if provider is not None:
+        metadata["ls_provider"] = provider
+    if model is not None:
+        metadata["ls_model_name"] = model
+
+    return {
+        "event": "on_chat_model_end",
+        "run_id": run_id,
+        "metadata": metadata,
+        "data": {"output": output},
+        "name": node,
+        "parent_ids": [],
+        "tags": [],
+    }
+
+
+class _NonStreamingModel(BaseChatModel):
+    """A model with no ``_astream``, so LangChain emits no stream events for it
+    — the shape a real provider takes when streaming is disabled, or when a
+    tool call is answered without streaming."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "test-non-streaming"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        message = AIMessage(
+            content="hi",
+            usage_metadata={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _StreamingModel(BaseChatModel):
+    """A model that streams and reports usage on its final chunk, as real
+    streaming providers do."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "test-streaming"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="hi"))])
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        yield ChatGenerationChunk(message=AIMessageChunk(content="h"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="i",
+                usage_metadata={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                response_metadata={"finish_reason": "stop"},
+            )
+        )
+
+
+async def _events_from_real_model(model, *, node="model", provider="openai",
+                                  model_name="gpt-4o"):
+    """Capture what LangChain ACTUALLY emits for a model call, rather than
+    assuming the event shape.
+
+    The model-call events are taken verbatim and only have the LangGraph run
+    metadata merged in (which LangGraph, not LangChain, supplies). If a future
+    LangChain changes where usage lives, these fixtures change with it and the
+    tests fail loudly — which is the point.
+    """
+    captured = []
+    async for event in model.astream_events([HumanMessage("q")], version="v2"):
+        if event["event"] not in ("on_chat_model_stream", "on_chat_model_end"):
+            continue
+        event["metadata"] = {
+            **(event.get("metadata") or {}),
+            "langgraph_node": node,
+            "ls_provider": provider,
+            "ls_model_name": model_name,
+        }
+        captured.append(event)
+    return captured
 
 
 def _error_event(message: str = "boom", node: str = "model"):
@@ -359,6 +461,40 @@ class TestMalformedProviderCounts(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(entry.input_tokens)
         self.assertEqual(entry.output_tokens, 3)
 
+    async def test_an_integer_too_large_to_be_a_float_does_not_abort_the_run(self):
+        """Regression: the count guard called ``math.isfinite`` first, which
+        coerces to float and raises ``OverflowError`` on a large int. The
+        exception escaped mid-stream, so the run died with no terminal event —
+        the guard killing the run it exists to protect."""
+        emitted = await _run([
+            _chunk_event(usage_metadata=_usage(input_tokens=10**1000, output_tokens=4),
+                         finish_reason="stop"),
+        ])
+
+        finished = _terminal(emitted, EventType.RUN_FINISHED)
+        self.assertEqual(
+            _wire(finished)["usage"],
+            [{"provider": "openai", "model": "gpt-4o", "outputTokens": 4}],
+        )
+
+    async def test_a_huge_integer_on_the_model_end_path_does_not_abort_the_run(self):
+        emitted = await _run([
+            _model_end_event(usage_metadata=_usage(input_tokens=10**1000)),
+        ])
+
+        finished = _terminal(emitted, EventType.RUN_FINISHED)
+        self.assertIsNone(finished.usage)
+
+    async def test_counts_beyond_the_int64_wire_range_are_dropped(self):
+        emitted = await _run([
+            _chunk_event(usage_metadata=_usage(input_tokens=2**63, output_tokens=6),
+                         finish_reason="stop"),
+        ])
+
+        entry = _terminal(emitted, EventType.RUN_FINISHED).usage[0]
+        self.assertIsNone(entry.input_tokens)
+        self.assertEqual(entry.output_tokens, 6)
+
     async def test_a_wholly_malformed_payload_does_not_fail_the_run(self):
         """The regression this guards: an unguarded count raises a
         ValidationError while BUILDING RUN_FINISHED, so the run ends with no
@@ -372,6 +508,153 @@ class TestMalformedProviderCounts(unittest.IsolatedAsyncioTestCase):
 
         finished = _terminal(emitted, EventType.RUN_FINISHED)
         self.assertIsNone(finished.usage)
+
+
+class TestNonStreamingModelUsage(unittest.IsolatedAsyncioTestCase):
+    """A model call that does not stream reports its usage ONLY on
+    ``on_chat_model_end``. Capturing from ``on_chat_model_stream`` alone missed
+    every such call — streaming disabled, or a tool call answered without
+    streaming — and those runs finished with no usage at all."""
+
+    async def test_a_real_non_streaming_model_reports_usage(self):
+        """Driven by what LangChain actually emits, not a hand-built event."""
+        events = await _events_from_real_model(_NonStreamingModel())
+
+        # Guard the fixture: if LangChain ever starts emitting stream events for
+        # a model with no _astream, this test would silently stop covering the
+        # non-streaming path.
+        self.assertEqual(
+            [e["event"] for e in events], ["on_chat_model_end"],
+            "fixture must exercise the non-streaming path (no stream events)",
+        )
+
+        finished = _terminal(await _run(events), EventType.RUN_FINISHED)
+        self.assertEqual(
+            _wire(finished)["usage"],
+            [{
+                "provider": "openai",
+                "model": "gpt-4o",
+                "inputTokens": 3,
+                "outputTokens": 2,
+                "totalTokens": 5,
+            }],
+        )
+
+    async def test_model_end_usage_is_recorded(self):
+        emitted = await _run([
+            _model_end_event(usage_metadata=_usage(input_tokens=3, output_tokens=2,
+                                                   total_tokens=5)),
+        ])
+
+        finished = _terminal(emitted, EventType.RUN_FINISHED)
+        self.assertEqual(
+            _wire(finished)["usage"],
+            [{"provider": "openai", "model": "gpt-4o", "inputTokens": 3,
+              "outputTokens": 2, "totalTokens": 5}],
+        )
+
+    async def test_model_end_output_delivered_as_a_dict_still_works(self):
+        emitted = await _run([
+            _model_end_event(usage_metadata=_usage(input_tokens=8),
+                             output_as_dict=True),
+        ])
+
+        self.assertEqual(
+            [u.input_tokens for u in _terminal(emitted, EventType.RUN_FINISHED).usage],
+            [8],
+        )
+
+    async def test_model_end_without_usage_changes_nothing(self):
+        emitted = await _run([_chunk_event(finish_reason="stop"), _model_end_event()])
+
+        finished = _terminal(emitted, EventType.RUN_FINISHED)
+        self.assertIsNone(finished.usage)
+        self.assertNotIn("usage", _wire(finished))
+
+
+class TestStreamedCallsAreNotDoubleCounted(unittest.IsolatedAsyncioTestCase):
+    """A streaming provider reports the same counts TWICE — once on the final
+    stream chunk, once on the aggregated model-end output — under the same run
+    id. The model-end read is a fallback, not an addition."""
+
+    async def test_a_real_streaming_model_is_counted_once(self):
+        events = await _events_from_real_model(_StreamingModel())
+
+        # Guard the fixture: this test is only meaningful if LangChain really
+        # does report the same usage on both channels.
+        with_usage = [
+            e for e in events
+            if getattr(
+                (e["data"].get("chunk") or e["data"].get("output")),
+                "usage_metadata", None,
+            )
+        ]
+        self.assertEqual(
+            [e["event"] for e in with_usage],
+            ["on_chat_model_stream", "on_chat_model_end"],
+            "fixture must report usage on BOTH channels for one call",
+        )
+        self.assertEqual(
+            len({e["run_id"] for e in with_usage}), 1,
+            "both reports must belong to the same model call",
+        )
+
+        finished = _terminal(await _run(events), EventType.RUN_FINISHED)
+        self.assertEqual(
+            _wire(finished)["usage"],
+            [{"provider": "openai", "model": "gpt-4o", "inputTokens": 3,
+              "outputTokens": 2, "totalTokens": 5}],
+            "the streamed call's tokens must be reported once, not doubled",
+        )
+
+    async def test_model_end_repeating_a_streamed_call_is_ignored(self):
+        emitted = await _run([
+            _chunk_event(usage_metadata=_usage(input_tokens=3, output_tokens=2),
+                         finish_reason="stop"),
+            _model_end_event(usage_metadata=_usage(input_tokens=3, output_tokens=2)),
+        ])
+
+        entry = _terminal(emitted, EventType.RUN_FINISHED).usage[0]
+        self.assertEqual((entry.input_tokens, entry.output_tokens), (3, 2))
+
+    async def test_a_streamed_call_and_a_separate_non_streamed_call_both_count(self):
+        """Dedup is per model call, not per run: a second call that never
+        streamed must still be counted."""
+        streamed = _chunk_event(usage_metadata=_usage(input_tokens=3),
+                                finish_reason="stop")
+        streamed["run_id"] = "call-a"
+
+        emitted = await _run([
+            streamed,
+            _model_end_event(usage_metadata=_usage(input_tokens=3), run_id="call-a"),
+            _model_end_event(usage_metadata=_usage(input_tokens=10), run_id="call-b"),
+        ])
+
+        self.assertEqual(
+            [u.input_tokens for u in _terminal(emitted, EventType.RUN_FINISHED).usage],
+            [13],
+        )
+
+    async def test_dedup_state_does_not_leak_between_runs(self):
+        agent = make_agent(emit_raw_events=False)
+
+        first = await _drive(agent, [
+            _model_end_event(usage_metadata=_usage(input_tokens=5), run_id="call-a"),
+        ])
+        self.assertEqual(
+            [u.input_tokens for u in _terminal(first, EventType.RUN_FINISHED).usage],
+            [5],
+        )
+
+        # Same model-call run id in the next run: a set that survived the run
+        # boundary would swallow this entirely.
+        second = await _drive(agent, [
+            _model_end_event(usage_metadata=_usage(input_tokens=7), run_id="call-a"),
+        ])
+        self.assertEqual(
+            [u.input_tokens for u in _terminal(second, EventType.RUN_FINISHED).usage],
+            [7],
+        )
 
 
 class TestUsageCarriesNoContent(unittest.IsolatedAsyncioTestCase):

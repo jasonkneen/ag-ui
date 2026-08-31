@@ -1626,6 +1626,10 @@ class LangGraphAgent:
             # into the terminal event by _collect_run_usage. Seeded per run, so
             # one run's counts can never be attributed to the next.
             "usage": [],
+            # Model-call run ids already counted, so the OnChatModelEnd fallback
+            # does not re-count what the stream already reported. Per run for
+            # the same reason as "usage" above.
+            "usage_run_ids": set(),
         }
         self.active_run = INITIAL_ACTIVE_RUN
         # Seed the public-id registry from the run's INPUT (client-echoed
@@ -3010,25 +3014,51 @@ class LangGraphAgent:
         )
         return events
 
-    def _record_chunk_usage(self, event: Any, usage_metadata: Any) -> None:
-        """Accumulate one usage entry per model call from a chunk's
-        ``usage_metadata``.
+    def _record_usage(self, event: Any, usage_metadata: Any, *, streamed: bool) -> None:
+        """Accumulate one usage entry per model call.
+
+        Usage reaches us on two channels, and which one a call uses is the
+        provider's choice, not ours:
+
+        * ``OnChatModelStream`` — the final streamed chunk, alongside
+          ``finish_reason``. This is the streaming case.
+        * ``OnChatModelEnd`` — the aggregated output message. This is the ONLY
+          channel when the model does not stream at all (streaming disabled, or
+          a tool call answered without streaming): no ``OnChatModelStream``
+          event is emitted for such a call, so a stream-only producer reports
+          nothing for it. Verified against this package's locked dependencies:
+          a non-streaming model reporting 3/2/5 produced no stream event and a
+          model-end output carrying the counts.
+
+        A streaming provider reports the SAME usage on BOTH channels under the
+        same run id, so the model-end read is a fallback, not an addition:
+        ``usage_run_ids`` records which calls the stream already covered and the
+        fallback skips those. The streaming path never consults the set, only
+        adds to it — two streamed chunks that each carry usage for one call are
+        still summed, matching the TypeScript producer.
 
         Kept per-call and folded together at the terminal event by
-        ``_collect_run_usage``, mirroring the TypeScript producer. The mapper is
-        the shared SDK one, so a malformed provider count (string, ``None``,
-        ``NaN``, negative, fractional) is dropped rather than forwarded: the
-        alternative is a ValidationError raised while BUILDING the terminal
-        event, which would cost the user the whole run over a token count.
+        ``_collect_run_usage``. The mapper is the shared SDK one, so a malformed
+        provider count (string, ``None``, ``NaN``, negative, fractional,
+        wider-than-int64) is dropped rather than forwarded: the alternative is a
+        ValidationError raised while BUILDING the terminal event, which would
+        cost the user the whole run over a token count.
 
-        A chunk with no ``usage_metadata``, or with nothing usable in it, adds
-        nothing at all — the field is then omitted from the terminal event
-        rather than reported as zeros, so "the provider reported no usage" stays
-        distinct from "the provider reported zero".
+        Nothing usable adds nothing at all — the field is then omitted from the
+        terminal event rather than reported as zeros, so "the provider reported
+        no usage" stays distinct from "the provider reported zero".
         """
         if not usage_metadata:
             return
-        metadata = (event.get("metadata") or {}) if isinstance(event, dict) else {}
+        is_dict = isinstance(event, dict)
+        run_id = event.get("run_id") if is_dict else None
+        covered = self.active_run.setdefault("usage_run_ids", set())
+        if not streamed and run_id in covered:
+            # The stream already reported this exact call. Counting the
+            # aggregated model-end copy as well would double every streamed
+            # call's tokens.
+            return
+        metadata = (event.get("metadata") or {}) if is_dict else {}
         entry = token_usage_from_langchain_metadata(
             usage_metadata,
             # LangChain's standard run metadata. Absent for some providers, in
@@ -3039,6 +3069,7 @@ class LangGraphAgent:
         )
         if entry is not None:
             self.active_run.setdefault("usage", []).append(entry)
+            covered.add(run_id)
 
     def _collect_run_usage(self) -> Optional[List[TokenUsage]]:
         """Aggregate this run's accumulated per-call usage for a terminal event.
@@ -3154,8 +3185,10 @@ class LangGraphAgent:
             # `usage_metadata` to the FINAL streamed chunk — the one that also
             # carries `finish_reason` — so this must run BEFORE the
             # finish-reason early return below or the usage of every model call
-            # would be dropped.
-            self._record_chunk_usage(event, _chunk_get(chunk_raw, "usage_metadata", None))
+            # would be dropped. OnChatModelEnd covers the non-streaming case.
+            self._record_usage(
+                event, _chunk_get(chunk_raw, "usage_metadata", None), streamed=True
+            )
 
             if response_metadata.get('finish_reason', None):
                 return
@@ -3489,6 +3522,25 @@ class LangGraphAgent:
                 return
 
         elif event_type == LangGraphEventTypes.OnChatModelEnd:
+            # The non-streaming channel for token usage, and the ONLY one for a
+            # model call that never streamed — such a call emits no
+            # OnChatModelStream event at all, so the streamed capture above
+            # never sees it. `data.output` is the aggregated message
+            # (AIMessage when the model did not stream, AIMessageChunk when it
+            # did); dual-path access because some upstream paths deliver it as
+            # a plain dict. Deduped by run id inside _record_usage, since a
+            # streaming provider reports the same counts on both channels.
+            output_message = (event.get("data") or {}).get("output")
+            self._record_usage(
+                event,
+                (
+                    output_message.get("usage_metadata")
+                    if isinstance(output_message, dict)
+                    else getattr(output_message, "usage_metadata", None)
+                ),
+                streamed=False,
+            )
+
             if self.get_message_in_progress(self.active_run["id"]) and self.get_message_in_progress(self.active_run["id"]).get("tool_call_id"):
                 resolved = self._dispatch_event(
                     ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=self.get_message_in_progress(self.active_run["id"])["tool_call_id"], raw_event=event)
