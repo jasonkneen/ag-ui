@@ -2142,20 +2142,12 @@ export class StrandsAgent {
               pendingToolResultIds.add(interrupt.toolCallId);
             }
           }
-          // Handle cancelled tool-bound interrupts: emit ToolCallResult immediately
-          for (const entry of resumeEntries) {
-            if (entry.status === "cancelled") {
-              const interrupt = priorPending.get(entry.interruptId);
-              if (interrupt?.toolCallId) {
-                yield {
-                  type: EventType.TOOL_CALL_RESULT,
-                  messageId: randomUUID(),
-                  toolCallId: interrupt.toolCallId,
-                  content: "Tool call cancelled by user.",
-                };
-              }
-            }
-          }
+          // A cancelled tool-bound interrupt gets no synthetic result here.
+          // The denial is forwarded to Strands below, its approval hook sets
+          // `cancel`, and the SDK produces the error tool result the
+          // afterToolCallEvent branch already turns into TOOL_CALL_RESULT.
+          // Emitting one here too gave the same toolCallId two results.
+          //
           // Note: even when ALL entries are cancelled, we still forward the
           // denial responses to Strands via stream() below rather than
           // short-circuiting here. This ensures native interrupt-state
@@ -3309,6 +3301,7 @@ export class StrandsAgent {
         type: EventType.RUN_FINISHED,
         threadId: inputData.threadId,
         runId: inputData.runId,
+        outcome: { type: "success" },
       };
     } catch (e) {
       const code =
@@ -3782,6 +3775,7 @@ export class StrandsAgent {
         type: EventType.RUN_FINISHED,
         threadId: inputData.threadId,
         runId: inputData.runId,
+        outcome: { type: "success" },
       };
     } catch (e) {
       const code =

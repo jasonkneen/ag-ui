@@ -1024,6 +1024,7 @@ from .utils import (
     UrlFetchPolicy,
     _FetchBudget,
     convert_agui_content_to_strands,
+    dumps_wire,
     flatten_content_to_text,
 )
 
@@ -1280,7 +1281,7 @@ def _serialize_tool_result_data(result_data: Any) -> str:
             f"Object of type {type(value).__name__} is not JSON serializable"
         )
 
-    return json.dumps(result_data, default=encode_bytes)
+    return dumps_wire(result_data, default=encode_bytes)
 
 
 async def _forward_inner_agent_events(
@@ -1317,7 +1318,7 @@ async def _forward_inner_agent_events(
         raw_str = (
             raw_input
             if isinstance(raw_input, str)
-            else json.dumps(raw_input, default=str)
+            else dumps_wire(raw_input, default=str)
         )
         entry = inner_tool_calls_seen.get(call_id)
         if entry is None:
@@ -1397,7 +1398,7 @@ async def _forward_inner_agent_events(
                 type=EventType.TOOL_CALL_RESULT,
                 tool_call_id=call_id,
                 message_id=str(uuid.uuid4()),
-                content=json.dumps(result_data, default=str),
+                content=dumps_wire(result_data, default=str),
                 # role intentionally omitted — same as the parent-level result
                 # path, so the frontend closes the spinner without writing the
                 # inner call into conversation history.
@@ -2964,7 +2965,7 @@ class StrandsAgent:
               for closing in _close_open_multiagent(nodes, open_steps):
                   yield closing
 
-              outcome = None
+              outcome = RunFinishedSuccessOutcome(type="success")
               if native_interrupts:
                   ag_ui_interrupts = [
                       _strands_interrupt_to_agui(interrupt)
@@ -4164,6 +4165,17 @@ class StrandsAgent:
             # client dispatching its follow-up run before the backend results
             # reach it, narrowing the ConcurrencyException race window.
             deferred_frontend_tool_ends = []
+            # Set when a deferred end's tool call was appended to
+            # ``snapshot_messages``, so the flush closes the batch with one
+            # MESSAGES_SNAPSHOT after the last end it emitted. One is enough:
+            # the append is eager, so that snapshot is the full state every
+            # deferred call in the batch would otherwise have re-sent
+            # byte-identically. The append stays eager on purpose (a run that
+            # dies before the flush must not lose the assistant message), which
+            # is also why the deferral cannot keep a frontend call out of
+            # earlier snapshots: in a mixed turn the backend result's snapshot
+            # already carries it before its end goes out.
+            deferred_frontend_snapshot_owed = False
             # Native ``toolUseId``s whose ``toolResult`` was processed this
             # run. Drained after each result batch to prune the persisted
             # tool-call meta map.
@@ -5114,6 +5126,12 @@ class StrandsAgent:
                                     tool_call_id=_fe_tool_use_id,
                                 )
                             deferred_frontend_tool_ends = []
+                            if deferred_frontend_snapshot_owed:
+                                deferred_frontend_snapshot_owed = False
+                                yield MessagesSnapshotEvent(
+                                    type=EventType.MESSAGES_SNAPSHOT,
+                                    messages=list(snapshot_messages),
+                                )
 
                         # The batch is fully emitted; stop before Strands runs
                         # another model cycle. Breaking HERE rather than relying
@@ -5223,7 +5241,7 @@ class StrandsAgent:
                         raw_str = (
                             tool_input_raw
                             if isinstance(tool_input_raw, str)
-                            else json.dumps(tool_input_raw, default=str)
+                            else dumps_wire(tool_input_raw, default=str)
                         )
 
                         # Try to parse as JSON if it looks complete
@@ -5238,7 +5256,7 @@ class StrandsAgent:
                             tool_input = tool_input_raw
 
                         args_str = (
-                            json.dumps(tool_input)
+                            dumps_wire(tool_input)
                             if isinstance(tool_input, dict)
                             else str(tool_input)
                         )
@@ -5509,9 +5527,10 @@ class StrandsAgent:
                                     # flushed after this turn's backend results (see
                                     # the pending_halt handler). Backend tools and
                                     # continue_after_frontend_call tools emit now.
-                                    if is_frontend_tool and not (
+                                    defer_end = is_frontend_tool and not (
                                         behavior and behavior.continue_after_frontend_call
-                                    ):
+                                    )
+                                    if defer_end:
                                         deferred_frontend_tool_ends.append(tool_use_id)
                                     else:
                                         yield ToolCallEndEvent(
@@ -5537,10 +5556,15 @@ class StrandsAgent:
                                                 ],
                                             )
                                         )
-                                        yield MessagesSnapshotEvent(
-                                            type=EventType.MESSAGES_SNAPSHOT,
-                                            messages=list(snapshot_messages),
-                                        )
+                                        # Eager append, deferred event: see the
+                                        # deferral bookkeeping declared above.
+                                        if defer_end:
+                                            deferred_frontend_snapshot_owed = True
+                                        else:
+                                            yield MessagesSnapshotEvent(
+                                                type=EventType.MESSAGES_SNAPSHOT,
+                                                messages=list(snapshot_messages),
+                                            )
                                         # Rotate so the next assistant message
                                         # in the snapshot (text or another
                                         # tool call) carries a distinct id —
@@ -5782,6 +5806,12 @@ class StrandsAgent:
                             tool_call_id=_fe_tool_use_id,
                         )
                     deferred_frontend_tool_ends = []
+                    if deferred_frontend_snapshot_owed:
+                        deferred_frontend_snapshot_owed = False
+                        yield MessagesSnapshotEvent(
+                            type=EventType.MESSAGES_SNAPSHOT,
+                            messages=list(snapshot_messages),
+                        )
             except Exception:
                 if force_stop_error is None:
                     raise
