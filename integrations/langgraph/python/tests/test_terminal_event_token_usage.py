@@ -485,9 +485,9 @@ class TestMalformedProviderCounts(unittest.IsolatedAsyncioTestCase):
         finished = _terminal(emitted, EventType.RUN_FINISHED)
         self.assertIsNone(finished.usage)
 
-    async def test_counts_beyond_the_int64_wire_range_are_dropped(self):
+    async def test_counts_beyond_the_safe_integer_wire_range_are_dropped(self):
         emitted = await _run([
-            _chunk_event(usage_metadata=_usage(input_tokens=2**63, output_tokens=6),
+            _chunk_event(usage_metadata=_usage(input_tokens=2**53, output_tokens=6),
                          finish_reason="stop"),
         ])
 

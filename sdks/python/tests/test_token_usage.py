@@ -154,15 +154,16 @@ class TokenUsageGuardTest(unittest.TestCase):
             )
         )
 
-    def test_counts_beyond_the_int64_wire_range_are_dropped(self):
-        """Counts are ``int64`` on the proto transport and ``long?`` in C#. A
-        Python int has no such bound, so a value past it is rejected at the
-        producer rather than becoming an encoder crash mid-stream."""
+    def test_counts_beyond_the_safe_integer_wire_range_are_dropped(self):
+        """The TypeScript protobuf decoder stops at ``Number.MAX_SAFE_INTEGER``,
+        which is the narrowest ceiling across the bindings. A Python int has no
+        such bound, so a value past it is rejected at the producer rather than
+        becoming an encoder crash mid-stream."""
         usage = token_usage_from_langchain_metadata(
-            {"input_tokens": 2**63, "output_tokens": 2**63 - 1}
+            {"input_tokens": 2**53, "output_tokens": 2**53 - 1}
         )
         self.assertIsNone(usage.input_tokens)
-        self.assertEqual(usage.output_tokens, 2**63 - 1)
+        self.assertEqual(usage.output_tokens, 2**53 - 1)
 
     def test_a_float_beyond_the_wire_range_is_dropped(self):
         usage = token_usage_from_langchain_metadata(

@@ -34,12 +34,13 @@ _COUNT_KEYS: Tuple[str, ...] = (
 )
 
 
-# The largest count that survives every binding's wire representation: proto
-# `int64` and C# `long?`. Python ints are unbounded, so a provider (or a bad
-# cast upstream of one) can hand over a number that simply cannot be encoded;
-# it is rejected here, at the producer, rather than becoming an encoder crash
-# mid-stream.
-_MAX_TOKEN_COUNT = 2**63 - 1
+# The largest count that survives every binding's wire representation. Proto
+# `int64` and C# `long?` reach 2**63 - 1, but the TypeScript protobuf decoder
+# stops at `Number.MAX_SAFE_INTEGER`, so that is the real ceiling across the
+# bindings. Python ints are unbounded, so a provider (or a bad cast upstream of
+# one) can hand over a number that simply cannot be encoded; it is rejected
+# here, at the producer, rather than becoming an encoder crash mid-stream.
+_MAX_TOKEN_COUNT = 2**53 - 1
 
 
 def _normalize_number(value: Any) -> Optional[int]:
