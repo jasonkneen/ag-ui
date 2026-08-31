@@ -85,6 +85,9 @@ from ag_ui.core import (
     SubagentFinishedEvent,
     SubagentFinishedSuspendedOutcome,
     SubagentErrorEvent,
+    TokenUsage,
+    aggregate_token_usage,
+    token_usage_from_langchain_metadata,
 )
 from .interrupts import lg_interrupts_to_agui, DEFAULT_RESUME_SENTINEL_CANCELLED, DEFAULT_RESUME_SENTINEL_MAP
 from ag_ui.encoder import EventEncoder
@@ -1619,6 +1622,10 @@ class LangGraphAgent:
             # out of the graph input in run(). Re-emitted in the snapshot so
             # they persist in the display without entering graph state.
             "inbound_subagent_messages": getattr(self, "_inbound_subagent_messages", []) or [],
+            # Per-model-call provider usage, appended during the run and folded
+            # into the terminal event by _collect_run_usage. Seeded per run, so
+            # one run's counts can never be attributed to the next.
+            "usage": [],
         }
         self.active_run = INITIAL_ACTIVE_RUN
         # Seed the public-id registry from the run's INPUT (client-echoed
@@ -1836,7 +1843,16 @@ class LangGraphAgent:
                     for ev in self.handle_node_change(None):
                         yield ev
                     yield self._dispatch_event(
-                        RunErrorEvent(type=EventType.RUN_ERROR, message=error_message, raw_event=event)
+                        RunErrorEvent(
+                            type=EventType.RUN_ERROR,
+                            message=error_message,
+                            raw_event=event,
+                            # Partial usage: a run that failed after one or more
+                            # model calls completed still spent those tokens, so
+                            # report them. Omitted (None) when the run died
+                            # before any call reported usage.
+                            usage=self._collect_run_usage(),
+                        )
                     )
                     # RUN_ERROR is terminal: the clients reject EVERY event after
                     # it ("The run has already errored with 'RUN_ERROR'"). `break`
@@ -2984,9 +3000,55 @@ class LangGraphAgent:
                 thread_id=thread_id,
                 run_id=run_id,
                 outcome=outcome,
+                # An interrupted run is a finished run for usage purposes: the
+                # model calls it already made were paid for and are reported.
+                # The short-circuit replay path in prepare_stream reaches this
+                # with no model calls at all, where _collect_run_usage returns
+                # None and the field is simply omitted.
+                usage=self._collect_run_usage(),
             )
         )
         return events
+
+    def _record_chunk_usage(self, event: Any, usage_metadata: Any) -> None:
+        """Accumulate one usage entry per model call from a chunk's
+        ``usage_metadata``.
+
+        Kept per-call and folded together at the terminal event by
+        ``_collect_run_usage``, mirroring the TypeScript producer. The mapper is
+        the shared SDK one, so a malformed provider count (string, ``None``,
+        ``NaN``, negative, fractional) is dropped rather than forwarded: the
+        alternative is a ValidationError raised while BUILDING the terminal
+        event, which would cost the user the whole run over a token count.
+
+        A chunk with no ``usage_metadata``, or with nothing usable in it, adds
+        nothing at all — the field is then omitted from the terminal event
+        rather than reported as zeros, so "the provider reported no usage" stays
+        distinct from "the provider reported zero".
+        """
+        if not usage_metadata:
+            return
+        metadata = (event.get("metadata") or {}) if isinstance(event, dict) else {}
+        entry = token_usage_from_langchain_metadata(
+            usage_metadata,
+            # LangChain's standard run metadata. Absent for some providers, in
+            # which case the entry carries counts with no labels — still usable,
+            # and aggregation groups all unlabelled calls together.
+            provider=metadata.get("ls_provider"),
+            model=metadata.get("ls_model_name"),
+        )
+        if entry is not None:
+            self.active_run.setdefault("usage", []).append(entry)
+
+    def _collect_run_usage(self) -> Optional[List[TokenUsage]]:
+        """Aggregate this run's accumulated per-call usage for a terminal event.
+
+        Returns ``None`` (an omitted field) when no provider usage was
+        reported, so consumers read missing usage as "not measured" rather than
+        as zero.
+        """
+        aggregated = aggregate_token_usage((self.active_run or {}).get("usage") or [])
+        return aggregated or None
 
     def _emit_success_finish(
         self, *, thread_id: str, run_id: str
@@ -2996,6 +3058,7 @@ class LangGraphAgent:
             type=EventType.RUN_FINISHED,
             thread_id=thread_id,
             run_id=run_id,
+            usage=self._collect_run_usage(),
         )
 
     def _build_command_from_agui_resume(
@@ -3086,6 +3149,13 @@ class LangGraphAgent:
 
             response_metadata = _chunk_get(chunk_raw, "response_metadata", None) or {}
             tool_call_chunks_list = _chunk_get(chunk_raw, "tool_call_chunks", None) or []
+
+            # Capture provider-reported token usage. LangChain attaches
+            # `usage_metadata` to the FINAL streamed chunk — the one that also
+            # carries `finish_reason` — so this must run BEFORE the
+            # finish-reason early return below or the usage of every model call
+            # would be dropped.
+            self._record_chunk_usage(event, _chunk_get(chunk_raw, "usage_metadata", None))
 
             if response_metadata.get('finish_reason', None):
                 return
