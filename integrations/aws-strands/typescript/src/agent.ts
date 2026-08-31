@@ -90,6 +90,22 @@ export { _buildToolResultContent };
 
 const LOG_PREFIX = "[@ag-ui/aws-strands]";
 
+/**
+ * Marks a RUN_FINISHED that reports success while the run's agent stays parked
+ * with nothing to hand the client. `run()` reads it to decide whether the
+ * resume may be remembered as completed.
+ *
+ * Carried on the event rather than in per-thread state so that it belongs to
+ * exactly one run by construction. Per-thread state cannot: the pause is
+ * recorded while the run holds its thread and acted on after it lets go, so
+ * another run starting in between could consume a record whose owner had not
+ * read it yet.
+ *
+ * A unique symbol, not a registry one, so no other code can mint this key by
+ * name. `JSON.stringify` drops symbol keys, so it never reaches the wire.
+ */
+const PAUSED_PARKED = Symbol("agui.strands.pausedWhileParked");
+
 // Strands' `randomUUID` return type is branded; normalise to plain string.
 const uuid = (): string => randomUUID();
 
@@ -990,16 +1006,87 @@ function _replaysRecordedAnswers(
     addressed.add(entry.interruptId);
     const answer = (interrupt as { response?: unknown }).response;
     if (answer === undefined) return false;
-    if (!_sameRecordedAnswer(answer, toResumeResponse(entry))) return false;
+    if (_sameRecordedAnswer(answer, toResumeResponse(entry, interrupt)))
+      continue;
+    // The legacy fallback exists only for a checkpoint written before the
+    // envelope, so it must not fire for an answer this release could have
+    // written itself. Without that guard a client that pre-wrapped its payload
+    // matches on the legacy shape and is then resumed with a second envelope
+    // around the first, silently. A pre-envelope payload that happened to look
+    // like an envelope is refused instead of accepted, which is the safe way to
+    // be wrong here.
+    if (_isCurrentGenericAnswer(answer)) return false;
+    if (!_sameRecordedAnswer(answer, _legacyResumeResponse(entry)))
+      return false;
   }
   return true;
 }
 
 /**
+ * True when `answer` is an envelope this release wraps a resolved answer in.
+ *
+ * Only the wrapped-answer key belongs here. The cancellation shape looks the
+ * same as a pre-envelope cancel PAYLOAD, which the shipped example's Cancel
+ * button submitted, so treating it as one of ours would refuse exactly the
+ * migration the legacy fallback exists for.
+ *
+ * That leaves one genuinely undecidable case, accepted knowingly: a resolved
+ * entry whose payload is `{cancelled:true}` matches both a pre-envelope raw
+ * payload and a cancellation this release recorded, and nothing in the entry or
+ * the checkpoint tells the two apart. It is treated as the migration, because
+ * that case is real and the other needs a client to resolve an interrupt with a
+ * payload that is exactly a cancellation.
+ */
+function _isCurrentGenericAnswer(answer: unknown): boolean {
+  if (typeof answer !== "object" || answer === null || Array.isArray(answer)) {
+    return false;
+  }
+  const keys = Object.keys(answer);
+  return keys.length === 1 && keys[0] === "response";
+}
+
+/**
+ * The answer the release before the resume envelope would have submitted.
+ *
+ * Read ONLY by the replay comparison. A checkpoint the SDK parked mid-resume
+ * before that release carries answers in this older shape, and an exact replay
+ * is the only way to finish the execution it holds, so a batch matching what the
+ * old code submitted still has to be recognised. Nothing else may use it: what
+ * this release submits is always the current shape.
+ *
+ * Python needs no counterpart for the envelope itself, which predates this
+ * change, so a checkpoint parked there already holds the shape it still
+ * computes. The one Python answer this change does move is the degenerate
+ * approval whose reason did not survive: the relaxed classifier now answers it
+ * raw when resolved and `{approved:false}` when cancelled, where both were
+ * previously enveloped. That side has its own narrow equivalent of this
+ * function for exactly that interrupt, and nothing wider.
+ */
+function _legacyResumeResponse(entry: ResumeEntry): unknown {
+  if (entry.status === "cancelled") return { status: "cancelled" };
+  return entry.payload === undefined ? {} : (entry.payload as unknown);
+}
+
+/**
  * Reserved native-interrupt name prefix for interrupts this adapter's
  * `interruptOnCall` hook raises. Anything else is a generic native interrupt.
+ *
+ * Reserved means reserved: an interrupt raised anywhere else under this prefix
+ * is classified, schema-checked and answered as an approval.
  */
 const TOOL_APPROVAL_NAME_PREFIX = "ag_ui:tool_call:";
+
+/**
+ * The shape a paused `context.interrupt()` is answered with when the client
+ * cancels (`ResumeEntry.status === "cancelled"`) rather than resolving, so a
+ * generic tool can treat the pause as a denial.
+ *
+ * Compare by value, not by identity: every answer is a fresh copy, so that a
+ * tool mutating what it received cannot poison later cancellations. Frozen for
+ * the same reason. A cancelled tool approval is answered `{ approved: false }`
+ * instead, which is the denial its own hook reads.
+ */
+export const INTERRUPT_CANCELLED = Object.freeze({ cancelled: true } as const);
 
 /**
  * The response contract advertised for a tool-approval interrupt.
@@ -1016,7 +1103,14 @@ function toolApprovalResponseSchema(): Record<string, unknown> {
   };
 }
 
-/** True when a native Strands interrupt came from the approval hook. */
+/**
+ * True when a native Strands interrupt came from the approval hook.
+ *
+ * The reserved name prefix is the whole test. It also decides whether a resume
+ * is answered raw or wrapped, so it deliberately does not additionally require
+ * the reason: an approval whose reason did not survive a restart still has to
+ * be answered in the shape its own hook reads.
+ */
 function isToolApprovalInterrupt(interrupt: unknown): boolean {
   const name = (interrupt as { name?: unknown } | null)?.name;
   return typeof name === "string" && name.startsWith(TOOL_APPROVAL_NAME_PREFIX);
@@ -1886,6 +1980,7 @@ export class StrandsAgent {
   >();
   /** Fingerprint of last successfully-processed resume per thread (idempotency). */
   private readonly _lastResumeFingerprint = new Map<string, string>();
+
   /**
    * When non-null, the adapter bypasses per-thread cloning and invokes
    * the orchestrator directly. See `StrandsAgentOptions.agent`.
@@ -2369,11 +2464,33 @@ export class StrandsAgent {
     // Run the agent. Track whether an error was emitted so we only store
     // the idempotency fingerprint after successful processing.
     let hadError = false;
+    let pausedSilently = false;
+    // A resume that ends on a NEW interrupt has not completed the turn it was
+    // answering, so it must not be remembered as a finished resume. The
+    // interrupt branch clears the fingerprint and persists the new interrupt
+    // deliberately; storing either here would undo both, and an exact retry of
+    // the stale batch would then be answered from the fingerprint with a
+    // success the client can act on while the tool stays parked for good.
+    let rePaused = false;
     const source = this._runRaw(inputData);
     const tracked = (async function* () {
       for await (const ev of source) {
-        if ((ev as { type: string }).type === EventType.RUN_ERROR)
-          hadError = true;
+        const kind = (ev as { type: string }).type;
+        if (kind === EventType.RUN_ERROR) hadError = true;
+        if (
+          kind === EventType.RUN_FINISHED &&
+          (ev as { outcome?: { type?: string } }).outcome?.type === "interrupt"
+        ) {
+          rePaused = true;
+        }
+        // Read off this run's own finish event, the same way `rePaused` is.
+        // Nothing else can reach it, so no other run can consume or clear it.
+        if (
+          kind === EventType.RUN_FINISHED &&
+          (ev as Record<symbol, unknown>)[PAUSED_PARKED] === true
+        ) {
+          pausedSilently = true;
+        }
         yield ev;
       }
     })();
@@ -2382,7 +2499,7 @@ export class StrandsAgent {
     } else {
       yield* tracked;
     }
-    if (!hadError && fingerprint) {
+    if (!hadError && !rePaused && !pausedSilently && fingerprint) {
       this._lastResumeFingerprint.set(threadId, fingerprint);
       const strandsAgent = this._agentsByThread.get(threadId);
       if (strandsAgent) {
@@ -2463,6 +2580,9 @@ export class StrandsAgent {
     threadId: string,
     runAbort: AbortController,
   ): AsyncGenerator<BaseEvent, void, void> {
+    // Set only by the pause below, and read only by the finish this method
+    // yields, so the two cannot be separated by anything.
+    let pausedWithNothingToReport = false;
     yield _runStarted(inputData);
 
     // One memo for the whole run. A cold run converts the same turns more than
@@ -2906,11 +3026,26 @@ export class StrandsAgent {
         // cleanup, hooks, snapshots, and session persistence all run
         // through Strands' normal completion path instead of being
         // bypassed by a synthetic RUN_FINISHED.
+
+        // A tool approval is answered raw and everything else with the
+        // envelope, so the checkpoint decides the shape. Read it through the
+        // same helper as the replay comparison, which keeps what is submitted
+        // and what a replay is checked against from ever disagreeing.
+        const nativeInterrupts = _nativeInterruptsById(
+          (
+            strandsAgent as unknown as {
+              _interruptState?: { interrupts?: unknown };
+            }
+          )._interruptState?.interrupts,
+        );
         invokeArgs = resumeEntries.map(
           (entry) =>
             new InterruptResponseContent({
               interruptId: entry.interruptId,
-              response: toResumeResponse(entry) as JSONValue,
+              response: toResumeResponse(
+                entry,
+                nativeInterrupts.get(entry.interruptId),
+              ) as JSONValue,
             }),
         );
       }
@@ -4594,7 +4729,9 @@ export class StrandsAgent {
       if (finalAgentResult?.stopReason === "interrupt") {
         const strandsInterrupts = finalAgentResult.interrupts ?? [];
         if (strandsInterrupts.length > 0) {
-          const aguiInterrupts = strandsInterrupts.map(strandsInterruptToAgui);
+          const aguiInterrupts = strandsInterrupts.map((raised) =>
+            strandsInterruptToAgui(raised, this._log),
+          );
           const interruptMap = new Map<string, AguiInterrupt>();
           for (const i of aguiInterrupts) interruptMap.set(i.id, i);
           this._pendingInterruptsByThread.set(threadId, interruptMap);
@@ -4633,19 +4770,47 @@ export class StrandsAgent {
           };
           return;
         }
-        // The run paused with nothing to hand back, so it falls through to the
-        // success finish below while the native checkpoint may stay parked.
-        // Mirrors the Python sibling's trace for the same blind spot.
+        // The run reported an interrupt and handed back nothing. Where the
+        // checkpoint is still parked, this finish is indistinguishable from a
+        // real success in the event stream, so it is recorded rather than
+        // inferred: remembering it as a completed resume would let a retry be
+        // answered from the fingerprint without ever reaching the parked tool.
+        //
+        // The stop reason alone is not enough to record it. A run that left no
+        // active checkpoint behind has finished its work, and withholding the
+        // fingerprint there would cost the client its idempotent retry and
+        // leave the answered interrupt recorded as pending.
+        //
+        // Not the same test the Python adapter applies, and the difference is
+        // upstream of this line rather than in it. That side falls back to the
+        // live checkpoint when the terminal result reports nothing, so a
+        // checkpoint still holding an unanswered interrupt is republished there
+        // as a pending-interrupt outcome, where this side reports a plain
+        // finish. Both then withhold the fingerprint, so neither answers a
+        // retry from it, but the events a client sees are not identical.
+        // Closing that would mean changing what this side reports, which is a
+        // wider change than the resume contract.
+        const parked =
+          (
+            strandsAgent as unknown as {
+              _interruptState?: { activated?: boolean };
+            }
+          )._interruptState?.activated === true;
+        pausedWithNothingToReport = parked;
         this._log.debug(
           `${LOG_PREFIX} Strands stopped for an interrupt with an empty interrupts list; reporting no pending interrupts`,
         );
       }
 
+      // The pause fact travels with the finish it describes. A symbol key so it
+      // cannot collide with the event schema and does not survive JSON, which
+      // keeps it off the wire; `run()` reads it before any transform runs.
       yield {
         type: EventType.RUN_FINISHED,
         threadId: inputData.threadId,
         runId: inputData.runId,
         outcome: { type: "success" },
+        ...(pausedWithNothingToReport ? { [PAUSED_PARKED]: true } : {}),
       };
     } catch (e) {
       const code =
@@ -5559,18 +5724,42 @@ function resolveResumeEntries(input: RunAgentInput): ResumeEntry[] {
 /**
  * AG-UI `ResumeEntry` → Strands `InterruptResponseContent.response`.
  *
- * A present payload is passed through raw, because that is what tools
- * destructure. It just can never be `undefined`: Strands reads
- * `response === undefined` as "still awaiting a human" and re-raises the same
- * interrupt forever. A generic interrupt publishes no responseSchema, so an
- * empty payload reaches here unchecked; stand in an empty object, which the
- * SDK counts as answered and a destructuring tool can still take.
+ * One contract with the Python adapter, so a tool body ports between them: a
+ * generic interrupt is answered with an envelope, `{ response: payload }` on
+ * resolve and {@link INTERRUPT_CANCELLED} on cancel, and unwraps via
+ * `.response` / `.cancelled`.
+ *
+ * The envelope is also what makes a falsy answer answerable. Strands reads a
+ * recorded answer either by presence (`response !== undefined`) or, on the
+ * oldest releases the Python adapter still supports, by truthiness, and an
+ * answer it reads as absent re-raises the same interrupt and re-runs the tool
+ * body forever. An envelope is always present and always truthy. An absent
+ * payload becomes `null` inside it rather than being dropped, so the recorded
+ * answer survives the JSON round trip through session persistence unchanged.
+ *
+ * Tool approvals are the exception in both languages: the approval hook reads
+ * `approved` off the answer directly, so a resolved approval's payload is passed
+ * through raw and anything else is spelled as the denial the hook expects. Rule 6
+ * schema-checks a resolved approval's payload before it reaches here.
+ *
+ * `nativeInterrupt` is required rather than optional: it is the whole
+ * discriminator, and omitting it would silently answer an approval with the
+ * envelope, which its hook reads as a denial.
  */
-function toResumeResponse(entry: ResumeEntry): unknown {
-  if (entry.status === "cancelled") {
-    return { status: "cancelled" };
+function toResumeResponse(
+  entry: ResumeEntry,
+  nativeInterrupt: unknown,
+): unknown {
+  if (isToolApprovalInterrupt(nativeInterrupt)) {
+    // Only a resolved entry can grant. Rule 6 schema-checks the payload of a
+    // resolved approval before it reaches here, and nothing else is a grant, so
+    // an unrecognised status denies rather than forwarding an unchecked answer.
+    return entry.status === "resolved"
+      ? (entry.payload as unknown)
+      : { approved: false };
   }
-  return entry.payload === undefined ? {} : (entry.payload as unknown);
+  if (entry.status === "cancelled") return { ...INTERRUPT_CANCELLED };
+  return { response: entry.payload === undefined ? null : entry.payload };
 }
 
 // ---------------------------------------------------------------------------
@@ -5687,7 +5876,10 @@ function persistInterruptBookkeeping(
 }
 
 /** Strands `Interrupt` → AG-UI `Interrupt`. */
-function strandsInterruptToAgui(interrupt: StrandsInterrupt): AguiInterrupt {
+function strandsInterruptToAgui(
+  interrupt: StrandsInterrupt,
+  log?: Logger,
+): AguiInterrupt {
   const reasonRaw = interrupt.reason;
   // Only interrupts raised by our own interruptOnCall hook (identified by
   // the "ag_ui:tool_call:" name prefix it always uses) are tool-call
@@ -5708,28 +5900,133 @@ function strandsInterruptToAgui(interrupt: StrandsInterrupt): AguiInterrupt {
     return out;
   }
 
-  const reason = "tool_call";
-  const out: AguiInterrupt = { id: interrupt.id, reason };
-  if (typeof reasonRaw === "object" && reasonRaw != null) {
-    const tn = (reasonRaw as Record<string, unknown>).tool_name;
-    if (typeof tn === "string") {
-      out.message = `Approve call to ${tn}?`;
-    }
+  // An approval carries the same keys on both bridges, so a client renders one
+  // the same way whichever language served it: a message, the response schema,
+  // and tool_name / tool_input / strandsName in metadata are always present,
+  // standing in the same defaults as the Python adapter. Two keys are
+  // conditional: toolCallId, which an approval raised without a native tool use
+  // has none of, and reason, added below only when nothing else carried it.
+  const { toolName, toolInput } = approvalReasonFields(reasonRaw, log);
+  const out: AguiInterrupt = {
+    id: interrupt.id,
+    reason: "tool_call",
+    message: `Approve call to ${toolName}?`,
+    responseSchema: toolApprovalResponseSchema(),
+    metadata: {
+      tool_name: toolName,
+      tool_input: toolInput,
+      strandsName: interrupt.name,
+    },
+  };
+  // Reported only when it is a usable string, matching the Python adapter,
+  // whose `Interrupt.tool_call_id` rejects anything else outright.
+  const toolUseId = plainObject(reasonRaw).tool_use_id;
+  if (typeof toolUseId === "string" && toolUseId) out.toolCallId = toolUseId;
+  // An approval whose reason carried nothing the three keys above could hold
+  // still publishes that reason, rather than reaching the client as nothing but
+  // the defaults. The test is what was actually extracted, not whether the
+  // reason was empty: a mapping like `{ question: "..." }` has keys and is still
+  // entirely unrepresented by tool_name / tool_input / toolCallId. Detached like
+  // everything else published, since a reason can be an array or a nested object.
+  const carriedNothing =
+    toolName === "unknown" &&
+    Object.keys(toolInput).length === 0 &&
+    out.toolCallId === undefined;
+  if (reasonRaw !== undefined && reasonRaw !== null && carriedNothing) {
+    (out.metadata as Record<string, unknown>).reason = detachedValue(
+      reasonRaw,
+      log,
+    );
   }
-  // Extract toolCallId from reason object if available
-  if (typeof reasonRaw === "object" && reasonRaw != null) {
-    const toolUseId = (reasonRaw as Record<string, unknown>).tool_use_id;
-    if (typeof toolUseId === "string") out.toolCallId = toolUseId;
-  }
-  out.responseSchema = toolApprovalResponseSchema();
-  const meta: Record<string, unknown> = { strandsName: interrupt.name };
-  if (typeof reasonRaw === "object" && reasonRaw != null) {
-    const r = reasonRaw as Record<string, unknown>;
-    if (r.tool_name) meta.tool_name = r.tool_name;
-    if (r.tool_input) meta.tool_input = r.tool_input;
-  }
-  out.metadata = meta;
   return out;
+}
+
+/** `value` as a plain object, or an empty one. */
+function plainObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * A detached copy of any JSON-shaped value, at every depth.
+ *
+ * The object form below is the common case; this one also takes an array, a
+ * string or a number, which is what an unusable interrupt reason can be.
+ */
+function detachedValue(value: unknown, log?: Logger): unknown {
+  try {
+    return structuredClone(value);
+  } catch (e) {
+    // Saying so matters: the caller published this expecting a copy, and what
+    // it actually got is a handle on the live interrupt reason. Inside its own
+    // `try` because a caller-supplied logger is arbitrary code that can throw,
+    // and a throw escaping here would turn a successfully raised interrupt into
+    // a run error.
+    try {
+      log?.warn(
+        `${LOG_PREFIX} could not detach an interrupt reason for publication; it is shared with the live checkpoint: ${_errorMessage(e)}`,
+      );
+    } catch {
+      // Nothing to do: the value below is still returned either way.
+    }
+    return value;
+  }
+}
+
+/**
+ * A detached copy of JSON-shaped data, at every depth.
+ *
+ * A shallow copy is not enough for anything published to a client: the nested
+ * values would still be handles on the live native interrupt's reason. Falls
+ * back to a shallow copy for the rare reason carrying something unclonable,
+ * which is still better than aliasing the whole object.
+ */
+function detachedCopy(
+  value: Record<string, unknown>,
+  log?: Logger,
+): Record<string, unknown> {
+  try {
+    return structuredClone(value);
+  } catch (e) {
+    // A shallow copy still leaves the nested values shared, so this is a
+    // degraded result and not the guarantee the caller asked for. Logged inside
+    // its own `try` for the same reason as above.
+    try {
+      log?.warn(
+        `${LOG_PREFIX} could not fully detach a tool input for publication; its nested values are shared with the live checkpoint: ${_errorMessage(e)}`,
+      );
+    } catch {
+      // Nothing to do: the copy below is still returned either way.
+    }
+    return { ...value };
+  }
+}
+
+/**
+ * The tool identity an approval publishes, read out of its native reason.
+ *
+ * The reason can be missing or malformed, most plausibly because it did not
+ * survive a restart, so both fields fall back. The same defaults and the same
+ * "is it usable?" tests as the Python adapter, so an approval published from
+ * either language reads identically.
+ */
+function approvalReasonFields(
+  reasonRaw: unknown,
+  log?: Logger,
+): {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+} {
+  const reason = plainObject(reasonRaw);
+  const name = reason.tool_name;
+  return {
+    toolName: typeof name === "string" && name ? name : "unknown",
+    // Detached at every depth, not merely copied at the top: the published
+    // metadata must not be a handle on the live native interrupt's reason at
+    // ANY level. Same guarantee in Python.
+    toolInput: detachedCopy(plainObject(reason.tool_input), log),
+  };
 }
 
 function getEventKind(event: unknown): string | undefined {
@@ -6142,12 +6439,17 @@ function _sortKeys(val: unknown): unknown {
 function resumeFingerprint(entries: ResumeEntry[]): string {
   const canonicalEntries = entries
     .map((entry) =>
-      // A resolved entry without a payload is not the same resume as one
-      // carrying an explicit null: `toResumeResponse` sends `{}` for the first
-      // and `null` for the second. Omit the slot rather than serializing
-      // `undefined`, which JSON would collapse into the null it must differ
-      // from. A cancelled entry's payload never reaches the SDK, so its
-      // canonical form is left alone.
+      // Omit the slot for a resolved entry without a payload rather than
+      // serializing `undefined`, which JSON would collapse into null. The two
+      // now submit the same answer, so keeping them distinct here means a
+      // retry that varies only in that spelling misses the idempotency
+      // short-circuit and is refused as having nothing open to address, rather
+      // than answered as the replay it is. Left as it stands because collapsing
+      // them changes idempotency behaviour, which is not this change's subject;
+      // the parked-checkpoint path bypasses the fingerprint entirely and
+      // compares submitted answers, so it already treats them as one. A
+      // cancelled entry's payload never reaches the SDK, so its canonical form
+      // is left alone.
       entry.status !== "cancelled" && entry.payload === undefined
         ? ([entry.interruptId, entry.status] as const)
         : ([

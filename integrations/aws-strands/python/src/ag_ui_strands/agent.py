@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import collections.abc
+from copy import deepcopy
 import types
 import typing
 import uuid
@@ -374,13 +375,30 @@ async def _stream_with_model_context(
         yield event
 
 
-# Sentinel handed back to a paused ``tool_context.interrupt()`` when the client
-# cancels (``ResumeEntry.status == "cancelled"``) rather than resolving. The
-# tool receives this in place of a real answer and can treat it as a denial.
-INTERRUPT_CANCELLED = {"cancelled": True}
+# The shape a paused ``tool_context.interrupt()`` is answered with when the
+# client cancels (``ResumeEntry.status == "cancelled"``) rather than resolving,
+# so a generic tool can treat the pause as a denial. Adapter-managed approvals
+# are answered ``{"approved": False}`` instead, and a frontend wait gets its own
+# envelope, so this is the generic-interrupt shape rather than every cancel.
+def _interrupt_cancelled() -> dict:
+    """A fresh cancellation sentinel.
+
+    Built here rather than copied off the exported constant, so a consumer
+    mutating that constant cannot change what a paused tool receives. Compare
+    what a tool receives by value, never by identity.
+
+    The export stays a plain dict rather than a read-only proxy so that consumers
+    can still ``json.dumps`` it; nothing inside this module reads it.
+    """
+    return {"cancelled": True}
+
+
+INTERRUPT_CANCELLED = _interrupt_cancelled()
 
 # Reserved native-interrupt name prefix for interrupts this adapter's approval
-# hook raises. Anything else is a generic native interrupt.
+# hook raises. Anything else is a generic native interrupt. Reserved means
+# reserved: an interrupt raised anywhere else under this prefix is classified,
+# schema-checked and answered as an approval.
 _TOOL_APPROVAL_NAME_PREFIX = "ag_ui:tool_call:"
 
 
@@ -420,13 +438,15 @@ def _tool_approval_response_schema() -> dict:
 
 
 def _is_tool_approval_interrupt(native_interrupt: Any) -> bool:
-    """True when a native Strands interrupt came from the approval hook."""
+    """True when a native Strands interrupt came from the approval hook.
+
+    The reserved name prefix is the whole test. It also decides whether a resume
+    is answered raw or wrapped, so it deliberately does not additionally require
+    the reason: an approval whose reason did not survive a restart still has to
+    be answered in the shape its own hook reads.
+    """
     name = getattr(native_interrupt, "name", None)
-    return (
-        isinstance(name, str)
-        and name.startswith(_TOOL_APPROVAL_NAME_PREFIX)
-        and isinstance(getattr(native_interrupt, "reason", None), dict)
-    )
+    return isinstance(name, str) and name.startswith(_TOOL_APPROVAL_NAME_PREFIX)
 
 
 def _wrap_resume_response(status: str, payload: Any) -> dict:
@@ -439,7 +459,7 @@ def _wrap_resume_response(status: str, payload: Any) -> dict:
     implementation unwraps it via ``.get("cancelled")`` / ``.get("response")``.
     """
     if status == "cancelled":
-        return dict(INTERRUPT_CANCELLED)
+        return _interrupt_cancelled()
     return {"response": payload}
 
 
@@ -472,11 +492,42 @@ def _native_resume_response(entry: Any, native_interrupt: Any) -> Any:
     comparison below, so the two cannot disagree about what was submitted.
     """
     if _is_tool_approval_interrupt(native_interrupt):
-        return {"approved": False} if entry.status == "cancelled" else entry.payload
+        # Only a resolved entry can grant, so a cancellation denies. Any other
+        # status would deny too, but cannot arrive: the wire type rejects it,
+        # since ``ResumeEntry.status`` admits only these two values. Stated as
+        # the reason rather than the forwarding site, which filters on only one
+        # of this function's three call paths. The TypeScript adapter reaches
+        # its equivalent guard the same way, and tests it, because its own types
+        # are structural rather than validated at the boundary.
+        return entry.payload if entry.status == "resolved" else {"approved": False}
     if is_frontend_tool_interrupt(native_interrupt):
         content, is_error = _frontend_tool_resume_content(entry)
         return wrap_frontend_tool_response(content, is_error=is_error)
     return _wrap_resume_response(entry.status, entry.payload)
+
+
+def _legacy_resume_response(entry: Any, native_interrupt: Any) -> Any:
+    """The answer the previous release recorded for this interrupt, or ``None``.
+
+    Only one interrupt changes shape across this release. A reserved-prefix
+    interrupt whose reason is not a mapping was classified generic before and is
+    classified as an approval now, so a checkpoint parked on it holds the generic
+    envelope while the replay comparison computes the raw approval answer. Left
+    unhandled, that thread never resumes: fresh input is refused because the
+    checkpoint is active, and the replay is refused because the shapes differ.
+
+    Deliberately narrow. ``None`` for every other interrupt, so nothing else
+    loosens: the envelope predates this release on this side, and a checkpoint
+    parked on anything else already holds the shape still computed for it.
+    """
+    if not _is_tool_approval_interrupt(native_interrupt):
+        return None
+    if isinstance(getattr(native_interrupt, "reason", None), Mapping):
+        # The old classifier agreed this was an approval, so no shape moved.
+        return None
+    return _wrap_resume_response(
+        getattr(entry, "status", None), getattr(entry, "payload", None)
+    )
 
 
 def _replays_recorded_answers(interrupt_state: Any, resume_entries: Any) -> bool:
@@ -490,7 +541,9 @@ def _replays_recorded_answers(interrupt_state: Any, resume_entries: Any) -> bool
     resume finds nothing open to address. Handing Strands the identical batch is
     the way out, because it lets the SDK finish the parked execution. The
     checkpoint itself must be left alone: clearing it would discard exactly that
-    parked execution. Anything short of an exact replay stays refused.
+    parked execution. Anything short of an exact replay stays refused, with one
+    exception for a checkpoint parked by the previous release: see
+    ``_legacy_resume_response``.
     """
     recorded = getattr(interrupt_state, "interrupts", {}) or {}
     if not recorded or len(resume_entries) != len(recorded):
@@ -504,9 +557,12 @@ def _replays_recorded_answers(interrupt_state: Any, resume_entries: Any) -> bool
         addressed.add(interrupt_id)
         if not _native_interrupt_is_answered(native_interrupt):
             return False
-        if native_interrupt.response != _native_resume_response(
+        if native_interrupt.response == _native_resume_response(
             entry, native_interrupt
         ):
+            continue
+        legacy = _legacy_resume_response(entry, native_interrupt)
+        if legacy is None or native_interrupt.response != legacy:
             return False
     return True
 
@@ -522,6 +578,113 @@ def _get_strands_session_manager(agent: Any) -> Any:
     )
 
 
+def _plain_mapping(value: Any) -> Mapping:
+    """Return ``value`` if it is a mapping, else an empty one."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def _detached_value(value: Any) -> Any:
+    """A copy of any JSON-shaped value, detached at every depth.
+
+    The mapping form below is the common case; this one also takes a list, a
+    string or a number, which is what an unusable interrupt reason can be.
+    """
+    try:
+        return deepcopy(value)
+    except Exception as exc:
+        # Saying so matters: the caller published this expecting a copy, and
+        # what it actually got is a handle on the live interrupt reason.
+        logger.warning(
+            "Could not detach an interrupt reason for publication; it is "
+            "shared with the live checkpoint: %s",
+            exc,
+        )
+        return value
+
+
+def _detached_copy(value: Mapping) -> dict:
+    """A copy of JSON-shaped data detached at every depth.
+
+    A shallow copy is not enough for anything published to a client: the nested
+    values would still be handles on the live native interrupt's reason. Falls
+    back to a shallow copy for the rare reason carrying something uncopyable,
+    which is still better than aliasing the whole mapping.
+    """
+    try:
+        return deepcopy(dict(value))
+    except Exception as exc:
+        # A shallow copy still leaves the nested values shared, so this is a
+        # degraded result and not the guarantee the caller asked for.
+        logger.warning(
+            "Could not fully detach a tool input for publication; its nested "
+            "values are shared with the live checkpoint: %s",
+            exc,
+        )
+        return dict(value)
+
+
+def _approval_tool_use_id(raw_reason: Any) -> Optional[str]:
+    """The native tool use an approval is bound to, or ``None``.
+
+    Reported only when it is a usable string. ``Interrupt.tool_call_id`` is
+    typed ``Optional[str]``, so forwarding anything else would fail validation
+    and take down a run that could otherwise be approved.
+    """
+    tool_use_id = _plain_mapping(raw_reason).get("tool_use_id")
+    return tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
+
+
+def _approval_reason_fields(raw_reason: Any) -> tuple[str, dict]:
+    """The tool identity an approval publishes, read out of its native reason.
+
+    The reason can be missing or malformed, most plausibly because it did not
+    survive a restart, so both fields fall back. The same defaults and the same
+    "is it usable?" tests as the TypeScript adapter, so an approval published
+    from either language reads identically.
+    """
+    reason = _plain_mapping(raw_reason)
+    tool_name = reason.get("tool_name")
+    return (
+        tool_name if isinstance(tool_name, str) and tool_name else "unknown",
+        # Detached at every depth, not merely copied at the top: the published
+        # metadata must not be a handle on the live native interrupt's reason at
+        # ANY level. Same guarantee in TypeScript.
+        _detached_copy(_plain_mapping(reason.get("tool_input"))),
+    )
+
+
+def _approval_metadata(
+    name: str, tool_name: str, tool_input: dict, raw_reason: Any
+) -> dict:
+    """The metadata an approval publishes.
+
+    ``strandsName`` is camelCase among snake_case keys on purpose: ``metadata``
+    is a free-form dict, so no alias generator rewrites it, and the TypeScript
+    adapter publishes exactly this spelling. Renaming either side to look tidier
+    would reintroduce the divergence this contract exists to remove.
+    """
+    metadata: dict = {
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "strandsName": name,
+    }
+    # An approval whose reason carried nothing the three keys above could hold
+    # still publishes that reason, rather than reaching the client as nothing but
+    # the defaults. The test is what was actually extracted, not whether the
+    # reason was empty: a mapping like ``{"question": "..."}`` has keys and is
+    # still entirely unrepresented by tool_name / tool_input / tool_call_id.
+    # Detached like everything else published, since a reason can be a list or a
+    # nested mapping.
+    carried_nothing = (
+        tool_name == "unknown"
+        and not tool_input
+        and _approval_tool_use_id(raw_reason) is None
+    )
+    if raw_reason is not None and carried_nothing:
+        metadata["reason"] = _detached_value(raw_reason)
+    return metadata
+
+
 def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
     """Map a native Strands ``Interrupt`` onto an AG-UI ``Interrupt``.
 
@@ -534,17 +697,19 @@ def _strands_interrupt_to_agui(strands_interrupt: Any) -> "Interrupt":
     raw_reason = getattr(strands_interrupt, "reason", None)
 
     if _is_tool_approval_interrupt(strands_interrupt):
-        tool_name = raw_reason.get("tool_name", "unknown")
+        # An approval carries the same keys on both bridges, so a client renders
+        # one the same way whichever language served it. Two keys are
+        # conditional: ``tool_call_id``, which an approval raised without a
+        # native tool use has none of, and ``reason``, which is published only
+        # when nothing else carried it.
+        tool_name, tool_input = _approval_reason_fields(raw_reason)
         return Interrupt(
             id=s_id,
             reason="tool_call",
             message=f"Approve call to {tool_name}?",
-            tool_call_id=raw_reason.get("tool_use_id"),
+            tool_call_id=_approval_tool_use_id(raw_reason),
             response_schema=_tool_approval_response_schema(),
-            metadata={
-                "tool_name": tool_name,
-                "tool_input": raw_reason.get("tool_input", {}),
-            },
+            metadata=_approval_metadata(name, tool_name, tool_input, raw_reason),
         )
 
     return Interrupt(
@@ -585,19 +750,38 @@ def _open_native_interrupts(interrupts: Any) -> dict:
     }
 
 
-def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
-    """Return the native Strands interrupts for a paused run, or ``[]``.
+def _extract_interrupts(agent: Any, terminal_result: Any) -> Tuple[list, bool]:
+    """Return the native Strands interrupts for a paused run, and whether the
+    run paused with nothing to report.
 
     Prefers the terminal ``AgentResult`` (``stop_reason == "interrupt"`` with a
     populated ``interrupts``); falls back to the live agent's
     ``_interrupt_state`` so a pause is still detected if the result event was
     consumed by the stream's early-break path.
+
+    The second element is true only when the agent is demonstrably still parked
+    and there is nothing to hand the client: the checkpoint is active, every
+    interrupt on it reads as answered, and the terminal result says the run
+    stopped for an interrupt. That finish is indistinguishable from an ordinary
+    success in the event stream, so the only honest signal is the branch that
+    took it saying so, and the caller needs it because remembering such a resume
+    as completed would let a retry be answered from the idempotency fingerprint
+    without ever reaching the parked agent.
+
+    A stop reason on its own is not enough. A run reporting an interrupt with no
+    checkpoint left behind has finished its work, and treating that as a pause
+    would withhold the fingerprint from a resume that really did complete, which
+    costs the client its idempotent retry and leaves the answered interrupt
+    recorded as pending.
     """
-    if terminal_result is not None:
-        if getattr(terminal_result, "stop_reason", None) == "interrupt":
-            interrupts = getattr(terminal_result, "interrupts", None) or []
-            if interrupts:
-                return list(interrupts)
+    stopped_for_interrupt = (
+        terminal_result is not None
+        and getattr(terminal_result, "stop_reason", None) == "interrupt"
+    )
+    if stopped_for_interrupt:
+        interrupts = getattr(terminal_result, "interrupts", None) or []
+        if interrupts:
+            return list(interrupts), False
     interrupt_state = getattr(agent, "_interrupt_state", None)
     if interrupt_state is not None and getattr(interrupt_state, "activated", False):
         open_interrupts = _open_native_interrupts(
@@ -611,8 +795,9 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> list:
                 "Native interrupt state is activated but every interrupt is "
                 "answered; reporting no pending interrupts"
             )
-        return list(open_interrupts.values())
-    return []
+            return [], stopped_for_interrupt
+        return list(open_interrupts.values()), False
+    return [], False
 
 
 def _interrupt_session_required_error() -> "RunErrorEvent":
@@ -823,7 +1008,10 @@ def _preflight_resume_entries(
     # An active checkpoint whose every interrupt is answered is a thread the SDK
     # parked mid-resume (see _replays_recorded_answers). The interrupts an exact
     # replay may address are the answered ones it is replaying.
-    if _replays_recorded_answers(interrupt_state, resume_entries):
+    replaying_recorded_answers = _replays_recorded_answers(
+        interrupt_state, resume_entries
+    )
+    if replaying_recorded_answers:
         addressable = dict(getattr(interrupt_state, "interrupts", {}) or {})
     else:
         addressable = open_interrupts
@@ -859,6 +1047,7 @@ def _preflight_resume_entries(
     pending_ag_ui = pending_ag_ui or {}
     for entry in resume_entries:
         ag_ui_interrupt = pending_ag_ui.get(entry.interrupt_id)
+        native = addressable.get(entry.interrupt_id)
 
         if ag_ui_interrupt and getattr(ag_ui_interrupt, "expires_at", None):
             expiry = datetime.fromisoformat(ag_ui_interrupt.expires_at)
@@ -868,6 +1057,24 @@ def _preflight_resume_entries(
                     message=f"Interrupt '{entry.interrupt_id}' has expired.",
                     code="INTERRUPT_EXPIRED",
                 )
+
+        # An answer recorded before this release was accepted under the rules of
+        # that release, and for the one interrupt whose classification moved
+        # there were no rules at all: it was generic, so any payload was valid.
+        # Re-judging it against the schema this release attaches would reject an
+        # answer the framework already holds, which is not a validation but a
+        # dead end, since replaying it is the only way to finish the execution
+        # parked behind it. Scoped to exactly that: an entry whose recorded
+        # answer matches the pre-upgrade shape for it, in a batch that replays
+        # the checkpoint as a whole.
+        #
+        # Below the expiry check on purpose. Only the schema is waived; an
+        # expired checkpoint is still refused, because an answer nobody may act
+        # on any more is not made actionable by having been recorded early.
+        if replaying_recorded_answers and native is not None:
+            legacy = _legacy_resume_response(entry, native)
+            if legacy is not None and getattr(native, "response", None) == legacy:
+                continue
 
         schema = (
             getattr(ag_ui_interrupt, "response_schema", None)
@@ -879,7 +1086,6 @@ def _preflight_resume_entries(
             # interrupt is restored. Adapter-owned interrupts have a fixed
             # contract, so validate against it rather than waving the payload
             # through.
-            native = addressable.get(entry.interrupt_id)
             if _is_tool_approval_interrupt(native):
                 schema = _tool_approval_response_schema()
             elif is_frontend_tool_interrupt(native):
@@ -6324,7 +6530,9 @@ class StrandsAgent:
             # so a generic interrupt handler would fire on a tool card it does
             # not own. Native waiting is how the adapter parks the call; it is
             # not a change to what the client sees.
-            native_interrupts = _extract_interrupts(strands_agent, terminal_result)
+            native_interrupts, paused_silently = _extract_interrupts(
+                strands_agent, terminal_result
+            )
             self._record_frontend_wait_bridge(
                 strands_agent, thread_id, native_interrupts
             )
@@ -6352,8 +6560,18 @@ class StrandsAgent:
                     outcome=pending_interrupt_outcome,
                 )
             else:
-                # Store fingerprint for idempotency only after successful processing
-                if resume_entries:
+                # Store fingerprint for idempotency only after successful
+                # processing, and not at all when the run left the agent parked
+                # with nothing to report: a retry answered from the fingerprint
+                # would never reach it. A local flag because the detection just
+                # above returned it; the TypeScript sibling carries its own such
+                # flag on the finish event it yields, because there the
+                # detection and this store sit in sibling methods. Not quite the
+                # same condition: that side reads only whether the checkpoint is
+                # active, where this one also requires every interrupt on it to
+                # be answered, because it falls back to the live checkpoint and
+                # would otherwise have republished the open one instead.
+                if resume_entries and not paused_silently:
                     fp = _resume_fingerprint(
                         resume_entries + fingerprint_only_entries
                     )

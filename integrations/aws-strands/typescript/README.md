@@ -200,19 +200,73 @@ Two complementary patterns are supported:
     "outcome": {
       "type": "interrupt",
       "interrupts": [
-        { "id": "...", "reason": "...", "metadata": { "strandsName": "..." } }
+        { "id": "...", "reason": "...", "metadata": { "reason": {} } }
       ]
     }
   }
   ```
 
-  The next `RunAgentInput` carries `resume[]` entries keyed by those `id`s.
-  The adapter converts each entry into a Strands `InterruptResponseContent`
-  (forwarding `payload` for `resolved` and `{ status: "cancelled" }` for
-  `cancelled`) and hands them straight to `agent.stream(...)`. Unknown
-  `interruptId`s still short-circuit with
-  `RUN_ERROR { code: "UNKNOWN_INTERRUPT" }` per
-  [interrupts.mdx rule 4](https://docs.ag-ui.com/concepts/interrupts).
+  A generic interrupt keeps the Strands name as its AG-UI `reason` (defaulting
+  to `"interrupt"` when the interrupt carries no name) and the free-form Strands reason
+  under `metadata.reason`. A tool configured with `interruptOnCall` instead
+  publishes a `tool_call` approval, which always carries a `message`, an
+  `approved` `responseSchema`, and `tool_name` / `tool_input` / `strandsName` in
+  `metadata`. Two keys are conditional: `toolCallId`, which an approval raised
+  without a native tool use has none of, and `reason`, which is published only
+  when the native reason carried nothing the other keys could hold. Published `tool_input` is a detached copy,
+  so inspecting it cannot reach into the SDK's live checkpoint.
+
+  The `ag_ui:tool_call:` name prefix is **reserved** for this adapter's approval
+  hook. An interrupt raised anywhere else under that prefix is classified,
+  schema-checked and answered as an approval.
+
+### The resume contract
+
+The next `RunAgentInput` carries `resume[]` entries keyed by those `id`s. The
+adapter converts each entry into a Strands `InterruptResponseContent` and hands
+them straight to `agent.stream(...)`. Unknown `interruptId`s still short-circuit
+with `RUN_ERROR { code: "UNKNOWN_INTERRUPT_ID" }` per
+[interrupts.mdx rule 2](https://docs.ag-ui.com/concepts/interrupts).
+
+`interrupt()` does **not** return `payload` directly. The adapter always hands
+Strands an envelope instead. Two reasons: an answer the SDK reads as absent
+re-raises the same interrupt and re-runs the tool body forever, and the Python
+adapter supports older Strands releases that read a recorded answer by
+truthiness rather than by presence. The envelope is always present and always
+truthy, which satisfies both, and it is what makes one tool body portable
+across the two bridges:
+
+| `resume[]` entry                    | what the paused `interrupt()` returns                              |
+| ----------------------------------- | ------------------------------------------------------------------ |
+| `status: "resolved"`, any `payload` | `{ response: payload }`                                            |
+| `status: "resolved"`, no `payload`  | `{ response: null }`                                               |
+| `status: "cancelled"`               | `{ cancelled: true }`, matching the exported `INTERRUPT_CANCELLED` |
+
+Destructure it with `.response` / `.cancelled`, and do not truthiness-check the
+envelope itself, since it is always truthy on resolve. Compare a cancellation by
+value rather than by identity: `INTERRUPT_CANCELLED` is exported so you can match
+its shape, and every answer is a fresh copy of it rather than the export itself.
+Treat what you receive as read-only. It is the same object the framework records
+as the answer, so mutating it changes what a later replay is compared against.
+This is the same contract the Python package applies, so a tool body ports
+between the two unchanged.
+
+Adapter-managed `interruptOnCall` approvals are an exception in both
+languages, and on Python a parked frontend tool is a second one that its own
+README documents: their `{ approved: boolean }` payload is passed through raw, because
+the approval hook reads `approved` off it directly. A cancelled approval is
+answered `{ approved: false }` rather than with the sentinel.
+
+Resuming a paused tool re-runs its body from the top, so any code before the
+`interrupt()` call executes again. Keep side effects after the pause resolves.
+
+> **Breaking change for tool bodies.** A resolved generic interrupt used to
+> reach the tool as the raw `payload`, and a cancellation as
+> `{ status: "cancelled" }`. Any tool reading the raw value must now read it off
+> `.response`, and a cancellation off `.cancelled`. A resolved tool approval is
+> unaffected, still receiving its payload raw; a cancelled one now receives
+> `{ approved: false }` where it previously received `{ status: "cancelled" }`. It follows `@ag-ui/aws-strands` 0.2.3; the release that carries it
+> is versioned in a separate bump commit, and this is not patch-compatible.
 
 ## Reasoning / extended thinking
 
