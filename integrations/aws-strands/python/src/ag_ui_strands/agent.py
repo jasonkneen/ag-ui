@@ -5710,6 +5710,17 @@ class StrandsAgent:
                                         )
                                         pending_halt = True
 
+                        elif "metadata" in inner_event:
+                            raw_payload = _sanitize_raw_event(
+                                event, run_invocation_state
+                            )
+                            if raw_payload is not None:
+                                yield RawEvent(
+                                    type=EventType.RAW,
+                                    event=raw_payload,
+                                    source="strands",
+                                )
+
                     # Strands' ``ModelMessageEvent`` re-announces the assistant
                     # turn as a whole once the model finishes it. Every part of
                     # it has already been streamed — text via
