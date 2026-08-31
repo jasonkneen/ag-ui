@@ -2696,6 +2696,8 @@ class StrandsAgent:
         # same new thread_id could otherwise both create an agent and one
         # would clobber the other.
         self._thread_init_lock = asyncio.Lock()
+        # Threads with an in-flight run, single-agent or orchestrator alike.
+        self._active_runs_by_thread: set[str] = set()
         # Threads with an in-flight orchestrator run. A Graph or Swarm holds
         # its node agents, which reject overlapping invocations, so a second
         # run on the same thread is rejected rather than allowed to collide.
@@ -2765,6 +2767,23 @@ class StrandsAgent:
         return RunFinishedInterruptOutcome(
             type="interrupt",
             interrupts=ag_ui_interrupts,
+        )
+
+    def _resume_answers_pending_interrupt(
+        self, input_data: RunAgentInput, thread_id: str
+    ) -> bool:
+        """Whether this run answers an interrupt this thread is parked at.
+
+        The same rule :meth:`_orchestrator_resume_prompt` applies, asked before
+        the run starts: a resume naming only stale or unknown ids answers
+        nothing, so it must not reach a parked orchestrator.
+        """
+        pending = self._pending_interrupts_by_thread.get(thread_id) or {}
+        if not pending:
+            return False
+        return any(
+            getattr(entry, "interrupt_id", None) in pending
+            for entry in (getattr(input_data, "resume", None) or [])
         )
 
     def _orchestrator_resume_prompt(
@@ -3144,6 +3163,52 @@ class StrandsAgent:
                 available to hooks and tools but is not added to the model
                 context.
         """
+        # Neither a per-thread cached agent nor an orchestrator can be
+        # multiplexed across invocations, so overlapping runs on one thread
+        # would interleave their turns in shared state. Refuse the collision
+        # with the code and text the TypeScript adapter uses. A resume and a
+        # retry after a disconnect are not the same thing as an overlap: each
+        # starts once the earlier run's generator has been torn down, which is
+        # what frees the slot. Torn down, not merely finished.
+        thread_id = input_data.thread_id or "default"
+        if thread_id in self._active_runs_by_thread:
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message=(
+                    f'Another run is already in progress on thread "{thread_id}". '
+                    "Wait for RUN_FINISHED before starting a new run on the "
+                    "same thread."
+                ),
+                code="THREAD_BUSY",
+            )
+            return
+
+        self._active_runs_by_thread.add(thread_id)
+        # Close the delegate explicitly: an abandoned consumer would otherwise
+        # leave the inner generator suspended until GC, so its teardown would
+        # not have run by the time the slot is released.
+        events = self._run_raw(input_data, invocation_state=invocation_state)
+        try:
+            async for event in events:
+                yield event
+        finally:
+            try:
+                await events.aclose()
+            finally:
+                self._active_runs_by_thread.discard(thread_id)
+
+    async def _run_raw(
+        self,
+        input_data: RunAgentInput,
+        *,
+        invocation_state: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        """Body of :meth:`run`, without the same-thread concurrency guard."""
 
         run_invocation_state = (
             dict(invocation_state) if invocation_state is not None else None
@@ -3161,25 +3226,39 @@ class StrandsAgent:
             # half-drawn pipeline behind it. Reject the collision up front with
             # the protocol-shaped code the TypeScript adapter uses.
             # A factory builds a fresh orchestrator per run, so only the same
-            # thread can collide. A shared instance cannot be multiplexed at
-            # all, so ANY overlapping run is refused, whatever its thread.
+            # thread can collide, and `run` already refused that. A shared
+            # instance cannot be multiplexed at all, so ANY overlapping run is
+            # refused here, whatever its thread.
+            request_thread = input_data.thread_id or "default"
             orchestrator_thread = (
-                (input_data.thread_id or "default")
+                request_thread
                 if self._orchestrator_factory is not None
                 else _SHARED_ORCHESTRATOR_RUN_KEY
             )
-            # A shared instance parked mid-execution for one thread must not
-            # be handed to anybody else, nor re-entered by a fresh run on its
-            # own thread: it is still sitting at its interrupt.
-            parked_threads = (
-                set(self._parked_orchestrators_by_thread)
-                if self._orchestrator_factory is None
-                else set()
-            )
-            is_resume = bool(getattr(input_data, "resume", None))
-            blocked_by_park = bool(parked_threads) and not (
-                is_resume and (input_data.thread_id or "default") in parked_threads
-            )
+            if self._orchestrator_factory is None:
+                # A shared instance parked mid-execution for one thread must
+                # not be handed to anybody else, nor re-entered by a fresh run
+                # on its own thread: it is still sitting at its interrupt.
+                parked_threads = set(self._parked_orchestrators_by_thread)
+                may_proceed = (
+                    bool(getattr(input_data, "resume", None))
+                    and request_thread in parked_threads
+                )
+            else:
+                # A factory builds its own instance per run, so only this
+                # thread's parked one is at stake. Anything but a resume that
+                # actually answers its interrupt would run on a fresh instance
+                # whose teardown drops the checkpoint, losing the paused
+                # conversation for good.
+                parked_threads = (
+                    {request_thread}
+                    if request_thread in self._parked_orchestrators_by_thread
+                    else set()
+                )
+                may_proceed = self._resume_answers_pending_interrupt(
+                    input_data, request_thread
+                )
+            blocked_by_park = bool(parked_threads) and not may_proceed
 
             if orchestrator_thread in self._active_orchestrator_runs or blocked_by_park:
                 yield RunStartedEvent(
@@ -3187,19 +3266,23 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                 )
-                yield RunErrorEvent(
-                    type=EventType.RUN_ERROR,
-                    message=(
+                if blocked_by_park:
+                    # No run is in progress here, so the busy wording would be
+                    # wrong: the orchestrator is idle but still parked.
+                    message = (
+                        "This orchestrator is paused at an interrupt on "
+                        f'thread "{sorted(parked_threads)[0]}". Answer that '
+                        "interrupt before starting another run."
+                    )
+                else:
+                    message = (
                         "Another run is already in progress on "
                         f"{_busy_scope(orchestrator_thread)}. Wait for "
                         "RUN_FINISHED before starting another."
-                        if not blocked_by_park
-                        else (
-                            "this orchestrator, which is paused at an interrupt "
-                            f"on thread \"{sorted(parked_threads)[0]}\". Answer "
-                            "that interrupt before starting another run."
-                        )
-                    ),
+                    )
+                yield RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=message,
                     code="THREAD_BUSY",
                 )
                 return
@@ -5963,25 +6046,19 @@ class StrandsAgent:
                     input_data.thread_id,
                 )
             finally:
-                # Properly close the async generator to avoid context detachment errors
-                # The generator should complete naturally when we consume all events,
-                # but we still try to close it explicitly to be safe
+                # Close the Strands generator explicitly rather than leaving
+                # it to GC. Whenever this runs from outside a ``__anext__``, the
+                # generator is SUSPENDED at a yield and ``ag_running`` reads
+                # False, so the old check took it for exhausted on nearly every
+                # path and skipped the close. The frontend-tool halt was the one
+                # case carved out by hand; a consumer that abandoned the run was
+                # not. Treating either as "already closed" left the cycle and
+                # its model stream open until collection, and from
+                # strands-agents 1.22.0 it also left that invocation holding the
+                # SDK's concurrency lock, so the thread's next run could not
+                # start at all.
                 try:
-                    # A frontend-tool halt breaks out of the loop with the
-                    # generator SUSPENDED at a yield, where ``ag_running`` is
-                    # False. The exhausted-generator check below would read
-                    # that as "already closed" and defer teardown to GC,
-                    # leaving the halted Strands cycle (and its model stream)
-                    # open. Close it explicitly instead.
-                    if halt_event_stream:
-                        await agent_stream.aclose()
-                    # Check if generator is already closed/exhausted
-                    elif not agent_stream.ag_running:
-                        # Generator is already closed, nothing to do
-                        pass
-                    else:
-                        # Try to close gracefully, but suppress context-related errors
-                        await agent_stream.aclose()
+                    await agent_stream.aclose()
                 except (
                     GeneratorExit,
                     ValueError,
@@ -5992,18 +6069,6 @@ class StrandsAgent:
                     # is closed in a different context, but don't affect functionality
                     # These errors are logged by Strands internally, we just prevent them from propagating
                     pass
-                except AttributeError:
-                    # Generator doesn't have ag_running attribute (older Python versions)
-                    # Just try to close it
-                    try:
-                        await agent_stream.aclose()
-                    except (
-                        GeneratorExit,
-                        ValueError,
-                        RuntimeError,
-                        StopAsyncIteration,
-                    ):
-                        pass
                 except Exception as e:
                     # Log other errors but don't fail
                     logger.warning(f"Error closing agent stream: {e}")
