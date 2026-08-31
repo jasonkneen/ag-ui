@@ -67,6 +67,7 @@ The root route lists the available demos:
 | `/a2ui-recovery`            | A2UI validate-and-retry recovery loop                           |
 | `/agentic-chat`             | Simple chat agent with a frontend-only `change_background` tool |
 | `/agentic-chat-reasoning`   | Reasoning / thinking event streaming                            |
+| `/agentic-chat-citations`   | Answers carrying the sources they came from                     |
 | `/agentic-chat-multimodal`  | Multimodal image / document analysis                            |
 | `/backend-tool-rendering`   | Backend-executed tools (charts, faux weather) rendered in AG-UI |
 | `/agentic-generative-ui`    | Demonstrates `PredictState` + delta streaming for plan tracking |

@@ -144,6 +144,7 @@ The integration supports the following AG-UI event families:
 - **Multi-agent**: `STEP_STARTED`, `STEP_FINISHED`, and `MultiAgentHandoff` custom events
 - **Generative UI**: `PredictState` custom events for optimistic UI updates
 - **Multimodal**: Image, document, and video content in user messages (converted to Strands ContentBlock format)
+- **Citations**: source passages attached to the assistant message's `metadata` (see below)
 
 The adapter advertises its full event / feature matrix at GET
 `/capabilities` (enabled by default; override via `createStrandsApp({ capabilitiesPath, capabilities })` or mount manually with `addCapabilities(app, path, overrides)`).
@@ -230,6 +231,174 @@ const model = new BedrockModel({
   },
 });
 ```
+
+## Citations
+
+When you give a model documents and turn citations on, its answer comes back
+with the passages it drew from: which document, where in that document, and the
+text of the passage itself. That is what lets an interface show "according to
+quarterly-report.pdf" next to a claim instead of asking the reader to take the
+answer on trust. Bedrock calls these citations. Strands documents them only as
+an API reference, at
+[`CitationsBlock`](https://strandsagents.com/docs/api/typescript/CitationsBlock/).
+
+The model emits them between the text deltas of the answer, so a citation
+arrives in the middle of the message it belongs to. This adapter attaches them
+to that message rather than emitting them separately, which is what keeps a
+citation joined to the thing it annotates.
+
+### Where they arrive
+
+Under the `citations` key of the assistant message's `metadata`, as a list. The
+key and the entry type are exported as `CITATIONS_METADATA_KEY` and
+`AguiCitation`:
+
+```ts
+import { CITATIONS_METADATA_KEY, type AguiCitation } from "@ag-ui/aws-strands";
+
+const cited = message.metadata?.[CITATIONS_METADATA_KEY] as
+  | AguiCitation[]
+  | undefined;
+```
+
+```json
+{
+  "citations": [
+    {
+      "title": "quarterly-report.pdf",
+      "sourceContent": [{ "text": "revenue grew 12%" }],
+      "location": {
+        "type": "documentChar",
+        "documentIndex": 0,
+        "start": 10,
+        "end": 26
+      },
+      "textOffset": 17
+    }
+  ]
+}
+```
+
+| Field           | Meaning                                                                 |
+| --------------- | ----------------------------------------------------------------------- |
+| `title`         | Title of the cited source, when the provider supplies one               |
+| `source`        | Source identifier, typically a URL for web citations                    |
+| `sourceContent` | The passage in the source document that supports the answer             |
+| `location`      | Where that passage sits in the source, discriminated by `type`          |
+| `content`       | The generated text the citation supports, where the provider reports it |
+| `textOffset`    | Characters of this message's text streamed when the citation arrived    |
+
+Which of these a response actually carries is the provider's choice. Bedrock
+sends `title`, `sourceContent` and `location`; it sends no `source` and no
+generated `content`, so both are absent on that path, in this adapter and in the
+Python one alike. The SDK's OpenAI Responses adapter sends `source` and
+`content` and a web location instead.
+
+`location` is `{ type: "documentChar" | "documentPage" | "documentChunk",
+documentIndex, start, end }` for document sources, `{ type: "searchResult",
+searchResultIndex, start, end }` for search results, and `{ type: "web", url,
+domain? }` for web ones. The union is exported as `AguiCitationLocation`.
+
+A location must arrive in one of two tagged forms: Bedrock's single-key wrapper
+(`{ documentChar: { ... } }`) or a discriminated object carrying a string
+`type`. Anything else cannot be placed, so the location is omitted and a warning
+names what was dropped; the citation itself is kept, since a provider that sent
+an unreadable location still named a source.
+
+Bedrock names the search-result kind `searchResultLocation` and this SDK renames
+it to `searchResult`; the Python adapter applies the same rename so both bridges
+agree on it. A kind neither SDK names yet never arrives here at all: the SDK's
+Bedrock mapper logs an unknown location and drops the citation with it, where
+the Python adapter passes it through. The asymmetry is upstream.
+
+A field the provider did not supply is absent rather than empty, and a citation
+that names no source at all is dropped rather than emitted as a bare
+`textOffset`. One that will not survive JSON encoding is dropped too, with a
+warning: metadata rides an event that is encoded for the stream, and a value
+that fails to encode would end the run early.
+
+The key is a plain metadata key, not AG-UI's reserved `ag-ui` one. Metadata is
+open by key and user space is yours, so an application already storing something
+under `citations` should rename it.
+
+### Where the two adapters agree, and where they do not
+
+For a Bedrock response this adapter and the Python one emit equal citation
+objects. That is what the normalisation is for: this SDK coalesces a
+missing `source` or `title` to `""` and those empties are dropped here, Python
+receives Bedrock's key-wrapped `location` and unwraps it to the same
+discriminated form, and both omit absent fields.
+
+They do not agree for every provider. Strands reports the generated span on the
+delta rather than on the citation, and the Python SDK's stream shape has no
+equivalent field, so a provider that supplies one (the OpenAI Responses adapter)
+reaches a TypeScript client with `content` and `source` and a Python client
+without them.
+
+### How precisely they can be placed
+
+**Message level is the ceiling, and it bounds what a frontend can render.** A
+citation locates a span in the _source_ document. It carries no offset into the
+answer, and AG-UI has no anchor for a span inside a message, so nothing here can
+promise "these words came from that passage".
+
+`textOffset` is the adapter's best effort at closing that gap: it records how
+much of the message had been streamed when the citation arrived. Bedrock emits a
+citation after the text it supports, which makes the offset the end of the
+annotated span in practice, but that is the provider's ordering rather than a
+guarantee, so treat a marker placed with it as approximate. Where the provider
+reports `content`, that is the generated span itself and is exact.
+
+`textOffset` is counted in **UTF-16 code units**, not characters. The number is
+an index into the message text a client holds, and the clients that will slice
+with it are browsers, where string indices are UTF-16 units. Both adapters count
+the same units, so an answer containing an emoji does not shift the marker on
+one side and not the other.
+
+### What a client sees while streaming
+
+The list is republished as it grows, so a client holds a whole prefix at every
+point rather than a fragment:
+
+1. A citation arrives and is attached to the next `TEXT_MESSAGE_CONTENT`, so it
+   is visible while the answer is still being written.
+2. Each publish carries every citation seen so far for that message. Metadata
+   merging replaces a key's value rather than appending to it, so the complete
+   list is the only correct thing to send.
+3. `TEXT_MESSAGE_END` carries the final list, which is how a citation with no
+   text after it reaches the client at all.
+4. The assistant message inside the following `MESSAGES_SNAPSHOT` carries the
+   same list. A snapshot replaces the message a client assembled, so without it
+   the citations would vanish the moment one arrived. That also applies to the
+   snapshot seeded from `RunAgentInput.messages` at the start of a later turn,
+   which is why the rebuild preserves a message's existing metadata.
+
+Citations belong to the message that was open when they arrived. A tool call
+closes that message and rotates its id, and the next message starts with none. A
+citation that arrives when no message is open has nothing to annotate, so it is
+dropped with a warning rather than carried onto whatever message comes next.
+
+On the multi-agent orchestrator path there is no `MESSAGES_SNAPSHOT` at all, so
+point 4 does not apply there and the node's `TEXT_MESSAGE_END` is the final
+carrier. That path keeps one accumulator for the run rather than one per node,
+where the Python adapter keys both per node; in practice a node's turn is closed
+when it finishes, so its citations still land on its own message, and the
+difference shows only for nodes whose output genuinely interleaves.
+
+### Chunk mode
+
+`emitChunkEvents` replaces the message triple with `TEXT_MESSAGE_CHUNK` and has
+no equivalent of `TEXT_MESSAGE_END`. That event is where a citation arriving
+after the last text delta travels, so its metadata is re-emitted as a final
+continuation chunk carrying nothing else. The client transform turns a
+metadata-only chunk into a zero-delta content event, which is how the value
+still reaches the reducer without re-opening the message.
+
+This matters most where there is no fallback: the multi-agent orchestrator path
+emits no `MESSAGES_SNAPSHOT` at all, whatever `emitMessagesSnapshot` says, so
+the chunk is the only carrier a trailing citation has there.
+
+`features.citations` is therefore `true` in every configuration.
 
 ## Install
 

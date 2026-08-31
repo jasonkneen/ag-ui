@@ -551,6 +551,16 @@ export interface StrandsAguiCapabilities {
     protobuf: boolean;
     /** Multiple sequential runs in one HTTP stream. One run per POST. */
     multipleRunsPerStream: boolean;
+    /**
+     * Model citations reach the client under the `citations` key of the
+     * annotated assistant message's metadata.
+     *
+     * True in every configuration. Chunk mode replaces `TEXT_MESSAGE_END`,
+     * which is where a citation arriving after the last text delta travels, so
+     * that metadata is re-emitted as a final metadata-only chunk rather than
+     * being dropped with the event.
+     */
+    citations: boolean;
   };
 }
 
@@ -596,6 +606,7 @@ export const DEFAULT_CAPABILITIES: StrandsAguiCapabilities = {
     stateDelta: false,
     protobuf: true,
     multipleRunsPerStream: false,
+    citations: true,
   },
 };
 

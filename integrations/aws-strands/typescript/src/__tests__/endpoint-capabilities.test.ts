@@ -96,7 +96,10 @@ describe("addCapabilities", () => {
 });
 
 describe("capabilitiesFor / addCapabilities { agent }", () => {
-  function makeAgent(emitChunkEvents: boolean): StrandsAgent {
+  function makeAgent(
+    emitChunkEvents: boolean,
+    emitMessagesSnapshot?: boolean,
+  ): StrandsAgent {
     return new StrandsAgent({
       agent: {
         model: {},
@@ -110,7 +113,10 @@ describe("capabilitiesFor / addCapabilities { agent }", () => {
         sessionManager: undefined,
       } as unknown as import("@strands-agents/sdk").Agent,
       name: "cap",
-      config: { emitChunkEvents },
+      config: {
+        emitChunkEvents,
+        ...(emitMessagesSnapshot !== undefined && { emitMessagesSnapshot }),
+      },
     });
   }
 
@@ -132,6 +138,21 @@ describe("capabilitiesFor / addCapabilities { agent }", () => {
     expect(caps.events.TEXT_MESSAGE_CHUNK).toBe(false);
     expect(caps.events.TEXT_MESSAGE_START).toBe(true);
     expect(caps.events.TEXT_MESSAGE_END).toBe(true);
+  });
+
+  it("advertises citations in every configuration", () => {
+    // Chunk mode drops TEXT_MESSAGE_END but re-emits its metadata as a final
+    // metadata-only chunk, so the closing citation survives with or without
+    // message snapshots. Nothing here may report a capability the runtime does
+    // not deliver; `citations.test.ts` pins the delivery.
+    expect(capabilitiesFor(makeAgent(false)).features.citations).toBe(true);
+    expect(capabilitiesFor(makeAgent(true)).features.citations).toBe(true);
+    expect(capabilitiesFor(makeAgent(false, false)).features.citations).toBe(
+      true,
+    );
+    expect(capabilitiesFor(makeAgent(true, false)).features.citations).toBe(
+      true,
+    );
   });
 
   it("addCapabilities({ agent }) serves the derived matrix", async () => {

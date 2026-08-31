@@ -21,8 +21,7 @@ poetry run python -m server
 ```
 
 `PORT` selects the port and defaults to 8000. It must be written in plain
-decimal digits with no leading zero and no sign, giving a number between 1 and
-65535. Anything else is refused at startup, naming the variable and the value,
+decimal digits with no leading zero and no sign, giving a number between 1 and 65535. Anything else is refused at startup, naming the variable and the value,
 rather than silently binding somewhere unreachable: `0` binds an arbitrary free
 port, and Python would otherwise read `0100` as 100 and `1_0` as 10.
 
@@ -50,6 +49,7 @@ It exposes:
 | --------------------------- | ---------------------------------------------- |
 | `/agentic-chat`             | Frontend tool demo                             |
 | `/agentic-chat-reasoning`   | Reasoning / thinking event streaming           |
+| `/agentic-chat-citations`   | Answers carrying the sources they came from    |
 | `/agentic-chat-multimodal`  | Multimodal image / document analysis           |
 | `/backend-tool-rendering`   | Backend tool rendering demo                    |
 | `/shared-state`             | Shared recipe state                            |
@@ -217,7 +217,7 @@ waiting is only how the adapter parks the call.
 Retries are idempotent. Re-sending an answer the checkpoint already holds
 verbatim neither resumes Strands nor re-invokes the model, including when a
 client replays its full history and repeats an answer alongside a new one. A
-*different* answer for the same call fails with
+_different_ answer for the same call fails with
 `FRONTEND_TOOL_RESULT_CONFLICT`.
 
 Strands is the source of truth for active calls, answered calls, partial
@@ -357,6 +357,163 @@ The integration supports the following AG-UI event families:
 - **Multi-agent**: `STEP_STARTED`, `STEP_FINISHED`, and `MultiAgentHandoff` custom events
 - **Generative UI**: `PredictState` custom events for optimistic UI updates
 - **Multimodal**: Image, document, and video content in user messages (converted to Strands ContentBlock format)
+- **Citations**: source passages attached to the assistant message's `metadata` (see below)
+
+## Citations
+
+When you give a model documents and turn citations on, its answer comes back
+with the passages it drew from: which document, where in that document, and the
+text of the passage itself. That is what lets an interface show "according to
+quarterly-report.pdf" next to a claim instead of asking the reader to take the
+answer on trust. Bedrock calls these citations. Strands documents them only as
+an API reference, and only for its TypeScript SDK, at
+[`CitationsBlock`](https://strandsagents.com/docs/api/typescript/CitationsBlock/).
+The Python SDK models the same concept in `strands.types.citations`, with the
+document and search-result location kinds; some fields on that page exist only
+on the TypeScript side, and the table below says which.
+
+The model emits them between the text deltas of the answer, so a citation
+arrives in the middle of the message it belongs to. This adapter attaches them
+to that message rather than emitting them separately, which is what keeps a
+citation joined to the thing it annotates.
+
+### Where they arrive
+
+Under the `citations` key of the assistant message's `metadata`, as a list:
+
+```json
+{
+  "citations": [
+    {
+      "title": "quarterly-report.pdf",
+      "sourceContent": [{ "text": "revenue grew 12%" }],
+      "location": {
+        "type": "documentChar",
+        "documentIndex": 0,
+        "start": 10,
+        "end": 26
+      },
+      "textOffset": 17
+    }
+  ]
+}
+```
+
+| Field           | Meaning                                                           | Bedrock |
+| --------------- | ----------------------------------------------------------------- | ------- |
+| `title`         | Title of the cited source                                         | yes     |
+| `sourceContent` | The passage in the source document that supports the answer       | yes     |
+| `location`      | Where that passage sits in the source, discriminated by `type`    | yes     |
+| `source`        | Source identifier, typically a URL                                | no      |
+| `content`       | The generated text the citation supports                          | no      |
+| `textOffset`    | UTF-16 code units of this message's text streamed when it arrived | derived |
+
+The `Bedrock` column matters because Strands passes the provider's own citation
+through. Bedrock's streaming citation carries `title`, `sourceContent` and
+`location` and nothing else, so `source` and `content` are simply absent on that
+path. They are in the shape because a provider that does supply them reaches
+this key by the same route, and because the TypeScript adapter emits them where
+its SDK produces them.
+
+`location` is `{ "type": "documentChar" \| "documentPage" \| "documentChunk",
+"documentIndex", "start", "end" }` for document sources,
+`{ "type": "searchResult", "searchResultIndex", "start", "end" }` for search
+results, and `{ "type": "web", "url", "domain" }` for web ones.
+
+A location must arrive in one of two tagged forms: Bedrock's single-key
+wrapper (`{"documentChar": {...}}`) or a discriminated object carrying a string
+`type`. Anything else cannot be placed, so the location is omitted and a warning
+names what was dropped; the citation itself is kept, since a provider that sent
+an unreadable location still named a source.
+
+Bedrock names the search-result kind `searchResultLocation` and the Strands
+TypeScript SDK renames it to `searchResult`; this adapter applies the same
+rename so both bridges agree on it. A kind neither SDK names yet is passed
+through here with its own name, and does **not** reach a TypeScript client at
+all: that SDK's Bedrock mapper logs an unknown location and drops the citation
+with it. The asymmetry is upstream and cannot be normalised away.
+
+A field the provider did not supply is absent rather than empty, and a citation
+that names no source is dropped rather than emitted as a bare `textOffset`. The
+generated span does not count as naming one, since it is the text being
+annotated rather than the thing annotating it. One that will not survive JSON encoding is dropped too, with a
+warning: metadata rides an event that is encoded for the stream, and a value
+that fails to encode would end the run early.
+
+The key is a plain metadata key, not AG-UI's reserved `ag-ui` one. Metadata is
+open by key and user space is yours, so an application already storing something
+under `citations` should rename it.
+
+### Where the two adapters agree, and where they do not
+
+For a Bedrock response the Python and TypeScript adapters emit equal citation
+objects. That is what the normalisation is for: the TypeScript Strands
+SDK coalesces a missing `source` or `title` to `""` and wraps nothing, Python
+receives Bedrock's key-wrapped `location` and omits absent fields, and both
+adapters converge on the same discriminated, empty-free shape.
+
+They do not agree for every provider. Strands reports the generated span on the
+delta rather than on the citation, and only some providers fill it: the
+TypeScript SDK's OpenAI Responses adapter supplies `content` and `source`, and
+the Python SDK's stream shape has no equivalent field. A provider that supplies
+a generated span therefore reaches a TypeScript client with `content` and a
+Python client without it.
+
+### How precisely they can be placed
+
+**Message level is the ceiling, and it bounds what a frontend can render.** A
+citation locates a span in the _source_ document. It carries no offset into the
+answer, and AG-UI has no anchor for a span inside a message, so nothing here can
+promise "these words came from that passage".
+
+`textOffset` is the adapter's best effort at closing that gap: it records how
+much of the message had been streamed when the citation arrived. Bedrock emits a
+citation after the text it supports, which makes the offset the end of the
+annotated span in practice, but that is the provider's ordering rather than a
+guarantee, so treat a marker placed with it as approximate.
+
+Where a provider reports `content`, that is the generated span itself and is
+exact, but no provider reaches this adapter with one: Strands' Python stream
+shape has no field for it. A TypeScript client can get it; a Python one cannot.
+
+`textOffset` is counted in **UTF-16 code units**, not characters. The number is
+an index into the message text a client holds, and the clients that will slice
+with it are browsers, where string indices are UTF-16 units. Both adapters count
+the same units, so an answer containing an emoji does not shift the marker on
+one side and not the other.
+
+### What a client sees while streaming
+
+The list is republished as it grows, so a client holds a whole prefix at every
+point rather than a fragment:
+
+1. A citation arrives and is attached to the next `TEXT_MESSAGE_CONTENT`, so it
+   is visible while the answer is still being written.
+2. Each publish carries every citation seen so far for that message. Metadata
+   merging replaces a key's value rather than appending to it, so the complete
+   list is the only correct thing to send.
+3. `TEXT_MESSAGE_END` carries the final list, which is how a citation with no
+   text after it reaches the client at all.
+4. The assistant message inside the following `MESSAGES_SNAPSHOT` carries the
+   same list. A snapshot replaces the message a client assembled, so without it
+   the citations would vanish the moment one arrived. That also applies to the
+   snapshot seeded from `RunAgentInput.messages` at the start of a later turn,
+   which is why the rebuild preserves a message's existing metadata.
+
+Citations belong to the message that was open when they arrived. A tool call
+closes that message and rotates its id, and the next message starts with none. A
+citation that arrives when no message is open has nothing to annotate, so it is
+dropped rather than carried onto whatever message comes next, and every drop is
+logged: at warning level when it was orphaned, at debug when it arrived after a
+tool result already stopped the text stream.
+
+On the multi-agent orchestrator path, each node's citations ride that node's own
+message, and there is no `MESSAGES_SNAPSHOT` at all: point 4 above does not
+apply there, so the node's `TEXT_MESSAGE_END` is the final carrier. The
+TypeScript adapter, which additionally offers a chunked event mode with no
+`TEXT_MESSAGE_END`, re-emits that metadata on a final metadata-only chunk for
+the same reason. This adapter has no chunked mode, so the question does not
+arise here.
 
 ## Next Steps
 

@@ -16,6 +16,7 @@ from .a2ui_tool import (
     is_auto_injected_a2ui_tool,
     plan_a2ui_injection,
 )
+from .citations import CITATIONS_METADATA_KEY
 from .client_proxy_tool import create_proxy_tool, sync_proxy_tools
 from .utils import (
     DEFAULT_URL_FETCH_POLICY,
@@ -53,6 +54,7 @@ __all__ = [
     "get_a2ui_tools",
     "is_auto_injected_a2ui_tool",
     "plan_a2ui_injection",
+    "CITATIONS_METADATA_KEY",
     "create_proxy_tool",
     "sync_proxy_tools",
     "create_strands_app",

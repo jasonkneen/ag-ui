@@ -990,6 +990,13 @@ from .a2ui_tool import (
     is_auto_injected_a2ui_tool,
     plan_a2ui_injection,
 )
+from .citations import (
+    CitationAccumulator,
+    _json_round_trip,
+    citation_from_event,
+    copy_metadata,
+    discard_orphans,
+)
 from .client_proxy_tool import (
     _is_proxy,
     registered_proxy_names,
@@ -1405,6 +1412,31 @@ async def _forward_inner_agent_events(
             )
 
 
+def _carried_metadata(msg: Any) -> "Dict[str, Any] | None":
+    """The message's own metadata, when it is something the wire can carry.
+
+    ``_build_snapshot_messages`` accepts ``Any`` and every other field it reads
+    goes through a coercion or an isinstance check, because callers hand it
+    unvalidated objects. Metadata gets the same treatment: anything that is not
+    a dict is dropped rather than handed to the model and raised on.
+    """
+    metadata = getattr(msg, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    # Copied, not referenced: the rebuilt message is retained and re-emitted in
+    # every later snapshot, so handing back the caller's object would alias the
+    # client's own input into all of them. A value that will not encode is
+    # dropped here rather than failing the stream at encode time, matching the
+    # citation path.
+    carried = _json_round_trip(metadata)
+    if carried is None:
+        logger.warning(
+            "Dropping message metadata that will not encode (message_id=%s)",
+            getattr(msg, "id", None),
+        )
+    return carried
+
+
 def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
     """Convert ``RunAgentInput.messages`` to AG-UI message objects.
 
@@ -1422,7 +1454,14 @@ def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
             raw = msg.content
             # Preserve list content (multimodal) as-is; only stringify unexpected types.
             content = raw if isinstance(raw, (str, list)) else _coerce_text(raw)
-            out.append(UserMessage(id=msg_id, role="user", content=content))
+            out.append(
+                UserMessage(
+                    id=msg_id,
+                    role="user",
+                    content=content,
+                    metadata=_carried_metadata(msg),
+                )
+            )
         elif role == "assistant":
             tool_calls_list = None
             raw_tool_calls = getattr(msg, "tool_calls", None)
@@ -1453,6 +1492,12 @@ def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
                     role="assistant",
                     content=_coerce_text(msg.content),
                     tool_calls=tool_calls_list,
+                    # Same reason the tool branch below preserves error and
+                    # encrypted_value: this is an AG-UI -> AG-UI rebuild of the
+                    # client's own message, and a snapshot REPLACES what the
+                    # client assembled. Dropping metadata here erases the
+                    # previous turn's citations the moment turn two starts.
+                    metadata=_carried_metadata(msg),
                 )
             )
         elif role == "tool":
@@ -1470,6 +1515,7 @@ def _build_snapshot_messages(input_messages: List[Any]) -> List[Any]:
                     # silently dropping the client's own fields.
                     error=getattr(msg, "error", None),
                     encrypted_value=getattr(msg, "encrypted_value", None),
+                    metadata=_carried_metadata(msg),
                 )
             )
     return out
@@ -2073,6 +2119,10 @@ class _MultiAgentNodeStreams:
     def __init__(self) -> None:
         self._text: Dict[str, str] = {}
         self._reasoning: Dict[str, str] = {}
+        # Citations are per node for the same reason message ids are: two nodes
+        # run concurrently and neither one's sources belong on the other's
+        # answer. Each accumulator carries its own node's text offset.
+        self._citations: Dict[str, CitationAccumulator] = {}
 
     def text(self, node_id: str, delta: str) -> List[Any]:
         events: List[Any] = []
@@ -2090,14 +2140,27 @@ class _MultiAgentNodeStreams:
                     role="assistant",
                 )
             )
+        self._accumulator(node_id).advance(delta)
         events.append(
             TextMessageContentEvent(
                 type=EventType.TEXT_MESSAGE_CONTENT,
                 message_id=message_id,
                 delta=delta,
+                metadata=self._accumulator(node_id).pending(),
             )
         )
         return events
+
+    def _accumulator(self, node_id: str) -> CitationAccumulator:
+        accumulator = self._citations.get(node_id)
+        if accumulator is None:
+            accumulator = CitationAccumulator()
+            self._citations[node_id] = accumulator
+        return accumulator
+
+    def citation(self, node_id: str, citation: Dict[str, Any]) -> None:
+        """Hold a citation until this node's text envelope publishes it."""
+        self._accumulator(node_id).add(citation)
 
     def reasoning(self, node_id: str, delta: str) -> List[Any]:
         events: List[Any] = []
@@ -2133,10 +2196,19 @@ class _MultiAgentNodeStreams:
     def _close_text(self, node_id: str) -> List[Any]:
         message_id = self._text.pop(node_id, None)
         if message_id is None:
+            # No text envelope was open, so there is nothing to close and
+            # nothing to attach to. The accumulator is deliberately left alone:
+            # this is reached when a reasoning delta arrives before the node's
+            # first text delta, and a citation already held for that node still
+            # belongs to the text message about to open. `close` sweeps what is
+            # genuinely left over.
             return []
+        accumulator = self._citations.pop(node_id, None)
         return [
             TextMessageEndEvent(
-                type=EventType.TEXT_MESSAGE_END, message_id=message_id
+                type=EventType.TEXT_MESSAGE_END,
+                message_id=message_id,
+                metadata=None if accumulator is None else accumulator.take(),
             )
         ]
 
@@ -2156,13 +2228,21 @@ class _MultiAgentNodeStreams:
     def close(self, node_id: str) -> List[Any]:
         events = self._close_text(node_id)
         events.extend(self._close_reasoning(node_id))
+        # Whatever is still held once the node is done never found a message.
+        leftover = self._citations.pop(node_id, None)
+        if leftover is not None:
+            discard_orphans(leftover, f"node_id={node_id}")
         return events
 
     def close_all(self) -> List[Any]:
         events: List[Any] = []
-        for node_id in list(self._text) + [
-            n for n in self._reasoning if n not in self._text
-        ]:
+        # Citation-only nodes are swept too: they emit nothing, but leaving
+        # them unvisited would drop their sources with no trace at all.
+        seen: set[str] = set()
+        for node_id in list(self._text) + list(self._reasoning) + list(self._citations):
+            if node_id in seen:
+                continue
+            seen.add(node_id)
             events.extend(self.close(node_id))
         return events
 
@@ -2944,6 +3024,10 @@ class StrandsAgent:
                           if inner.get("data"):
                               for text_event in nodes.text(node_id, inner["data"]):
                                   yield text_event
+                          elif (
+                              inner_citation := citation_from_event(inner)
+                          ) is not None:
+                              nodes.citation(node_id, inner_citation)
                           elif inner.get("reasoningText") and inner.get("reasoning"):
                               for reasoning_event in nodes.reasoning(
                                   node_id, inner["reasoningText"]
@@ -4142,6 +4226,11 @@ class StrandsAgent:
             message_id = str(uuid.uuid4())
             message_started = False
             accumulated_text = ""
+            # Citations belong to the message that was open when they
+            # arrived, so this is drained at every message boundary. It counts
+            # its own text offset rather than reading ``accumulated_text``,
+            # which is reset only when snapshots are being emitted.
+            citations = CitationAccumulator()
             # Tracks the latest assistant text id that was actually emitted on
             # the wire. Tool calls use it only when no snapshot will expose the
             # tool-call AssistantMessage id.
@@ -4647,10 +4736,16 @@ class StrandsAgent:
 
                         text_chunk = str(event["data"])
                         accumulated_text += text_chunk
+                        citations.advance(text_chunk)
                         yield TextMessageContentEvent(
                             type=EventType.TEXT_MESSAGE_CONTENT,
                             message_id=message_id,
                             delta=text_chunk,
+                            # Citations reach the client on the next text delta
+                            # after they arrive, so a reader sees its sources
+                            # while the answer is still streaming rather than
+                            # only once the message closes.
+                            metadata=citations.pending(),
                         )
 
                     # Handle reasoning/thinking text streaming
@@ -4721,6 +4816,31 @@ class StrandsAgent:
                     elif "reasoning_signature" in event and event.get("reasoning"):
                         sig = event.get("reasoning_signature", "")
                         logger.debug(f"Received reasoning signature: {str(sig)[:20]}...")
+
+                    # A citation, held until the message it annotates publishes
+                    # it. It is recorded against the text emitted so far, which
+                    # is the only positional information available: the citation
+                    # itself locates a span in the SOURCE document and says
+                    # nothing about where in the answer it belongs.
+                    #
+                    # Reaching this branch is also what stops citations being
+                    # forwarded as RAW. That fallback is for events this adapter
+                    # does not map, and this one is now mapped.
+                    elif (citation := citation_from_event(event)) is not None:
+                        # Skipped for the same reason the text branch skips:
+                        # once streaming is stopped the message is closed, so a
+                        # citation recorded here would carry a stale offset and
+                        # then be reported as an orphan. Logged rather than
+                        # dropped in silence, because every other citation-loss
+                        # path in this adapter says so.
+                        if stop_text_streaming:
+                            logger.debug(
+                                "Dropping a citation that arrived after text "
+                                "streaming stopped (thread_id=%s)",
+                                input_data.thread_id,
+                            )
+                        else:
+                            citations.add(citation)
 
                     # Handle multi-agent node start (maps to STEP_STARTED)
                     elif isinstance(event, dict) and event.get("type") == MULTIAGENT_NODE_START:
@@ -5055,10 +5175,14 @@ class StrandsAgent:
 
                             if behavior and behavior.stop_streaming_after_result:
                                 stop_text_streaming = True
+                                if not message_started:
+                                    discard_orphans(citations, f"thread_id={input_data.thread_id}")
                                 if message_started:
+                                    citation_metadata = citations.take()
                                     yield TextMessageEndEvent(
                                         type=EventType.TEXT_MESSAGE_END,
                                         message_id=message_id,
+                                        metadata=citation_metadata,
                                     )
                                     message_started = False
                                     # Splice point 4 of 4 (early-exit
@@ -5073,6 +5197,7 @@ class StrandsAgent:
                                                 id=message_id,
                                                 role="assistant",
                                                 content=accumulated_text,
+                                                metadata=copy_metadata(citation_metadata),
                                             )
                                         )
                                         accumulated_text = ""
@@ -5324,10 +5449,14 @@ class StrandsAgent:
                                 # Close any open assistant text turn so the
                                 # snapshot order matches the wire-event order
                                 # and so message_id can rotate cleanly.
+                                if not message_started:
+                                    discard_orphans(citations, f"thread_id={input_data.thread_id}")
                                 if message_started:
+                                    citation_metadata = citations.take()
                                     yield TextMessageEndEvent(
                                         type=EventType.TEXT_MESSAGE_END,
                                         message_id=message_id,
+                                        metadata=citation_metadata,
                                     )
                                     if (
                                         emit_snapshots
@@ -5338,6 +5467,7 @@ class StrandsAgent:
                                                 id=message_id,
                                                 role="assistant",
                                                 content=accumulated_text,
+                                                metadata=copy_metadata(citation_metadata),
                                             )
                                         )
                                         accumulated_text = ""
@@ -5641,9 +5771,17 @@ class StrandsAgent:
                                                 value=predict_state_payload,
                                             )
 
+                                    if not message_started:
+                                        discard_orphans(
+                                            citations,
+                                            f"thread_id={input_data.thread_id}",
+                                        )
                                     if message_started:
+                                        citation_metadata = citations.take()
                                         yield TextMessageEndEvent(
-                                            type=EventType.TEXT_MESSAGE_END, message_id=message_id
+                                            type=EventType.TEXT_MESSAGE_END,
+                                            message_id=message_id,
+                                            metadata=citation_metadata,
                                         )
                                         if (
                                             emit_snapshots
@@ -5654,6 +5792,7 @@ class StrandsAgent:
                                                     id=message_id,
                                                     role="assistant",
                                                     content=accumulated_text,
+                                                    metadata=copy_metadata(citation_metadata),
                                                 )
                                             )
                                             accumulated_text = ""
@@ -5771,8 +5910,9 @@ class StrandsAgent:
 
                     # Anything the chain above does not map gets forwarded as a
                     # RAW event rather than being dropped without a trace
-                    # (issue #2291). Bedrock citation deltas arrive here, as do
-                    # provider extensions this adapter predates. The deliberate
+                    # (issue #2291). Provider extensions this adapter predates
+                    # arrive here; citations no longer do, because the branch
+                    # above now maps them. The deliberate
                     # lifecycle skips at the top of the loop short-circuit
                     # before reaching this branch and stay silent.
                     #
@@ -5881,10 +6021,17 @@ class StrandsAgent:
                     message_id=reasoning_message_id
                 )
 
-            # End message if started
+            # End message if started. A turn that cited without producing any
+            # text has nothing to attach them to, so they are dropped loudly
+            # rather than carried into whatever message comes next.
+            if not message_started:
+                discard_orphans(citations, f"thread_id={input_data.thread_id}")
             if message_started:
+                citation_metadata = citations.take()
                 yield TextMessageEndEvent(
-                    type=EventType.TEXT_MESSAGE_END, message_id=message_id
+                    type=EventType.TEXT_MESSAGE_END,
+                    message_id=message_id,
+                    metadata=citation_metadata,
                 )
                 # Splice point 4 of 4 (terminal): commit the final
                 # assistant text turn into the snapshot so the frontend
@@ -5895,6 +6042,7 @@ class StrandsAgent:
                             id=message_id,
                             role="assistant",
                             content=accumulated_text,
+                            metadata=copy_metadata(citation_metadata),
                         )
                     )
                     accumulated_text = ""
