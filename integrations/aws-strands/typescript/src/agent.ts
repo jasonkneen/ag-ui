@@ -52,7 +52,14 @@ import {
   isAutoInjectedA2UITool,
   A2UI_STREAM_KEY,
 } from "./a2ui-tool";
-import { convertAguiContentToStrands, flattenContentToText } from "./utils";
+import {
+  convertAguiContentToStrands,
+  convertAguiContentToStrandsDetailed,
+  createUrlFetchCache,
+  flattenContentToText,
+  type DroppedMedia,
+  type MediaConversionOptions,
+} from "./utils";
 import type { SeenToolCall } from "./types";
 import { DEFAULT_LOGGER, resolveLogger, type Logger } from "./logger";
 
@@ -1087,9 +1094,36 @@ export function buildSnapshotMessages(
  * Multimodal content is routed through ``convertAguiContentToStrands`` so
  * image/document/video blocks reach the LLM intact across replay.
  */
+/**
+ * Does this message content carry an attachment the converter should handle?
+ *
+ * One definition for all three conversion sites. They previously each spelled
+ * this out, and two of the three dereferenced `item.type` on an element that
+ * arrives off the wire, so a null in the array threw before the converter's
+ * own guards could drop it.
+ */
+function _contentHasMedia(content: readonly unknown[]): boolean {
+  return content.some((item) => {
+    if (!item || typeof item !== "object") return false;
+    const type = (item as { type?: unknown }).type;
+    return (
+      type === "image" ||
+      type === "audio" ||
+      type === "video" ||
+      type === "document" ||
+      // The deprecated form. Omitting it made the converter's binary branch
+      // unreachable: the attachment was dropped before conversion, with no
+      // report, and on the live turn the prompt was replaced by the empty
+      // string that flattening a binary-only message produces.
+      type === "binary"
+    );
+  });
+}
+
 async function _buildStrandsHistory(
   input_messages: AguiMessage[],
   log: Logger,
+  fetchOptions?: MediaConversionOptions,
 ): Promise<Array<{ role: "user" | "assistant"; content: unknown[] }>> {
   const out: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
   for (const msg of input_messages ?? []) {
@@ -1098,12 +1132,14 @@ async function _buildStrandsHistory(
       const content: unknown[] = [];
       const raw = msg.content;
       if (Array.isArray(raw)) {
-        const hasMedia = raw.some((item: { type?: string }) =>
-          ["image", "audio", "video", "document"].includes(item.type ?? ""),
-        );
+        const hasMedia = _contentHasMedia(raw);
         if (hasMedia) {
           try {
-            const blocks = await convertAguiContentToStrands(raw as never, log);
+            const blocks = await convertAguiContentToStrands(
+              raw as never,
+              log,
+              { ...fetchOptions, messageId: msg.id },
+            );
             for (const b of blocks) {
               if (b instanceof TextBlock) {
                 content.push({ text: b.text });
@@ -1122,14 +1158,26 @@ async function _buildStrandsHistory(
             );
           }
           if (content.length === 0) {
-            content.push({ text: flattenContentToText(raw as never) || "" });
+            // An empty string here is rejected by the provider, which turns
+            // one dead attachment URL into a thread that fails on every
+            // subsequent run. The seed and live-turn paths both avoid it.
+            const fallback = flattenContentToText(raw as never);
+            if (fallback) content.push({ text: fallback });
           }
         } else {
-          content.push({ text: flattenContentToText(raw as never) });
+          const text = flattenContentToText(raw as never);
+          if (text) content.push({ text });
         }
       } else {
-        content.push({ text: _coerceText(raw) });
+        const text = _coerceText(raw);
+        if (text) content.push({ text });
       }
+      // A turn that produced nothing still has to occupy its place. The
+      // provider rejects an empty content array and a blank text block, but it
+      // also rejects the assistant-first or consecutive-assistant history that
+      // dropping this turn would leave behind, so the repair is the same
+      // single space the document-only guard uses.
+      if (content.length === 0) content.push({ text: " " });
       out.push({ role: "user", content });
     } else if (role === "assistant") {
       const blocks: unknown[] = [];
@@ -1163,7 +1211,10 @@ async function _buildStrandsHistory(
           toolUse: { toolUseId: tc.id, name, input: parsed },
         });
       }
-      if (blocks.length === 0) blocks.push({ text: "" });
+      // A blank text block is rejected by the provider, so an assistant turn
+      // with neither text nor tool calls keeps its place with a space rather
+      // than an empty string.
+      if (blocks.length === 0) blocks.push({ text: " " });
       out.push({ role: "assistant", content: blocks });
     } else if (role === "tool") {
       const toolCallId = (msg as { toolCallId?: string }).toolCallId || "";
@@ -1388,6 +1439,7 @@ export class StrandsAgent {
   private async _ensureAgent(
     inputData: RunAgentInput,
     threadId: string,
+    fetchOptions?: MediaConversionOptions,
   ): Promise<{ agent: StrandsAgentCore } | { error: BaseEvent }> {
     let strandsAgent = this._agentsByThread.get(threadId);
     if (strandsAgent) return { agent: strandsAgent };
@@ -1399,6 +1451,7 @@ export class StrandsAgent {
         seedMessages = await buildStrandsSeed(
           inputData.messages ?? [],
           this._log,
+          fetchOptions,
         );
       } catch (e) {
         this._log.error(
@@ -1821,10 +1874,61 @@ export class StrandsAgent {
     inputData: RunAgentInput,
     threadId: string,
   ): AsyncGenerator<BaseEvent, void, void> {
+    // Covers the whole run, including the seed's attachment downloads, which
+    // an inner `finally` did not reach.
+    //
+    // What this does NOT do is cancel a download on client disconnect. The
+    // endpoint signals a disconnect by calling `return()` on this generator,
+    // and a generator parked inside an `await` cannot be interrupted that way:
+    // the call queues behind whatever is in flight. Every media fetch happens
+    // inside such an await. The signal is wired through to the fetch and does
+    // cancel it when something aborts mid-flight, but nothing reaches it from
+    // a disconnect; that needs a cancellation channel independent of
+    // generator abandonment. `multimodal-run-egress` pins the current limit.
+    const runAbort = new AbortController();
+    try {
+      yield* this._runSingleAgentInner(inputData, threadId, runAbort);
+    } finally {
+      runAbort.abort();
+    }
+  }
+
+  /** Tell the client which attachments did not reach the model, and why. */
+  private async *_reportDroppedMedia(
+    dropped: DroppedMedia[],
+    delivered: number,
+  ): AsyncGenerator<BaseEvent, void, void> {
+    if (dropped.length === 0) return;
+    yield {
+      type: EventType.CUSTOM,
+      name: "MediaDropped",
+      value: {
+        dropped: dropped.map((d) => ({ type: d.type, reason: d.reason })),
+        delivered,
+      },
+    } as BaseEvent;
+  }
+
+  private async *_runSingleAgentInner(
+    inputData: RunAgentInput,
+    threadId: string,
+    runAbort: AbortController,
+  ): AsyncGenerator<BaseEvent, void, void> {
     yield _runStarted(inputData);
 
+    // One memo for the whole run. A cold run converts the same turns more than
+    // once (construction seed, then replayed history), so without this every
+    // remote attachment in the thread is downloaded once per conversion.
+    const fetchCache = createUrlFetchCache();
+
+    const fetchOptions = { fetchCache, signal: runAbort.signal };
+
     // Get or create agent instance for this thread.
-    const agentResult = await this._ensureAgent(inputData, threadId);
+    const agentResult = await this._ensureAgent(
+      inputData,
+      threadId,
+      fetchOptions,
+    );
     if ("error" in agentResult) {
       yield agentResult.error;
       return;
@@ -1974,6 +2078,10 @@ export class StrandsAgent {
       // tool results in history), synthesise a "frontend tool executed"
       // message so the model understands the context.
       let userMessage: string | ContentBlock[] = "Hello";
+      // Attachments on the live turn that could not be delivered. Reported
+      // below so a client can tell a partial delivery from a turn that
+      // carried no attachments at all.
+      let droppedMedia: DroppedMedia[] = [];
       if (pendingToolResultIds.size > 0 && inputData.messages) {
         // Collect EVERY trailing tool result, not just the last: a parallel
         // frontend-tool turn resolves N results in one continuation run and
@@ -2022,16 +2130,15 @@ export class StrandsAgent {
             msg.content != null
           ) {
             if (Array.isArray(msg.content)) {
-              const hasMedia = msg.content.some((item: { type?: string }) =>
-                ["image", "audio", "video", "document"].includes(
-                  item.type ?? "",
-                ),
-              );
+              const hasMedia = _contentHasMedia(msg.content);
               if (hasMedia) {
-                const blocks = await convertAguiContentToStrands(
-                  msg.content,
-                  this._log,
-                );
+                const { blocks, dropped } =
+                  await convertAguiContentToStrandsDetailed(
+                    msg.content,
+                    this._log,
+                    { ...fetchOptions, messageId: msg.id },
+                  );
+                droppedMedia = dropped;
                 if (blocks.length > 0) {
                   userMessage = blocks;
                 } else {
@@ -2042,6 +2149,11 @@ export class StrandsAgent {
                       `${LOG_PREFIX} all media content blocks failed conversion; falling back to text`,
                     );
                   } else {
+                    // Report what was lost BEFORE refusing: this is the one
+                    // case where the per-item reasons matter most, and
+                    // returning first meant the client only ever saw the
+                    // refusal with no account of why.
+                    yield* this._reportDroppedMedia(dropped, 0);
                     yield _runError(
                       "All media content blocks failed conversion and no text fallback is available",
                       "MEDIA_RESOLUTION_FAILED",
@@ -2089,6 +2201,18 @@ export class StrandsAgent {
           };
         }
       }
+
+      // Attachments that never reached the model are reported before it runs,
+      // so a client sees the loss alongside the turn it belongs to rather than
+      // having to infer it from an answer that ignores the attachment.
+      yield* this._reportDroppedMedia(
+        droppedMedia,
+        Array.isArray(userMessage)
+          ? // Media blocks only: the text blocks alongside them are not what a
+            // client is asking about when it asks what arrived.
+            userMessage.filter((b) => !(b instanceof TextBlock)).length
+          : 0,
+      );
 
       // Per-run state.
       let messageId = uuid();
@@ -2177,6 +2301,7 @@ export class StrandsAgent {
         const nativeHistory = await _buildStrandsHistory(
           inputData.messages ?? [],
           this._log,
+          fetchOptions,
         );
         if (nativeHistory.length > 0) {
           // Apply stateContextBuilder to the last user-text message in the
@@ -2238,7 +2363,6 @@ export class StrandsAgent {
       // AbortController wired into Strands's `cancelSignal` so that abandoning
       // the outer generator (HTTP client disconnect) stops the underlying
       // Bedrock streaming call rather than silently burning tokens.
-      const runAbort = new AbortController();
       const agentStream = strandsAgent.stream(invokeArgs as never, {
         cancelSignal: runAbort.signal,
       });
@@ -4288,6 +4412,7 @@ async function* collapseToChunkEvents(
 export async function buildStrandsSeed(
   messages: AguiMessage[],
   log?: Logger,
+  fetchOptions?: MediaConversionOptions,
 ): Promise<AgentConfig["messages"]> {
   if (messages.length === 0) return undefined;
 
@@ -4299,6 +4424,7 @@ export async function buildStrandsSeed(
   const seed = await convertMessagesForStrandsSeed(
     messages.slice(0, sliceEnd),
     log,
+    fetchOptions,
   );
   if (seed.length === 0) return undefined;
 
@@ -4318,6 +4444,7 @@ export async function buildStrandsSeed(
 export async function convertMessagesForStrandsSeed(
   messages: AguiMessage[],
   log?: Logger,
+  fetchOptions?: MediaConversionOptions,
 ): Promise<Array<{ role: "user" | "assistant"; content: unknown[] }>> {
   const out: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
   let pendingToolCalls: Map<string, string> | null = null;
@@ -4351,8 +4478,20 @@ export async function convertMessagesForStrandsSeed(
       } else if (Array.isArray(msg.content)) {
         // Assistant-side multimodal history is rare — preserve text only.
         for (const c of msg.content) {
-          if (c && typeof c === "object" && "text" in (c as object)) {
-            content.push({ text: (c as { text: string }).text });
+          // Same three shapes `flattenContentToText` accepts, and no others:
+          // copying `text` off anything carrying the key sent a tool result's
+          // payload to the model as if the user had typed it.
+          const typed = c as { type?: unknown; text?: unknown };
+          const carriesText =
+            typed?.type === undefined ||
+            typed?.type === "text" ||
+            typed?.type === "textBlock";
+          if (
+            carriesText &&
+            typeof typed?.text === "string" &&
+            typed.text.length > 0
+          ) {
+            content.push({ text: typed.text });
           }
         }
       }
@@ -4418,21 +4557,13 @@ export async function convertMessagesForStrandsSeed(
     if (typeof rawUserContent === "string") {
       if (rawUserContent.length > 0) content.push({ text: rawUserContent });
     } else if (Array.isArray(rawUserContent)) {
-      const hasMedia = rawUserContent.some((c: unknown) => {
-        if (!c || typeof c !== "object") return false;
-        const type = (c as { type?: string }).type;
-        return (
-          type === "image" ||
-          type === "audio" ||
-          type === "video" ||
-          type === "document"
-        );
-      });
+      const hasMedia = _contentHasMedia(rawUserContent);
       if (hasMedia) {
         try {
           const blocks = await convertAguiContentToStrands(
             rawUserContent as never,
             log,
+            { ...fetchOptions, messageId: msg.id },
           );
           for (const b of blocks) {
             if (b instanceof TextBlock) {
@@ -4457,13 +4588,29 @@ export async function convertMessagesForStrandsSeed(
         }
       } else {
         for (const c of rawUserContent) {
-          if (c && typeof c === "object" && "text" in (c as object)) {
-            content.push({ text: (c as { text: string }).text });
+          // Same three shapes `flattenContentToText` accepts, and no others:
+          // copying `text` off anything carrying the key sent a tool result's
+          // payload to the model as if the user had typed it.
+          const typed = c as { type?: unknown; text?: unknown };
+          const carriesText =
+            typed?.type === undefined ||
+            typed?.type === "text" ||
+            typed?.type === "textBlock";
+          if (
+            carriesText &&
+            typeof typed?.text === "string" &&
+            typed.text.length > 0
+          ) {
+            content.push({ text: typed.text });
           }
         }
       }
     }
-    if (content.length === 0) continue;
+    // A user turn that yielded nothing still has to occupy its place: dropping
+    // it leaves the assistant-first or consecutive-assistant history the
+    // provider refuses, which is the same failure in a different shape. The
+    // repair is the single space the document-only guard uses.
+    if (content.length === 0) content.push({ text: " " });
     out.push({ role: "user", content });
   }
 

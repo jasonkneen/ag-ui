@@ -8,6 +8,51 @@ import type { Message as AguiMessage } from "@ag-ui/core";
 import { convertMessagesForStrandsSeed, buildStrandsSeed } from "../agent";
 
 describe("convertMessagesForStrandsSeed", () => {
+  it("seeds only real text from a content array", async () => {
+    const seed = await convertMessagesForStrandsSeed([
+      {
+        id: "u1",
+        role: "user",
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: null },
+          { type: "jsonBlock", text: "not the user's words" },
+          { type: "text", text: "keep me" },
+        ],
+      } as unknown as AguiMessage,
+    ]);
+    // Copying `text` off anything carrying the key sent the provider an empty
+    // block, a null, and a tool result's payload as if the user had typed it.
+    expect(seed).toEqual([{ role: "user", content: [{ text: "keep me" }] }]);
+  });
+
+  it("keeps a turn that yields no text so roles still alternate", async () => {
+    const seed = await convertMessagesForStrandsSeed([
+      { id: "u1", role: "user", content: "hello" },
+      { id: "a1", role: "assistant", content: "hi" },
+      {
+        id: "u2",
+        role: "user",
+        content: [{ type: "text", text: "" }],
+      },
+      { id: "a2", role: "assistant", content: "still here" },
+    ] as unknown as AguiMessage[]);
+
+    // Dropping the empty turn leaves ["user","assistant","assistant"], which
+    // the provider rejects just as surely as the blank text block that
+    // dropping it was meant to avoid.
+    expect(seed.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    const texts = seed.flatMap((m) =>
+      (m.content as { text?: string }[]).map((c) => c.text),
+    );
+    expect(texts).not.toContain("");
+  });
+
   it("drops system and developer messages", async () => {
     const seed = await convertMessagesForStrandsSeed([
       {
