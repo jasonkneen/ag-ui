@@ -39,16 +39,15 @@ logger = logging.getLogger(__name__)
 
 
 def dumps_wire(value: Any, **kwargs: Any) -> str:
-    """Serialize the way the TypeScript adapter's ``JSON.stringify`` does.
+    """Serialize compact JSON with JavaScript-style separators and Unicode.
 
     Both adapters re-serialize tool arguments and tool results before putting
-    them on the wire, so ``json.dumps`` defaults would make identical values
-    differ byte-for-byte across the two bridges: it pads its separators, and it
-    escapes non-ASCII that ``JSON.stringify`` emits verbatim.
+    them on the wire. Python's default encoder pads separators and escapes
+    non-ASCII; those two representations are normalized here.
 
-    One divergence is deliberately left in place: Python renders a float
-    ``1.0`` as ``1.0`` where JavaScript renders it as ``1``. Python has a float
-    type JavaScript lacks, and collapsing it would misreport the value's type.
+    Number formatting remains Python-native and can differ from
+    ``JSON.stringify``, including ``1.0`` vs ``1``, ``-0.0`` vs ``0``, and
+    fixed-versus-exponent notation.
     """
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, **kwargs)
 

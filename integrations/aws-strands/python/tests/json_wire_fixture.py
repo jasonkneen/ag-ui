@@ -1,8 +1,8 @@
-"""The canonical value the wire-serialization tests round through the bridge.
+"""Canonical fixture for wire serialization normalized by ``dumps_wire``.
 
-One fixture carries every axis on which Python's ``json.dumps`` and the
-TypeScript adapter's ``JSON.stringify`` can diverge: nesting, a non-ASCII
-letter, an astral character, a forward slash and a control character.
+It covers nesting, non-ASCII and astral characters, forward slashes, and
+control characters. Numeric formatting is intentionally excluded because it
+remains Python-native.
 """
 
 from __future__ import annotations

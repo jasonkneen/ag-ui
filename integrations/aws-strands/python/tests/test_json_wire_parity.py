@@ -1,11 +1,8 @@
-"""Every place the bridge re-serializes JSON onto the wire matches the
-TypeScript adapter's ``JSON.stringify``.
+"""Verify compact, Unicode-preserving output at every JSON wire site.
 
-Both adapters re-serialize tool arguments and tool results rather than
-forwarding what the model emitted, so a Python default that ``JSON.stringify``
-does not share shows up as a byte difference between the two bridges for the
-same value. Each test below drives one such call site with the same fixture and
-pins the exact string.
+The fixture covers separator and string-escaping behavior shared with the
+TypeScript adapter's ``JSON.stringify``. Numeric spelling remains Python-native
+and is outside this parity fixture.
 """
 
 from __future__ import annotations
@@ -30,7 +27,7 @@ from tests.json_wire_fixture import (
 )
 
 
-def test_the_fixture_covers_the_axes_that_can_diverge():
+def test_the_fixture_covers_the_normalized_axes():
     assert PARITY_JSON != PARITY_JSON_PYTHON_DEFAULT
     assert json.loads(PARITY_JSON) == PARITY_VALUE
 
