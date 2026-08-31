@@ -511,6 +511,9 @@ async def test_completed_node_reports_no_status():
 async def test_second_run_on_a_busy_thread_is_rejected():
     # An orchestrator's node agents reject overlapping invocations, so the
     # collision is refused up front instead of surfacing as a raw SDK error.
+    # Same thread, so the per-thread guard in `run` answers first and the
+    # orchestrator's own guard is never reached. The message is pinned so that
+    # a change swapping which guard answers fails here instead of passing.
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -544,6 +547,10 @@ async def test_second_run_on_a_busy_thread_is_rejected():
         EventType.RUN_ERROR,
     ]
     assert second[-1].code == "THREAD_BUSY"
+    assert second[-1].message == (
+        'Another run is already in progress on thread "test-thread". Wait for '
+        "RUN_FINISHED before starting a new run on the same thread."
+    )
 
 
 @pytest.mark.asyncio
@@ -1117,6 +1124,12 @@ async def test_shared_orchestrator_refuses_overlap_on_any_thread():
         EventType.RUN_ERROR,
     ]
     assert second[-1].code == "THREAD_BUSY"
+    # A different thread, so `run`'s per-thread guard lets this through and the
+    # orchestrator's own guard is what refuses it.
+    assert second[-1].message == (
+        "Another run is already in progress on this orchestrator, which is "
+        "shared by every thread. Wait for RUN_FINISHED before starting another."
+    )
 
 
 @pytest.mark.asyncio
@@ -1668,12 +1681,20 @@ async def test_a_parked_shared_instance_refuses_an_unrelated_run():
         EventType.RUN_ERROR,
     ]
     assert events[-1].code == "THREAD_BUSY"
+    # A parked orchestrator has no run in progress, so the refusal names the
+    # interrupt rather than a concurrent run. Pinned in full: the sentence used
+    # to begin mid-clause, and the wording identifies which guard answered.
+    assert events[-1].message == (
+        'This orchestrator is paused at an interrupt on thread "thread-a". '
+        "Answer that interrupt before starting another run."
+    )
 
     # A non-resume run on the parked thread is refused for the same reason.
     same_thread = FakeInput(messages=[FakeMessage("user", "third")])
     same_thread.thread_id = "thread-a"
     again = await collect(agent, same_thread)
     assert again[-1].code == "THREAD_BUSY"
+    assert again[-1].message == events[-1].message
 
 
 @pytest.mark.asyncio
