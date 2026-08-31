@@ -555,10 +555,10 @@ export interface StrandsAguiCapabilities {
      * Model citations reach the client under the `citations` key of the
      * annotated assistant message's metadata.
      *
-     * False in one configuration, which {@link capabilitiesFor} derives: chunk
-     * events replace `TEXT_MESSAGE_END`, which is where a citation arriving
-     * after the last text delta travels, and with message snapshots also off
-     * there is nothing left to carry it.
+     * True in every configuration. Chunk mode replaces `TEXT_MESSAGE_END`,
+     * which is where a citation arriving after the last text delta travels, so
+     * that metadata is re-emitted as a final metadata-only chunk rather than
+     * being dropped with the event.
      */
     citations: boolean;
   };
@@ -657,21 +657,10 @@ function mergeCapabilities(
  * matrix reflects what the client will actually observe.
  */
 export function capabilitiesFor(
-  agent: {
-    config: { emitChunkEvents?: boolean; emitMessagesSnapshot?: boolean };
-  },
+  agent: { config: { emitChunkEvents?: boolean } },
   overrides?: StrandsAguiCapabilitiesOverrides,
 ): StrandsAguiCapabilities {
   const base = mergeCapabilities(overrides);
-  // Chunk mode drops TEXT_MESSAGE_END, so a citation arriving after the last
-  // text delta rides the message snapshot instead. Turn both off and it has
-  // nowhere left to go, which is a capability the client does not have.
-  if (
-    agent.config.emitChunkEvents &&
-    agent.config.emitMessagesSnapshot === false
-  ) {
-    base.features.citations = false;
-  }
   if (agent.config.emitChunkEvents) {
     base.events.TEXT_MESSAGE_START = false;
     base.events.TEXT_MESSAGE_CONTENT = false;
@@ -706,12 +695,7 @@ export function addCapabilities(
   capabilities?:
     | StrandsAguiCapabilitiesOverrides
     | {
-        agent: {
-          config: {
-            emitChunkEvents?: boolean;
-            emitMessagesSnapshot?: boolean;
-          };
-        };
+        agent: { config: { emitChunkEvents?: boolean } };
         overrides?: StrandsAguiCapabilitiesOverrides;
       },
 ): void {

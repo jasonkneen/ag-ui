@@ -299,6 +299,12 @@ documentIndex, start, end }` for document sources, `{ type: "searchResult",
 searchResultIndex, start, end }` for search results, and `{ type: "web", url,
 domain? }` for web ones. The union is exported as `AguiCitationLocation`.
 
+A location must arrive in one of two tagged forms: Bedrock's single-key wrapper
+(`{ documentChar: { ... } }`) or a discriminated object carrying a string
+`type`. Anything else cannot be placed, so the location is omitted and a warning
+names what was dropped; the citation itself is kept, since a provider that sent
+an unreadable location still named a source.
+
 Bedrock names the search-result kind `searchResultLocation` and this SDK renames
 it to `searchResult`; the Python adapter applies the same rename so both bridges
 agree on it. A kind neither SDK names yet never arrives here at all: the SDK's
@@ -379,26 +385,20 @@ where the Python adapter keys both per node; in practice a node's turn is closed
 when it finishes, so its citations still land on its own message, and the
 difference shows only for nodes whose output genuinely interleaves.
 
-### The one configuration that cannot deliver them
+### Chunk mode
 
 `emitChunkEvents` replaces the message triple with `TEXT_MESSAGE_CHUNK` and has
-no equivalent of `TEXT_MESSAGE_END`, so a citation arriving after the last text
-delta reaches the client through the message snapshot instead. With
-`emitMessagesSnapshot` also off there is nothing left to carry it, and
-`capabilitiesFor` advertises `features.citations: false` for exactly that
-combination.
+no equivalent of `TEXT_MESSAGE_END`. That event is where a citation arriving
+after the last text delta travels, so its metadata is re-emitted as a final
+continuation chunk carrying nothing else. The client transform turns a
+metadata-only chunk into a zero-delta content event, which is how the value
+still reaches the reducer without re-opening the message.
 
-The flag is coarser than the loss it describes: a citation followed by more text
-still arrives in that configuration, because it rides the next
-`TEXT_MESSAGE_CHUNK`. Only the trailing one is lost. The flag reports `false`
-because a client cannot tell in advance which it is going to get.
+This matters most where there is no fallback: the multi-agent orchestrator path
+emits no `MESSAGES_SNAPSHOT` at all, whatever `emitMessagesSnapshot` says, so
+the chunk is the only carrier a trailing citation has there.
 
-It is also narrower than the loss in one place it cannot see. The flag is
-derived from configuration alone, and the multi-agent orchestrator path emits no
-`MESSAGES_SNAPSHOT` whatever `emitMessagesSnapshot` says, so chunk mode loses a
-trailing citation there even with snapshots left on. The adapter logs once per
-stream when it drops an event carrying metadata, which is the signal to watch
-for; the flag does not cover it.
+`features.citations` is therefore `true` in every configuration.
 
 ## Install
 

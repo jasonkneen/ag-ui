@@ -419,6 +419,12 @@ its SDK produces them.
 `{ "type": "searchResult", "searchResultIndex", "start", "end" }` for search
 results, and `{ "type": "web", "url", "domain" }` for web ones.
 
+A location must arrive in one of two tagged forms: Bedrock's single-key
+wrapper (`{"documentChar": {...}}`) or a discriminated object carrying a string
+`type`. Anything else cannot be placed, so the location is omitted and a warning
+names what was dropped; the citation itself is kept, since a provider that sent
+an unreadable location still named a source.
+
 Bedrock names the search-result kind `searchResultLocation` and the Strands
 TypeScript SDK renames it to `searchResult`; this adapter applies the same
 rename so both bridges agree on it. A kind neither SDK names yet is passed
@@ -502,7 +508,11 @@ tool result already stopped the text stream.
 
 On the multi-agent orchestrator path, each node's citations ride that node's own
 message, and there is no `MESSAGES_SNAPSHOT` at all: point 4 above does not
-apply there, so the node's `TEXT_MESSAGE_END` is the final carrier.
+apply there, so the node's `TEXT_MESSAGE_END` is the final carrier. The
+TypeScript adapter, which additionally offers a chunked event mode with no
+`TEXT_MESSAGE_END`, re-emits that metadata on a final metadata-only chunk for
+the same reason. This adapter has no chunked mode, so the question does not
+arise here.
 
 ## Next Steps
 

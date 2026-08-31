@@ -346,10 +346,15 @@ describe("citations in chunk mode", () => {
       await collect(agent),
       EventType.TEXT_MESSAGE_CHUNK,
     );
+    const carrying = chunks
+      .map((e) => citationsOn(e)?.map((c) => c.title))
+      .filter(Boolean);
 
-    expect(
-      chunks.map((e) => citationsOn(e)?.map((c) => c.title)).filter(Boolean),
-    ).toEqual([["first.pdf"]]);
+    // Twice: once mid-stream on the delta that follows the citation, and once
+    // on the closing metadata-only chunk. Both carry the complete list, and
+    // metadata merging replaces a key's value rather than appending, so the
+    // repeat is a no-op for the reducer rather than a duplicate citation.
+    expect(carrying).toEqual([["first.pdf"], ["first.pdf"]]);
   });
 });
 
@@ -701,9 +706,11 @@ describe("regressions found in review", () => {
     ).toBe("a");
   });
 
-  it("still delivers a trailing citation in chunk mode, through the snapshot", async () => {
-    // Chunk mode drops TEXT_MESSAGE_END, so the snapshot message is the only
-    // carrier left for a citation that arrives after the last text delta.
+  it("delivers a trailing citation in chunk mode on a metadata-only chunk", async () => {
+    // Chunk mode drops TEXT_MESSAGE_END, which is the only event a citation
+    // arriving after the last text delta rides. Its metadata is re-emitted as
+    // a continuation chunk instead, which the client transform turns into a
+    // zero-delta content event so the reducer still sees it.
     const agent = scriptedStrandsAgent(
       [stream.textDelta("Revenue grew."), citationDelta({ title: "last.pdf" })],
       { config: { emitChunkEvents: true } },
@@ -712,6 +719,19 @@ describe("regressions found in review", () => {
     const events = await collect(agent);
 
     expect(eventsOfType(events, EventType.TEXT_MESSAGE_END)).toEqual([]);
+
+    const chunks = eventsOfType(events, EventType.TEXT_MESSAGE_CHUNK);
+    const carrying = chunks.filter((e) => citationsOn(e) !== undefined);
+    expect(carrying).toHaveLength(1);
+    expect(citationsOn(carrying[0])?.map((c) => c.title)).toEqual(["last.pdf"]);
+
+    // Carried by a continuation chunk, not by re-opening the message.
+    const last = carrying[0] as { delta?: string; role?: string };
+    expect(last.delta).toBeUndefined();
+    expect(last.role).toBeUndefined();
+
+    // The snapshot still carries it too, for a client that takes the snapshot
+    // as authoritative.
     const message = lastSnapshotAssistant(events);
     expect(message).toBeDefined();
     expect(
@@ -1001,24 +1021,121 @@ describe("hostile citation input", () => {
   });
 });
 
-describe("citation loss is never silent", () => {
-  it("warns once when chunk mode drops the event carrying citations", async () => {
-    const warn = vi.fn();
-    const agent = scriptedStrandsAgent(
-      [stream.textDelta("Revenue grew."), citationDelta({ title: "last.pdf" })],
-      {
-        config: {
-          emitChunkEvents: true,
-          logger: { debug: vi.fn(), warn, error: vi.fn() },
-        },
+describe("chunked multi-agent mode", () => {
+  /**
+   * The configuration the capability document claimed and did not deliver:
+   * chunk events on, driving an orchestrator, whose path emits no
+   * MESSAGES_SNAPSHOT at all. A citation arriving after the node's last text
+   * delta had nothing left to ride once the END was dropped.
+   */
+  function citingOrchestrator() {
+    return {
+      id: "test-graph",
+      async *stream(_input: string) {
+        yield { type: "beforeNodeCallEvent", nodeId: "researcher" };
+        yield {
+          type: "nodeStreamUpdateEvent",
+          nodeId: "researcher",
+          inner: {
+            source: "agent",
+            event: {
+              type: "modelContentBlockDeltaEvent",
+              delta: { type: "textDelta", text: "Revenue grew." },
+            },
+          },
+        };
+        yield {
+          type: "nodeStreamUpdateEvent",
+          nodeId: "researcher",
+          inner: {
+            source: "agent",
+            event: {
+              type: "modelContentBlockDeltaEvent",
+              delta: {
+                type: "citationsDelta",
+                citations: [{ title: "trailing.pdf" }],
+                content: [],
+              },
+            },
+          },
+        };
+        yield {
+          type: "afterNodeCallEvent",
+          nodeId: "researcher",
+          nodeType: "agent",
+        };
       },
-    );
+    };
+  }
 
-    await collect(agent);
+  it("delivers a trailing citation with no snapshot to fall back on", async () => {
+    const agent = new StrandsAgent({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      agent: citingOrchestrator() as any,
+      name: "t",
+      config: { emitChunkEvents: true },
+    });
 
-    const lines = warn.mock.calls.filter((c) =>
-      String(c[0]).includes("emitChunkEvents drops TEXT_MESSAGE_END"),
+    const events = await collect(agent);
+
+    // The premise: no END, and no snapshot anywhere on this path.
+    expect(eventsOfType(events, EventType.TEXT_MESSAGE_END)).toEqual([]);
+    expect(eventsOfType(events, EventType.MESSAGES_SNAPSHOT)).toEqual([]);
+
+    const carrying = eventsOfType(events, EventType.TEXT_MESSAGE_CHUNK).filter(
+      (e) => citationsOn(e) !== undefined,
     );
-    expect(lines).toHaveLength(1);
+    expect(carrying).toHaveLength(1);
+    expect(citationsOn(carrying[0])?.map((c) => c.title)).toEqual([
+      "trailing.pdf",
+    ]);
+    expect(citationsOn(carrying[0])?.[0].textOffset).toBe(
+      "Revenue grew.".length,
+    );
+  });
+
+  it("keeps the chunk on the message it annotates", async () => {
+    const agent = new StrandsAgent({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      agent: citingOrchestrator() as any,
+      name: "t",
+      config: { emitChunkEvents: true },
+    });
+
+    const chunks = eventsOfType(
+      await collect(agent),
+      EventType.TEXT_MESSAGE_CHUNK,
+    ) as { messageId?: string; metadata?: unknown }[];
+
+    const opener = chunks.find((c) => c.metadata === undefined);
+    const carrying = chunks.find((c) => c.metadata !== undefined);
+    expect(opener?.messageId).toBeDefined();
+    expect(carrying?.messageId).toBe(opener?.messageId);
+  });
+});
+
+describe("an untagged location", () => {
+  it("is omitted with a warning, and the citation survives", () => {
+    // A provider sending an untagged shape still named a source, so dropping
+    // the whole citation would lose more than it protects.
+    const { entry, warn } = normalizedVia({
+      title: "quarterly-report.pdf",
+      location: { documentChar: "0-9" },
+    });
+
+    expect(entry?.title).toBe("quarterly-report.pdf");
+    expect(entry?.location).toBeUndefined();
+    expect(
+      warn.mock.calls.some((c) => String(c[0]).includes("not in tagged form")),
+    ).toBe(true);
+  });
+
+  it("is not warned about when the provider sent no location at all", () => {
+    const { entry, warn } = normalizedVia({ title: "x.pdf" });
+
+    expect(entry?.title).toBe("x.pdf");
+    expect(
+      warn.mock.calls.some((c) => String(c[0]).includes("not in tagged form")),
+    ).toBe(false);
   });
 });

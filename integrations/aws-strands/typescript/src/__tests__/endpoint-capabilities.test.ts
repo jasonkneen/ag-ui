@@ -140,39 +140,19 @@ describe("capabilitiesFor / addCapabilities { agent }", () => {
     expect(caps.events.TEXT_MESSAGE_END).toBe(true);
   });
 
-  it("advertises citations except where nothing can carry the last one", () => {
-    // The closing citation rides TEXT_MESSAGE_END, and the snapshot message
-    // carries the list either way. Chunk mode drops the END; turning snapshots
-    // off as well leaves it nowhere to go.
+  it("advertises citations in every configuration", () => {
+    // Chunk mode drops TEXT_MESSAGE_END but re-emits its metadata as a final
+    // metadata-only chunk, so the closing citation survives with or without
+    // message snapshots. Nothing here may report a capability the runtime does
+    // not deliver; `citations.test.ts` pins the delivery.
     expect(capabilitiesFor(makeAgent(false)).features.citations).toBe(true);
     expect(capabilitiesFor(makeAgent(true)).features.citations).toBe(true);
     expect(capabilitiesFor(makeAgent(false, false)).features.citations).toBe(
       true,
     );
     expect(capabilitiesFor(makeAgent(true, false)).features.citations).toBe(
-      false,
+      true,
     );
-  });
-
-  it("serves citations:false for a plain config literal, not just a StrandsAgent", async () => {
-    // The derivation reads `emitMessagesSnapshot`, so `addCapabilities`'s own
-    // parameter type has to admit it. When it did not, this literal was a
-    // TS2353 excess-property error and the derivation was unreachable through
-    // the documented form.
-    const { port, close } = await startApp((app) =>
-      addCapabilities(app, "/capabilities", {
-        agent: {
-          config: { emitChunkEvents: true, emitMessagesSnapshot: false },
-        },
-      }),
-    );
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/capabilities`);
-      const body = await res.json();
-      expect(body.features.citations).toBe(false);
-    } finally {
-      await close();
-    }
   });
 
   it("addCapabilities({ agent }) serves the derived matrix", async () => {

@@ -1009,3 +1009,27 @@ async def test_client_metadata_that_will_not_encode_is_dropped_not_forwarded(cap
 
     assert rebuilt[0].metadata is None
     assert any("will not encode" in r.message for r in caplog.records)
+
+
+def test_an_untagged_location_is_omitted_with_a_warning_not_in_silence(caplog):
+    """The citation survives; only the location this adapter cannot place goes.
+
+    A provider sending an untagged shape still named a source, so dropping the
+    whole citation would lose more than it protects.
+    """
+    with caplog.at_level("WARNING"):
+        entry = normalize_citation(
+            {"title": "quarterly-report.pdf", "location": {"documentChar": "0-9"}}, 4
+        )
+
+    assert entry == {"title": "quarterly-report.pdf", "textOffset": 4}
+    assert any("not in tagged form" in r.message for r in caplog.records)
+
+
+def test_an_absent_location_is_not_warned_about(caplog):
+    """Only a location that was sent and could not be read earns the warning."""
+    with caplog.at_level("WARNING"):
+        entry = normalize_citation({"title": "x.pdf"}, 0)
+
+    assert entry == {"title": "x.pdf", "textOffset": 0}
+    assert not any("not in tagged form" in r.message for r in caplog.records)

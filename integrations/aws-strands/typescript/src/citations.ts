@@ -295,7 +295,22 @@ function normalizeCitation(
   }
 
   const location = normalizeLocation(source.location);
-  if (location !== undefined) entry.location = location;
+  if (location !== undefined) {
+    entry.location = location;
+  } else if (source.location) {
+    // Kept, minus the location. A provider that sends an untagged shape still
+    // named a source; dropping the whole citation over a field this adapter
+    // cannot place would lose more than it protects.
+    log.warn(
+      `[@ag-ui/aws-strands] Omitting a citation location that is not in ` +
+        `tagged form (${
+          typeof source.location === "object" && !Array.isArray(source.location)
+            ? `keys=${describeKeys(source.location as object)}`
+            : typeof source.location
+        }). A location must be either Bedrock's single-key wrapper or a ` +
+        `discriminated object with a string \`type\`.`,
+    );
+  }
 
   const sourceContent = textEntries(source.sourceContent);
   if (sourceContent.length > 0) entry.sourceContent = sourceContent;

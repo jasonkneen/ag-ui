@@ -202,9 +202,22 @@ def normalize_citation(citation: Any, text_offset: int) -> Optional[Dict[str, An
         if isinstance(value, str) and value:
             entry[field] = value
 
-    location = normalize_location(citation.get("location"))
+    raw_location = citation.get("location")
+    location = normalize_location(raw_location)
     if location is not None:
         entry["location"] = location
+    elif raw_location:
+        # Kept, minus the location. A provider that sends an untagged shape
+        # still named a source; dropping the whole citation over a field this
+        # adapter cannot place would lose more than it protects.
+        logger.warning(
+            "Omitting a citation location that is not in tagged form "
+            "(keys=%s). A location must be either Bedrock's single-key "
+            "wrapper or a discriminated object with a string `type`.",
+            _describe_keys(raw_location)
+            if isinstance(raw_location, dict)
+            else type(raw_location).__name__,
+        )
 
     source_content = _text_entries(citation.get("sourceContent"))
     if source_content:

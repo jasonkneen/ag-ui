@@ -1812,7 +1812,7 @@ export class StrandsAgent {
       }
     })();
     if (this.config.emitChunkEvents) {
-      yield* collapseToChunkEvents(tracked, this._log);
+      yield* collapseToChunkEvents(tracked);
     } else {
       yield* tracked;
     }
@@ -4350,15 +4350,15 @@ function unwrapStrandsEvent(event: unknown): unknown {
  *   transformer auto-emits `TEXT_MESSAGE_START`.
  * - Each chunk with a `delta` auto-emits `TEXT_MESSAGE_CONTENT`.
  * - `TEXT_MESSAGE_END` is auto-emitted by the client transformer when
- *   ids change or the stream ends — we drop our explicit END event.
+ *   ids change or the stream ends, so we drop our explicit END event, but not
+ *   its metadata: that rides a final metadata-only chunk, which is how a
+ *   trailing citation survives this mode.
  *
  * Same pattern for `TOOL_CALL_*` and `REASONING_MESSAGE_*`.
  */
 async function* collapseToChunkEvents(
   source: AsyncGenerator<BaseEvent, void, void>,
-  log: Logger = DEFAULT_LOGGER,
 ): AsyncGenerator<BaseEvent, void, void> {
-  let droppedEndMetadata = false;
   for await (const event of source) {
     switch (event.type) {
       case EventType.TEXT_MESSAGE_START: {
@@ -4386,24 +4386,26 @@ async function* collapseToChunkEvents(
         } as BaseEvent;
         break;
       }
-      case EventType.TEXT_MESSAGE_END:
-        // Dropped by design: the client transformer closes the message itself.
-        // Metadata that only ever rode the END goes with it, which for a
-        // trailing citation means the message snapshot is the only carrier
-        // left. Warned about once per stream rather than in silence, because
-        // this is otherwise the only citation-loss path in the adapter that
-        // says nothing. `capabilitiesFor` reports `features.citations: false`
-        // when snapshots are off too, since then nothing carries it at all.
-        if (event.metadata !== undefined && !droppedEndMetadata) {
-          droppedEndMetadata = true;
-          log.warn(
-            `${LOG_PREFIX} emitChunkEvents drops TEXT_MESSAGE_END, and with ` +
-              `it metadata that rode only that event. A trailing citation ` +
-              `reaches the client through MESSAGES_SNAPSHOT instead, or not ` +
-              `at all when emitMessagesSnapshot is off.`,
-          );
+      case EventType.TEXT_MESSAGE_END: {
+        // The END itself is dropped: the client transformer closes the message
+        // on its own. Its metadata is not, because a citation that arrives
+        // after the last text delta rides only this event, and the message
+        // snapshot is not always there to carry it: the multi-agent
+        // orchestrator path emits none at all.
+        //
+        // A continuation chunk carrying only metadata is the transform's own
+        // route for this. It synthesizes no START and no delta, and turns into
+        // a zero-delta content event so the value still reaches the reducer.
+        const e = event as { messageId?: string };
+        if (event.metadata !== undefined && e.messageId !== undefined) {
+          yield {
+            type: EventType.TEXT_MESSAGE_CHUNK,
+            messageId: e.messageId,
+            metadata: event.metadata,
+          } as BaseEvent;
         }
         break;
+      }
       case EventType.TOOL_CALL_START: {
         const e = event as {
           toolCallId?: string;
