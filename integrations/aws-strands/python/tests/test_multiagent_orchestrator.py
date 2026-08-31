@@ -756,6 +756,25 @@ async def test_incoming_state_is_snapshotted_without_messages():
 
 
 @pytest.mark.asyncio
+async def test_successful_run_reports_the_success_outcome():
+    # Parity with the single-agent path: a client reading RUN_FINISHED.outcome
+    # must see success, not an absent outcome.
+    orchestrator = FakeOrchestrator(
+        [
+            {"type": "multiagent_node_start", "node_id": "a", "node_type": "agent"},
+            node_stream("a", {"data": "hi"}),
+            {"type": "multiagent_node_stop", "node_id": "a"},
+        ]
+    )
+    events = await collect(make_agent(orchestrator))
+    finished = events[-1]
+
+    assert finished.type == EventType.RUN_FINISHED
+    assert finished.outcome is not None
+    assert finished.outcome.type == "success"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_failure_becomes_run_error():
     orchestrator = FakeOrchestrator([], raises=RuntimeError("graph exploded"))
     events = await collect(make_agent(orchestrator))
@@ -1326,7 +1345,7 @@ async def test_a_completed_run_clears_the_pending_interrupt():
     resume_input.resume = [_ResumeEntry()]
     events = await collect(agent, resume_input)
 
-    assert events[-1].outcome is None
+    assert events[-1].outcome.type == "success"
     assert not agent._pending_interrupts_by_thread.get("test-thread")
 
 

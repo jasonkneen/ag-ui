@@ -1632,7 +1632,7 @@ async def test_native_interrupt_resumes_live_without_session_and_restores_callba
     saved_meta = live_core.state.get(AG_UI_TOOL_CALL_MAP_STATE_KEY)
     assert saved_meta["native-confirm"] == {
         "name": "confirm_action",
-        "args": '{"key": "widget-1"}',
+        "args": '{"key":"widget-1"}',
         "input": {"key": "widget-1"},
         "strands_tool_id": "native-confirm",
     }
@@ -1658,7 +1658,7 @@ async def test_native_interrupt_resumes_live_without_session_and_restores_callba
         assert ctx.tool_name == "confirm_action"
         assert ctx.tool_use_id == "native-confirm"
         assert ctx.tool_input == {"key": "widget-1"}
-        assert ctx.args_str == '{"key": "widget-1"}'
+        assert ctx.args_str == '{"key":"widget-1"}'
     assert [
         event.value
         for event in resumed_events

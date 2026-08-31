@@ -248,6 +248,40 @@ describe("StrandsAgent native interrupt bridge (Strands SDK 1.1.0+)", () => {
     ).toBeUndefined();
   });
 
+  it("closes a cancelled tool card with exactly one result", async () => {
+    // The denial reaches the approval hook, which sets `cancel`, and the SDK
+    // then produces the error tool result the afterToolCallEvent branch turns
+    // into TOOL_CALL_RESULT. A second, synthetic result for the same call
+    // would leave the client reconciling two answers to one tool card.
+    const { agent } = approvalAgent();
+    const first = await collect(agent, userTurn());
+    const id = soleInterruptId(first);
+
+    const second = await collect(
+      agent,
+      minimalRunInput({
+        runId: "run-2",
+        resume: [{ interruptId: id, status: "cancelled" }] as never,
+      }),
+    );
+    expectNoRunError(second, "cancelled resume");
+
+    const results = second.filter(
+      (e) => e.type === EventType.TOOL_CALL_RESULT,
+    ) as (BaseEvent & { toolCallId: string; content: string })[];
+    expect(results.map((r) => r.toolCallId)).toEqual(["tu-1"]);
+    expect(results[0].content).toContain("denied approval");
+    // Inside the run envelope: after RUN_STARTED and before the finish, so a
+    // client that closes the card on RUN_FINISHED still sees the result.
+    const types = second.map((e) => e.type);
+    const resultIndex = second.indexOf(results[0]);
+    const finishedIndex = types.indexOf(EventType.RUN_FINISHED);
+    expect(types[0]).toBe(EventType.RUN_STARTED);
+    expect(types).toContain(EventType.RUN_FINISHED);
+    expect(resultIndex).toBeGreaterThan(0);
+    expect(resultIndex).toBeLessThan(finishedIndex);
+  });
+
   it("logs a debug trace when a paused result carries no interrupts", async () => {
     // The run finishes as a success with nothing to resume, so the only trace
     // an operator can get that the checkpoint may still be parked is this log.
@@ -269,7 +303,7 @@ describe("StrandsAgent native interrupt bridge (Strands SDK 1.1.0+)", () => {
     // Control flow is unchanged: still a plain success finish, no extra event.
     const finished = events.at(-1) as BaseEvent & { outcome?: { type: string } };
     expect(finished.type).toBe(EventType.RUN_FINISHED);
-    expect(finished.outcome).toBeUndefined();
+    expect(finished.outcome).toEqual({ type: "success" });
     expect(events.map((e) => e.type)).not.toContain(EventType.RUN_ERROR);
 
     const traced = debug.mock.calls.map(([message]) => String(message));

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import http.client
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -35,6 +36,22 @@ InvocationStateProvider: TypeAlias = Callable[
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def dumps_wire(value: Any, **kwargs: Any) -> str:
+    """Serialize the way the TypeScript adapter's ``JSON.stringify`` does.
+
+    Both adapters re-serialize tool arguments and tool results before putting
+    them on the wire, so ``json.dumps`` defaults would make identical values
+    differ byte-for-byte across the two bridges: it pads its separators, and it
+    escapes non-ASCII that ``JSON.stringify`` emits verbatim.
+
+    One divergence is deliberately left in place: Python renders a float
+    ``1.0`` as ``1.0`` where JavaScript renders it as ``1``. Python has a float
+    type JavaScript lacks, and collapsing it would misreport the value's type.
+    """
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, **kwargs)
+
 
 # Allowed formats per media type for Strands ContentBlock
 _IMAGE_FORMATS: Set[str] = {"png", "jpeg", "gif", "webp"}

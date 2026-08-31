@@ -12,6 +12,7 @@ from strands.tools.registry import ToolRegistry
 
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
+from tests.json_wire_fixture import PARITY_JSON, PARITY_VALUE
 
 
 def _build_agent(thread_id: str, result_content: list[dict]) -> StrandsAgent:
@@ -165,3 +166,10 @@ async def test_text_results_keep_the_existing_last_text_block_semantics():
         ]
     )
     assert json.loads(content) == "second"
+
+
+async def test_a_json_result_reaches_the_wire_as_json_stringify_would_write_it():
+    """The TypeScript adapter re-serializes with ``JSON.stringify``; the
+    Python defaults would make the same value differ byte-for-byte."""
+    content = await _tool_result_content([{"json": PARITY_VALUE}])
+    assert content == PARITY_JSON
