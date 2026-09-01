@@ -373,10 +373,13 @@ class ForcedStop {
    * recorded provider failure. Latching before logging and swallowing a logger
    * failure means neither can be lost.
    *
-   * An adapter code defect (`TypeError` / `ReferenceError`) is not classified
-   * here. The caller checks for one itself, ahead of its frontend-halt swallow,
-   * which the check would otherwise reach first, so one never arrives here. A
-   * second copy of that check would be a guard nothing can drive.
+   * No type is classified here beyond the bypass names above. A `TypeError`
+   * out of the SDK call arrived from where the model, the SDK and the
+   * integrator's tools all run, so it is recorded like any other failure from
+   * there rather than singled out; Python classifies nothing by exception type
+   * at the matching point either. The caller does test for one, but only to
+   * keep it out of its frontend-halt swallow, and it reaches this method
+   * either way.
    *
    * Nothing guards against a second `record` on the same run, deliberately:
    * the call site `break`s out of its consume loop the moment one returns, so
@@ -898,9 +901,173 @@ function _coerceId(value: unknown): string {
   return typeof value === "string" && value.length > 0 ? value : uuid();
 }
 
+/**
+ * Human-readable description of what the busy guard is protecting.
+ *
+ * A thread is the only scope this side guards, so a thread is the only scope
+ * this renders. Python's `_busy_scope` takes the guard key rather than a
+ * thread id and also renders a whole shared orchestrator, which it needs
+ * because a single orchestrator instance there refuses every overlapping run
+ * whatever its thread. Both sides emit the same `THREAD_BUSY` template; only
+ * the set of scopes that can fill it differs.
+ */
+function _busyScope(threadId: string): string {
+  return `thread "${threadId}"`;
+}
+
 /** Extract a human-readable message from an unknown error. */
 function _errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * A failure this adapter reports but did not cause.
+ *
+ * `TypeError` and `ReferenceError` are what a defect in this adapter's own
+ * code throws, which is why the terminal-error classifier reads them as
+ * `ADAPTER_BUG`. They are also what an integrator's tool throws, and what
+ * `JSON.stringify` throws over a value from outside this adapter. Throwing
+ * this instead at the places that know the fault came from outside keeps
+ * `ADAPTER_BUG` pointing at code the maintainer of this adapter can fix.
+ *
+ * It carries the original failure's message so the wire text is unchanged, and
+ * the original value as `cause` so the stack still names the real origin. A
+ * `prefix` is how a caller adds its own framing without replacing either.
+ * Python's `_ForeignFault` is the same arm.
+ *
+ * Constructing one is total. Deriving the message is a call into arbitrary
+ * code (`_errorMessage` reads `message` off the thrown value, which a getter
+ * or a `Proxy` trap can define), and a wrapper that throws while wrapping
+ * hands the classifier the very `TypeError` it was built to suppress.
+ */
+class _ForeignFault extends Error {
+  constructor(cause: unknown, prefix?: string) {
+    const text = _safeErrorMessage(cause);
+    super(prefix ? `${prefix}: ${text}` : text);
+    this.name = "ForeignFault";
+    this.cause = cause;
+  }
+}
+
+/**
+ * `_errorMessage` that cannot itself throw.
+ *
+ * A value whose text cannot be read falls back to its name, which is what
+ * Python's `_exception_text` falls back to, and to a constant when there is no
+ * readable name either.
+ */
+function _safeErrorMessage(e: unknown): string {
+  try {
+    return _errorMessage(e);
+  } catch {
+    return _errorName(e) ?? "Unknown error";
+  }
+}
+
+/**
+ * The RUN_ERROR code for a failure that escaped a run loop.
+ *
+ * `FRONTEND_TOOL_IDENTITY_ERROR` is claimed first and on identity alone: a
+ * frontend call this bridge cannot correlate through Strands' native tool-use
+ * id is neither a fault from outside nor a defect here, and the exception
+ * carries the sentence the client reads. Only what gets past it is classified
+ * by type below.
+ *
+ * `ADAPTER_BUG` says the fault is in this adapter and sends the developer
+ * reading it here rather than to the provider or the SDK, so it is claimed
+ * only for the types a code defect throws AND only when nothing upstream has
+ * established that the fault came from elsewhere. A `_ForeignFault` is that
+ * establishment: the orchestrator's stream boundary and the tool-result
+ * serializer throw it for failures this adapter merely reported.
+ *
+ * The claim is still made on type alone, so it is a claim and not a proof.
+ * Adapter code that runs inside the Strands call (a registered hook, a proxy
+ * tool) throws from where the SDK does and so is never reported as this
+ * adapter's defect either, which is the direction that costs a developer a
+ * wrong-looking code rather than a wrong place to look.
+ */
+function _terminalErrorCode(e: unknown): string {
+  if (e instanceof FrontendToolIdentityError) {
+    return "FRONTEND_TOOL_IDENTITY_ERROR";
+  }
+  return e instanceof TypeError || e instanceof ReferenceError
+    ? "ADAPTER_BUG"
+    : "STRANDS_ERROR";
+}
+
+/**
+ * Re-yield `source`, reporting anything it throws as a `_ForeignFault`.
+ *
+ * The orchestrator pulls its stream through a `for await`, which leaves no
+ * boundary between what the SDK raised and what this adapter's translation of
+ * an event raised. This restores one, as Python's
+ * `_stream_with_model_context` does for both of its loops. The single-agent
+ * loop needs no equivalent: it reports every failure out of its own `next()`
+ * as the forced stop, which never reaches the classifier at all. Teardown
+ * stays with the caller, which already returns the underlying stream in its
+ * own `finally`.
+ */
+async function* _foreignStreamFaults<T>(
+  source: AsyncIterable<T>,
+): AsyncGenerator<T, void, void> {
+  const iterator = source[Symbol.asyncIterator]();
+  while (true) {
+    let next: IteratorResult<T, unknown>;
+    try {
+      next = await iterator.next();
+    } catch (e) {
+      throw new _ForeignFault(e);
+    }
+    if (next.done) return;
+    yield next.value;
+  }
+}
+
+/**
+ * Serialize a tool result for the AG-UI string field.
+ *
+ * The value comes from an integrator's tool, and `JSON.stringify` throws a
+ * `TypeError` over two shapes a tool can hold without noticing: a `BigInt`,
+ * and a structure that refers back to itself. Both are that tool's contract to
+ * fix rather than a defect here, which is what the terminal-error classifier
+ * would otherwise read them as. Python's `_serialize_tool_result_data` is the
+ * same arm over `json.dumps`.
+ */
+function _serializeToolResultData(resultData: unknown): string {
+  if (resultData == null) return "";
+  try {
+    return JSON.stringify(resultData);
+  } catch (e) {
+    throw new _ForeignFault(e, "Tool result is not JSON serializable");
+  }
+}
+
+/**
+ * The initial STATE_SNAPSHOT payload, or `undefined` for no snapshot.
+ *
+ * AG-UI types `state` as any value, so a client is free to send something that
+ * is not a keyed object. Only a keyed object can carry the `messages` key the
+ * frontend manages separately and does not want echoed back, which is what the
+ * filter is for; an array taken through the same filter reaches the wire as an
+ * index-keyed object nobody asked for, and a scalar reaches it as a snapshot
+ * that is not an object at all. Neither is a payload this event has carried
+ * before, so a non-object gets no snapshot. Python's
+ * `_state_snapshot_payload` is the same arm.
+ */
+function _stateSnapshotPayload(
+  state: unknown,
+): Record<string, unknown> | undefined {
+  if (!_isPlainStateObject(state)) return undefined;
+  const snapshot: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(state as Record<string, unknown>)) {
+    if (k !== "messages") snapshot[k] = v;
+  }
+  return snapshot;
+}
+
+/** Whether a client-supplied `state` is a keyed object rather than a value. */
+function _isPlainStateObject(state: unknown): boolean {
+  return state !== null && typeof state === "object" && !Array.isArray(state);
 }
 
 /**
@@ -1875,7 +2042,9 @@ export class StrandsAgent {
    * Threads with an in-flight run. Strands `Agent.stream()` throws if a
    * second invocation is started on a busy agent; we detect the collision
    * up front and emit a protocol-shaped RUN_ERROR/THREAD_BUSY instead.
-   * The Python adapter carries the same guard, with the same code and text.
+   * Python guards the same collision with the same code and the same text,
+   * but only around an orchestrator, and keyed by thread only when a factory
+   * builds one per run; its single-agent path has no guard of its own.
    */
   private readonly _activeRunsByThread = new Set<string>();
   /** Outstanding AG-UI interrupt objects per thread, used to validate
@@ -2285,7 +2454,8 @@ export class StrandsAgent {
       if (missing.length > 0) {
         yield _runStarted(inputData);
         yield _runError(
-          `Partial resume: missing interrupt IDs: ${missing.join(", ")}. All open interrupts must be addressed.`,
+          `Partial resume: missing interrupt IDs: ${missing.sort().join(", ")}. ` +
+            "All open interrupts must be addressed.",
           "PARTIAL_RESUME",
         );
         return;
@@ -2402,7 +2572,8 @@ export class StrandsAgent {
     if (this._activeRunsByThread.has(threadId)) {
       yield _runStarted(inputData);
       yield _runError(
-        `Another run is already in progress on thread "${threadId}". Wait for RUN_FINISHED before starting a new run on the same thread.`,
+        `Another run is already in progress on ${_busyScope(threadId)}. ` +
+          "Wait for RUN_FINISHED before starting another.",
         "THREAD_BUSY",
       );
       return;
@@ -2566,14 +2737,9 @@ export class StrandsAgent {
       // Emit state snapshot if provided. Filter out `messages` from state to
       // avoid "Unknown message role" errors — the frontend manages messages
       // separately and doesn't recognize the "tool" role.
-      if (inputData.state && typeof inputData.state === "object") {
-        const snapshot: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(
-          inputData.state as Record<string, unknown>,
-        )) {
-          if (k !== "messages") snapshot[k] = v;
-        }
-        yield { type: EventType.STATE_SNAPSHOT, snapshot };
+      const initialSnapshot = _stateSnapshotPayload(inputData.state);
+      if (initialSnapshot !== undefined) {
+        yield { type: EventType.STATE_SNAPSHOT, snapshot: initialSnapshot };
       }
 
       // Splice point 1 of 4: emit the initial messages snapshot so the
@@ -2834,9 +3000,15 @@ export class StrandsAgent {
       // message snapshots are being emitted.
       const citations = new CitationAccumulator(this._log);
       const toolCallsSeen = new Map<string, SeenToolCall>();
-      const currentState: Record<string, unknown> = {
-        ...((inputData.state ?? {}) as object),
-      };
+      // Tracks state for the final snapshot. Seeded from a plain object only:
+      // the tool-driven updates below are key/value merges, and a client is
+      // free to send a state that is not one, which a spread takes apart into
+      // index keys rather than leaving alone.
+      const currentState: Record<string, unknown> = _isPlainStateObject(
+        inputData.state,
+      )
+        ? { ...(inputData.state as Record<string, unknown>) }
+        : {};
       let stopModelStreaming = false;
       let haltEventStream = false;
       let pendingHalt = false;
@@ -3387,16 +3559,6 @@ export class StrandsAgent {
           try {
             next = await agentStream.next();
           } catch (streamErr) {
-            // A code defect in the adapter is neither a provider failure nor
-            // the halt sentinel, so it keeps its own classification whether or
-            // not a halt is armed. Checked before the halt swallow rather than
-            // left to `record`, which the swallow would otherwise reach first.
-            if (
-              streamErr instanceof TypeError ||
-              streamErr instanceof ReferenceError
-            ) {
-              throw streamErr;
-            }
             // Strands throws "Stream ended without completing a message" when
             // a frontend tool call halts the agent before the model emits a
             // final assistant message. Once we have decided to halt, that
@@ -3404,8 +3566,9 @@ export class StrandsAgent {
             // failure in the same window is not, and must not be swallowed
             // into a success.
             //
-            // `frontendHalt` deliberately stays as it is, so the closeout below
-            // is skipped rather than reached with nothing to do. Strands defers
+            // `frontendHalt` deliberately stays as it is, so the halt-turn
+            // closeout below is skipped rather than reached with nothing to do.
+            // Strands defers
             // appending BOTH the assistant `toolUse` and its `toolResult` until
             // after the tool batch, and yields them only after the
             // `afterToolsEvent` the latch rides, so a throw arriving here landed
@@ -3416,7 +3579,20 @@ export class StrandsAgent {
             // its own `finally` on the error path and the `AfterInvocationEvent`
             // that comes out of the drain saves the snapshot before the throw
             // reaches this loop. Saving again here would write the same bytes.
+            //
+            // A `TypeError` or `ReferenceError` is never that throw, so it is
+            // held out of the swallow: the sentinel is identified by shape
+            // rather than by type, and `stop-reasons.test.ts` drives one of
+            // these wearing that shape. Held out of the SWALLOW only. What it
+            // reports is not decided here: like every other failure out of
+            // this call it is recorded as the forced stop, so the message and
+            // tool-call closeout still runs, which is what Python does with an
+            // exception Strands caught mid-cycle whatever its type.
+            const cannotBeHaltSentinel =
+              streamErr instanceof TypeError ||
+              streamErr instanceof ReferenceError;
             if (
+              !cannotBeHaltSentinel &&
               (pendingHalt || haltEventStream) &&
               _isFrontendHaltSentinel(streamErr)
             ) {
@@ -4119,8 +4295,7 @@ export class StrandsAgent {
             // history. A fresh message id ensures CopilotKit creates a
             // standalone ToolMessage and closes the spinner correctly.
             const toolResultMessageId = uuid();
-            const toolResultContent =
-              resultData == null ? "" : JSON.stringify(resultData);
+            const toolResultContent = _serializeToolResultData(resultData);
             yield {
               type: EventType.TOOL_CALL_RESULT,
               toolCallId: resultToolId,
@@ -4648,12 +4823,7 @@ export class StrandsAgent {
         outcome: { type: "success" },
       };
     } catch (e) {
-      const code =
-        e instanceof FrontendToolIdentityError
-          ? "FRONTEND_TOOL_IDENTITY_ERROR"
-          : e instanceof TypeError || e instanceof ReferenceError
-            ? "ADAPTER_BUG"
-            : "STRANDS_ERROR";
+      const code = _terminalErrorCode(e);
       this._log.error(`${LOG_PREFIX} _runSingleAgent failed:`, e);
       yield _runError(_errorMessage(e), code);
     }
@@ -4918,14 +5088,9 @@ export class StrandsAgent {
   ): AsyncGenerator<BaseEvent, void, void> {
     yield _runStarted(inputData);
     try {
-      if (inputData.state && typeof inputData.state === "object") {
-        const snapshot: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(
-          inputData.state as Record<string, unknown>,
-        )) {
-          if (k !== "messages") snapshot[k] = v;
-        }
-        yield { type: EventType.STATE_SNAPSHOT, snapshot };
+      const initialSnapshot = _stateSnapshotPayload(inputData.state);
+      if (initialSnapshot !== undefined) {
+        yield { type: EventType.STATE_SNAPSHOT, snapshot: initialSnapshot };
       }
 
       // Orchestrators take string | ContentBlock[] (MultiAgentInput); extract
@@ -4995,7 +5160,7 @@ export class StrandsAgent {
       // another is FAILED too. What a partially failed Graph owes a client is a
       // design question, not missing plumbing. See `ARCHITECTURE.md`.
       try {
-        for await (const rawEvent of orchestratorStream) {
+        for await (const rawEvent of _foreignStreamFaults(orchestratorStream)) {
           const event = unwrapStrandsEvent(rawEvent);
           const kind = getEventKind(event);
 
@@ -5190,10 +5355,7 @@ export class StrandsAgent {
         outcome: { type: "success" },
       };
     } catch (e) {
-      const code =
-        e instanceof TypeError || e instanceof ReferenceError
-          ? "ADAPTER_BUG"
-          : "STRANDS_ERROR";
+      const code = _terminalErrorCode(e);
       this._log.error(`${LOG_PREFIX} _runOrchestrator failed:`, e);
       yield _runError(_errorMessage(e), code);
     }
@@ -5535,7 +5697,8 @@ function validateResumePayload(
     const missingKeys = required.filter((k) => !(k in payload));
     if (missingKeys.length > 0) {
       return _runError(
-        `Invalid payload for interrupt '${entry.interruptId}': missing required keys ${JSON.stringify(missingKeys)}.`,
+        `Invalid payload for interrupt '${entry.interruptId}': ` +
+          `missing required keys: ${missingKeys.join(", ")}.`,
         "INVALID_PAYLOAD",
       );
     }
@@ -6231,6 +6394,11 @@ function jsonSchemaTypeMatches(value: unknown, type: string): boolean {
   }
 }
 
+// JSON Schema type names that take "an". The Python bridge keys off the same
+// set: the rendered message is a wire contract clients match literally.
+const VOWEL_INITIAL_JSON_SCHEMA_TYPES = new Set(["array", "integer", "object"]);
+
 function jsonSchemaTypeDescription(type: string): string {
-  return type === "object" || type === "array" ? `an ${type}` : `a ${type}`;
+  const article = VOWEL_INITIAL_JSON_SCHEMA_TYPES.has(type) ? "an" : "a";
+  return `${article} ${type}`;
 }

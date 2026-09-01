@@ -351,6 +351,68 @@ _MODEL_CONTEXT_HOOK_MARKER = "_ag_ui_transient_model_context_hook"
 _MODEL_CONTEXT_MUTATION_MARKER = "_ag_ui_transient_model_context_mutation"
 
 
+def _exception_text(exc: BaseException) -> str:
+    """``str(exc)`` that cannot itself raise.
+
+    ``__str__`` is arbitrary code, so reading a failure's text is a call that
+    can fail. It is read only to build a ``_ForeignFault``, where a raise would
+    escape as the very ``TypeError`` that wrapper exists to keep out of
+    ``ADAPTER_BUG``. A text that cannot be read falls back to the type name,
+    which still tells the reader what failed.
+    """
+    try:
+        return str(exc)
+    except Exception:
+        return type(exc).__name__
+
+
+class _ForeignFault(Exception):
+    """A failure this adapter reports but did not cause.
+
+    ``TypeError``, ``AttributeError`` and ``NameError`` are what a defect in
+    this adapter's own code raises, which is why the terminal-error classifier
+    reads them as ``ADAPTER_BUG``. They are also what an integrator's tool
+    raises, and what this adapter raises when it meets a value from outside it
+    that cannot be used. Raising this instead at the places that know the fault
+    came from outside keeps ``ADAPTER_BUG`` pointing at code the maintainer of
+    this adapter can actually fix.
+
+    It carries the original failure's text so the wire message is unchanged,
+    and the original exception as ``__cause__`` so the traceback still names
+    the real origin.
+
+    Constructing one is total. A wrapper that can raise while wrapping hands
+    the classifier the type it was built to suppress, which is the
+    misattribution this class exists to remove, so the text is read through
+    ``_exception_text`` here rather than at each raise site.
+    """
+
+    def __init__(self, cause: BaseException, prefix: str | None = None) -> None:
+        text = _exception_text(cause)
+        super().__init__(f"{prefix}: {text}" if prefix else text)
+
+
+def _terminal_error_code(exc: BaseException) -> str:
+    """The RUN_ERROR code for an exception that escaped a run loop.
+
+    ``ADAPTER_BUG`` says the fault is in this adapter and sends the developer
+    reading it here rather than to the provider or the SDK, so it is claimed
+    only for the exception types a code defect raises AND only when nothing
+    upstream has established that the fault came from elsewhere. A
+    ``_ForeignFault`` is that establishment: the SDK-stream boundary and the
+    serializer raise it for failures this adapter merely reported.
+
+    The claim is still made on exception type alone, so it is a claim and not
+    a proof. Adapter code that runs inside the Strands call (a registered hook,
+    a proxy tool) raises past that boundary and so is reported as a fault from
+    outside, which is the direction that costs a developer a wrong-looking code
+    rather than a wrong place to look.
+    """
+    if isinstance(exc, (TypeError, AttributeError, NameError)):
+        return "ADAPTER_BUG"
+    return "STRANDS_ERROR"
+
+
 async def _stream_with_model_context(
     stream: AsyncIterator[Any], context_block: str
 ) -> AsyncIterator[Any]:
@@ -361,6 +423,14 @@ async def _stream_with_model_context(
     ContextVar token therefore cannot be held across an adapter yield: the
     later reset may run in a different task context. Set and restore around
     each pull instead, before yielding the resulting event to the endpoint.
+
+    This is also the one place both run loops pull the Strands stream through,
+    which makes it the boundary between this adapter's code and everything the
+    SDK runs for it: the model provider, the integrator's tools, the SDK
+    itself. A failure arriving from there is reported as a ``_ForeignFault`` so
+    an integrator's ``TypeError`` is not read as this adapter's defect.
+    ``BaseException`` is deliberately not caught: cancellation and generator
+    close are not faults and must keep their own types.
     """
     iterator = stream.__aiter__()
     while True:
@@ -369,6 +439,8 @@ async def _stream_with_model_context(
             event = await iterator.__anext__()
         except StopAsyncIteration:
             return
+        except Exception as exc:
+            raise _ForeignFault(exc) from exc
         finally:
             _MODEL_CONTEXT_BLOCK.reset(token)
         yield event
@@ -799,6 +871,80 @@ def _continuation_tool_name_error(tool_call_ids: list) -> "RunErrorEvent":
     )
 
 
+def _parse_interrupt_expiry(raw: Any) -> "datetime | None":
+    """Read an interrupt's ``expires_at`` as an aware UTC instant.
+
+    ``expiresAt`` is documented as ISO-8601 and holds whatever the producer
+    stored. Python 3.10, which this package supports, rejects the trailing
+    ``Z`` an ordinary RFC 3339 timestamp carries, and an offsetless timestamp
+    cannot be compared against an aware ``now`` on any version. An offsetless
+    value is read as UTC so one stored string means one instant whatever
+    timezone the host runs in. Returns ``None`` for a value that is not a
+    timestamp at all.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text[-1:] in ("Z", "z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _required_key_text(key: Any) -> str:
+    """Render one ``required`` entry the way JavaScript's ``join`` renders it.
+
+    ``required`` is copied out of the integrator's ``response_schema``, so its
+    entries carry whatever JSON put there rather than strings only. The
+    rendered sentence is a wire contract the TypeScript bridge builds with
+    ``Array.prototype.join``, which coerces instead of failing, so this
+    coerces instead of failing too and never raises.
+
+    The two agree on the values a JSON schema normally carries: strings,
+    booleans, null, arrays, objects, and the numbers JavaScript prints in
+    full. They do not agree on every number. Python prints a large magnitude
+    in full where JavaScript switches to an exponent at 1e21, because an
+    integral float is rendered through ``int`` here. For a tiny magnitude the
+    direction reverses: Python switches to an exponent below 1e-4 and
+    JavaScript only below 1e-6, so 1e-6 renders as ``1e-06`` here and as
+    ``0.000001`` there. Python also pads to two exponent digits where
+    JavaScript writes one, and prints the non-finite floats Python's ``json``
+    accepts by default as ``nan`` and ``inf`` where JavaScript writes ``NaN``
+    and ``Infinity``.
+    """
+    if isinstance(key, str):
+        return key
+    if key is None:
+        return ""
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, float) and key.is_integer():
+        return str(int(key))
+    if isinstance(key, (int, float)):
+        return str(key)
+    if isinstance(key, list):
+        return ",".join(_required_key_text(item) for item in key)
+    return "[object Object]"
+
+
+def _payload_key(key: Any) -> str:
+    """Render one ``required`` entry the way JavaScript keys an object with it.
+
+    ``k in payload`` coerces ``k`` with ``String``, which is not the ``join``
+    rendering of the same entry: ``null`` joins as empty text and keys as
+    ``"null"``. Looking the sentence's text up instead would refuse a payload
+    the TypeScript bridge accepts and accept one it refuses.
+    """
+    if key is None:
+        return "null"
+    return _required_key_text(key)
+
+
 def _preflight_resume_entries(
     agent: Any,
     resume_entries: Any,
@@ -850,7 +996,8 @@ def _preflight_resume_entries(
         return RunErrorEvent(
             type=EventType.RUN_ERROR,
             message=(
-                f"Partial resume: missing interrupt IDs {sorted(missing_ids)}. "
+                "Partial resume: missing interrupt IDs: "
+                f"{', '.join(sorted(missing_ids))}. "
                 "All open interrupts must be addressed."
             ),
             code="PARTIAL_RESUME",
@@ -861,7 +1008,12 @@ def _preflight_resume_entries(
         ag_ui_interrupt = pending_ag_ui.get(entry.interrupt_id)
 
         if ag_ui_interrupt and getattr(ag_ui_interrupt, "expires_at", None):
-            expiry = datetime.fromisoformat(ag_ui_interrupt.expires_at)
+            expiry = _parse_interrupt_expiry(ag_ui_interrupt.expires_at)
+            if expiry is None:
+                return _interrupt_resume_error(
+                    f"Interrupt '{entry.interrupt_id}' carries an expiry that "
+                    f"is not a timestamp: {ag_ui_interrupt.expires_at!r}"
+                )
             if datetime.now(timezone.utc) > expiry:
                 return RunErrorEvent(
                     type=EventType.RUN_ERROR,
@@ -900,14 +1052,17 @@ def _preflight_resume_entries(
                 ),
                 code="INVALID_PAYLOAD",
             )
-        required = schema.get("required", [])
-        missing_keys = [key for key in required if key not in payload]
+        missing_keys = [
+            _required_key_text(key)
+            for key in schema.get("required", [])
+            if _payload_key(key) not in payload
+        ]
         if missing_keys:
             return RunErrorEvent(
                 type=EventType.RUN_ERROR,
                 message=(
                     f"Invalid payload for interrupt '{entry.interrupt_id}': "
-                    f"missing required keys {missing_keys}."
+                    f"missing required keys: {', '.join(missing_keys)}."
                 ),
                 code="INVALID_PAYLOAD",
             )
@@ -1061,6 +1216,16 @@ def _resume_fingerprint(resume_entries: list[ResumeEntry]) -> str:
     ).hexdigest()
 
 
+# JSON Schema type names that take "an". The TypeScript bridge keys off the same
+# set: the rendered message is a wire contract clients match literally.
+_VOWEL_INITIAL_JSON_SCHEMA_TYPES = frozenset({"array", "integer", "object"})
+
+
+def _json_schema_type_description(expected_type: str) -> str:
+    article = "an" if expected_type in _VOWEL_INITIAL_JSON_SCHEMA_TYPES else "a"
+    return f"{article} {expected_type}"
+
+
 def _validate_object_payload_property_types(
     schema: dict[str, Any], payload: dict[str, Any]
 ) -> str | None:
@@ -1082,8 +1247,8 @@ def _validate_object_payload_property_types(
             continue
         if _json_schema_type_matches(payload[field], expected_type):
             continue
-        article = "an" if expected_type in {"object", "array"} else "a"
-        return f"field '{field}' must be {article} {expected_type}."
+        description = _json_schema_type_description(expected_type)
+        return f"field '{field}' must be {description}."
 
     return None
 
@@ -1271,12 +1436,36 @@ def _extract_tool_result_data(result_content: Any) -> Any:
     return fallback_results or None
 
 
+def _state_snapshot_payload(state: Any) -> dict[str, Any] | None:
+    """The initial ``StateSnapshotEvent`` payload, or ``None`` for no snapshot.
+
+    AG-UI types ``state`` as ``Any``, so a client is free to send something
+    that is not a mapping. Reading one as a mapping raises ``AttributeError``
+    and reports a client's payload as this adapter's own defect. Forwarding it
+    verbatim instead would put a scalar or a list on a wire that has only ever
+    carried an object here, so a non-mapping gets the no-snapshot reading the
+    orchestrator path already gave it.
+
+    Only a mapping can carry the ``messages`` key the frontend manages
+    separately and does not want echoed back, which is what the filter is for.
+    """
+    if not isinstance(state, dict):
+        return None
+    return {k: v for k, v in state.items() if k != "messages"}
+
+
 def _serialize_tool_result_data(result_data: Any) -> str:
     """Serialize a tool result for the AG-UI string field.
 
     Strands represents inline media bytes as ``bytes``. TypeScript's SDK
     ``toJSON`` method base64-encodes them, so do the same here to keep both
     adapters wire-compatible. ``None`` represents a genuinely empty result.
+
+    The value comes from an integrator's tool, so a value JSON cannot carry is
+    that tool's contract to fix and not a defect here. Both ways ``json.dumps``
+    reports one raise ``TypeError`` (this fallback for an unsupported value, the
+    encoder itself for an unsupported dict key), which the terminal-error
+    classifier would otherwise read as this adapter's own bug.
     """
     if result_data is None:
         return ""
@@ -1288,7 +1477,10 @@ def _serialize_tool_result_data(result_data: Any) -> str:
             f"Object of type {type(value).__name__} is not JSON serializable"
         )
 
-    return dumps_wire(result_data, default=encode_bytes)
+    try:
+        return dumps_wire(result_data, default=encode_bytes)
+    except (TypeError, ValueError) as exc:
+        raise _ForeignFault(exc, "Tool result is not JSON serializable") from exc
 
 
 async def _forward_inner_agent_events(
@@ -2931,13 +3123,11 @@ class StrandsAgent:
 
         try:
           try:
-              state = input_data.state
-              if isinstance(state, dict):
+              initial_snapshot = _state_snapshot_payload(input_data.state)
+              if initial_snapshot is not None:
                   yield StateSnapshotEvent(
                       type=EventType.STATE_SNAPSHOT,
-                      snapshot={
-                          k: v for k, v in state.items() if k != "messages"
-                      },
+                      snapshot=initial_snapshot,
                   )
 
               # A run that resumes an interrupt must hand Strands its response
@@ -2970,8 +3160,15 @@ class StrandsAgent:
                       baseline = parked.baseline
                   else:
                       # Otherwise fresh per run: nothing carries from a previous
-                      # run, and two runs never touch the same instance.
-                      orchestrator = self._orchestrator_factory()
+                      # run, and two runs never touch the same instance. The
+                      # factory is the integrator's, so a raise from it is
+                      # their fault and not this adapter's.
+                      try:
+                          orchestrator = self._orchestrator_factory()
+                      except Exception as exc:
+                          raise _ForeignFault(
+                              exc, "Orchestrator factory failed"
+                          ) from exc
                       baseline = None
               else:
                   orchestrator = self._orchestrator
@@ -3149,11 +3346,7 @@ class StrandsAgent:
                   outcome=outcome,
               )
           except Exception as e:
-              code = (
-                  "ADAPTER_BUG"
-                  if isinstance(e, (TypeError, AttributeError, NameError))
-                  else "STRANDS_ERROR"
-              )
+              code = _terminal_error_code(e)
               logger.error(f"_run_orchestrator failed: {e}", exc_info=True)
               # A Graph fails fast: the first node exception cancels its siblings
               # and re-raises, so a raise landing mid-text is routine. Without
@@ -3233,9 +3426,8 @@ class StrandsAgent:
             yield RunErrorEvent(
                 type=EventType.RUN_ERROR,
                 message=(
-                    f'Another run is already in progress on thread "{thread_id}". '
-                    "Wait for RUN_FINISHED before starting a new run on the "
-                    "same thread."
+                    f"Another run is already in progress on {_busy_scope(thread_id)}. "
+                    "Wait for RUN_FINISHED before starting another."
                 ),
                 code="THREAD_BUSY",
             )
@@ -3319,23 +3511,23 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                 )
-                if blocked_by_park:
-                    # No run is in progress here, so the busy wording would be
-                    # wrong: the orchestrator is idle but still parked.
-                    message = (
-                        "This orchestrator is paused at an interrupt on "
-                        f'thread "{sorted(parked_threads)[0]}". Answer that '
-                        "interrupt before starting another run."
-                    )
-                else:
-                    message = (
-                        "Another run is already in progress on "
-                        f"{_busy_scope(orchestrator_thread)}. Wait for "
-                        "RUN_FINISHED before starting another."
-                    )
                 yield RunErrorEvent(
                     type=EventType.RUN_ERROR,
-                    message=message,
+                    # No run is in progress on the parked branch, so the busy
+                    # wording would be wrong there.
+                    message=(
+                        (
+                            "This orchestrator is paused at an interrupt on "
+                            f'thread "{sorted(parked_threads)[0]}". Answer that '
+                            "interrupt before starting another run."
+                        )
+                        if blocked_by_park
+                        else (
+                            "Another run is already in progress on "
+                            f"{_busy_scope(orchestrator_thread)}. Wait for "
+                            "RUN_FINISHED before starting another."
+                        )
+                    ),
                     code="THREAD_BUSY",
                 )
                 return
@@ -3713,7 +3905,7 @@ class StrandsAgent:
             else:
                 yield RunErrorEvent(
                     type=EventType.RUN_ERROR,
-                    message="No pending interrupt for this thread.",
+                    message="No pending interrupts for this thread.",
                     code="UNKNOWN_INTERRUPT_ID",
                 )
             return
@@ -4011,14 +4203,13 @@ class StrandsAgent:
             )
 
             # Emit state snapshot if provided
-            if hasattr(input_data, "state") and input_data.state is not None:
-                # Filter out messages from state to avoid "Unknown message role" errors
-                # The frontend manages messages separately and doesn't recognize "tool" role
-                state_snapshot = {
-                    k: v for k, v in input_data.state.items() if k != "messages"
-                }
+            initial_snapshot = _state_snapshot_payload(
+                getattr(input_data, "state", None)
+            )
+            if initial_snapshot is not None:
                 yield StateSnapshotEvent(
-                    type=EventType.STATE_SNAPSHOT, snapshot=state_snapshot
+                    type=EventType.STATE_SNAPSHOT,
+                    snapshot=initial_snapshot,
                 )
 
             # Splice point 1 of 4: emit the initial messages snapshot right
@@ -4319,9 +4510,20 @@ class StrandsAgent:
                                     message_id=getattr(msg, "id", None),
                                 )
                                 if not user_message:
-                                    # All content blocks failed conversion — fall back to text
-                                    user_message = flatten_content_to_text(msg.content) or ""
-                                    logger.warning("All media content blocks failed conversion, falling back to text")
+                                    text_fallback = flatten_content_to_text(msg.content)
+                                    if not text_fallback:
+                                        yield RunErrorEvent(
+                                            type=EventType.RUN_ERROR,
+                                            message=(
+                                                "All media content blocks failed "
+                                                "conversion and no text fallback is "
+                                                "available"
+                                            ),
+                                            code="MEDIA_RESOLUTION_FAILED",
+                                        )
+                                        return
+                                    user_message = text_fallback
+                                    logger.warning("All media content blocks failed conversion; falling back to text")
                             else:
                                 user_message = flatten_content_to_text(msg.content)
                         else:
@@ -4369,7 +4571,12 @@ class StrandsAgent:
             # Kept separate from ``tool_calls_seen`` so inner calls never take
             # part in parent-level result lookup, snapshotting or halt logic.
             inner_tool_calls_seen: Dict[str, Dict[str, Any]] = {}
-            current_state = dict(input_data.state or {})  # Track state for final snapshot
+            # Tracks state for the final snapshot. Seeded from a mapping only:
+            # the tool-driven updates below are key/value merges, and a client
+            # is free to send a state that is not a mapping at all.
+            current_state = (
+                dict(input_data.state) if isinstance(input_data.state, dict) else {}
+            )
             stop_text_streaming = False
             halt_event_stream = False
             pending_halt = False
@@ -4927,7 +5134,11 @@ class StrandsAgent:
                     # successful finish. Continue once more so Strands can raise
                     # the underlying exception and unwind the generator cleanly.
                     if event.get("force_stop"):
-                        raw_reason = str(event.get("force_stop_reason", "")).strip()
+                        # A reason key set to ``None`` is as reasonless as an
+                        # absent one; ``str()`` on it would send the client the
+                        # word "None" in place of the fallback.
+                        reason = event.get("force_stop_reason")
+                        raw_reason = "" if reason is None else str(reason).strip()
                         force_stop_error = (
                             raw_reason or "The Strands agent stopped unexpectedly."
                         )
@@ -6376,7 +6587,8 @@ class StrandsAgent:
         except Exception as e:
             import traceback
 
+            code = _terminal_error_code(e)
             traceback.print_exc()
             yield RunErrorEvent(
-                type=EventType.RUN_ERROR, message=str(e), code="STRANDS_ERROR"
+                type=EventType.RUN_ERROR, message=str(e), code=code
             )
