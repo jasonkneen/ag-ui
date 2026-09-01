@@ -9,10 +9,15 @@ run has to reach the model with it some other way or say why it cannot.
 The message path has a continuation prompt to carry the answer in. The resume
 path has none, because it drives Strands with its interrupt responses instead,
 so an uncorrected placeholder is what the model would read as the answer.
+
+What the resume path refuses on is that remaining placeholder, not the decline
+itself. The two are not the same: an id whose placeholder is already gone
+declines every time it is re-admitted, and a long-lived thread accumulates those.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -46,6 +51,13 @@ RECONCILE_LOGGER = "ag_ui_strands.agent"
 # ---------------------------------------------------------------------------
 # Doubles
 # ---------------------------------------------------------------------------
+
+
+def _no_session_core(history) -> "_MockStrandsCore":
+    """A cached agent with no session manager, so replay owns the history."""
+    core = _MockStrandsCore(session_manager=None)
+    core.messages = list(history)
+    return core
 
 
 def _repository_manager(messages=None) -> SimpleNamespace:
@@ -98,14 +110,16 @@ def _placeholder_message(tool_use_id: str) -> dict:
     return {"role": "user", "content": [{"toolResult": _placeholder_result(tool_use_id)}]}
 
 
-def _adapter() -> StrandsAgent:
+def _adapter(config: StrandsAgentConfig | None = None) -> StrandsAgent:
     core = MagicMock()
     core.model = MagicMock()
     core.system_prompt = "You are a test assistant."
     core.tool_registry = MagicMock()
     core.tool_registry.registry = {}
     core.record_direct_tool_call = True
-    return StrandsAgent(agent=core, name="test_agent", config=StrandsAgentConfig())
+    return StrandsAgent(
+        agent=core, name="test_agent", config=config or StrandsAgentConfig()
+    )
 
 
 def _run_input(messages, *, resume=None, tools=None) -> RunAgentInput:
@@ -247,7 +261,9 @@ class TestDeclinedCorrectionOnTheMessagePath:
 def _resume_core(*, extra_placeholder: bool) -> _MockStrandsCore:
     """A checkpoint parking one proxy placeholder, admitting two answers.
 
-    ``extra_placeholder`` decides whether ``fe-2`` has anything to correct.
+    ``extra_placeholder`` decides whether ``fe-2`` still has a stub in the live
+    history: with one, the model would read it as the client's answer, and
+    without one there is nothing left for a decline to leave behind.
     """
     core = _MockStrandsCore(
         session_manager=_repository_manager(),
@@ -277,12 +293,29 @@ def _resume_input() -> RunAgentInput:
     )
 
 
+def _refusing_rewrite(corrects: set[str]):
+    """A rewriter that corrects only *corrects*, leaving other stubs standing.
+
+    Today's rewriter always corrects a stub it was handed an answer for, so a
+    decline and a remaining stub cannot co-occur through it. The gate is about
+    what the model would read, not about which rewriter left it there, so the
+    refusal is driven from that condition directly.
+    """
+    return patch(
+        "ag_ui_strands.agent.reconcile_frontend_tool_results",
+        return_value=set(corrects),
+    )
+
+
 class TestDeclinedCorrectionOnTheResumePath:
     @pytest.mark.asyncio
-    async def test_a_decline_refuses_the_run(self):
-        core = _resume_core(extra_placeholder=False)
+    async def test_a_remaining_stub_refuses_the_run(self):
+        core = _resume_core(extra_placeholder=True)
 
-        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+        with (
+            patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core),
+            _refusing_rewrite({"native-proxy"}),
+        ):
             events = await _collect(_adapter(), _resume_input())
 
         errors = _errors(events)
@@ -299,11 +332,12 @@ class TestDeclinedCorrectionOnTheResumePath:
         assert core._interrupt_state.activated
 
     @pytest.mark.asyncio
-    async def test_the_refusal_names_the_declined_ids(self, caplog):
-        core = _resume_core(extra_placeholder=False)
+    async def test_the_refusal_names_the_stubbed_ids(self, caplog):
+        core = _resume_core(extra_placeholder=True)
 
         with (
             patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core),
+            _refusing_rewrite({"native-proxy"}),
             caplog.at_level(logging.ERROR, logger=RECONCILE_LOGGER),
         ):
             await _collect(_adapter(), _resume_input())
@@ -315,8 +349,22 @@ class TestDeclinedCorrectionOnTheResumePath:
         )
 
     @pytest.mark.asyncio
+    async def test_a_decline_with_nothing_left_to_correct_resumes(self):
+        # An id kept for retry whose placeholder is already gone. It is
+        # re-admitted and re-declined on every later turn, and it is never
+        # pruned, so refusing on the decline would wedge the thread for good.
+        core = _resume_core(extra_placeholder=False)
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect(_adapter(), _resume_input())
+
+        assert _errors(events) == []
+        assert len(core.stream_prompts) == 1
+
+    @pytest.mark.asyncio
     async def test_every_correction_landing_resumes_normally(self):
         core = _resume_core(extra_placeholder=True)
+
 
         with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
             events = await _collect(_adapter(), _resume_input())
@@ -325,4 +373,107 @@ class TestDeclinedCorrectionOnTheResumePath:
         assert len(core.stream_prompts) == 1
         assert core._interrupt_state.context["tool_results"][0]["content"] == [
             {"text": '{"approved": true}'}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The replay path stands down rather than replay a history missing the answer
+# ---------------------------------------------------------------------------
+
+
+def _cached_history_awaiting_an_answer() -> list:
+    return [
+        {"role": "user", "content": [{"text": "what is the weather"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "fe-1", "name": "get_weather", "input": {}}}
+            ],
+        },
+        _placeholder_message("fe-1"),
+    ]
+
+
+class TestReplayThatWouldDropTheAnswer:
+    @pytest.mark.asyncio
+    async def test_a_delta_only_turn_keeps_its_history_and_says_the_answer(self):
+        # The payload carries the result without the assistant message that
+        # opened the call, so the rebuilt history has no home for it. Replaying
+        # what little rebuilt would replace the whole conversation with it.
+        core = _no_session_core(_cached_history_awaiting_an_answer())
+        before = copy.deepcopy(core.messages)
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect(
+                _adapter(),
+                _run_input(
+                    [ToolMessage(id="t1", tool_call_id="fe-1", content="sunny, 22C")],
+                    tools=[
+                        Tool(name="get_weather", description="w", parameters={})
+                    ],
+                ),
+            )
+
+        assert _errors(events) == []
+        assert core.messages == before
+        assert core.stream_prompts == ["get_weather returned: sunny, 22C"]
+
+    @pytest.mark.asyncio
+    async def test_a_history_that_answers_itself_still_replays(self):
+        core = _no_session_core(_cached_history_awaiting_an_answer())
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect(
+                _adapter(),
+                _run_input(
+                    [
+                        UserMessage(id="u1", content="what is the weather"),
+                        AssistantMessage(
+                            id="a1",
+                            tool_calls=[
+                                ToolCall(
+                                    id="fe-1",
+                                    function=FunctionCall(
+                                        name="get_weather", arguments="{}"
+                                    ),
+                                )
+                            ],
+                        ),
+                        ToolMessage(
+                            id="t1", tool_call_id="fe-1", content="sunny, 22C"
+                        ),
+                    ],
+                    tools=[Tool(name="get_weather", description="w", parameters={})],
+                ),
+            )
+
+        assert _errors(events) == []
+        # ``None`` tells Strands to stream from the replaced history as-is.
+        assert core.stream_prompts == [None]
+        assert core.messages[-1]["content"][0]["toolResult"]["content"] == [
+            {"text": "sunny, 22C"}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The legacy path has no repaired history to rely on either
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationDisabled:
+    @pytest.mark.asyncio
+    async def test_the_answer_is_still_carried(self):
+        # Nothing repairs a history when replay is off, so every admitted answer
+        # is the prompt's to say.
+        core = _declining_core()
+        agent = _adapter(StrandsAgentConfig(replay_history_into_strands=False))
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", return_value=core):
+            events = await _collect(
+                agent, _run_input(_answered_call_then_new_question())
+            )
+
+        assert _errors(events) == []
+        assert core.stream_prompts == [
+            'approveTool returned: {"approved": false}\nand now what?'
         ]

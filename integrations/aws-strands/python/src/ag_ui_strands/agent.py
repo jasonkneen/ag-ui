@@ -1505,6 +1505,7 @@ def _continuation_result_line(
 def _build_strands_history(
     input_messages: List[Any],
     url_fetch_policy: "UrlFetchPolicy | None" = None,
+    dropped_tool_result_ids: set[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Convert ``RunAgentInput.messages`` to Strands native ``Messages``.
 
@@ -1523,6 +1524,11 @@ def _build_strands_history(
     ``toolResult`` no ``toolUse`` in the replayed history answers is a history
     real providers reject, so replaying one turns a turn the continuation prompt
     could still have carried into a generic provider failure.
+
+    A dropped result is also an answer this history no longer carries, so the
+    caller has to know: pass *dropped_tool_result_ids* and it is filled with the
+    ids left out, which is the signal to reach the model some other way rather
+    than to replay a history the client's answer is missing from.
     """
     out: List[Dict[str, Any]] = []
     fetch_budget = _FetchBudget(url_fetch_policy)
@@ -1546,6 +1552,8 @@ def _build_strands_history(
                     "answers: tool_call_id=%s",
                     tool_call_id,
                 )
+                if dropped_tool_result_ids is not None:
+                    dropped_tool_result_ids.add(tool_call_id)
                 continue
             pending_tool_results.append(
                 {
@@ -4428,12 +4436,32 @@ class StrandsAgent:
                 raise RuntimeError(
                     "Strands agent does not expose a hook registry for transient context"
                 )
+            dropped_replay_result_ids: set[str] = set()
             if replay_history:
                 native_history = await asyncio.to_thread(
                     _build_strands_history,
                     input_data.messages,
                     self.config.url_fetch_policy,
+                    dropped_replay_result_ids,
                 )
+            if replay_history and dropped_replay_result_ids:
+                # The rebuilt history has no home for those results, so replaying
+                # it would hand the model a turn the client's answer is missing
+                # from -- and on a delta-only payload, which carries the result
+                # without the assistant message that opened the call, it would
+                # replace the whole cached conversation with what little the
+                # payload rebuilt. The legacy continuation path says the answer
+                # instead, over a history this run leaves alone.
+                logger.warning(
+                    "History replay would drop the client's answer for tool_call_ids "
+                    "%s, so this turn carries it in the continuation prompt and "
+                    "leaves the existing history in place",
+                    sorted(dropped_replay_result_ids),
+                )
+                uncarried_result_ids = [
+                    result["tool_call_id"] for result in frontend_results
+                ]
+            elif replay_history:
                 # Apply ``state_context_builder`` to the last user-text
                 # message in the reconciled history rather than to the
                 # synthetic ``user_message`` string. This matches what the
@@ -4521,17 +4549,34 @@ class StrandsAgent:
                     )
                 if resume_submitted:
                     # A resume drives Strands with its interrupt responses, so it
-                    # has no continuation prompt to fall back on, and a decline
-                    # here leaves the uncorrected placeholder as what the model
-                    # reads for the client's answer. Refused, like the pre-write
-                    # gates above, rather than answered with a stub. Later than
-                    # those gates by necessity: only the attempt itself says a
-                    # correction declined.
-                    if declined_native_ids:
+                    # has no continuation prompt to fall back on, and an
+                    # uncorrected placeholder is then what the model reads for the
+                    # client's answer. Refused, like the pre-write gates above,
+                    # rather than answered with a stub. Later than those gates by
+                    # necessity: only the attempt itself says a correction
+                    # declined.
+                    #
+                    # A decline alone does not mean a stub remains. It also
+                    # describes an id with nothing left to correct anywhere, which
+                    # a long-lived thread accumulates: a recorded id is kept until
+                    # its placeholder is corrected, so one whose placeholder is
+                    # already gone is re-admitted and re-declined on every later
+                    # turn. Refusing on the decline would wedge that thread for
+                    # good. The stub itself is the condition, so that is what is
+                    # read.
+                    stubbed_declined_ids = [
+                        native_id
+                        for native_id in declined_native_ids
+                        if has_placeholder_results(
+                            getattr(strands_agent, "messages", None) or [],
+                            only_ids={native_id},
+                        )
+                    ]
+                    if stubbed_declined_ids:
                         logger.error(
                             "Active interrupt tool result reconciliation failed: "
                             "no correction landed for native ids %s",
-                            declined_native_ids,
+                            stubbed_declined_ids,
                         )
                         yield _interrupt_reconciliation_error()
                         return
@@ -4569,6 +4614,12 @@ class StrandsAgent:
                     if reconciled and not has_newer_user_message
                     else user_message
                 )
+            else:
+                # Neither branch ran, so nothing repaired a history and no answer
+                # is in one. Everything this turn admitted is the prompt's to say.
+                uncarried_result_ids = [
+                    result["tool_call_id"] for result in frontend_results
+                ]
 
             # A user message after the results is this run's prompt, which means
             # the trailing derivation above produced nothing and the answers
