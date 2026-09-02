@@ -63,9 +63,18 @@ async def _set_schema_version(
         database.upsert_schema_version(table_name, version)
 
 
+async def _table_exists(database: BaseDb | AsyncBaseDb, table_name: str) -> bool:
+    if isinstance(database, AsyncBaseDb):
+        return await database.table_exists(table_name)
+    return database.table_exists(table_name)
+
+
 async def _snapshot_legacy_session_runs(
     database: BaseDb | AsyncBaseDb,
 ) -> list[tuple[str, Optional[str], int, dict]]:
+    if not await _table_exists(database, database.session_table_name):
+        return []
+
     table_name = database.db_engine.dialect.identifier_preparer.quote(
         database.session_table_name
     )

@@ -11,7 +11,7 @@ from unittest.mock import patch
 from agno.db.in_memory import InMemoryDb
 from agno.db.sqlite import SqliteDb as AgnoSqliteDb
 from agno.db.migrations.manager import MigrationManager
-from agno.learn.utils import legacy_entity_learning_id
+from agno.learn.utils import build_learning_id, legacy_entity_learning_id
 
 from migrate_v3 import migrate_to_v3
 
@@ -156,6 +156,58 @@ class DatabaseMigrationTests(unittest.TestCase):
 
                 self.assertEqual(
                     database.get_latest_schema_version("agno_sessions"), "2.5.6"
+                )
+            finally:
+                database.close()
+
+    def test_learning_only_database_migrates_without_a_sessions_table(self) -> None:
+        entity_id = "learning-only-entity"
+        entity_type = "person"
+        user_id = "learning-only-user"
+        legacy_learning_id = legacy_entity_learning_id(
+            entity_id, entity_type, "user"
+        )
+        migrated_learning_id = build_learning_id(
+            "entity_memory",
+            user_id=user_id,
+            entity_id=entity_id,
+            entity_type=entity_type,
+            namespace="user",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = AgnoSqliteDb(
+                db_file=str(Path(temporary_directory) / "learning-only.db")
+            )
+            try:
+                database.upsert_learning(
+                    id=legacy_learning_id,
+                    learning_type="entity_memory",
+                    content={"user_id": user_id, "facts": ["preserved"]},
+                    user_id=user_id,
+                    namespace="user",
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                )
+                database.upsert_schema_version(
+                    database.learnings_table_name, "2.5.6"
+                )
+                self.assertFalse(database.table_exists(database.session_table_name))
+
+                asyncio.run(migrate_to_v3(database))
+
+                self.assertEqual(
+                    database.get_latest_schema_version(database.session_table_name),
+                    "3.0.0",
+                )
+                self.assertEqual(
+                    database.get_latest_schema_version(database.learnings_table_name),
+                    "3.0.0",
+                )
+                migrated_learning = database.get_learning_by_id(migrated_learning_id)
+                self.assertIsNotNone(migrated_learning)
+                self.assertEqual(
+                    migrated_learning["content"],
+                    {"user_id": user_id, "facts": ["preserved"]},
                 )
             finally:
                 database.close()
