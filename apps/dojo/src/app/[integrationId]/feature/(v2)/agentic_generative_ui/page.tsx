@@ -2,7 +2,7 @@
 import React from "react";
 import "@copilotkit/react-core/v2/styles.css";
 import "./style.css";
-import { 
+import {
   useAgent,
   UseAgentUpdate,
   useConfigureSuggestions,
@@ -17,7 +17,9 @@ interface AgenticGenerativeUIProps {
   }>;
 }
 
-const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({ params }) => {
+const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({
+  params,
+}) => {
   const { integrationId } = React.use(params);
   return (
     <CopilotKit
@@ -30,11 +32,36 @@ const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({ params }) => 
   );
 };
 
-interface AgentState {
-  steps: {
-    description: string;
-    status: "pending" | "completed";
-  }[];
+interface AgentStep {
+  description: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+function isAgentStep(value: unknown): value is AgentStep {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  return (
+    "description" in value &&
+    typeof value.description === "string" &&
+    "status" in value &&
+    (value.status === "pending" ||
+      value.status === "in_progress" ||
+      value.status === "completed")
+  );
+}
+
+function normalizeAgentSteps(state: unknown): AgentStep[] {
+  if (typeof state !== "object" || state === null || !("steps" in state)) {
+    return [];
+  }
+
+  if (!Array.isArray(state.steps)) {
+    return [];
+  }
+
+  return state.steps.filter(isAgentStep);
 }
 
 const Chat = () => {
@@ -43,8 +70,6 @@ const Chat = () => {
     agentId: "agentic_generative_ui",
     updates: [UseAgentUpdate.OnStateChanged],
   });
-
-  const agentState = agent.state as AgentState | undefined;
 
   useConfigureSuggestions({
     suggestions: [
@@ -60,7 +85,7 @@ const Chat = () => {
     available: "always",
   });
 
-  const steps = agentState?.steps;
+  const steps = normalizeAgentSteps(agent.state);
 
   return (
     <div className="flex justify-center items-center h-full w-full">
@@ -69,7 +94,7 @@ const Chat = () => {
           agentId="agentic_generative_ui"
           className="h-full rounded-2xl max-w-6xl mx-auto"
           messageView={{
-            children: ({ messageElements, interruptElement }  ) => (
+            children: ({ messageElements, interruptElement }) => (
               <div data-testid="copilot-message-list" className="flex flex-col">
                 {messageElements}
                 {steps && steps.length > 0 && (
@@ -87,8 +112,16 @@ const Chat = () => {
   );
 };
 
-function TaskProgress({ steps, theme }: { steps: AgentState["steps"]; theme?: string }) {
-  const completedCount = steps.filter((step) => step.status === "completed").length;
+function TaskProgress({
+  steps,
+  theme,
+}: {
+  steps: AgentStep[];
+  theme?: string;
+}) {
+  const completedCount = steps.filter(
+    (step) => step.status === "completed",
+  ).length;
   const progressPercentage = (completedCount / steps.length) * 100;
 
   return (
@@ -107,7 +140,9 @@ function TaskProgress({ steps, theme }: { steps: AgentState["steps"]; theme?: st
             <h3 className="text-xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
               Task Progress
             </h3>
-            <div className={`text-sm ${theme === "dark" ? "text-slate-400" : "text-gray-500"}`}>
+            <div
+              className={`text-sm ${theme === "dark" ? "text-slate-400" : "text-gray-500"}`}
+            >
               {completedCount}/{steps.length} Complete
             </div>
           </div>
@@ -135,7 +170,8 @@ function TaskProgress({ steps, theme }: { steps: AgentState["steps"]; theme?: st
             const isCurrentPending =
               step.status === "pending" &&
               index === steps.findIndex((s) => s.status === "pending");
-            const isFuturePending = step.status === "pending" && !isCurrentPending;
+            const isFuturePending =
+              step.status === "pending" && !isCurrentPending;
 
             return (
               <div
@@ -259,8 +295,18 @@ function TaskProgress({ steps, theme }: { steps: AgentState["steps"]; theme?: st
 // Enhanced Icons
 function CheckIcon() {
   return (
-    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+    <svg
+      className="w-4 h-4 text-white"
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={3}
+        d="M5 13l4 4L19 7"
+      />
     </svg>
   );
 }
@@ -273,7 +319,14 @@ function SpinnerIcon() {
       fill="none"
       viewBox="0 0 24 24"
     >
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <circle
+        className="opacity-25"
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="4"
+      />
       <path
         className="opacity-75"
         fill="currentColor"

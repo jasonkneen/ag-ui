@@ -3,7 +3,7 @@
 This example shows how to create an Agno Agent with tools (YFinanceTools) and expose it in an AG-UI compatible way.
 """
 
-from agno.agent.agent import Agent
+from agno.agent import Agent
 from agno.db.in_memory import InMemoryDb
 from agno.models.openai import OpenAIChat
 from agno.os import AgentOS

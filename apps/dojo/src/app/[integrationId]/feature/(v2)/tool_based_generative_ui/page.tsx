@@ -1,7 +1,7 @@
 "use client";
 import React, { useState } from "react";
 import "@copilotkit/react-core/v2/styles.css";
-import { 
+import {
   useFrontendTool,
   useConfigureSuggestions,
   CopilotSidebar,
@@ -30,7 +30,9 @@ interface Haiku {
   gradient: string;
 }
 
-export default function ToolBasedGenerativeUI({ params }: ToolBasedGenerativeUIProps) {
+export default function ToolBasedGenerativeUI({
+  params,
+}: ToolBasedGenerativeUIProps) {
   const { integrationId } = React.use(params);
   const { chatDefaultOpen } = useURLParams();
 
@@ -78,14 +80,103 @@ const VALID_IMAGE_NAMES = [
   "Senso-ji_Temple_Asakusa_Cherry_Blossoms_Kimono_Umbrella.jpg",
   "Cherry_Blossoms_Sakura_Night_View_City_Lights_Japan.jpg",
   "Mount_Fuji_Lake_Reflection_Cherry_Blossoms_Sakura_Spring.jpg",
-];
+] as const;
+
+const SAFE_GRADIENT_INNER_FUNCTIONS = new Set([
+  "rgb",
+  "rgba",
+  "hsl",
+  "hsla",
+  "hwb",
+  "lab",
+  "lch",
+  "oklab",
+  "oklch",
+  "color",
+  "color-mix",
+  "calc",
+  "min",
+  "max",
+  "clamp",
+]);
+
+function isNonBlankHaikuLine(value: string): boolean {
+  return value.trim().length > 0;
+}
+
+function isSafeGradient(value: string): boolean {
+  const css = value.trim();
+  const root = /^(?:linear|radial|conic)-gradient\s*\(/i.exec(css);
+  if (!root) return false;
+
+  const firstParen = css.indexOf("(", root[0].length - 1);
+  let depth = 0;
+
+  for (let index = firstParen; index < css.length; index++) {
+    const character = css[index];
+    if (
+      character === "\\" ||
+      character === '"' ||
+      character === "'" ||
+      character === ";" ||
+      character === "{" ||
+      character === "}" ||
+      css.startsWith("/*", index)
+    ) {
+      return false;
+    }
+
+    if (character === "(") {
+      if (depth > 0) {
+        const nameEnd = index;
+        let nameStart = index - 1;
+        while (nameStart >= 0 && /[a-z0-9-]/i.test(css[nameStart])) {
+          nameStart--;
+        }
+        const name = css.slice(nameStart + 1, nameEnd).toLowerCase();
+        if (!SAFE_GRADIENT_INNER_FUNCTIONS.has(name)) return false;
+      }
+      depth++;
+    } else if (character === ")") {
+      depth--;
+      if (depth < 0 || (depth === 0 && index !== css.length - 1)) {
+        return false;
+      }
+    }
+  }
+
+  return depth === 0 && css.slice(firstParen + 1, -1).trim().length > 0;
+}
+
+const HAIKU_LINE = z
+  .string()
+  .trim()
+  .refine(isNonBlankHaikuLine, "Haiku lines cannot be blank");
+const SAFE_GRADIENT = z
+  .string()
+  .refine(
+    isSafeGradient,
+    "Use a linear, radial, or conic CSS gradient without URLs",
+  );
+const HAIKU_SCHEMA = z
+  .object({
+    japanese: z.array(HAIKU_LINE).length(3),
+    english: z.array(HAIKU_LINE).length(3),
+    image_name: z.enum(VALID_IMAGE_NAMES),
+    gradient: SAFE_GRADIENT,
+  })
+  .strict();
 
 function HaikuDisplay() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [haikus, setHaikus] = useState<Haiku[]>([
     {
       japanese: ["仮の句よ", "まっさらながら", "花を呼ぶ"],
-      english: ["A placeholder verse—", "even in a blank canvas,", "it beckons flowers."],
+      english: [
+        "A placeholder verse—",
+        "even in a blank canvas,",
+        "it beckons flowers.",
+      ],
       image_name: null,
       gradient: "",
     },
@@ -95,19 +186,14 @@ function HaikuDisplay() {
     {
       agentId: "tool_based_generative_ui",
       name: "generate_haiku",
-       parameters: z.object({
-        japanese: z.array(z.string()).describe("3 lines of haiku in Japanese"),
-        english: z.array(z.string()).describe("3 lines of haiku translated to English"),
-        image_name: z.string().describe(`One relevant image name from: ${VALID_IMAGE_NAMES.join(", ")}`),
-        gradient: z.string().describe("CSS Gradient color for the background"),
-      })  ,
+      parameters: HAIKU_SCHEMA,
       followUp: false,
-      handler: async ({ japanese, english, image_name, gradient }: { japanese: string[]; english: string[]; image_name: string; gradient: string }) => {
+      handler: async ({ japanese, english, image_name, gradient }) => {
         const newHaiku: Haiku = {
-          japanese: japanese || [],
-          english: english || [],
-          image_name: image_name || null,
-          gradient: gradient || "",
+          japanese,
+          english,
+          image_name,
+          gradient,
         };
         setHaikus((prev) => [
           newHaiku,
@@ -117,8 +203,9 @@ function HaikuDisplay() {
         return "Haiku generated!";
       },
       render: ({ args }: { args: Partial<Haiku> }) => {
-        if (!args.japanese) return <></>;
-        return <HaikuCard haiku={args as Haiku} />;
+        const parsed = HAIKU_SCHEMA.safeParse(args);
+        if (!parsed.success) return <></>;
+        return <HaikuCard haiku={parsed.data} />;
       },
     },
     [haikus],
@@ -149,7 +236,7 @@ function HaikuDisplay() {
   );
 }
 
-function HaikuCard({ haiku }: { haiku: Partial<Haiku> }) {
+function HaikuCard({ haiku }: { haiku: Haiku }) {
   return (
     <div
       data-testid="haiku-card"

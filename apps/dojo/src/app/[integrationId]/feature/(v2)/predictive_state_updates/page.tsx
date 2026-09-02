@@ -9,7 +9,7 @@ import { diffWords } from "diff";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { useEffect, useState, useRef } from "react";
-import { 
+import {
   useAgent,
   UseAgentUpdate,
   useHumanInTheLoop,
@@ -31,13 +31,21 @@ interface PredictiveStateUpdatesProps {
   }>;
 }
 
-export default function PredictiveStateUpdates({ params }: PredictiveStateUpdatesProps) {
+export default function PredictiveStateUpdates({
+  params,
+}: PredictiveStateUpdatesProps) {
   const { integrationId } = React.use(params);
   const { isMobile } = useMobileView();
   const { chatDefaultOpen } = useURLParams();
   const defaultChatHeight = 50;
-  const { isChatOpen, setChatHeight, setIsChatOpen, isDragging, chatHeight, handleDragStart } =
-    useMobileChat(defaultChatHeight);
+  const {
+    isChatOpen,
+    setChatHeight,
+    setIsChatOpen,
+    isDragging,
+    chatHeight,
+    handleDragStart,
+  } = useMobileChat(defaultChatHeight);
   const chatTitle = "AI Document Editor";
   const chatDescription = "Ask me to create or edit a document";
 
@@ -73,7 +81,9 @@ export default function PredictiveStateUpdates({ params }: PredictiveStateUpdate
                 <div className="flex items-center gap-3">
                   <div>
                     <div className="font-medium text-gray-900">{chatTitle}</div>
-                    <div className="text-sm text-gray-500">{chatDescription}</div>
+                    <div className="text-sm text-gray-500">
+                      {chatDescription}
+                    </div>
                   </div>
                 </div>
                 <div
@@ -152,7 +162,10 @@ export default function PredictiveStateUpdates({ params }: PredictiveStateUpdate
 
             {/* Backdrop */}
             {isChatOpen && (
-              <div className="fixed inset-0 z-30" onClick={() => setIsChatOpen(false)} />
+              <div
+                className="fixed inset-0 z-30"
+                onClick={() => setIsChatOpen(false)}
+              />
             )}
           </>
         ) : (
@@ -195,7 +208,10 @@ const DocumentEditor = () => {
         title: "Write a mermaid story",
         message: "Please write a story about a mermaid named Luna.",
       },
-      { title: "Add character", message: "Please add a character named Courage." },
+      {
+        title: "Add character",
+        message: "Please add a character named Courage.",
+      },
     ],
     available: "always",
   });
@@ -234,7 +250,10 @@ const DocumentEditor = () => {
   useEffect(() => {
     if (wasRunning.current && !isLoading) {
       // Run just finished - set the text one final time
-      if (currentDocument.trim().length > 0 && currentDocument !== agentState?.document) {
+      if (
+        currentDocument.trim().length > 0 &&
+        currentDocument !== agentState?.document
+      ) {
         const newDocument = agentState?.document || "";
         const diff = diffPartialText(currentDocument, newDocument, true);
         const markdown = fromMarkdown(diff);
@@ -289,7 +308,9 @@ const DocumentEditor = () => {
             setAgentState({ document: currentDocument });
           }}
           onConfirm={() => {
-            editor?.commands.setContent(fromMarkdown(agentState?.document || ""));
+            editor?.commands.setContent(
+              fromMarkdown(agentState?.document || ""),
+            );
             setCurrentDocument(agentState?.document || "");
             setAgentState({ document: agentState?.document || "" });
           }}
@@ -305,10 +326,20 @@ const DocumentEditor = () => {
       agentId: "predictive_state_updates",
       name: "write_document",
       description: `Present the proposed changes to the user for review`,
-       parameters: z.object({
-        document: z.string().describe("The full updated document in markdown format"),
-      }) ,
-      render({ args, status, respond }: { args: { document?: string }; status: string; respond?: (result: unknown) => Promise<void> }) {
+      parameters: z.object({
+        document: z
+          .string()
+          .describe("The full updated document in markdown format"),
+      }),
+      render({
+        args,
+        status,
+        respond,
+      }: {
+        args: { document?: string };
+        status: string;
+        respond?: (result: unknown) => Promise<void>;
+      }) {
         if (status === "executing") {
           return (
             <ConfirmChanges
@@ -320,9 +351,10 @@ const DocumentEditor = () => {
                 setAgentState({ document: currentDocument });
               }}
               onConfirm={() => {
-                editor?.commands.setContent(fromMarkdown(agentState?.document || ""));
-                setCurrentDocument(agentState?.document || "");
-                setAgentState({ document: agentState?.document || "" });
+                const acceptedDocument = args.document || "";
+                editor?.commands.setContent(fromMarkdown(acceptedDocument));
+                setCurrentDocument(acceptedDocument);
+                setAgentState({ document: acceptedDocument });
               }}
             />
           );
@@ -353,7 +385,13 @@ interface ConfirmChangesProps {
   onConfirm: () => void;
 }
 
-function ConfirmChanges({ args: _args, respond, status, onReject, onConfirm }: ConfirmChangesProps) {
+function ConfirmChanges({
+  args: _args,
+  respond,
+  status,
+  onReject,
+  onConfirm,
+}: ConfirmChangesProps) {
   const [accepted, setAccepted] = useState<boolean | null>(null);
   return (
     <div
@@ -421,7 +459,11 @@ function fromMarkdown(text: string) {
   return md.render(text);
 }
 
-function diffPartialText(oldText: string, newText: string, isComplete: boolean = false) {
+function diffPartialText(
+  oldText: string,
+  newText: string,
+  isComplete: boolean = false,
+) {
   let oldTextToCompare = oldText;
   if (oldText.length > newText.length && !isComplete) {
     // make oldText shorter
