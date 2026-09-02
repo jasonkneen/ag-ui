@@ -596,6 +596,102 @@ class TestRunErrorPath:
         assert not any(k[0] == "leaky" for k in adapter._per_run_result)
 
 
+class TestMultimodalQueryBoundary:
+    @pytest.mark.asyncio
+    async def test_worker_receives_structured_image_and_pdf_prompt(
+        self, make_input, monkeypatch
+    ):
+        captured = {}
+
+        class _CapturingWorker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def query(self, prompt, session_id="default"):
+                captured["prompt"] = prompt
+                captured["session_id"] = session_id
+
+                async def _gen():
+                    return
+                    yield  # pragma: no cover
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        adapter = ClaudeAgentAdapter(name="t")
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _CapturingWorker)
+        inp = make_input(
+            thread_id="thread-media",
+            messages=[
+                {
+                    "id": "1",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "data",
+                                "value": "aW1hZ2U=",
+                                "mime_type": "image/png",
+                            },
+                        },
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "data",
+                                "value": "cGRm",
+                                "mime_type": "application/pdf",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+
+        _ = [event async for event in adapter.run(inp)]
+        sdk_messages = [message async for message in captured["prompt"]]
+
+        assert captured["session_id"] == "thread-media"
+        assert sdk_messages == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aW1hZ2U=",
+                            },
+                        },
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "cGRm",
+                            },
+                        },
+                    ],
+                },
+                "parent_tool_use_id": None,
+                "session_id": "thread-media",
+            }
+        ]
+
+
 class _FakeAliveWorker:
     """A SessionWorker stand-in that stays alive and is never queried."""
 
