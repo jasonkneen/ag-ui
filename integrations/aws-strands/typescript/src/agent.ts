@@ -604,6 +604,16 @@ const NEWER_SDK_FIELD_PLAN = {
   // then does not keep, so there is nothing to read back. Its effect travels
   // through those two instead.
   contextManager: "notForwarded",
+  // Declared as `boolean | BackgroundTasksConfig`, but the Agent consumes it
+  // into a BackgroundTasks plugin bound to that agent and registered in its
+  // plugin registry, and keeps nothing under this name except that plugin.
+  // Forwarding what is readable would hand a plugin to a field that expects a
+  // config: every real setting (`never`, `maxConcurrency`, `timeout`) would
+  // read back as undefined and fall back to its default while background
+  // execution stayed switched on, so a tool the template excluded would become
+  // eligible for it again. The config is plain data, so per-thread background
+  // execution is set through threadAgentConfig instead.
+  backgroundTasks: "notForwarded",
   // Both hold conversation-scoped data. Handing one instance to every thread
   // is the same hazard as sharing the conversation manager, so they are
   // dropped and recorded rather than cross-wired.
