@@ -1,5 +1,7 @@
 [project]
 name = "ag_ui_strands"
+description = "Implementation of the AG-UI protocol for AWS Strands Agents."
+readme = "README.md"
 license = "MIT"
 version = "0.3.0"
 license-files = ["LICENSE"]

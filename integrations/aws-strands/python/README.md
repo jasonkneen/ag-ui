@@ -238,26 +238,57 @@ interrupt round-trip:
   `Interrupt` per Strands interrupt. Generic native interrupts preserve the
   Strands name as the AG-UI reason and the free-form Strands reason under
   `metadata.reason`. Tools configured with `ToolBehavior(interrupt_on_call=True)`
-  instead emit a `tool_call` approval interrupt with an `approved` response
-  schema. Applies to server-executed tools only. For client-provided tools, gate
+  instead emit a `tool_call` approval interrupt, which always carries a
+  `message`, an `approved` `response_schema`, and
+  `tool_name` / `tool_input` / `strandsName` in `metadata`, the same keys the
+  TypeScript package publishes. Two keys are conditional: `tool_call_id`, which
+  an approval raised without a native tool use has none of, and `reason`, which
+  is published only when the native reason carried nothing the other keys could
+  hold. Published `tool_input` is
+  a detached copy, so inspecting it cannot reach into the SDK's live checkpoint.
+  The `ag_ui:tool_call:` name prefix is **reserved** for this adapter's approval
+  hook; an interrupt raised anywhere else under that prefix is classified,
+  schema-checked and answered as an approval.
+  Applies to server-executed tools only. For client-provided tools, gate
   execution in the client — define the tool with a `render` that calls `respond`,
   not a `handler` — since the tool runs in the browser and the adapter has already
   finished the public AG-UI run.
 - To resume, the client sends the next `RunAgentInput` on the **same
   `thread_id`** with `resume=[ResumeEntry(interrupt_id=..., status="resolved",
-payload=...)]`. Strands' resume gate is truthiness-based (`if
-interrupt_.response:`), so a falsy `payload` (`None`, `False`, `""`, `0`,
-  `[]`, `{}`) would otherwise re-raise the same interrupt and re-run the tool
-  body forever. To prevent that, `interrupt()` does **not** return `payload`
-  directly — it returns a truthy envelope: `{"response": payload}` on
-  resolve, `{"cancelled": True}` on cancel. Destructure it with
-  `.get("response")` / `.get("cancelled")`. Adapter-managed
-  `interrupt_on_call` approvals are the exception: their
-  `{"approved": bool}` payload is passed through directly.
-- For generic native interrupts, `status="cancelled"` resumes the tool with
-  the sentinel `{"cancelled": True}` (`ag_ui_strands.INTERRUPT_CANCELLED`)
-  so it can treat the pause as a denial. An adapter-managed approval receives
-  `{"approved": False}` instead.
+payload=...)]`. The minimum supported Strands release gates its resume on
+  truthiness (`if interrupt_.response:`), so a falsy `payload` (`None`,
+  `False`, `""`, `0`, `[]`, `{}`) would otherwise re-raise the same interrupt
+  and re-run the tool body forever, and every release reads an absent answer
+  the same way. To prevent that, `interrupt()` does **not** return `payload`
+  directly. It returns an envelope, which is always present and always truthy:
+
+  | `resume` entry                     | what the paused `interrupt()` returns                              |
+  | ---------------------------------- | ------------------------------------------------------------------ |
+  | `status="resolved"`, any `payload` | `{"response": payload}`                                            |
+  | `status="resolved"`, no `payload`  | `{"response": None}`                                               |
+  | `status="cancelled"`               | `{"cancelled": True}`, matching the exported `INTERRUPT_CANCELLED` |
+
+  Destructure it with `.get("response")` / `.get("cancelled")`, and do not
+  truthiness-check the envelope itself, since it is always truthy on resolve.
+  Compare a cancellation by value rather than by identity: `INTERRUPT_CANCELLED`
+  is exported so you can match its shape, and every answer is built fresh rather
+  than copied from the export, so mutating the export cannot change what a tool
+  receives. Treat what you receive as read-only: it is the
+  same object Strands records as the answer, so mutating it changes what a later
+  replay is compared against. This is the same contract the
+  `@ag-ui/aws-strands` TypeScript package applies, so a tool body ports between
+  the two unchanged.
+
+- Adapter-managed `interrupt_on_call` approvals are the exception in both
+  languages: a resolved approval's `{"approved": bool}` payload is passed through
+  raw, because the approval hook reads `approved` off it directly, and anything
+  else is answered `{"approved": False}` rather than with the sentinel.
+- A frontend tool parked in a native interrupt is a third, Python-only shape. It
+  is answered under a reserved key,
+  `{"__ag_ui_frontend_tool_response__": {"content": str, "is_error": bool}}`,
+  translated from the client's ordinary `ToolMessage`. It has no TypeScript
+  counterpart, because that adapter halts the stream for frontend tools instead
+  of parking one, so this is not part of the cross-language contract above.
 - **Re-execution on resume:** resuming a paused tool re-runs its body from
   the top — any code before the `interrupt()` call executes again. Guard
   side effects that must not repeat:
