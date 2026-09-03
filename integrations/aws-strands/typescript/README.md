@@ -391,6 +391,11 @@ const agent = new Agent({
 const aguiAgent = new StrandsAgent({ agent, name: "MyAgent" });
 ```
 
+The adapter checks for this at construction time: a template `Agent` still
+holding `McpClient` entries gets a warning naming how many, because their tools
+cannot reach a per-thread clone. Spreading the resolved tools in silences it,
+once the client itself is out of `tools`.
+
 `McpClient` comes from the package root. `@strands-agents/sdk` publishes an
 `exports` map with no `./mcp` entry, so a subpath import of it does not
 resolve. Any `Transport` from `@modelcontextprotocol/sdk` works in its place;

@@ -2219,25 +2219,31 @@ export class StrandsAgent {
       );
     }
 
-    // Detect unconnected MCP clients passed directly into `tools: [...]`.
-    // Strands resolves a connected `McpClient`'s tools into `agent.tools` at
-    // construction time; an unconnected one stays as the bare client and the
-    // resolved tool list never appears here. The fix is on the caller's
-    // side: `await client.connect()` and spread `await client.listTools()`
-    // into the `tools` array.
-    for (const tool of this._templateFields.tools ?? []) {
-      if (
-        tool != null &&
-        typeof (tool as { connect?: unknown }).connect === "function" &&
-        typeof (tool as { name?: unknown }).name !== "string"
-      ) {
-        this._log.warn(
-          `${LOG_PREFIX} an entry in the template Agent's \`tools\` looks like ` +
-            "an unconnected McpClient — its tools will not be available to the " +
-            "model. Call `await client.connect()` and spread the resolved tool " +
-            "list into `tools: [...]` before constructing the Agent.",
-        );
-      }
+    // Detect MCP clients passed directly into `tools: [...]`, whose tools are
+    // therefore absent from the resolved list this adapter clones.
+    //
+    // Strands routes an `McpClient` out of `tools` into an internal client
+    // list rather than into the tool registry, and registers its tools only
+    // inside `Agent.initialize()`, which runs on the first invocation. The
+    // template Agent is never invoked, so the `agent.tools` list cloned onto
+    // every per-thread agent never gains them. Connecting the client first
+    // changes nothing, because `listTools()` connects lazily; the distinction
+    // is resolved-versus-unresolved, not connected-versus-unconnected.
+    //
+    // The client list is private, so it is read through `_readTemplateField`,
+    // which tries the public name before the underscore one and returns
+    // `undefined` rather than throwing when neither is there.
+    const templateMcpClients = _readTemplateField(agentCore, "mcpClients");
+    if (Array.isArray(templateMcpClients) && templateMcpClients.length > 0) {
+      this._log.warn(
+        `${LOG_PREFIX} the template Agent's \`tools\` holds ` +
+          `${templateMcpClients.length} McpClient ` +
+          `${templateMcpClients.length === 1 ? "entry" : "entries"} whose ` +
+          "tools are not in `agent.tools`, so they will not be available to " +
+          "the model. Resolve them yourself and spread the result in: " +
+          "`await client.connect()`, then `tools: [...(await " +
+          "client.listTools())]`. Drop the client from `tools` once you do.",
+      );
     }
   }
 
