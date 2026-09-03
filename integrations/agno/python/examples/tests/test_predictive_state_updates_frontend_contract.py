@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -41,28 +42,56 @@ def _write_document_hitl_block(content: str) -> str:
     return content[start:end]
 
 
+def _confirm_changes_block(content: str) -> str:
+    start = content.index('name: "confirm_changes"')
+    end = content.index("// Action to write the document.", start)
+    return content[start:end]
+
+
+def _on_confirm_body(block: str) -> str:
+    """Return the body of the onConfirm arrow, found by brace matching."""
+    marker = "onConfirm={() => {"
+    start = block.index(marker) + len(marker)
+    depth = 1
+    for index in range(start, len(block)):
+        char = block[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return block[start:index]
+    raise AssertionError("unterminated onConfirm body")
+
+
+def _normalize(code: str) -> str:
+    """Strip whitespace and the trailing commas Prettier adds when wrapping."""
+    return re.sub(r",(?=[)\]}])", "", re.sub(r"\s+", "", code))
+
+
+def _assert_contains_code(test: unittest.TestCase, haystack: str, needle: str) -> None:
+    test.assertIn(_normalize(needle), _normalize(haystack), needle)
+
+
 class PredictiveStateUpdatesFrontendContractTests(unittest.TestCase):
     def test_write_document_confirm_commits_reviewed_tool_document(self) -> None:
-        expected_commit = (
-            'const acceptedDocument = args.document || "";\n'
-            "                editor?.commands.setContent(fromMarkdown(acceptedDocument));\n"
-            "                setCurrentDocument(acceptedDocument);\n"
-            "                setAgentState({ document: acceptedDocument });"
-        )
-        stale_commit = (
-            'editor?.commands.setContent(fromMarkdown(agentState?.document || ""));\n'
-            '                setCurrentDocument(agentState?.document || "");\n'
-            '                setAgentState({ document: agentState?.document || "" });'
-        )
+        expected_commit = """
+            const acceptedDocument = args.document || "";
+            editor?.commands.setContent(fromMarkdown(acceptedDocument));
+            setCurrentDocument(acceptedDocument);
+            setAgentState({ document: acceptedDocument });
+        """
 
         for label, content in {
             "source": _source_page(),
             "generated": _generated_page(),
         }.items():
             with self.subTest(label=label):
-                write_document_block = _write_document_hitl_block(content)
-                self.assertIn(expected_commit, write_document_block)
-                self.assertNotIn(stale_commit, write_document_block)
+                on_confirm = _on_confirm_body(_write_document_hitl_block(content))
+                _assert_contains_code(self, on_confirm, expected_commit)
+                # Confirm must commit the reviewed tool document, never
+                # whatever agent state happens to hold at that moment.
+                self.assertNotIn("agentState", on_confirm)
 
         self.assertEqual(_generated_page(), _source_page())
 
@@ -78,11 +107,9 @@ class PredictiveStateUpdatesFrontendContractTests(unittest.TestCase):
             "generated": _generated_page(),
         }.items():
             with self.subTest(label=label):
-                start = content.index('name: "confirm_changes"')
-                end = content.index("// Action to write the document.", start)
-                confirm_changes_block = content[start:end]
+                on_confirm = _on_confirm_body(_confirm_changes_block(content))
                 for fragment in state_based_fragments:
-                    self.assertIn(fragment, confirm_changes_block)
+                    _assert_contains_code(self, on_confirm, fragment)
 
 
 if __name__ == "__main__":
