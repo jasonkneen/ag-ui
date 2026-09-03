@@ -33,6 +33,7 @@ AGENTIC_DOJO_PAGE = (
     / "page.tsx"
 )
 DOJO_FILES = REPO_ROOT / "apps" / "dojo" / "src" / "files.json"
+DOJO_DIR = REPO_ROOT / "apps" / "dojo"
 EXPECTED_IMAGE_NAMES = (
     "Osaka_Castle_Turret_Stone_Wall_Pine_Trees_Daytime.jpg",
     "Tokyo_Skyline_Night_Tokyo_Tower_Mount_Fuji_View.jpg",
@@ -60,6 +61,26 @@ def _run_javascript(source: str, expression: str) -> object:
         check=True,
         capture_output=True,
         text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def _run_typescript(source: str, expression: str) -> object:
+    if not (DOJO_DIR / "node_modules" / "zod").exists():
+        raise AssertionError(
+            "zod is not installed under apps/dojo/node_modules; run pnpm install"
+        )
+    completed = subprocess.run(
+        [
+            "node",
+            "--input-type=module-typescript",
+            "--eval",
+            f'import {{ z }} from "zod";\n{source}\n{expression}',
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=DOJO_DIR,
     )
     return json.loads(completed.stdout)
 
@@ -145,6 +166,39 @@ def _haiku_validator_results(function_name: str, values: list[str]) -> list[bool
     return result
 
 
+def _haiku_parse_results(payloads: list[object]) -> list[dict[str, object]]:
+    page = DOJO_PAGE.read_text()
+    if "function parseHaikuToolArgs" not in page:
+        raise AssertionError("parseHaikuToolArgs is not defined")
+    start = page.index("const VALID_IMAGE_NAMES = [")
+    end = page.index("\n\nfunction HaikuDisplay", start)
+    helpers = page[start:end].replace("interface Haiku", "type Haiku =")
+    expression = (
+        f"console.log(JSON.stringify({json.dumps(payloads)}.map(parseHaikuToolArgs)))"
+    )
+    result = _run_typescript(helpers, expression)
+    if not isinstance(result, list) or not all(
+        isinstance(item, dict) for item in result
+    ):
+        raise AssertionError("parseHaikuToolArgs did not return an object list")
+    return result
+
+
+def _handler_block() -> str:
+    block = _frontend_tool_block()
+    start = block.index("handler:")
+    return block[start:]
+
+
+def _valid_haiku_payload() -> dict[str, object]:
+    return {
+        "japanese": ["古池や", "蛙飛び込む", "水の音"],
+        "english": ["An old silent pond", "A frog jumps into the pond", "Splash"],
+        "image_name": EXPECTED_IMAGE_NAMES[0],
+        "gradient": "linear-gradient(135deg, #0f172a 0%, #2563eb 100%)",
+    }
+
+
 def _declared_image_names() -> tuple[str, ...]:
     page = DOJO_PAGE.read_text()
     start = page.index("const VALID_IMAGE_NAMES = [")
@@ -227,7 +281,7 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
 
         page = DOJO_PAGE.read_text()
         schema_start = page.index("const HAIKU_SCHEMA = z")
-        schema_end = page.index("\n\nfunction HaikuDisplay", schema_start)
+        schema_end = page.index("\n\n", schema_start)
         schema = page[schema_start:schema_end]
         fields = re.findall(r"^\s+(\w+): ", schema, flags=re.MULTILINE)
 
@@ -302,6 +356,44 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         self.assertIn("if (!parsed.success)", render)
         self.assertIn("haiku={parsed.data}", render)
         self.assertNotIn("args as Haiku", render)
+
+    def test_handler_parser_rejects_invalid_arguments_and_names_the_fields(
+        self,
+    ) -> None:
+        valid = _valid_haiku_payload()
+        missing_english = {k: v for k, v in valid.items() if k != "english"}
+        results = _haiku_parse_results(
+            [
+                missing_english,
+                {**valid, "japanese": "not a list"},
+                {**valid, "image_name": "Not_In_The_Allowlist.jpg"},
+                {**valid, "gradient": 'url("https://example.test/pixel.png")'},
+            ]
+        )
+
+        for result, field in zip(
+            results, ["english", "japanese", "image_name", "gradient"]
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(result["ok"], False)
+                self.assertNotIn("haiku", result)
+                self.assertIsInstance(result["message"], str)
+                self.assertIn(field, result["message"])
+
+    def test_handler_parser_accepts_the_valid_haiku_payload(self) -> None:
+        valid = _valid_haiku_payload()
+
+        self.assertEqual(_haiku_parse_results([valid]), [{"ok": True, "haiku": valid}])
+
+    def test_handler_stores_only_parsed_haiku_arguments(self) -> None:
+        handler = _handler_block()
+
+        self.assertRegex(handler, r"parseHaikuToolArgs\(\s*args\s*\)")
+        self.assertRegex(
+            handler, r"if\s*\(\s*!parsed\.ok\s*\)\s*return parsed\.message;"
+        )
+        self.assertIn("parsed.haiku", handler)
+        self.assertNotRegex(handler, r"handler:\s*async\s*\(\s*\{")
 
     def test_client_tool_keeps_follow_up_disabled(self) -> None:
         self.assertIn("followUp: false", _frontend_tool_block())

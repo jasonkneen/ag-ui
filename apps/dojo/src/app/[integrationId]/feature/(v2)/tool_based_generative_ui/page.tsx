@@ -167,6 +167,28 @@ const HAIKU_SCHEMA = z
   })
   .strict();
 
+// The runtime hands the handler raw JSON, so the same strict schema that gates
+// the streaming preview must gate what gets stored as a haiku.
+function parseHaikuToolArgs(
+  args: unknown,
+): { ok: true; haiku: Haiku } | { ok: false; message: string } {
+  const parsed = HAIKU_SCHEMA.safeParse(args);
+  if (parsed.success) return { ok: true, haiku: parsed.data };
+  const fields = Array.from(
+    new Set(
+      parsed.error.issues.flatMap((issue) =>
+        issue.code === "unrecognized_keys"
+          ? issue.keys
+          : [issue.path.join(".") || "arguments"],
+      ),
+    ),
+  );
+  return {
+    ok: false,
+    message: `generate_haiku rejected these fields: ${fields.join(", ")}. Fix them and call the tool again.`,
+  };
+}
+
 function HaikuDisplay() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [haikus, setHaikus] = useState<Haiku[]>([
@@ -188,15 +210,11 @@ function HaikuDisplay() {
       name: "generate_haiku",
       parameters: HAIKU_SCHEMA,
       followUp: false,
-      handler: async ({ japanese, english, image_name, gradient }) => {
-        const newHaiku: Haiku = {
-          japanese,
-          english,
-          image_name,
-          gradient,
-        };
+      handler: async (args) => {
+        const parsed = parseHaikuToolArgs(args);
+        if (!parsed.ok) return parsed.message;
         setHaikus((prev) => [
-          newHaiku,
+          parsed.haiku,
           ...prev.filter((h) => h.english[0] !== "A placeholder verse—"),
         ]);
         setActiveIndex(0);
