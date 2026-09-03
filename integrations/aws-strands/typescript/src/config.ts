@@ -3,6 +3,7 @@
 import type { RunAgentInput, BaseEvent } from "@ag-ui/core";
 import type { AgentConfig, SessionManager } from "@strands-agents/sdk";
 import type { A2UIInjectConfig } from "./a2ui-tool";
+import type { TemplateToolSelectionEntry } from "./template-tools";
 
 import type { Logger } from "./logger";
 
@@ -140,6 +141,15 @@ export type ThreadAgentConfigProvider = (
   input: RunAgentInput,
 ) => Partial<AgentConfig> | Promise<Partial<AgentConfig>>;
 
+/**
+ * Chooses which of the template's tools one request may see.
+ *
+ * See {@link StrandsAgentConfig.templateToolsProvider}.
+ */
+export type TemplateToolsProvider = (
+  input: RunAgentInput,
+) => MaybePromise<Iterable<TemplateToolSelectionEntry> | null | undefined>;
+
 /** Top-level configuration for the Strands agent adapter. */
 export interface StrandsAgentConfig {
   /** Per-tool overrides keyed by the Strands tool name. */
@@ -206,6 +216,60 @@ export interface StrandsAgentConfig {
    * ```
    */
   threadAgentConfig?: ThreadAgentConfigProvider;
+  /**
+   * Which of the template agent's tools this request may see.
+   *
+   * Called once per request with that request's `RunAgentInput`, so the answer
+   * can vary turn by turn on one thread: the caller's identity is in
+   * `forwardedProps` or `context`, and a tool the request must not reach is
+   * simply left out of the returned iterable. May be async.
+   *
+   * Return the tools themselves or their names, whichever is to hand. Return
+   * `null` or `undefined` to decline filtering, which leaves every template
+   * tool available; an empty array is a real answer and leaves none of them. A
+   * name the template does not contribute is dropped with a warning, because
+   * this hook narrows the wrapped agent's tools and cannot add one.
+   *
+   * Applied to the live per-thread agent's tool registry, never by rebuilding
+   * that agent: the instance holds the thread's `SessionManager`, its native
+   * interrupt checkpoint and its history, so replacing it to change a tool list
+   * would discard a conversation and any approval waiting inside it.
+   *
+   * Three consequences worth knowing:
+   *
+   * - A tool in the batch a live interrupt checkpoint would resume stays
+   *   registered whatever this returns. The human's answer is about to be
+   *   routed back into that batch, and an absent tool turns it into a "tool not
+   *   found" the model re-fires. Filtering resumes once the pause closes. This
+   *   is the rule `syncProxyTools` already applies to a proxy parked in a
+   *   frontend-tool interrupt.
+   * - History is never rewritten. A filtered-out tool's earlier calls and
+   *   results stay in the thread's messages, so the model can still read what
+   *   it did with a tool it can no longer call, and a provider that returns
+   *   different sets across turns does not invalidate the transcript.
+   * - If it throws, the run yields `RUN_ERROR` with code
+   *   `TEMPLATE_TOOLS_PROVIDER_ERROR` and stops, matching `threadAgentConfig`.
+   *   A filter that fails open would hand the model tools the caller meant to
+   *   withhold.
+   *
+   * Client-declared tools on `RunAgentInput.tools` are outside this hook: they
+   * are re-synchronised from the request every turn already, so a caller that
+   * wants fewer of those sends fewer. Not applied on the multi-agent
+   * orchestrator path, which has no template registry to filter.
+   *
+   * @example
+   * ```ts
+   * new StrandsAgent({
+   *   agent: template,
+   *   name: "assistant",
+   *   config: {
+   *     templateToolsProvider: (input) =>
+   *       input.forwardedProps?.role === "admin" ? null : ["read_docs"],
+   *   },
+   * })
+   * ```
+   */
+  templateToolsProvider?: TemplateToolsProvider;
   /**
    * Emit `MessagesSnapshotEvent` at lifecycle boundaries (after the initial
    * `STATE_SNAPSHOT`, after each `TOOL_CALL_END` / `TOOL_CALL_RESULT`, and

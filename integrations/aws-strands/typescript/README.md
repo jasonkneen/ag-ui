@@ -75,6 +75,7 @@ See [../ARCHITECTURE.md](../ARCHITECTURE.md) for diagrams and a deeper dive.
 | -------------------------- | ------------------------------------------------------------------------------- |
 | `src/agent.ts`             | Core wrapper translating Strands streams into AG-UI events                      |
 | `src/config.ts`            | Config primitives (`StrandsAgentConfig`, `ToolBehavior`, `PredictStateMapping`) |
+| `src/template-tools.ts`    | Per-request filter over the template agent's tools                              |
 | `src/server.ts`            | `createStrandsApp` + Express transport (subpath: `@ag-ui/aws-strands/server`)   |
 | `src/endpoint.ts`          | Express endpoint helpers (used by `server.ts`)                                  |
 | `src/utils.ts`             | Multimodal content conversion                                                   |
@@ -180,6 +181,64 @@ const aguiAgent = new StrandsAgent({ agent });
 The adapter logs a warning at construction time if it spots an entry in
 `tools` that looks like an unconnected client (has a `.connect()` method but
 no `.name`).
+
+## Per-request tool filtering
+
+`StrandsAgentConfig.templateToolsProvider` decides which of the template
+agent's tools one request may see. It is called once per request with that
+request's `RunAgentInput`, so the answer can vary turn by turn on a single
+thread:
+
+```ts
+const READ_ONLY = ["search_docs", "get_order"];
+
+const aguiAgent = new StrandsAgent({
+  agent,
+  name: "assistant",
+  config: {
+    templateToolsProvider: (input) =>
+      // Derive the role from authenticated request context in production;
+      // forwardedProps is client-controlled.
+      (input.forwardedProps as { role?: string })?.role === "admin"
+        ? null // no filtering: every template tool stays available
+        : READ_ONLY,
+  },
+});
+```
+
+Return the tools themselves or their names. `null` or `undefined` declines to
+filter; an empty array is a real answer and withholds all of them. A name the
+template does not contribute is dropped with a warning, because the hook
+narrows the wrapped agent's tools and cannot add one. The provider may be
+async.
+
+The filter is applied to the tool registry the thread's live Strands `Agent`
+already owns, the same way client-declared tools are synchronised, and never by
+rebuilding that agent. The per-thread instance holds the thread's
+`SessionManager`, its native interrupt checkpoint and its history, so replacing
+it to change a tool list would discard a conversation and any approval waiting
+inside it.
+
+Three consequences follow from that:
+
+- **A parked call is never orphaned.** A tool in the batch a live interrupt
+  checkpoint would resume stays registered whatever the provider returns: the
+  human's answer is about to be routed back into that batch, and an absent tool
+  turns it into a "tool not found" the model re-fires. Filtering resumes once
+  the pause closes. This is the rule `syncProxyTools` already applies to a proxy
+  parked in a frontend-tool interrupt.
+- **History is never rewritten.** A filtered-out tool's earlier calls and
+  results stay in the thread's messages, so the model can still read what it
+  did with a tool it can no longer call.
+- **A failure is terminal.** If the provider throws, the run yields `RUN_ERROR`
+  with code `TEMPLATE_TOOLS_PROVIDER_ERROR` and stops, matching
+  `threadAgentConfig`. A filter that failed open would hand the model exactly
+  the tools the caller meant to withhold.
+
+Scope is the template's own tools. Client-declared tools on
+`RunAgentInput.tools` are re-synchronised from the request every turn already,
+so a caller that wants fewer of those sends fewer. The hook is not applied on
+the multi-agent orchestrator path, which has no template registry to filter.
 
 ## Human-in-the-loop interrupts
 

@@ -359,6 +359,13 @@ export class ScriptedModel extends Model {
    */
   public readonly handedMessages: StrandsMessage[][] = [];
 
+  /**
+   * The tool names offered on each turn, oldest first. What the registry held
+   * when the turn started, as the model itself saw it, which is the only place
+   * a per-request tool filter is observable from outside the adapter.
+   */
+  public readonly offeredToolNames: Set<string>[] = [];
+
   private readonly config: Record<string, unknown> = {
     modelId: "scripted-model",
   };
@@ -381,9 +388,15 @@ export class ScriptedModel extends Model {
     Object.assign(this.config, modelConfig);
   }
 
-  async *stream(messages: StrandsMessage[]): AsyncIterable<ModelStreamEvent> {
+  async *stream(
+    messages: StrandsMessage[],
+    options?: { toolSpecs?: { name: string }[] },
+  ): AsyncIterable<ModelStreamEvent> {
     this.handedMessages.push(messages);
     this.seenMessages.push(messages.map(recordedCopy));
+    this.offeredToolNames.push(
+      new Set((options?.toolSpecs ?? []).map((spec) => spec.name)),
+    );
     if (this.throwOnCall !== undefined && this.calls + 1 === this.throwOnCall) {
       this.calls += 1;
       throw new Error("scripted provider failure");

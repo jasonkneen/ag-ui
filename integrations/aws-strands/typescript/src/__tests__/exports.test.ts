@@ -19,6 +19,8 @@ describe("public export surface", () => {
       "createProxyTool",
       "syncProxyTools",
       "isProxyTool",
+      "syncTemplateTools",
+      "parkedBatchToolNames",
     ];
     for (const name of expected) {
       expect(pkg).toHaveProperty(name);

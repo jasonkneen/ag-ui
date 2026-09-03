@@ -77,13 +77,14 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for diagrams and a deeper dive.
 
 ## Key Files
 
-| File                            | Description                                                                     |
-| ------------------------------- | ------------------------------------------------------------------------------- |
-| `src/ag_ui_strands/agent.py`    | Core wrapper translating Strands streams into AG-UI events                      |
-| `src/ag_ui_strands/config.py`   | Config primitives (`StrandsAgentConfig`, `ToolBehavior`, `PredictStateMapping`) |
-| `src/ag_ui_strands/endpoint.py` | FastAPI endpoint helper                                                         |
-| `src/ag_ui_strands/utils.py`    | `create_strands_app`, multimodal conversion, and `UrlFetchPolicy`               |
-| `examples/server/api/*.py`      | Ready-to-run demo apps                                                          |
+| File                                  | Description                                                                     |
+| ------------------------------------- | ------------------------------------------------------------------------------- |
+| `src/ag_ui_strands/agent.py`          | Core wrapper translating Strands streams into AG-UI events                      |
+| `src/ag_ui_strands/config.py`         | Config primitives (`StrandsAgentConfig`, `ToolBehavior`, `PredictStateMapping`) |
+| `src/ag_ui_strands/template_tools.py` | Per-request filter over the template agent's tools                              |
+| `src/ag_ui_strands/endpoint.py`       | FastAPI endpoint helper                                                         |
+| `src/ag_ui_strands/utils.py`          | `create_strands_app`, multimodal conversion, and `UrlFetchPolicy`               |
+| `examples/server/api/*.py`            | Ready-to-run demo apps                                                          |
 
 ## Amazon Bedrock AgentCore considerations
 
@@ -197,6 +198,66 @@ because Strands adds its own runtime entries to that dictionary. Do not source
 trusted values from client-controlled `forwarded_props`; derive them from
 authenticated request context instead. Custom routes can pass the same state
 directly with `agent.run(input_data, invocation_state={...})`.
+
+## Per-request tool filtering
+
+`StrandsAgentConfig.template_tools_provider` decides which of the template
+agent's tools one request may see. It is called once per request with that
+request's `RunAgentInput`, so the answer can vary turn by turn on a single
+thread:
+
+```python
+from ag_ui.core import RunAgentInput
+from ag_ui_strands import StrandsAgent, StrandsAgentConfig
+
+READ_ONLY = ["search_docs", "get_order"]
+
+def tools_for(input_data: RunAgentInput):
+    # Derive the role from authenticated request context in production;
+    # forwarded_props is client-controlled.
+    if (input_data.forwarded_props or {}).get("role") == "admin":
+        return None  # no filtering: every template tool stays available
+    return READ_ONLY
+
+agui_agent = StrandsAgent(
+    strands_agent,
+    name="assistant",
+    config=StrandsAgentConfig(template_tools_provider=tools_for),
+)
+```
+
+Return the tools themselves or their names. `None` declines to filter; an empty
+list is a real answer and withholds all of them. A name the template does not
+contribute is dropped with a warning, because the hook narrows the wrapped
+agent's tools and cannot add one. The provider may be async.
+
+The filter is applied to the tool registry the thread's live Strands `Agent`
+already owns, the same way client-declared tools are synchronised, and never by
+rebuilding that agent. The per-thread instance holds the thread's
+`SessionManager`, its native interrupt checkpoint and its history, so replacing
+it to change a tool list would discard a conversation and any approval waiting
+inside it.
+
+Three consequences follow from that:
+
+- **A parked call is never orphaned.** A tool in the batch a live interrupt
+  checkpoint would resume stays registered whatever the provider returns: the
+  human's answer is about to be routed back into that batch, and an absent tool
+  turns it into a "tool not found" the model re-fires. Filtering resumes once
+  the pause closes. This is the rule `sync_proxy_tools` already applies to a
+  proxy parked in a frontend-tool interrupt.
+- **History is never rewritten.** A filtered-out tool's earlier calls and
+  results stay in the thread's messages, so the model can still read what it
+  did with a tool it can no longer call.
+- **A failure is terminal.** If the provider raises, the run yields `RUN_ERROR`
+  with code `TEMPLATE_TOOLS_PROVIDER_ERROR` and stops, matching
+  `thread_agent_kwargs`. A filter that failed open would hand the model exactly
+  the tools the caller meant to withhold.
+
+Scope is the template's own tools. Client-declared tools on
+`RunAgentInput.tools` are re-synchronised from the request every turn already,
+so a caller that wants fewer of those sends fewer. The hook is not applied on
+the multi-agent orchestrator path, which has no template registry to filter.
 
 ## Human-in-the-loop (native Strands interrupts)
 

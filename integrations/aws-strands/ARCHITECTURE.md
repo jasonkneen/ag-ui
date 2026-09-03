@@ -150,6 +150,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
 | `tool_behaviors: Dict[str, ToolBehavior]` | Per-tool overrides keyed by the Strands tool name.                                                                           |
 | `state_context_builder`                   | Callable that enriches the outgoing prompt with the current shared state (useful for reiterating plan steps, recipes, etc.). |
 | `session_manager_provider`                | Factory invoked once per thread to produce a per-thread `SessionManager`.                                                    |
+| `template_tools_provider`                 | Per-request choice of which template tools this request may see, applied to the live per-thread registry.                    |
 | `emit_messages_snapshot`                  | Global opt-out of the four-point `MESSAGES_SNAPSHOT` emission. Default `True`.                                               |
 | `replay_history_into_strands`             | Global opt-out of the per-run Strands history reconciliation. Default `True`.                                                |
 
@@ -206,6 +207,7 @@ typescript/src/
 ├── agent.ts              ← StrandsAgent (port of agent.py)
 ├── client-proxy-tool.ts  ← sync of RunAgentInput.tools into Strands registry
 ├── config.ts             ← StrandsAgentConfig, ToolBehavior, helpers
+├── template-tools.ts     ← per-request filter over the template agent's tools
 ├── endpoint.ts           ← Express route registration + capabilities endpoint
 ├── logger.ts             ← injectable Logger interface + internal default
 ├── session-reconcile.ts  ← port of session_reconcile.py, snapshot-shaped

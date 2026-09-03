@@ -1364,6 +1364,10 @@ from .client_proxy_tool import (
     sync_proxy_tools,
     waits_for_frontend_call,
 )
+from .template_tools import (
+    parked_batch_tool_names,
+    sync_template_tools,
+)
 from .frontend_tool_interrupt import (
     frontend_tool_response_schema,
     index_frontend_tool_interrupts,
@@ -4155,6 +4159,38 @@ class StrandsAgent:
             strands_agent.state.set("agui_context", agui_context)
         except Exception as e:
             logger.warning(f"Failed to set agui_context on strands_agent.state: {e}")
+
+        # Filter the tools the template contributed, per request. Applied to
+        # the registry this thread's live agent already owns: that instance
+        # carries the thread's session manager, its interrupt checkpoint and
+        # its history, so rebuilding it to change a tool list would discard a
+        # conversation and any approval waiting inside it.
+        if self.config.template_tools_provider is not None:
+            try:
+                template_tool_selection = await maybe_await(
+                    self.config.template_tools_provider(input_data)
+                )
+            except Exception as e:  # noqa: BLE001 - surfaced as RUN_ERROR
+                logger.error(
+                    "template_tools_provider failed: %s", e, exc_info=True
+                )
+                # Deliberately terminal rather than unfiltered: a filter that
+                # fails open hands the model tools the caller meant to withhold.
+                ev_started, ev_error = _error_events(
+                    input_data,
+                    "Failed to resolve the template tools for this request: "
+                    f"{e}",
+                    "TEMPLATE_TOOLS_PROVIDER_ERROR",
+                )
+                yield ev_started
+                yield ev_error
+                return
+            sync_template_tools(
+                strands_agent.tool_registry,
+                self._tools,
+                template_tool_selection,
+                exempt_names=parked_batch_tool_names(strands_agent),
+            )
 
         # Sync proxy tools from client-defined tools. A proxy parked in a live
         # frontend-tool interrupt is exempt from removal: Strands is about to

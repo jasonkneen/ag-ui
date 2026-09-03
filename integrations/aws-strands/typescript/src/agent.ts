@@ -54,6 +54,8 @@ import {
   jsonRoundTrip,
 } from "./citations";
 import { isProxyTool, syncProxyTools } from "./client-proxy-tool";
+import { parkedBatchToolNames, syncTemplateTools } from "./template-tools";
+import type { TemplateToolSelectionEntry } from "./template-tools";
 import {
   planA2UIInjection,
   isAutoInjectedA2UITool,
@@ -2774,6 +2776,42 @@ export class StrandsAgent {
       return;
     }
     const strandsAgent = agentResult.agent;
+
+    // Filter the tools the template contributed, per request. Applied to the
+    // registry this thread's live agent already owns: that instance carries the
+    // thread's session manager, its interrupt checkpoint and its history, so
+    // rebuilding it to change a tool list would discard a conversation and any
+    // approval waiting inside it.
+    if (this.config.templateToolsProvider) {
+      let selection: Iterable<TemplateToolSelectionEntry> | null | undefined;
+      try {
+        selection = await maybeAwait(
+          this.config.templateToolsProvider(inputData),
+        );
+      } catch (e) {
+        const msg = _errorMessage(e);
+        this._log.error(
+          `${LOG_PREFIX} templateToolsProvider failed: ${msg}`,
+          e,
+        );
+        // Deliberately terminal rather than unfiltered: a filter that fails
+        // open hands the model tools the caller meant to withhold.
+        yield _runError(
+          `Failed to resolve the template tools for this request: ${msg}`,
+          "TEMPLATE_TOOLS_PROVIDER_ERROR",
+        );
+        return;
+      }
+      syncTemplateTools(
+        strandsAgent.toolRegistry,
+        this._templateFields.tools ?? [],
+        selection,
+        {
+          exemptNames: parkedBatchToolNames(strandsAgent),
+          log: this._log,
+        },
+      );
+    }
 
     // Sync proxy tools from client-defined tools.
     if (inputData.tools && inputData.tools.length > 0) {
