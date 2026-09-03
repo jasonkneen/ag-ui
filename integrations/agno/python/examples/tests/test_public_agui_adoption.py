@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,18 +12,42 @@ DOJO_ROOT = PROJECT_ROOT.parents[3] / "apps" / "dojo" / "src"
 DOJO_FILES = DOJO_ROOT / "files.json"
 DOJO_FEATURES = DOJO_ROOT / "app" / "[integrationId]" / "feature"
 PRIVATE_AGENT_MODULE = "agno.agent.agent"
+SERVER_PACKAGE = "server"
+API_PACKAGE = "server.api"
 
 
-def _imported_symbols(tree: ast.AST) -> set[tuple[str, str]]:
+def _module_package(path: Path) -> str:
+    return ".".join(path.relative_to(PROJECT_ROOT).parts[:-1])
+
+
+def _resolve_import_from(node: ast.ImportFrom, package: str) -> str:
+    if node.level == 0:
+        return node.module or ""
+    package_parts = package.split(".") if package else []
+    if node.level > len(package_parts):
+        raise ValueError(
+            f"relative import (level {node.level}) reaches beyond package {package!r}"
+        )
+    base = package_parts[: len(package_parts) - node.level + 1]
+    return ".".join([*base, *node.module.split(".")] if node.module else base)
+
+
+def _is_module_under(module: str, package: str) -> bool:
+    return module == package or module.startswith(f"{package}.")
+
+
+def _imported_symbols(
+    tree: ast.AST, package: str = API_PACKAGE
+) -> set[tuple[str, str]]:
     return {
-        (node.module or "", alias.name)
+        (_resolve_import_from(node, package), alias.name)
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
 
 
-def _imported_modules(tree: ast.AST) -> set[str]:
+def _imported_modules(tree: ast.AST, package: str = API_PACKAGE) -> set[str]:
     imported_modules: set[str] = set()
     string_bindings: dict[str, str] = {}
     importlib_aliases = {"importlib"}
@@ -39,13 +64,14 @@ def _imported_modules(tree: ast.AST) -> set[str]:
                 node.value.value, str
             ):
                 string_bindings[node.target.id] = node.value.value
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imported_modules.add(node.module)
-            if node.module == "agno.os.interfaces.agui":
+        elif isinstance(node, ast.ImportFrom):
+            module = _resolve_import_from(node, package)
+            imported_modules.add(module)
+            if module == "agno.os.interfaces.agui" or node.module is None:
                 imported_modules.update(
-                    f"{node.module}.{alias.name}" for alias in node.names
+                    f"{module}.{alias.name}" for alias in node.names
                 )
-            if node.module == "importlib":
+            if module == "importlib":
                 import_module_aliases.update(
                     alias.asname or alias.name
                     for alias in node.names
@@ -109,52 +135,76 @@ def _is_private_agent_module(module: str) -> bool:
     )
 
 
-def _private_agent_imports(tree: ast.AST) -> set[str]:
+def _private_agent_imports(tree: ast.AST, package: str = API_PACKAGE) -> set[str]:
     imports = {
-        module for module in _imported_modules(tree) if _is_private_agent_module(module)
+        module
+        for module in _imported_modules(tree, package)
+        if _is_private_agent_module(module)
     }
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            if node.module == "agno.agent":
-                imports.update(
-                    PRIVATE_AGENT_MODULE
-                    for alias in node.names
-                    if alias.name == "agent"
-                )
+        if (
+            isinstance(node, ast.ImportFrom)
+            and _resolve_import_from(node, package) == "agno.agent"
+        ):
+            imports.update(
+                PRIVATE_AGENT_MODULE for alias in node.names if alias.name == "agent"
+            )
 
     return imports
 
 
 def _assert_no_private_agent_imports(
-    test_case: unittest.TestCase, tree: ast.AST
+    test_case: unittest.TestCase, tree: ast.AST, package: str = API_PACKAGE
 ) -> None:
+    private_imports = _private_agent_imports(tree, package)
     test_case.assertFalse(
-        _private_agent_imports(tree),
-        f"found private Agent module import: {sorted(_private_agent_imports(tree))}",
+        private_imports,
+        f"found private Agent module import: {sorted(private_imports)}",
     )
 
 
-def _assert_imports_public_agent(test_case: unittest.TestCase, tree: ast.AST) -> None:
-    _assert_no_private_agent_imports(test_case, tree)
-    test_case.assertIn(("agno.agent", "Agent"), _imported_symbols(tree))
+def _assert_imports_public_agent(
+    test_case: unittest.TestCase, tree: ast.AST, package: str = API_PACKAGE
+) -> None:
+    _assert_no_private_agent_imports(test_case, tree, package)
+    test_case.assertIn(("agno.agent", "Agent"), _imported_symbols(tree, package))
 
 
-def _assert_uses_stock_public_agui(test_case: unittest.TestCase, tree: ast.AST) -> None:
-    imported_modules = _imported_modules(tree)
+def _assert_uses_stock_public_agui(
+    test_case: unittest.TestCase, tree: ast.AST, package: str = API_PACKAGE
+) -> None:
+    imported_modules = _imported_modules(tree, package)
     called_names = _called_names(tree)
 
-    test_case.assertIn(("agno.os.interfaces.agui", "AGUI"), _imported_symbols(tree))
+    test_case.assertIn(
+        ("agno.os.interfaces.agui", "AGUI"), _imported_symbols(tree, package)
+    )
+    server_imports = {
+        module
+        for module in imported_modules
+        if _is_module_under(module, SERVER_PACKAGE)
+        and not _is_module_under(module, API_PACKAGE)
+    }
     test_case.assertFalse(
-        {
-            module
-            for module in imported_modules
-            if module == "server.local_agui" or module.startswith("server.local_agui.")
-        },
-        "found local AG-UI compatibility adapter import",
+        server_imports,
+        f"found imports of server modules outside server.api: {sorted(server_imports)}",
     )
     test_case.assertIn("AGUI", called_names)
     test_case.assertNotIn("ResumeAwareAGUI", called_names)
+
+
+def _assert_server_contains_only_api_package(
+    test_case: unittest.TestCase, server_root: Path
+) -> None:
+    entries = {
+        path.name for path in server_root.iterdir() if path.name != "__pycache__"
+    }
+    test_case.assertEqual(
+        entries,
+        {"__init__.py", "api"},
+        "server/ may only contain __init__.py and the api package",
+    )
 
 
 def _generated_agno_python_sources(catalog: object) -> list[tuple[str, str]]:
@@ -220,6 +270,15 @@ def _assert_unique_generated_source_names(
     )
 
 
+def _write_server_layout(root: Path, extra_files: list[str]) -> Path:
+    server_root = root / "server"
+    for relative in ["__init__.py", "api/__init__.py", *extra_files]:
+        path = server_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+    return server_root
+
+
 class PublicAguiAdoptionTests(unittest.TestCase):
     def test_imported_modules_reports_import_from_and_direct_imports(self) -> None:
         tree = ast.parse(
@@ -265,6 +324,16 @@ __import__(name="agno.os.interfaces.agui.input")
                 "agno.os.interfaces.agui.input",
             }.issubset(_imported_modules(tree))
         )
+
+    def test_relative_agent_import_does_not_satisfy_public_agent_guard(self) -> None:
+        tree = ast.parse("from .agno.agent import Agent")
+
+        self.assertEqual(
+            _imported_symbols(tree, package="server.api"),
+            {("server.api.agno.agent", "Agent")},
+        )
+        with self.assertRaises(AssertionError):
+            _assert_imports_public_agent(self, tree)
 
     def test_private_agent_module_direct_import_fails_public_agent_guard(self) -> None:
         tree = ast.parse(
@@ -319,6 +388,106 @@ private_agent = loader.import_module(name=private_module)
         with self.assertRaisesRegex(AssertionError, "private Agent"):
             _assert_imports_public_agent(self, tree)
 
+    def test_imported_modules_resolves_relative_imports_against_the_package(
+        self,
+    ) -> None:
+        tree = ast.parse(
+            """
+from ..local_agui import ResumeAwareAGUI as AGUIShim
+from .agent.agent import Agent
+from . import agui_compat
+"""
+        )
+
+        self.assertEqual(
+            _imported_modules(tree, package="server.api"),
+            {
+                "server.local_agui",
+                "server.api.agent.agent",
+                "server.api",
+                "server.api.agui_compat",
+            },
+        )
+
+    def test_imported_modules_rejects_relative_imports_beyond_the_package(
+        self,
+    ) -> None:
+        tree = ast.parse("from ... import local_agui")
+
+        with self.assertRaisesRegex(ValueError, "beyond"):
+            _imported_modules(tree, package="server.api")
+
+    def test_module_package_is_the_dotted_directory_under_the_project_root(
+        self,
+    ) -> None:
+        self.assertEqual(_module_package(API_ROOT / "agentic_chat.py"), "server.api")
+        self.assertEqual(
+            _module_package(PROJECT_ROOT / "server" / "__init__.py"), "server"
+        )
+        self.assertEqual(_module_package(PROJECT_ROOT / "migrate_v3.py"), "")
+
+    def test_relative_local_adapter_import_fails_stock_agui_guard(self) -> None:
+        tree = ast.parse(
+            """
+from agno.os.interfaces.agui import AGUI
+from ..local_agui import ResumeAwareAGUI as AGUI
+
+AGUI(agent=object())
+"""
+        )
+
+        with self.assertRaisesRegex(AssertionError, "outside server.api"):
+            _assert_uses_stock_public_agui(self, tree)
+
+    def test_renamed_local_adapter_import_fails_stock_agui_guard(self) -> None:
+        tree = ast.parse(
+            """
+from agno.os.interfaces.agui import AGUI
+from server.agui_compat import Adapter as AGUI
+
+AGUI(agent=object())
+"""
+        )
+
+        with self.assertRaisesRegex(AssertionError, "outside server.api"):
+            _assert_uses_stock_public_agui(self, tree)
+
+    def test_aliased_local_adapter_import_fails_stock_agui_guard(self) -> None:
+        tree = ast.parse(
+            """
+from agno.os.interfaces.agui import AGUI
+from server import agui_compat as compat
+
+AGUI = compat.Adapter
+AGUI(agent=object())
+"""
+        )
+
+        with self.assertRaisesRegex(AssertionError, "outside server.api"):
+            _assert_uses_stock_public_agui(self, tree)
+
+    def test_stray_server_module_fails_layout_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_root = _write_server_layout(Path(tmp), ["agui_compat.py"])
+
+            with self.assertRaisesRegex(AssertionError, "api package"):
+                _assert_server_contains_only_api_package(self, server_root)
+
+    def test_stray_server_package_fails_layout_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_root = _write_server_layout(Path(tmp), ["compat/__init__.py"])
+
+            with self.assertRaisesRegex(AssertionError, "api package"):
+                _assert_server_contains_only_api_package(self, server_root)
+
+    def test_layout_guard_ignores_pycache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_root = _write_server_layout(
+                Path(tmp), ["__pycache__/__init__.cpython-312.pyc"]
+            )
+
+            _assert_server_contains_only_api_package(self, server_root)
+
     def test_dynamic_local_adapter_import_fails_stock_agui_guard(self) -> None:
         tree = ast.parse(
             """
@@ -331,7 +500,7 @@ AGUI(agent=object())
 """
         )
 
-        with self.assertRaisesRegex(AssertionError, "local AG-UI"):
+        with self.assertRaisesRegex(AssertionError, "outside server.api"):
             _assert_uses_stock_public_agui(self, tree)
 
     def test_generated_catalog_collection_preserves_duplicate_names(self) -> None:
@@ -412,7 +581,7 @@ from agno.agent.agent import (
         for path in demo_paths:
             with self.subTest(path=path.name):
                 tree = ast.parse(path.read_text(), filename=str(path))
-                _assert_imports_public_agent(self, tree)
+                _assert_imports_public_agent(self, tree, _module_package(path))
 
     def test_demos_use_the_stock_public_agui_interface(self) -> None:
         demo_paths = sorted(
@@ -423,13 +592,13 @@ from agno.agent.agent import (
             with self.subTest(path=path.name):
                 source = path.read_text()
                 tree = ast.parse(source, filename=str(path))
-                _assert_uses_stock_public_agui(self, tree)
+                _assert_uses_stock_public_agui(self, tree, _module_package(path))
 
-    def test_project_has_no_local_agui_compatibility_adapter(self) -> None:
-        self.assertFalse((PROJECT_ROOT / "server" / "local_agui.py").exists())
+    def test_server_package_contains_only_the_api_package(self) -> None:
+        _assert_server_contains_only_api_package(self, PROJECT_ROOT / "server")
 
-    def test_project_has_no_pre_split_agui_imports(self) -> None:
-        legacy_modules = {
+    def test_project_imports_nothing_from_agui_internals(self) -> None:
+        internal_modules = {
             "agno.os.interfaces.agui.media",
             "agno.os.interfaces.agui.utils",
         }
@@ -439,12 +608,13 @@ from agno.agent.agent import (
                 continue
             with self.subTest(path=path.relative_to(PROJECT_ROOT)):
                 imported_modules = _imported_modules(
-                    ast.parse(path.read_text(), filename=str(path))
+                    ast.parse(path.read_text(), filename=str(path)),
+                    _module_package(path),
                 )
-                legacy_imports = legacy_modules & imported_modules
+                internal_imports = internal_modules & imported_modules
                 self.assertFalse(
-                    legacy_imports,
-                    f"found legacy AG-UI imports: {sorted(legacy_imports)}",
+                    internal_imports,
+                    f"found AG-UI internals imports: {sorted(internal_imports)}",
                 )
 
     def test_project_has_no_private_agent_imports(self) -> None:
@@ -453,7 +623,7 @@ from agno.agent.agent import (
                 continue
             with self.subTest(path=path.relative_to(PROJECT_ROOT)):
                 tree = ast.parse(path.read_text(), filename=str(path))
-                _assert_no_private_agent_imports(self, tree)
+                _assert_no_private_agent_imports(self, tree, _module_package(path))
 
     def test_generated_agno_python_sources_use_stock_public_interfaces(self) -> None:
         catalog = json.loads(DOJO_FILES.read_text())
