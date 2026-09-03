@@ -93,11 +93,6 @@ class _PredictiveHitlModel(Model):
                 ]
             )
         else:
-            expected_result = ("write-document-1", '{"accepted":true}')
-            if expected_result not in tool_results:
-                raise AssertionError(
-                    "resumed model call did not receive the correlated tool result"
-                )
             yield ModelResponse(content="The reviewed document was accepted.")
 
     def _parse_provider_response(self, response: Any, **kwargs: Any) -> ModelResponse:
@@ -129,10 +124,10 @@ class _PlainReplyModel(Model):
         return response
 
 
-def _sse_events(text: str) -> list[dict[str, Any]]:
+def _sse_events(response_text: str) -> list[dict[str, Any]]:
     return [
-        json.loads(line[len("data:") :])
-        for line in text.splitlines()
+        json.loads(line.removeprefix("data:"))
+        for line in response_text.splitlines()
         if line.startswith("data:")
     ]
 
@@ -198,16 +193,51 @@ class StateAndResumeRegressionTests(unittest.TestCase):
             ).model_dump(by_alias=True),
         )
 
-        self.assertEqual(paused_response.status_code, 200)
-        self.assertIn('"toolCallName":"write_document"', paused_response.text)
-        self.assertEqual(resumed_response.status_code, 200)
-        self.assertIn("The reviewed document was accepted.", resumed_response.text)
+        for label, response in {
+            "paused": paused_response,
+            "resumed": resumed_response,
+        }.items():
+            with self.subTest(response=label):
+                self.assertEqual(response.status_code, 200)
+                events = _sse_events(response.text)
+                # The stock router folds model exceptions into a RAW RunError
+                # payload and still ends with RUN_FINISHED over HTTP 200, so
+                # a clean stream has to be asserted explicitly.
+                self.assertNotIn("RUN_ERROR", [event["type"] for event in events])
+                self.assertNotIn("RunError", response.text)
+                self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+
+        paused_events = _sse_events(paused_response.text)
+        tool_call_start = next(
+            event for event in paused_events if event["type"] == "TOOL_CALL_START"
+        )
+        self.assertEqual(tool_call_start["toolCallName"], "write_document")
+        self.assertEqual(tool_call_start["toolCallId"], "write-document-1")
+        tool_call_end_index = paused_events.index(
+            {"type": "TOOL_CALL_END", "toolCallId": "write-document-1"}
+        )
+        self.assertGreater(tool_call_end_index, paused_events.index(tool_call_start))
+        self.assertEqual(
+            [event["type"] for event in paused_events[tool_call_end_index + 1 :]],
+            ["STATE_SNAPSHOT", "RUN_FINISHED"],
+        )
+
+        resumed_events = _sse_events(resumed_response.text)
+        self.assertEqual(
+            "".join(
+                event["delta"]
+                for event in resumed_events
+                if event["type"] == "TEXT_MESSAGE_CONTENT"
+            ),
+            "The reviewed document was accepted.",
+        )
+
         self.assertEqual(model.calls, 2)
         self.assertIn("write_document", model.tool_names_by_call[0])
         self.assertIn("update_session_state", model.tool_names_by_call[0])
-        self.assertIn(
-            ("write-document-1", '{"accepted":true}'),
+        self.assertEqual(
             model.tool_results_by_call[1],
+            [("write-document-1", '{"accepted":true}')],
         )
 
     def test_shared_state_snapshot_excludes_agno_session_bookkeeping(self) -> None:
