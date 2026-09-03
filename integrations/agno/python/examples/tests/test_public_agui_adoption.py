@@ -7,7 +7,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 API_ROOT = PROJECT_ROOT / "server" / "api"
-DOJO_FILES = PROJECT_ROOT.parents[3] / "apps" / "dojo" / "src" / "files.json"
+DOJO_ROOT = PROJECT_ROOT.parents[3] / "apps" / "dojo" / "src"
+DOJO_FILES = DOJO_ROOT / "files.json"
+DOJO_FEATURES = DOJO_ROOT / "app" / "[integrationId]" / "feature"
 PRIVATE_AGENT_MODULE = "agno.agent.agent"
 
 
@@ -169,6 +171,44 @@ def _generated_agno_python_sources(catalog: object) -> list[tuple[str, str]]:
     ]
 
 
+def _generated_agno_entries(catalog: object) -> list[tuple[str, str, str]]:
+    if not isinstance(catalog, dict):
+        return []
+
+    return [
+        (key.split("::", 1)[1], entry["name"], entry["content"])
+        for key, entries in catalog.items()
+        if isinstance(key, str) and key.startswith("agno::")
+        if isinstance(entries, list)
+        for entry in entries
+        if isinstance(entry, dict)
+        and (entry.get("name") == "page.tsx" or entry.get("language") == "python")
+    ]
+
+
+def _generated_entry_source_path(demo: str, name: str) -> Path:
+    if name.endswith(".py"):
+        return API_ROOT / name
+    for version in ("(v2)", "(v1)"):
+        candidate = DOJO_FEATURES / version / demo / name
+        if candidate.exists():
+            return candidate
+    return DOJO_FEATURES / "(v2)" / demo / name
+
+
+def _assert_generated_entry_matches_source(
+    test_case: unittest.TestCase, demo: str, name: str, content: str
+) -> None:
+    source_path = _generated_entry_source_path(demo, name)
+    test_case.assertTrue(source_path.exists(), f"missing source {source_path}")
+    test_case.assertEqual(
+        content,
+        source_path.read_text(),
+        f"generated agno::{demo} {name} differs from {source_path}; "
+        "regenerate apps/dojo/src/files.json",
+    )
+
+
 def _assert_unique_generated_source_names(
     test_case: unittest.TestCase, generated_sources: list[tuple[str, str]]
 ) -> None:
@@ -319,6 +359,19 @@ AGUI(agent=object())
                 self, _generated_agno_python_sources(catalog)
             )
 
+    def test_mutated_generated_entry_fails_source_parity(self) -> None:
+        catalog = json.loads(DOJO_FILES.read_text())
+        demo, name, content = next(
+            (demo, name, content)
+            for demo, name, content in _generated_agno_entries(catalog)
+            if name.endswith(".py")
+        )
+
+        with self.assertRaisesRegex(AssertionError, "differs from"):
+            _assert_generated_entry_matches_source(
+                self, demo, name, content + "\n# drifted\n"
+            )
+
     def test_dunder_private_agent_import_fails_public_agent_guard(self) -> None:
         tree = ast.parse(
             """
@@ -417,6 +470,15 @@ from agno.agent.agent import (
                 tree = ast.parse(source, filename=name)
                 _assert_imports_public_agent(self, tree)
                 _assert_uses_stock_public_agui(self, tree)
+
+    def test_generated_agno_entries_match_their_sources(self) -> None:
+        catalog = json.loads(DOJO_FILES.read_text())
+        entries = _generated_agno_entries(catalog)
+
+        self.assertTrue(entries, "no agno:: entries found in the Dojo catalog")
+        for demo, name, content in entries:
+            with self.subTest(demo=demo, name=name):
+                _assert_generated_entry_matches_source(self, demo, name, content)
 
 
 if __name__ == "__main__":

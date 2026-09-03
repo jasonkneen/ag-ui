@@ -89,6 +89,15 @@ def _generated_agentic_page() -> str:
     )
 
 
+def _generated_haiku_page() -> str:
+    catalog = json.loads(DOJO_FILES.read_text())
+    return next(
+        entry["content"]
+        for entry in catalog["agno::tool_based_generative_ui"]
+        if entry["name"] == "page.tsx"
+    )
+
+
 def _task_progress_block(page: str) -> str:
     start = page.index("function TaskProgress")
     end = page.index("\n\n// Enhanced Icons", start)
@@ -200,6 +209,16 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
                 self.assertIn("const isActive = index === activeStepIndex;", block)
                 self.assertNotIn("isCurrentPending", block)
                 self.assertNotIn("isFuturePending", block)
+
+    def test_generated_haiku_page_matches_source(self) -> None:
+        source_page = DOJO_PAGE.read_text()
+        generated_page = _generated_haiku_page()
+
+        self.assertEqual(generated_page, source_page)
+        for label, page in {"source": source_page, "generated": generated_page}.items():
+            with self.subTest(page=label):
+                self.assertIn("gradient: SAFE_GRADIENT", page)
+                self.assertIn("image_name: z.enum(VALID_IMAGE_NAMES)", page)
 
     def test_frontend_schema_is_the_strict_haiku_contract(self) -> None:
         block = _frontend_tool_block()
