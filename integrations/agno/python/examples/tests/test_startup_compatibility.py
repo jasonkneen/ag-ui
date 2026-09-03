@@ -11,12 +11,12 @@ from starlette.routing import Mount
 from server import app as dojo_app
 from server.api.agentic_chat import agent as agentic_chat_agent
 from server.api.agentic_chat_multimodal import agent as agentic_chat_multimodal_agent
-from server.api.agentic_generative_ui import agent as agentic_generative_ui_agent
 from server.api.agentic_chat_reasoning import agent as reasoning_agent
+from server.api.agentic_generative_ui import agent as agentic_generative_ui_agent
 from server.api.human_in_the_loop import agent as human_in_the_loop_agent
 from server.api.predictive_state_updates import agent as predictive_state_updates_agent
+from server.api.shared_state import agent as shared_state_agent
 from server.api.tool_based_generative_ui import agent as tool_based_generative_ui_agent
-
 
 EXPECTED_DOJO_MOUNTS = {
     "/agentic_chat",
@@ -72,6 +72,18 @@ class StartupCompatibilityTests(unittest.TestCase):
 
         for name, agent in frontend_tool_agents:
             with self.subTest(agent=name):
+                self.assertIsNotNone(agent.db)
+
+    def test_stateful_demos_persist_session_state_in_a_db(self) -> None:
+        stateful_agents = (
+            ("agentic_generative_ui", agentic_generative_ui_agent),
+            ("predictive_state_updates", predictive_state_updates_agent),
+            ("shared_state", shared_state_agent),
+        )
+
+        for name, agent in stateful_agents:
+            with self.subTest(agent=name):
+                self.assertTrue(agent.enable_agentic_state)
                 self.assertIsNotNone(agent.db)
 
     def test_agentic_generative_ui_streams_steps_from_agno_session_state(self) -> None:

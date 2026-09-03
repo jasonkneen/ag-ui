@@ -16,6 +16,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from server.api.predictive_state_updates import agent as predictive_state_updates_agent
+from server.api.shared_state import agent as shared_state_agent
+from server.api.shared_state import app as shared_state_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parents[3]
@@ -105,6 +107,36 @@ class _PredictiveHitlModel(Model):
         return response
 
 
+class _PlainReplyModel(Model):
+    def invoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise NotImplementedError
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise NotImplementedError
+
+    def invoke_stream(self, *args: Any, **kwargs: Any) -> Iterator[ModelResponse]:
+        yield ModelResponse()
+
+    async def ainvoke_stream(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[ModelResponse]:
+        yield ModelResponse(content="The recipe is unchanged.")
+
+    def _parse_provider_response(self, response: Any, **kwargs: Any) -> ModelResponse:
+        return response
+
+    def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
+        return response
+
+
+def _sse_events(text: str) -> list[dict[str, Any]]:
+    return [
+        json.loads(line[len("data:") :])
+        for line in text.splitlines()
+        if line.startswith("data:")
+    ]
+
+
 def _run_input(
     *, run_id: str, messages: list[UserMessage | ToolMessage]
 ) -> RunAgentInput:
@@ -177,6 +209,45 @@ class StateAndResumeRegressionTests(unittest.TestCase):
             ("write-document-1", '{"accepted":true}'),
             model.tool_results_by_call[1],
         )
+
+    def test_shared_state_snapshot_excludes_agno_session_bookkeeping(self) -> None:
+        model = _PlainReplyModel(id="shared-state-snapshot-test")
+        original_model = shared_state_agent.model
+        shared_state_agent.model = model
+        self.addCleanup(setattr, shared_state_agent, "model", original_model)
+
+        recipe = {
+            "title": "Pancakes",
+            "skill_level": "Beginner",
+            "cooking_time": "15 min",
+            "special_preferences": ["Vegetarian"],
+            "ingredients": [{"name": "Flour", "amount": "1 cup", "icon": "🌾"}],
+            "instructions": ["Mix", "Fry"],
+        }
+        response = TestClient(shared_state_app).post(
+            "/agui",
+            json=RunAgentInput(
+                threadId="shared-state-snapshot-thread",
+                runId="shared-state-snapshot-run",
+                state={"recipe": recipe},
+                messages=[UserMessage(id="user-1", content="Show me the recipe")],
+                tools=[],
+                context=[],
+                forwardedProps={},
+            ).model_dump(by_alias=True),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        snapshots = [
+            event["snapshot"]
+            for event in _sse_events(response.text)
+            if event["type"] == "STATE_SNAPSHOT"
+        ]
+        self.assertTrue(snapshots, "no STATE_SNAPSHOT event was streamed")
+        final_snapshot = snapshots[-1]
+        self.assertEqual(final_snapshot["recipe"], recipe)
+        for key in ("current_session_id", "current_user_id", "current_run_id"):
+            self.assertNotIn(key, final_snapshot)
 
     def test_agentic_steps_are_narrowed_at_the_render_boundary(self) -> None:
         malformed_state = validate_state(

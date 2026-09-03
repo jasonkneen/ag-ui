@@ -6,11 +6,13 @@ snapshots to the frontend on every change.
 """
 
 from agno.agent import Agent
+from agno.db.in_memory import InMemoryDb
 from agno.models.openai import OpenAIChat
 from agno.os import AgentOS
 from agno.os.interfaces.agui import AGUI
 
 agent = Agent(
+    db=InMemoryDb(),
     model=OpenAIChat(id="gpt-4o"),
     session_state={},
     add_session_state_to_context=True,
