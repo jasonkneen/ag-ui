@@ -332,6 +332,24 @@ def _haiku_parse_results(payloads: list[object]) -> list[dict[str, object]]:
     return result
 
 
+def _haiku_preview_results(payloads: list[object]) -> list[object]:
+    page = DOJO_PAGE.read_text()
+    if "function toPreviewHaiku" not in page:
+        raise AssertionError("toPreviewHaiku is not defined")
+    start = page.index("const VALID_IMAGE_NAMES = [")
+    end = page.index("\n\nfunction HaikuDisplay", start)
+    helpers = page[start:end].replace("interface Haiku", "type Haiku =")
+    expression = (
+        f"console.log(JSON.stringify({json.dumps(payloads)}.map(toPreviewHaiku)))"
+    )
+    result = _run_typescript(helpers, expression)
+    if not isinstance(result, list) or not all(
+        item is None or isinstance(item, dict) for item in result
+    ):
+        raise AssertionError("toPreviewHaiku did not return an object-or-null list")
+    return result
+
+
 def _handler_block() -> str:
     block = _frontend_tool_block()
     start = block.index("handler:")
@@ -513,16 +531,42 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
             [False, False, False, False],
         )
 
-    def test_streaming_preview_validates_complete_args_before_render(self) -> None:
+    def test_streaming_preview_sanitizes_args_before_render(self) -> None:
         page = DOJO_PAGE.read_text()
         render_start = page.index("render:", page.index('name: "generate_haiku"'))
         render_end = page.index("\n      },", render_start)
         render = page[render_start:render_end]
 
-        self.assertIn("HAIKU_SCHEMA.safeParse(args)", render)
-        self.assertIn("if (!parsed.success)", render)
-        self.assertIn("haiku={parsed.data}", render)
+        self.assertIn("toPreviewHaiku(args)", render)
+        self.assertIn("if (!preview)", render)
+        self.assertIn("haiku={preview}", render)
         self.assertNotIn("args as Haiku", render)
+
+    def test_streaming_preview_renders_partial_args_and_drops_unsafe_values(
+        self,
+    ) -> None:
+        partial = {"japanese": ["ふるいけや", "かわずとびこむ", "みずのおと"]}
+        text_only = {
+            **partial,
+            "english": ["An old pond", "a frog leaps in", "sound of water"],
+        }
+        unsafe = {
+            **text_only,
+            "image_name": "not-in-the-list.jpg",
+            "gradient": "url(https://example.com/x.png)",
+        }
+
+        previews = _haiku_preview_results(
+            [partial, text_only, unsafe, {"english": ["only"]}]
+        )
+
+        self.assertIsNotNone(previews[0])
+        self.assertEqual(previews[0]["japanese"], partial["japanese"])
+        self.assertEqual(previews[0]["english"], [])
+        self.assertEqual(previews[1]["english"], text_only["english"])
+        self.assertIsNone(previews[2]["image_name"])
+        self.assertEqual(previews[2]["gradient"], "")
+        self.assertIsNone(previews[3])
 
     def test_handler_parser_rejects_invalid_arguments_and_names_the_fields(
         self,

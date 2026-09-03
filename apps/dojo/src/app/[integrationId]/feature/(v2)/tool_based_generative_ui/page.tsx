@@ -203,6 +203,30 @@ function parseHaikuToolArgs(
   };
 }
 
+// Preview arguments stream in field by field, and some backends send only the
+// haiku text, so the card renders as soon as there are Japanese lines. Only the
+// values that reach CSS or an image lookup are sanitized here; the strict schema
+// still gates what the handler stores.
+function toPreviewHaiku(args: Partial<Haiku>): Haiku | null {
+  const japanese = (args.japanese ?? []).filter(
+    (line): line is string => typeof line === "string",
+  );
+  if (japanese.length === 0) return null;
+  const english = (args.english ?? []).filter(
+    (line): line is string => typeof line === "string",
+  );
+  const imageName =
+    typeof args.image_name === "string" &&
+    (VALID_IMAGE_NAMES as readonly string[]).includes(args.image_name)
+      ? args.image_name
+      : null;
+  const gradient =
+    typeof args.gradient === "string" && isSafeGradient(args.gradient)
+      ? args.gradient
+      : "";
+  return { japanese, english, image_name: imageName, gradient };
+}
+
 function HaikuDisplay() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [haikus, setHaikus] = useState<Haiku[]>([
@@ -237,9 +261,9 @@ function HaikuDisplay() {
         return "Haiku generated!";
       },
       render: ({ args }: { args: Partial<Haiku> }) => {
-        const parsed = HAIKU_SCHEMA.safeParse(args);
-        if (!parsed.success) return <></>;
-        return <HaikuCard haiku={parsed.data} />;
+        const preview = toPreviewHaiku(args);
+        if (!preview) return <></>;
+        return <HaikuCard haiku={preview} />;
       },
     },
     [haikus],
