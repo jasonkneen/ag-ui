@@ -194,13 +194,11 @@ The adapter advertises an event / feature matrix at GET `/capabilities`
 `addCapabilities(app, path, { agent, overrides })` to derive the chunk flags from
 a live agent's `emitChunkEvents` rather than pinning them).
 
-Two flags in that matrix need reading with care. `DEFAULT_CAPABILITIES` reports
-`events.RAW: false`, which predates the adapter emitting `RAW` at all: the
-passthrough described below is live whatever the matrix says, so do not gate a
-client on that flag. `events.STATE_DELTA: false` and `features.stateDelta: false`
-are not a mistake, and mean what they say about the adapter, which emits no delta
-of its own; a `customResultHandler` that emits one is your own addition. Fold an
-override in for either if you serve the matrix to something that reads it.
+One flag in that matrix needs reading with care. `events.STATE_DELTA: false` and
+`features.stateDelta: false` are not a mistake, and mean what they say about the
+adapter, which emits no delta of its own; a `customResultHandler` that emits one
+is your own addition. Fold an override in if you serve the matrix to something
+that reads it.
 
 ## Unmapped Strands events reach the client as `RAW`
 
