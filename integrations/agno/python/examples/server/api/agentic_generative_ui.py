@@ -28,9 +28,10 @@ agent = Agent(
             'status must be one of "pending", "in_progress", or "completed".'
         ),
         (
-            'First write every step as "pending". Then, for each step in order, '
-            'write the full list with that step set to "in_progress", '
-            'then write the full list again with that step set to "completed" before moving to the next step.'
+            'First write every step as "pending". Then walk the steps in order: '
+            'write the full list with the current step set to "in_progress"; '
+            'on the next write set that step to "completed" and the following step to "in_progress". '
+            'Finish by writing the full list with the last step set to "completed".'
         ),
         "After the last step is completed, give a brief one-sentence summary with some emojis.",
         "Do NOT repeat the steps in your response.",

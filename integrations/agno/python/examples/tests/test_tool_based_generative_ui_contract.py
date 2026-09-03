@@ -248,6 +248,16 @@ def _generated_agentic_page() -> str:
     )
 
 
+def _state_update_renderer_block(page: str) -> str:
+    marker = 'name: "update_session_state"'
+    if marker not in page:
+        raise AssertionError("no renderer is registered for update_session_state")
+    name = page.index(marker)
+    start = page.rindex("useRenderTool({", 0, name)
+    end = page.index("});", name) + len("});")
+    return page[start:end]
+
+
 def _generated_haiku_page() -> str:
     catalog = json.loads(DOJO_FILES.read_text())
     return next(
@@ -401,6 +411,23 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
                 self.assertIn("const isActive = index === activeStepIndex;", block)
                 self.assertNotIn("isCurrentPending", block)
                 self.assertNotIn("isFuturePending", block)
+
+    def test_agentic_page_hides_the_state_update_tool_calls(self) -> None:
+        pages = {
+            "source": AGENTIC_DOJO_PAGE.read_text(),
+            "generated": _generated_agentic_page(),
+        }
+
+        for label, page in pages.items():
+            with self.subTest(page=label):
+                v2_import = page[: page.index('} from "@copilotkit/react-core/v2"')]
+                self.assertIn("useRenderTool,", v2_import)
+                block = _state_update_renderer_block(page)
+                self.assertIn('agentId: "agentic_generative_ui"', block)
+                self.assertIn("render: () => <></>", block)
+                chat_start = page.index("const Chat = () => {")
+                chat_end = page.index("function TaskProgress", chat_start)
+                self.assertTrue(chat_start < page.index(block) < chat_end)
 
     def test_generated_haiku_page_matches_source(self) -> None:
         source_page = DOJO_PAGE.read_text()

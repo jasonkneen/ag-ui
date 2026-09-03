@@ -6,8 +6,10 @@ import {
   useAgent,
   UseAgentUpdate,
   useConfigureSuggestions,
+  useRenderTool,
   CopilotChat,
 } from "@copilotkit/react-core/v2";
+import { z } from "zod";
 import { useTheme } from "next-themes";
 import { CopilotKit } from "@copilotkit/react-core";
 
@@ -79,6 +81,15 @@ const Chat = () => {
   const { agent } = useAgent({
     agentId: "agentic_generative_ui",
     updates: [UseAgentUpdate.OnStateChanged],
+  });
+
+  // The progress card below renders the streamed state, so hide the raw
+  // state-update tool calls that would otherwise show as default tool cards.
+  useRenderTool({
+    name: "update_session_state",
+    agentId: "agentic_generative_ui",
+    parameters: z.record(z.string(), z.unknown()),
+    render: () => <></>,
   });
 
   useConfigureSuggestions({

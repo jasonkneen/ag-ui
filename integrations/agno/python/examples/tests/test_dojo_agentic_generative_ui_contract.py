@@ -51,8 +51,15 @@ class DojoAgenticGenerativeUiContractTests(unittest.TestCase):
         prompt = _prompt()
 
         self.assertIn('First write every step as "pending"', prompt)
-        self.assertIn('write the full list with that step set to "in_progress"', prompt)
         self.assertIn(
+            'write the full list with the current step set to "in_progress"', prompt
+        )
+        self.assertIn(
+            'set that step to "completed" and the following step to "in_progress"',
+            prompt,
+        )
+        self.assertIn('the last step set to "completed"', prompt)
+        self.assertNotIn(
             'write the full list again with that step set to "completed"', prompt
         )
         self.assertIn("exactly 10 steps", prompt)
