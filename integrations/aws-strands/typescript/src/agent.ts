@@ -2136,9 +2136,12 @@ export class StrandsAgent {
    * Threads with an in-flight run. Strands `Agent.stream()` throws if a
    * second invocation is started on a busy agent; we detect the collision
    * up front and emit a protocol-shaped RUN_ERROR/THREAD_BUSY instead.
-   * Python guards the same collision with the same code and the same text,
-   * but only around an orchestrator, and keyed by thread only when a factory
-   * builds one per run; its single-agent path has no guard of its own.
+   * Python refuses the same per-thread collision before entering its own run
+   * body, with the same code and the same message text. It additionally
+   * guards a shared orchestrator instance across every thread, since such an
+   * instance cannot be multiplexed at all; that arm narrows back to per-thread
+   * when a callable builds a fresh orchestrator per run. It also refuses a run
+   * against an orchestrator parked at an interrupt.
    */
   private readonly _activeRunsByThread = new Set<string>();
   /** Outstanding AG-UI interrupt objects per thread, used to validate
