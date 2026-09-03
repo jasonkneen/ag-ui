@@ -44,6 +44,10 @@ from strands.types.interrupt import InterruptResponseContent
 # "session_manager" is excluded: it is supplied per-thread via
 # StrandsAgentConfig.session_manager_provider (see run()). Forwarding a
 # template-level session_manager would make every thread share one session_id.
+# "plugins" is excluded: Agent consumes the list during init, registering each
+# plugin's hooks and tools into its own registries and keeping only a registry
+# bound to that agent, so there is no list to read back. Callers supply them
+# per-thread through the explicit StrandsAgent(plugins=...) kwarg.
 _AGUI_EXPLICIT_PARAMS = {
     "self",
     "model",
@@ -52,6 +56,7 @@ _AGUI_EXPLICIT_PARAMS = {
     "messages",
     "hooks",
     "session_manager",
+    "plugins",
 }
 
 
@@ -169,6 +174,63 @@ def _registry_contents(holder: Any) -> Any:
             if isinstance(value, (list, tuple)):
                 return list(value)
     return _MISSING
+
+
+# Whether the installed Strands takes ``plugins`` on its Agent constructor.
+# The plugin system arrived after this package's declared strands-agents floor,
+# so the adapter's own ``plugins=`` kwarg can be handed a release with nowhere
+# to put it. Probed off the signature rather than compared against a version,
+# for the same reason the forwarding probe is: what matters is the parameter
+# being there, not which release put it there.
+_STRANDS_ACCEPTS_PLUGINS = (
+    "plugins" in inspect.signature(StrandsAgentCore.__init__).parameters
+)
+
+
+# Strands namespaces the plugins it registers on every Agent itself, and
+# registers them whether or not the caller passed any. Anything under this
+# prefix is therefore the SDK's, not a setting to report as dropped.
+_SDK_PLUGIN_NAME_PREFIX = "strands:"
+
+
+def _template_plugin_names(agent: Any) -> List[str]:
+    """Names of the plugins the caller put on the template.
+
+    ``plugins`` is handled through an explicit kwarg, so the generic probe
+    skips it and would never report it. Reading the registry here is what
+    lets a caller who set plugins on the template be told they do not carry,
+    instead of getting silence.
+
+    Strands' own plugins are filtered out by name. Every Agent is built with
+    at least one of them, so counting them would warn every caller about a
+    setting nobody made. A caller plugin that borrowed the SDK's prefix would
+    be missed by this, which is the harmless direction: the cost is one
+    warning not said, against a warning said to everyone.
+    """
+    for attr in _candidate_attributes("plugins"):
+        try:
+            holder = getattr(agent, attr, None)
+        except Exception:  # noqa: BLE001 - a raising property is not a plugin list
+            continue
+        if holder is None:
+            continue
+        if isinstance(holder, (list, tuple)):
+            contents: Any = holder
+        else:
+            contents = _registry_contents(holder)
+        if contents is _MISSING or not contents:
+            continue
+        names = []
+        for plugin in contents:
+            name = getattr(plugin, "name", None)
+            # An entry with no readable name cannot be attributed to the SDK,
+            # so it counts as the caller's rather than being dropped silently.
+            label = name if isinstance(name, str) else type(plugin).__name__
+            if not label.startswith(_SDK_PLUGIN_NAME_PREFIX):
+                names.append(label)
+        if names:
+            return names
+    return []
 
 
 def _element_type(annotation: Any) -> Any:
@@ -2997,6 +3059,7 @@ class StrandsAgent:
         description: str = "",
         config: "StrandsAgentConfig | None" = None,
         hooks: "list | None" = None,
+        plugins: "list | None" = None,
         agents_by_thread: "Dict[str, Any] | None" = None,
     ):
         # Detect a multi-agent orchestrator structurally. A Graph or Swarm has
@@ -3065,9 +3128,18 @@ class StrandsAgent:
             self._unreadable_params = []
             self._template_owned_params = []
 
-        # Params wired to the template are a known structural limit, not a
-        # surprise, so they are recorded without a warning. Params this adapter
-        # could not read at all are the ones worth interrupting for.
+        # ``plugins`` is handled explicitly, so the generic probe above skips
+        # it and cannot report it. A template built with plugins is still a
+        # dropped setting, so record it here and let it be reported through the
+        # same route as every other param that will not carry.
+        if self._orchestrator is None and _template_plugin_names(agent):
+            self._template_owned_params.append("plugins")
+
+        # Both kinds of param will fail to reach per-thread agents, and both
+        # are reported when a thread is built. They are kept apart because they
+        # ask for different reading: an unreadable param is a gap in this
+        # adapter that a later release may close, while one the SDK wired to
+        # the agent that received it will never carry.
         self._unforwardable_params = [
             *self._unreadable_params,
             *self._template_owned_params,
@@ -3095,6 +3167,43 @@ class StrandsAgent:
         # the caller and forward them to every per-thread instance so any
         # observability / loop-cap / policy-enforcement hook actually fires.
         self._hooks = list(hooks) if hooks else []
+
+        # Plugins forwarded to each per-thread StrandsAgentCore.
+        #
+        # A dedicated kwarg for the same reason ``hooks`` has one, one step
+        # further along. Strands consumes the plugin list during init: it calls
+        # each plugin's ``init_agent`` and registers its hooks and tools into
+        # that agent's registries, keeping only a registry bound to that agent.
+        # There is no list left to read back, and the registry cannot be handed
+        # to a second agent. Since the template never serves a request, a
+        # plugin registered there never runs against the agents that do, and a
+        # plugin whose whole behaviour lives in ``init_agent`` silently does
+        # nothing. Taking them from the caller instead lets every per-thread
+        # agent build its own.
+        self._plugins = list(plugins) if plugins else []
+        # Refused at wrap time rather than on the first request. Without this
+        # the kwarg reaches a constructor with no parameter for it and Strands
+        # raises a bare TypeError from inside per-thread construction, which
+        # escapes the run generator: the caller sees a traceback pointing at
+        # the SDK rather than at the argument they passed, and only once a
+        # request arrives. This is a static misconfiguration, knowable the
+        # moment the wrapper is built, so it is answered there.
+        # Not raised for an orchestrator, which never builds a per-thread agent
+        # and so ignores plugins on every release. Refusing only the old ones
+        # there would report a version problem for something the new ones do
+        # not do either.
+        if (
+            self._plugins
+            and self._orchestrator is None
+            and not _STRANDS_ACCEPTS_PLUGINS
+        ):
+            raise TypeError(
+                "plugins= was supplied, but the installed strands-agents "
+                f"({distribution_version('strands-agents')}) has no `plugins` "
+                "parameter on Agent, so they cannot be forwarded to per-thread "
+                "agents. Upgrade strands-agents to a release that supports "
+                "plugins, or drop the argument."
+            )
 
         self.name = name
         self.description = description
@@ -3580,25 +3689,57 @@ class StrandsAgent:
         Said once per param, and only about params this thread's kwargs did not
         supply, so acting on it makes it stop without the first thread becoming
         the policy for every later one.
+
+        The two kinds get their own message. An unreadable param is a gap in
+        this adapter, and a caller reading that can reasonably wait for a later
+        release to close it. A param the SDK wired to the agent that received
+        it is a structural limit rather than a gap: no adapter release will
+        carry it, so the per-thread route is the whole answer rather than a
+        stopgap. One sentence for both would send half the readers after a fix
+        that is not coming.
         """
-        still_missing = sorted(
-            name
-            for name in self._unreadable_params
-            if name not in core_kwargs and name not in self._reported_uncarried
-        )
-        if not still_missing:
-            return
-        self._reported_uncarried.update(still_missing)
-        # Phrased as a capability, not an accusation: an unreadable param is
-        # unreadable whether or not the caller set one, so this cannot say that
-        # anything was actually lost.
-        logger.warning(
-            "this Strands release stores these Agent constructor params where the "
-            "adapter cannot read them back, so a value set on the template through "
-            "them will not reach per-thread agents: %s. Supply them per thread "
-            "with StrandsAgentConfig.thread_agent_kwargs.",
-            ", ".join(still_missing),
-        )
+
+        def _unreported(names: List[str]) -> List[str]:
+            return sorted(
+                name
+                for name in names
+                if name not in core_kwargs and name not in self._reported_uncarried
+            )
+
+        unreadable = _unreported(self._unreadable_params)
+        template_owned = _unreported(self._template_owned_params)
+        self._reported_uncarried.update(unreadable)
+        self._reported_uncarried.update(template_owned)
+
+        if unreadable:
+            # Phrased as a capability, not an accusation: an unreadable param
+            # is unreadable whether or not the caller set one, so this cannot
+            # say that anything was actually lost.
+            logger.warning(
+                "this Strands release stores these Agent constructor params where the "
+                "adapter cannot read them back, so a value set on the template through "
+                "them will not reach per-thread agents: %s. Supply them per thread "
+                "with StrandsAgentConfig.thread_agent_kwargs.",
+                ", ".join(unreadable),
+            )
+        if template_owned:
+            # ``plugins`` is the one of these with a dedicated kwarg, so point
+            # at it rather than making every caller write a hook for the case
+            # the adapter already has an answer to.
+            route = (
+                "Pass them to StrandsAgent(plugins=[...])"
+                if template_owned == ["plugins"]
+                else "Supply them per thread with "
+                "StrandsAgentConfig.thread_agent_kwargs"
+            )
+            logger.warning(
+                "these Agent constructor params are consumed by the Strands Agent "
+                "that received them and cannot be handed to another agent, so a "
+                "value set on the template will not reach per-thread agents: %s. "
+                "%s.",
+                ", ".join(template_owned),
+                route,
+            )
 
     async def run(
         self,
@@ -3825,6 +3966,12 @@ class StrandsAgent:
                     core_kwargs = dict(self._agent_kwargs)
                     if self._hooks:
                         core_kwargs["hooks"] = list(self._hooks)
+                    # Same falsy-omission rule as hooks, for the same reason:
+                    # ``plugins=[]`` is a value a future StrandsAgentCore could
+                    # read as "disable the defaults", which is not what an
+                    # absent setting means.
+                    if self._plugins:
+                        core_kwargs["plugins"] = list(self._plugins)
                     # The caller's per-thread kwargs go on last, so they can
                     # supply what the template cannot carry and override what
                     # it can. See StrandsAgentConfig.thread_agent_kwargs.
@@ -3854,8 +4001,6 @@ class StrandsAgent:
                             return
                         core_kwargs.update(dict(extra or {}))
                     self._report_uncarried_params(core_kwargs)
-                    if self.config.thread_agent_kwargs is None:
-                        self._report_uncarried_params(core_kwargs)
                     # Re-asserted after the caller: these keep threads apart
                     # and a run coherent, so they stay the adapter's to set.
                     for owned in ("model", "system_prompt", "tools", "session_manager"):
