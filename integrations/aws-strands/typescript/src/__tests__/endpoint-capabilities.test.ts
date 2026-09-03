@@ -20,7 +20,7 @@ async function startApp(configure: (app: express.Express) => void): Promise<{
   app.use(express.json({ limit: "1mb" }));
   configure(app);
   const server = await new Promise<import("http").Server>((resolve) => {
-    const s = app.listen(0, () => resolve(s));
+    const s = app.listen(0, "127.0.0.1", () => resolve(s));
   });
   const port = (server.address() as AddressInfo).port;
   return {
