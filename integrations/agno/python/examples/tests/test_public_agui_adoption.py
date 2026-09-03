@@ -17,6 +17,18 @@ API_PACKAGE = "server.api"
 AGUI_PACKAGE = "agno.os.interfaces.agui"
 AGUI_SYMBOL = "AGUI"
 STOCK_AGUI_IMPORT = f"from {AGUI_PACKAGE} import {AGUI_SYMBOL}"
+# Mirrors featureFiles in apps/dojo/scripts/generate-content-json.ts: the
+# generator copies only these from a feature directory and skips anything else.
+GENERATED_FEATURE_FILES = ("page.tsx", "style.css", "README.mdx")
+GENERATED_LANGUAGES = {
+    ".py": "python",
+    ".tsx": "typescript",
+    ".css": "css",
+    ".mdx": "markdown",
+}
+# Emitted from the Agno menu features but backed by no server/api module, so
+# the generator finds no python source for it and emits the frontend files only.
+FRONTEND_ONLY_DEMOS = frozenset({"v1_agentic_chat"})
 
 
 def _module_package(path: Path) -> str:
@@ -372,6 +384,121 @@ def _assert_unique_generated_source_names(
         len(set(names)),
         "generated Agno Python entries must have unique names",
     )
+
+
+def _generated_agno_demos(catalog: object) -> dict[str, list[dict]]:
+    if not isinstance(catalog, dict):
+        return {}
+
+    return {
+        key.split("::", 1)[1]: entries
+        for key, entries in catalog.items()
+        if isinstance(key, str) and key.startswith("agno::")
+        if isinstance(entries, list)
+    }
+
+
+def _generated_feature_dir(demo: str) -> Path:
+    # Mirrors resolveFeatureDir in the generator: (v1) wins when it exists.
+    v1_dir = DOJO_FEATURES / "(v1)" / demo
+    return v1_dir if v1_dir.exists() else DOJO_FEATURES / "(v2)" / demo
+
+
+def _api_demo_modules() -> set[str]:
+    return {path.stem for path in API_ROOT.glob("*.py") if path.name != "__init__.py"}
+
+
+def _assert_generated_demo_keys_are_total(
+    test_case: unittest.TestCase, demos: dict[str, list[dict]]
+) -> None:
+    test_case.assertEqual(
+        set(demos),
+        _api_demo_modules() | FRONTEND_ONLY_DEMOS,
+        "agno:: demo keys must be exactly the server/api demo modules plus the "
+        "frontend-only demos; regenerate apps/dojo/src/files.json",
+    )
+
+
+def _assert_generated_entry_is_byte_equal(
+    test_case: unittest.TestCase, demo: str, entry: dict, source_path: Path
+) -> None:
+    name = entry["name"]
+    test_case.assertEqual(
+        entry.get("language"),
+        GENERATED_LANGUAGES[Path(name).suffix],
+        f"generated agno::{demo} {name} carries the wrong language",
+    )
+    test_case.assertEqual(
+        entry.get("content"),
+        source_path.read_text(),
+        f"generated agno::{demo} {name} differs from {source_path}; "
+        "regenerate apps/dojo/src/files.json",
+    )
+
+
+def _assert_generated_demo_is_total(
+    test_case: unittest.TestCase, demo: str, entries: list[dict]
+) -> None:
+    names = [entry["name"] for entry in entries]
+    test_case.assertEqual(
+        len(names), len(set(names)), f"agno::{demo} entries must have unique names"
+    )
+
+    python_entries = [entry for entry in entries if entry["name"].endswith(".py")]
+    python_source = API_ROOT / f"{demo}.py"
+    if demo in FRONTEND_ONLY_DEMOS:
+        test_case.assertFalse(
+            python_source.exists(),
+            f"{demo} is listed frontend-only but {python_source} exists",
+        )
+        test_case.assertEqual(
+            python_entries,
+            [],
+            f"agno::{demo} is frontend-only, expected no python entry",
+        )
+    else:
+        test_case.assertEqual(
+            [entry["name"] for entry in python_entries],
+            [python_source.name],
+            f"agno::{demo} must carry exactly one python entry named {python_source.name}",
+        )
+        _assert_generated_entry_is_byte_equal(
+            test_case, demo, python_entries[0], python_source
+        )
+
+    feature_dir = _generated_feature_dir(demo)
+    test_case.assertTrue(feature_dir.is_dir(), f"missing feature dir {feature_dir}")
+    expected_feature_files = {
+        name for name in GENERATED_FEATURE_FILES if (feature_dir / name).is_file()
+    }
+    feature_entries = [entry for entry in entries if not entry["name"].endswith(".py")]
+    test_case.assertEqual(
+        {entry["name"] for entry in feature_entries},
+        expected_feature_files,
+        f"agno::{demo} feature files must be exactly the generator-selected files "
+        f"under {feature_dir}",
+    )
+    for entry in feature_entries:
+        _assert_generated_entry_is_byte_equal(
+            test_case, demo, entry, feature_dir / entry["name"]
+        )
+
+
+def _clean_generated_demos(
+    demos: dict[str, list[dict]], *names: str
+) -> tuple[str, ...]:
+    # Negative controls mutate demos whose committed entries are known to match,
+    # so a failure can only come from the mutation.
+    for name in names:
+        _assert_generated_demo_is_total(unittest.TestCase(), name, demos[name])
+    return names
+
+
+def _swap_generated_python_entries(first: list[dict], second: list[dict]) -> list[dict]:
+    second_python = next(entry for entry in second if entry["name"].endswith(".py"))
+    return [
+        second_python if entry["name"].endswith(".py") else entry for entry in first
+    ]
 
 
 def _write_server_layout(root: Path, extra_files: list[str]) -> Path:
@@ -983,6 +1110,101 @@ from agno.agent.agent import (
         for demo, name, content in entries:
             with self.subTest(demo=demo, name=name):
                 _assert_generated_entry_matches_source(self, demo, name, content)
+
+    def test_generated_agno_catalog_is_total(self) -> None:
+        catalog = json.loads(DOJO_FILES.read_text())
+        demos = _generated_agno_demos(catalog)
+
+        _assert_generated_demo_keys_are_total(self, demos)
+        for demo, entries in sorted(demos.items()):
+            with self.subTest(demo=demo):
+                _assert_generated_demo_is_total(self, demo, entries)
+
+    def test_swapped_generated_python_entries_fail_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        first, second = _clean_generated_demos(demos, "agentic_chat", "shared_state")
+        swapped = _swap_generated_python_entries(demos[first], demos[second])
+
+        with self.assertRaisesRegex(AssertionError, "exactly one python entry"):
+            _assert_generated_demo_is_total(self, first, swapped)
+
+    def test_dropped_generated_page_entry_fails_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        (demo,) = _clean_generated_demos(demos, "agentic_chat")
+        dropped = [entry for entry in demos[demo] if entry["name"] != "page.tsx"]
+
+        with self.assertRaisesRegex(AssertionError, "feature files"):
+            _assert_generated_demo_is_total(self, demo, dropped)
+
+    def test_extra_generated_entry_fails_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        (demo,) = _clean_generated_demos(demos, "agentic_chat")
+        extra = [
+            *demos[demo],
+            {"name": "style.css", "content": "", "language": "css", "type": "file"},
+        ]
+
+        with self.assertRaisesRegex(AssertionError, "feature files"):
+            _assert_generated_demo_is_total(self, demo, extra)
+
+    def test_miskeyed_generated_entry_fails_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        first, second = _clean_generated_demos(demos, "agentic_chat", "shared_state")
+        miskeyed = [
+            next(entry for entry in demos[second] if entry["name"] == "page.tsx")
+            if entry["name"] == "page.tsx"
+            else entry
+            for entry in demos[first]
+        ]
+
+        with self.assertRaisesRegex(AssertionError, "differs from"):
+            _assert_generated_demo_is_total(self, first, miskeyed)
+
+    def test_python_entry_on_frontend_only_demo_fails_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        (demo, donor) = _clean_generated_demos(demos, "v1_agentic_chat", "agentic_chat")
+        python_entry = next(
+            entry for entry in demos[donor] if entry["language"] == "python"
+        )
+
+        with self.assertRaisesRegex(AssertionError, "no python entry"):
+            _assert_generated_demo_is_total(self, demo, [*demos[demo], python_entry])
+
+    def test_missing_or_extra_generated_demo_key_fails_total_parity(self) -> None:
+        demos = _generated_agno_demos(json.loads(DOJO_FILES.read_text()))
+        _assert_generated_demo_keys_are_total(self, demos)
+
+        missing = {
+            demo: entries for demo, entries in demos.items() if demo != "agentic_chat"
+        }
+        with self.assertRaisesRegex(AssertionError, "agno:: demo keys"):
+            _assert_generated_demo_keys_are_total(self, missing)
+
+        extra = {**demos, "not_a_demo": demos["agentic_chat"]}
+        with self.assertRaisesRegex(AssertionError, "agno:: demo keys"):
+            _assert_generated_demo_keys_are_total(self, extra)
+
+    def test_generated_agno_demos_keeps_only_agno_keys(self) -> None:
+        catalog = {
+            "agno::example": [{"name": "example.py"}],
+            "ag2::example": [{"name": "example.py"}],
+            "agno::other": "not a list",
+        }
+
+        self.assertEqual(
+            _generated_agno_demos(catalog), {"example": [{"name": "example.py"}]}
+        )
+        self.assertEqual(_generated_agno_demos("not a catalog"), {})
+
+    def test_generated_feature_dir_prefers_v1_like_the_generator(self) -> None:
+        self.assertEqual(
+            _generated_feature_dir("v1_agentic_chat"),
+            DOJO_FEATURES / "(v1)" / "v1_agentic_chat",
+        )
+        self.assertEqual(
+            _generated_feature_dir("agentic_chat"),
+            DOJO_FEATURES / "(v2)" / "agentic_chat",
+        )
 
 
 if __name__ == "__main__":
