@@ -75,6 +75,41 @@ The integration has three main layers:
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for diagrams and a deeper dive.
 
+## Per-thread agents: hooks and plugins
+
+The wrapper does not run the agent you hand it. That one is a template: the
+adapter reads its constructor settings back off the instance and builds a fresh
+`strands.Agent` per `thread_id`, so one conversation cannot see another's
+history. Most settings survive that rebuild automatically.
+
+Two do not, because Strands consumes them during construction rather than
+keeping the list you passed. Hooks become a `HookRegistry`, and plugins are run
+against the agent that received them and recorded in a registry bound to it.
+Neither can be read back or handed to a second agent, so a template is the one
+place they will not work. Pass them to the wrapper instead and every per-thread
+agent gets its own:
+
+```python
+agui_agent = StrandsAgent(
+    agent=strands_agent,
+    name="my_agent",
+    hooks=[MyHookProvider()],
+    plugins=[AgentSkills(skills="./skills/")],
+)
+```
+
+Set either on the template and the adapter logs a warning naming the setting
+the first time a thread is built, rather than dropping it in silence. For a
+value that has to differ per thread, build it in
+`StrandsAgentConfig.thread_agent_kwargs`, which runs per request and wins over
+both routes above.
+
+| Scenario                                                | Support boundary                                                                                                                                                        |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `hooks=[...]`                                           | Supported on every release this package supports.                                                                                                                        |
+| `plugins=[...]`                                         | Requires `strands-agents >= 1.28.0`, the release that added `plugins` to `Agent`. On an older release the wrapper raises `TypeError` when it is constructed, not on the first request. |
+| `hooks` / `plugins` with a multi-agent orchestrator     | Ignored. An orchestrator is invoked directly, so there is no per-thread agent to attach them to.                                                                          |
+
 ## Key Files
 
 | File                            | Description                                                                     |

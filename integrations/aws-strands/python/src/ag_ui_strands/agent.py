@@ -176,6 +176,17 @@ def _registry_contents(holder: Any) -> Any:
     return _MISSING
 
 
+# Whether the installed Strands takes ``plugins`` on its Agent constructor.
+# The plugin system arrived after this package's declared strands-agents floor,
+# so the adapter's own ``plugins=`` kwarg can be handed a release with nowhere
+# to put it. Probed off the signature rather than compared against a version,
+# for the same reason the forwarding probe is: what matters is the parameter
+# being there, not which release put it there.
+_STRANDS_ACCEPTS_PLUGINS = (
+    "plugins" in inspect.signature(StrandsAgentCore.__init__).parameters
+)
+
+
 # Strands namespaces the plugins it registers on every Agent itself, and
 # registers them whether or not the caller passed any. Anything under this
 # prefix is therefore the SDK's, not a setting to report as dropped.
@@ -3170,6 +3181,29 @@ class StrandsAgent:
         # nothing. Taking them from the caller instead lets every per-thread
         # agent build its own.
         self._plugins = list(plugins) if plugins else []
+        # Refused at wrap time rather than on the first request. Without this
+        # the kwarg reaches a constructor with no parameter for it and Strands
+        # raises a bare TypeError from inside per-thread construction, which
+        # escapes the run generator: the caller sees a traceback pointing at
+        # the SDK rather than at the argument they passed, and only once a
+        # request arrives. This is a static misconfiguration, knowable the
+        # moment the wrapper is built, so it is answered there.
+        # Not raised for an orchestrator, which never builds a per-thread agent
+        # and so ignores plugins on every release. Refusing only the old ones
+        # there would report a version problem for something the new ones do
+        # not do either.
+        if (
+            self._plugins
+            and self._orchestrator is None
+            and not _STRANDS_ACCEPTS_PLUGINS
+        ):
+            raise TypeError(
+                "plugins= was supplied, but the installed strands-agents "
+                f"({distribution_version('strands-agents')}) has no `plugins` "
+                "parameter on Agent, so they cannot be forwarded to per-thread "
+                "agents. Upgrade strands-agents to a release that supports "
+                "plugins, or drop the argument."
+            )
 
         self.name = name
         self.description = description

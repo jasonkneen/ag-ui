@@ -23,6 +23,7 @@ import logging
 import types
 import typing
 import warnings
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,6 +33,8 @@ from strands.tools.registry import ToolRegistry
 from ag_ui_strands.agent import (
     StrandsAgent,
     _AGUI_EXPLICIT_PARAMS,
+    _STRANDS_ACCEPTS_PLUGINS,
+    _template_plugin_names,
     _extract_agent_kwargs,
     _forwardable_parameters,
     _references_agent,
@@ -42,29 +45,23 @@ from ag_ui_strands.agent import (
 )
 
 
-# The plugin system arrived after the declared strands-agents floor, and the
-# floor is one of the lanes this suite runs in. Probed as a capability rather
-# than a version so the gate tracks the feature itself.
-#
-# This is not the skip the module docstring rules out. That one is about a
-# param the installed SDK has and this suite finds awkward; here the SDK has no
-# plugins at all, so there is no setting to carry and nothing to be silent
-# about.
+# Only the one test below that drives a real ``strands.Agent`` with a real
+# plugin needs the SDK's plugin system. Everything else here exercises the
+# adapter's own reading, reporting and forwarding, which are the adapter's
+# code on every release, so those tests run at the declared strands-agents
+# floor too. Keeping the gate that narrow is deliberate: a skip at the floor
+# is a version of this package nobody checked.
 try:
     from strands.plugins import Plugin as _StrandsPlugin
 except ImportError:  # pragma: no cover - depends on the installed SDK
     _StrandsPlugin = None
 
-_NO_PLUGIN_SUPPORT = (
-    _StrandsPlugin is None
-    or "plugins" not in inspect.signature(Agent.__init__).parameters
+_needs_sdk_plugins = pytest.mark.skipif(
+    _StrandsPlugin is None or not _STRANDS_ACCEPTS_PLUGINS,
+    reason="this strands-agents release has no plugin system to drive",
 )
-_needs_plugins = pytest.mark.skipif(
-    _NO_PLUGIN_SUPPORT,
-    reason="this strands-agents release has no plugin system to carry",
-)
-# Subclassable stand-in so the plugin classes below still import on a release
-# without them. Every test that touches one is skipped there.
+# Subclassable stand-in so the plugin class below still imports on a release
+# without them. The single test that touches it is skipped there.
 _PluginBase = _StrandsPlugin if _StrandsPlugin is not None else object
 
 
@@ -978,26 +975,59 @@ async def test_no_warning_for_a_param_the_hook_supplies(caplog):
 # second agent, so a plugin set on the template never runs against the agents
 # that serve requests. The adapter answers that with a dedicated kwarg, and
 # tells anyone who used the template instead.
+#
+# Most of what follows is the adapter reading, reporting and forwarding, none
+# of which needs a real plugin. Those tests use a synthetic registry and plain
+# sentinels, the way the resolver tests above already do, so they run on every
+# supported release rather than only the ones new enough to have plugins.
 
 
-class _CountingPlugin(_PluginBase):
-    """Records how many agents it was initialized against."""
+class _FakePluginRegistry:
+    """A plugin registry in the shape the adapter reads.
 
-    name = "counting-plugin"
+    Bound to its agent by weak reference and keyed by plugin name, which is
+    what a real ``_PluginRegistry`` is. Built here rather than by constructing
+    a real Agent with plugins so these tests still run at the declared
+    strands-agents floor, which has no plugin system at all.
+    """
 
-    def __init__(self):
-        super().__init__()
-        self.agents: list = []
+    def __init__(self, owner, plugins: dict):
+        self._agent_ref = weakref.ref(owner)
+        self._plugins = dict(plugins)
 
-    def init_agent(self, agent):
-        self.agents.append(agent)
+
+class _NamedPlugin:
+    """The only thing the adapter reads off a plugin is its name."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+def _template_with_plugins(*names: str):
+    """A real Agent carrying a registry of caller plugins under those names."""
+    agent = Agent(model=_mock_model())
+    agent._plugin_registry = _FakePluginRegistry(
+        agent, {name: _NamedPlugin(name) for name in names}
+    )
+    return agent
 
 
 def _plugin_warnings(messages: list[str]) -> list[str]:
     return [m for m in messages if "plugins" in m]
 
 
-@_needs_plugins
+def _as_if_sdk_took_plugins():
+    """Assert the forwarding on a release whose real Agent would refuse it.
+
+    The per-thread core is a stub in these tests, and a stub takes any kwarg.
+    What stands between them and running at the declared floor is the wrap-time
+    capability check, so declaring the capability is the whole adaptation. It
+    says out loud what the stub already assumes, which is better than skipping
+    and leaving the adapter's own forwarding logic unasserted on that release.
+    """
+    return patch("ag_ui_strands.agent._STRANDS_ACCEPTS_PLUGINS", True)
+
+
 @pytest.mark.asyncio
 async def test_template_plugins_are_named_when_a_thread_is_built(caplog):
     """The silence this closes: plugins on the template, and no plugins anywhere.
@@ -1007,8 +1037,7 @@ async def test_template_plugins_are_named_when_a_thread_is_built(caplog):
     the worst of the two failure modes: nothing to notice and nothing to
     search for.
     """
-    template = Agent(model=_mock_model(), plugins=[_CountingPlugin()])
-    ag = StrandsAgent(template, name="test")
+    ag = StrandsAgent(_template_with_plugins("mine"), name="test")
 
     with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
         with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
@@ -1020,7 +1049,6 @@ async def test_template_plugins_are_named_when_a_thread_is_built(caplog):
     )
 
 
-@_needs_plugins
 @pytest.mark.asyncio
 async def test_an_agent_with_no_caller_plugins_says_nothing(caplog):
     """Strands registers plugins of its own on every Agent.
@@ -1042,7 +1070,23 @@ async def test_an_agent_with_no_caller_plugins_says_nothing(caplog):
     )
 
 
-@_needs_plugins
+def test_the_sdks_own_plugins_are_not_read_as_the_callers():
+    """The filter that keeps the warning off every caller, asserted directly.
+
+    Driven against a synthetic registry so it states the rule rather than
+    whichever built-ins the installed release happens to register.
+    """
+    agent = Agent(model=_mock_model())
+    agent._plugin_registry = _FakePluginRegistry(
+        agent,
+        {"strands:model": _NamedPlugin("strands:model"), "mine": _NamedPlugin("mine")},
+    )
+
+    assert _template_plugin_names(agent) == ["mine"], (
+        "expected only the caller's plugin to be reported as uncarried"
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_plugins_warning_when_the_explicit_kwarg_supplies_them(caplog):
     """Acting on the warning has to make it stop.
@@ -1050,12 +1094,14 @@ async def test_no_plugins_warning_when_the_explicit_kwarg_supplies_them(caplog):
     The kwarg is what the message asks for, so a caller who has already used
     it must not keep hearing about the template.
     """
-    template = Agent(model=_mock_model(), plugins=[_CountingPlugin()])
-    ag = StrandsAgent(template, name="test", plugins=[_CountingPlugin()])
+    with _as_if_sdk_took_plugins():
+        ag = StrandsAgent(
+            _template_with_plugins("on-template"), name="test", plugins=[object()]
+        )
 
-    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
-        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
-            await _trigger_thread_creation(ag, "t1")
+        with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+            with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+                await _trigger_thread_creation(ag, "t1")
 
     assert not _plugin_warnings(caplog.messages), (
         f"warned about plugins the caller had already supplied; "
@@ -1063,12 +1109,10 @@ async def test_no_plugins_warning_when_the_explicit_kwarg_supplies_them(caplog):
     )
 
 
-@_needs_plugins
 @pytest.mark.asyncio
 async def test_plugins_are_only_warned_about_once(caplog):
     """One thread's message must not become every thread's message."""
-    template = Agent(model=_mock_model(), plugins=[_CountingPlugin()])
-    ag = StrandsAgent(template, name="test")
+    ag = StrandsAgent(_template_with_plugins("mine"), name="test")
 
     with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
         with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
@@ -1084,12 +1128,10 @@ async def test_plugins_are_only_warned_about_once(caplog):
     )
 
 
-@_needs_plugins
 @pytest.mark.asyncio
 async def test_the_plugins_warning_points_at_the_kwarg_that_fixes_it():
     """A message naming the problem and not the route is half a message."""
-    template = Agent(model=_mock_model(), plugins=[_CountingPlugin()])
-    ag = StrandsAgent(template, name="test")
+    ag = StrandsAgent(_template_with_plugins("mine"), name="test")
 
     with patch.object(logging.getLogger("ag_ui_strands.agent"), "warning") as warn:
         with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
@@ -1103,16 +1145,20 @@ async def test_the_plugins_warning_points_at_the_kwarg_that_fixes_it():
     )
 
 
-@_needs_plugins
 @pytest.mark.asyncio
 async def test_plugins_kwarg_reaches_the_per_thread_agent():
-    """The forwarding half: what the caller passes is what the thread gets."""
-    plugin = _CountingPlugin()
-    template = Agent(model=_mock_model())
-    ag = StrandsAgent(template, name="test", plugins=[plugin])
+    """The forwarding half: what the caller passes is what the thread gets.
 
-    with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
-        instance = await _trigger_thread_creation(ag, "t1")
+    A sentinel rather than a real plugin, because the adapter's job here is to
+    hand the list on unexamined. What a real plugin then does with a real
+    Agent is asserted separately below.
+    """
+    plugin = object()
+    with _as_if_sdk_took_plugins():
+        ag = StrandsAgent(Agent(model=_mock_model()), name="test", plugins=[plugin])
+
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            instance = await _trigger_thread_creation(ag, "t1")
 
     assert "plugins" in instance.init_kwargs, (
         f"plugins kwarg never reached the per-thread constructor; "
@@ -1124,7 +1170,6 @@ async def test_plugins_kwarg_reaches_the_per_thread_agent():
     )
 
 
-@_needs_plugins
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "plugins_value",
@@ -1149,13 +1194,49 @@ async def test_a_falsy_plugins_value_omits_the_kwarg(plugins_value):
     )
 
 
-@_needs_plugins
+def test_plugins_on_a_release_without_them_is_refused_at_wrap_time():
+    """A release below the plugin system gets an answer, not a traceback.
+
+    The declared strands-agents floor has no ``plugins`` parameter at all.
+    Left alone, the kwarg reached that constructor and Strands raised a bare
+    TypeError from inside per-thread construction, which escapes the run
+    generator: the caller saw an SDK traceback on their first request rather
+    than a sentence about the argument they passed. Refusing while the wrapper
+    is being built says it once, at the point the mistake was made.
+    """
+    template = Agent(model=_mock_model())
+
+    with patch("ag_ui_strands.agent._STRANDS_ACCEPTS_PLUGINS", False):
+        with pytest.raises(TypeError, match="plugins"):
+            StrandsAgent(template, name="test", plugins=[object()])
+
+        # Not asking for the feature is not a misconfiguration, so the same
+        # release must still build a wrapper that never mentions plugins.
+        StrandsAgent(template, name="test")
+        StrandsAgent(template, name="test", plugins=[])
+
+
+class _CountingPlugin(_PluginBase):
+    """Records which agents it was initialized against."""
+
+    name = "counting-plugin"
+
+    def __init__(self):
+        super().__init__()
+        self.agents: list = []
+
+    def init_agent(self, agent):
+        self.agents.append(agent)
+
+
+@_needs_sdk_plugins
 @pytest.mark.asyncio
 async def test_a_forwarded_plugin_is_initialized_once_per_thread():
     """The assertion that outranks the kwarg plumbing.
 
-    Run against the real ``strands.Agent``: what a plugin is for is the work
-    it does in ``init_agent``, and that has to happen against each agent that
+    The one test here that needs the SDK's real plugin system, and the reason
+    it is worth a skip on older releases: what a plugin is for is the work it
+    does in ``init_agent``, and that has to happen against each agent that
     serves requests. Once per thread and against that thread's own agent is
     the whole contract; the kwarg is only how it gets there.
     """
