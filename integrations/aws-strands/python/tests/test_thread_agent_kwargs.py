@@ -11,6 +11,8 @@ Mirrors the TypeScript ``threadAgentConfig`` suite.
 
 from __future__ import annotations
 
+import inspect
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -174,3 +176,104 @@ async def test_hook_failure_ends_the_run_and_leaves_the_thread_uncached():
         async for _ in ag.run(_run_input()):
             pass
     assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# plugins
+# ---------------------------------------------------------------------------
+#
+# ``plugins`` has a dedicated kwarg on the adapter, so it reaches this hook
+# with something already in the box. Three sources can name it at once: the
+# template, which cannot carry; the kwarg; and this hook. These fix the order
+# between them, and fix that using either route silences the warning about
+# the template.
+
+
+# Gated on the SDK having a plugin system at all: it arrived after the declared
+# strands-agents floor, and the floor is one of the lanes this suite runs in.
+try:
+    from strands.plugins import Plugin as _StrandsPlugin
+except ImportError:  # pragma: no cover - depends on the installed SDK
+    _StrandsPlugin = None
+
+_needs_plugins = pytest.mark.skipif(
+    _StrandsPlugin is None
+    or "plugins" not in inspect.signature(Agent.__init__).parameters,
+    reason="this strands-agents release has no plugin system to carry",
+)
+_PluginBase = _StrandsPlugin if _StrandsPlugin is not None else object
+
+
+class _NamedPlugin(_PluginBase):
+    def __init__(self, name: str):
+        self._name = name
+        super().__init__()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def init_agent(self, agent):
+        pass
+
+
+@_needs_plugins
+@pytest.mark.asyncio
+async def test_the_hook_can_supply_plugins():
+    """The general route still works for the param that gained a kwarg.
+
+    A caller who wants a plugin built per thread, rather than one instance
+    shared by every thread, has nowhere else to do it.
+    """
+    plugin = _NamedPlugin("from-hook")
+    template = Agent(model=_mock_model())
+    config = StrandsAgentConfig(thread_agent_kwargs=lambda _input: {"plugins": [plugin]})
+    ag = StrandsAgent(template, name="test", config=config)
+
+    await _build(ag)
+
+    assert _CapturingCore.instances[-1].init_kwargs["plugins"] == [plugin]
+
+
+@_needs_plugins
+@pytest.mark.asyncio
+async def test_hook_plugins_win_over_the_adapter_kwarg():
+    """Same precedence every other param has, and for the same reason.
+
+    The hook sees the request; the constructor kwarg was fixed once at
+    startup. Whichever knows more about this thread should be the one that
+    decides, so the later writer wins.
+    """
+    from_ctor = _NamedPlugin("from-ctor")
+    from_hook = _NamedPlugin("from-hook")
+    template = Agent(model=_mock_model())
+    config = StrandsAgentConfig(
+        thread_agent_kwargs=lambda _input: {"plugins": [from_hook]}
+    )
+    ag = StrandsAgent(template, name="test", plugins=[from_ctor], config=config)
+
+    await _build(ag)
+
+    assert _CapturingCore.instances[-1].init_kwargs["plugins"] == [from_hook]
+
+
+@_needs_plugins
+@pytest.mark.asyncio
+async def test_no_warning_about_template_plugins_the_hook_supplies(caplog):
+    """Acting on the warning through this route has to make it stop too.
+
+    The message names the constructor kwarg, but the hook answers it just as
+    completely, and a caller who took that route has lost nothing.
+    """
+    template = Agent(model=_mock_model(), plugins=[_NamedPlugin("on-template")])
+    config = StrandsAgentConfig(
+        thread_agent_kwargs=lambda _input: {"plugins": [_NamedPlugin("from-hook")]}
+    )
+    ag = StrandsAgent(template, name="test", config=config)
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        await _build(ag)
+
+    assert not [m for m in caplog.messages if "plugins" in m], (
+        f"warned about plugins the hook supplied; got {caplog.messages}"
+    )
