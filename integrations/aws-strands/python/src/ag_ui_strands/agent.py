@@ -10,6 +10,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import collections.abc
 from copy import deepcopy
 import types
@@ -872,7 +873,12 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> Tuple[list, bool]:
     return [], False
 
 
-def _interrupt_session_required_error() -> "RunErrorEvent":
+# ``usage`` is optional because both of these are raised from two places: a
+# preflight gate, which has no model call behind it, and the post-stream gate,
+# which does.
+def _interrupt_session_required_error(
+    usage: "List[TokenUsage] | None" = None,
+) -> "RunErrorEvent":
     return RunErrorEvent(
         type=EventType.RUN_ERROR,
         message=(
@@ -880,10 +886,13 @@ def _interrupt_session_required_error() -> "RunErrorEvent":
             "interrupt checkpoint"
         ),
         code="INTERRUPT_SESSION_REQUIRED",
+        usage=usage,
     )
 
 
-def _interrupt_session_capability_error() -> "RunErrorEvent":
+def _interrupt_session_capability_error(
+    usage: "List[TokenUsage] | None" = None,
+) -> "RunErrorEvent":
     return RunErrorEvent(
         type=EventType.RUN_ERROR,
         message=(
@@ -892,6 +901,7 @@ def _interrupt_session_capability_error() -> "RunErrorEvent":
             "list_messages() and update_message()"
         ),
         code="INTERRUPT_SESSION_CAPABILITY_ERROR",
+        usage=usage,
     )
 
 
@@ -1341,7 +1351,9 @@ from ag_ui.core import (
     ToolCallResultEvent,
     ToolCallStartEvent,
     ToolMessage,
+    TokenUsage,
     UserMessage,
+    aggregate_token_usage,
 )
 
 from ag_ui_a2ui_toolkit import split_a2ui_schema_context
@@ -1395,6 +1407,149 @@ from .utils import (
     dumps_wire,
     flatten_content_to_text,
 )
+
+
+# The largest token count every AG-UI binding can carry. Proto int64 reaches
+# further, but the TypeScript protobuf decoder stops at MAX_SAFE_INTEGER, so
+# that is the real ceiling. Mirrors the SDK's own limit.
+_MAX_TOKEN_COUNT = 2**53 - 1
+
+# Strands ``Usage`` (camelCase) -> AG-UI ``TokenUsage`` (snake_case).
+# ``cacheWriteInputTokens`` is absent on purpose: AG-UI has no slot for it and
+# folding it into a neighbouring count would overstate that count. Strands
+# reports no reasoning-token count at all, so ``reasoning_tokens`` is never set
+# from this channel.
+_STRANDS_USAGE_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("input_tokens", "inputTokens"),
+    ("output_tokens", "outputTokens"),
+    ("total_tokens", "totalTokens"),
+    ("cached_input_tokens", "cacheReadInputTokens"),
+)
+
+# Model class name -> canonical provider label, shared verbatim with the
+# TypeScript bridge so one vendor reports one label whichever bridge served the
+# run. A table rather than a derivation from the class name because the two
+# SDKs do not name these classes identically: Python's Google model is
+# ``GeminiModel`` while the TypeScript one lives under ``models/google``, and a
+# derived label would silently split that vendor in two. A class not listed
+# here omits the provider label rather than guessing.
+_STRANDS_PROVIDER_LABELS: Dict[str, str] = {
+    "AnthropicModel": "anthropic",
+    "BedrockModel": "bedrock",
+    "GeminiModel": "google",
+    "LiteLLMModel": "litellm",
+    "LlamaAPIModel": "llamaapi",
+    "LlamaCppModel": "llamacpp",
+    "MistralModel": "mistral",
+    "OllamaModel": "ollama",
+    "OpenAIModel": "openai",
+    "SageMakerAIModel": "sagemaker",
+    "WriterModel": "writer",
+}
+
+
+def _usage_count(value: Any) -> "int | None":
+    """Accept a provider count only if the wire can carry it, else drop it.
+
+    Providers do report strings, ``None``s and ``NaN``s next to their counts,
+    and ``TokenUsage`` validates ``ge=0`` in the producer's own constructor: an
+    unguarded value would raise while BUILDING the terminal event and cost the
+    caller a whole successful run over one token count. Dropping the count
+    keeps the rest of the entry.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # ``bool`` subclasses ``int``, and ``True`` is not a token count.
+        return None
+    if isinstance(value, int):
+        # Settled before any float check: ``math.isfinite`` coerces to float
+        # and raises OverflowError on a large int, which would abort the run
+        # from inside the guard that exists to protect it.
+        return value if 0 <= value <= _MAX_TOKEN_COUNT else None
+    if not math.isfinite(value):
+        return None
+    if value < 0 or value > _MAX_TOKEN_COUNT or int(value) != value:
+        return None
+    return int(value)
+
+
+def _model_usage_labels(model: Any) -> "Tuple[str | None, str | None]":
+    """Provider and model labels for a Strands model instance.
+
+    Read defensively at every step. ``get_config`` belongs to the integrator on
+    a custom model, so it may be missing, may raise, and may return something
+    that is not a mapping. A label that cannot be read is omitted; it never
+    fails the run.
+    """
+    if model is None:
+        return None, None
+    provider = _STRANDS_PROVIDER_LABELS.get(type(model).__name__)
+    get_config = getattr(model, "get_config", None)
+    config: Any = None
+    if callable(get_config):
+        try:
+            config = get_config()
+        except Exception:
+            logger.debug("model get_config failed while labelling usage", exc_info=True)
+    model_id = _plain_mapping(config).get("model_id")
+    return provider, model_id if isinstance(model_id, str) and model_id else None
+
+
+def _record_metadata_usage(
+    entries: List[Any], metadata_holder: Any, model: Any
+) -> None:
+    """Append this metadata event's usage, when it reports a usable count.
+
+    Strands emits one metadata event per model invocation, so a multi-cycle run
+    accumulates one entry per call and they are folded into one entry per
+    (provider, model) at the terminal event. Read from this channel rather than
+    ``AgentResult.metrics.accumulated_usage``, which is pre-summed and seeded
+    with zeros and so cannot tell "the provider reported nothing" apart from
+    "the provider reported zero".
+
+    Only counts and the two labels are copied: ``TokenUsage`` feeds anonymous
+    telemetry, so no prompt, completion, trace or latency may ride along.
+    """
+    usage = _plain_mapping(_plain_mapping(metadata_holder).get("metadata")).get("usage")
+    counts = {
+        agui_key: _usage_count(_plain_mapping(usage).get(strands_key))
+        for agui_key, strands_key in _STRANDS_USAGE_FIELDS
+    }
+    if all(value is None for value in counts.values()):
+        # A labels-only entry is not usage. Adding nothing keeps an unreported
+        # run's field omitted rather than present as zeros.
+        return
+    provider, model_id = _model_usage_labels(model)
+    fields: Dict[str, Any] = {
+        key: value for key, value in counts.items() if value is not None
+    }
+    if provider is not None:
+        fields["provider"] = provider
+    if model_id is not None:
+        fields["model"] = model_id
+    entries.append(TokenUsage(**fields))
+
+
+def _collect_run_usage(entries: Sequence[Any]) -> "List[TokenUsage] | None":
+    """Fold a run's per-call entries into its terminal event's ``usage``.
+
+    ``None`` (an omitted field) when nothing was reported, so a consumer reads
+    a missing field as "not measured" rather than as zero. Aggregation is the
+    SDK's shared helper, so both bridges emit the same shape.
+    """
+    return aggregate_token_usage(list(entries)) or None
+
+
+def _orchestrator_node_model(orchestrator: Any, node_id: Any) -> Any:
+    """The model behind an orchestrator node, for usage labelling.
+
+    The metadata event carries no agent handle, but the node id it arrives
+    under does resolve: Graph and Swarm both key ``nodes`` by id and hold the
+    leaf on ``executor``. A nested orchestrator resolves to the inner Graph or
+    Swarm instead, which has no model, so those entries stay label-less and
+    still aggregate truthfully.
+    """
+    node = _plain_mapping(getattr(orchestrator, "nodes", None)).get(node_id)
+    return getattr(getattr(node, "executor", node), "model", None)
 
 
 def _resume_fingerprint(resume_entries: list[ResumeEntry]) -> str:
@@ -3311,6 +3466,10 @@ class StrandsAgent:
         # Native interrupts raised during this run, reported on RUN_FINISHED so
         # the client knows the run paused rather than completed.
         native_interrupts: List[Any] = []
+        # Provider-reported usage, one entry per model call in the order the
+        # nodes reported it. Local to this generator, so a second sequential
+        # run cannot inherit the first run's counts.
+        run_usage: List[Any] = []
         # Leaf conversation state to rewind to when this run does not pause.
         baseline: "List[Tuple[list, list]] | None" = None
         # Set only once an interrupt outcome has actually been committed. While
@@ -3496,6 +3655,15 @@ class StrandsAgent:
                           node_id, inner = _unwrap_multiagent_node_stream(event)
                           if inner is None:
                               continue
+                          # A node's model reports usage on the same metadata
+                          # event the single-agent loop reads, one wrapper
+                          # deeper. Labelled from the node that raised it, so a
+                          # multi-model orchestrator keeps its models apart.
+                          _record_metadata_usage(
+                              run_usage,
+                              inner.get("event"),
+                              _orchestrator_node_model(orchestrator, node_id),
+                          )
                           if inner.get("data"):
                               for text_event in nodes.text(node_id, inner["data"]):
                                   yield text_event
@@ -3550,6 +3718,9 @@ class StrandsAgent:
                   thread_id=input_data.thread_id,
                   run_id=input_data.run_id,
                   outcome=outcome,
+                  # An interrupted run is a finished run for usage purposes:
+                  # the model calls its nodes already made were real.
+                  usage=_collect_run_usage(run_usage),
               )
           except Exception as e:
               code = _terminal_error_code(e)
@@ -3561,7 +3732,12 @@ class StrandsAgent:
               for closing in _close_open_multiagent(nodes, open_steps, failed=True):
                   yield closing
               yield RunErrorEvent(
-                  type=EventType.RUN_ERROR, message=str(e), code=code
+                  type=EventType.RUN_ERROR,
+                  message=str(e),
+                  code=code,
+                  # Partial usage: a node that failed after earlier nodes
+                  # completed still spent their tokens.
+                  usage=_collect_run_usage(run_usage),
               )
         finally:
             # Runs for normal completion, exceptions, cancellation and
@@ -4369,6 +4545,13 @@ class StrandsAgent:
             _resume_prompt = interrupt_responses
             # Bookkeeping is cleared only after successful processing below so
             # reconciliation failures leave the checkpoint retryable.
+
+        # Provider-reported usage, one entry per model call in the order the
+        # stream reported it, folded into the terminal event below. Local to
+        # this generator, so a second sequential run starts from nothing.
+        # Declared out here rather than inside the guarded body because the
+        # error paths that report partial usage are its ``except`` clauses.
+        run_usage: List[Any] = []
 
         # ── Start run ─────────────────────────────────────────────────────
         # Start run
@@ -6543,6 +6726,15 @@ class StrandsAgent:
                                         pending_halt = True
 
                         elif "metadata" in inner_event:
+                            # One event per model invocation, so a run that
+                            # loops through several tool cycles accumulates one
+                            # entry per call. Still forwarded as RAW below: the
+                            # metrics and trace this carries are not usage.
+                            _record_metadata_usage(
+                                run_usage,
+                                inner_event,
+                                getattr(strands_agent, "model", None),
+                            )
                             raw_payload = _sanitize_raw_event(
                                 event, run_invocation_state
                             )
@@ -6707,6 +6899,9 @@ class StrandsAgent:
                     type=EventType.RUN_ERROR,
                     message=force_stop_error,
                     code="STRANDS_FORCE_STOP",
+                    # Partial usage: a forced stop lands after the cycles that
+                    # got that far had already been paid for.
+                    usage=_collect_run_usage(run_usage),
                 )
                 return
 
@@ -6715,12 +6910,16 @@ class StrandsAgent:
             # repository boundary needed for a safe resume is available.
             if active_proxy_placeholder_ids(strands_agent):
                 if session_manager is None:
-                    yield _interrupt_session_required_error()
+                    yield _interrupt_session_required_error(
+                        _collect_run_usage(run_usage)
+                    )
                     return
                 if not _supports_repository_reconciliation(
                     session_manager, strands_agent
                 ):
-                    yield _interrupt_session_capability_error()
+                    yield _interrupt_session_capability_error(
+                        _collect_run_usage(run_usage)
+                    )
                     return
 
             # Final state snapshot before finishing
@@ -6769,6 +6968,9 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                     outcome=pending_interrupt_outcome,
+                    # An interrupted run is a finished run for usage purposes:
+                    # the model calls it already made were real.
+                    usage=_collect_run_usage(run_usage),
                 )
             else:
                 # Store fingerprint for idempotency only after successful
@@ -6794,6 +6996,7 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                     outcome=RunFinishedSuccessOutcome(type="success"),
+                    usage=_collect_run_usage(run_usage),
                 )
 
         except _FrontendToolIdentityError as e:
@@ -6801,6 +7004,7 @@ class StrandsAgent:
                 type=EventType.RUN_ERROR,
                 message=str(e),
                 code="FRONTEND_TOOL_IDENTITY_ERROR",
+                usage=_collect_run_usage(run_usage),
             )
         except Exception as e:
             import traceback
@@ -6808,5 +7012,11 @@ class StrandsAgent:
             code = _terminal_error_code(e)
             traceback.print_exc()
             yield RunErrorEvent(
-                type=EventType.RUN_ERROR, message=str(e), code=code
+                type=EventType.RUN_ERROR,
+                message=str(e),
+                code=code,
+                # Partial usage: a run that failed after one or more model
+                # calls still spent those tokens. Omitted when it died before
+                # any call reported usage.
+                usage=_collect_run_usage(run_usage),
             )
