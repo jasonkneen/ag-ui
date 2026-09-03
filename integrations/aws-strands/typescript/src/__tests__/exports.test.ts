@@ -21,6 +21,8 @@ describe("public export surface", () => {
       "isProxyTool",
       "syncTemplateTools",
       "parkedBatchToolNames",
+      "DEFAULT_URL_FETCH_POLICY",
+      "UrlFetchPolicyError",
     ];
     for (const name of expected) {
       expect(pkg).toHaveProperty(name);
@@ -55,6 +57,17 @@ describe("public export surface", () => {
     for (const name of serverOnly) {
       expect(pkg).not.toHaveProperty(name);
     }
+  });
+
+  it("keeps the internal URL-fetch error off the public surface", () => {
+    // The public class is the refusal a host can act on. Its counterpart,
+    // UrlFetchUnavailableError, separates "could not reach a verdict" from
+    // "refused" inside the fetch, and both are already turned into a logged
+    // `null` before any caller sees either. The Python package exports no
+    // equivalent, so exporting one here would be a surface the two adapters
+    // do not share.
+    expect(pkg).toHaveProperty("UrlFetchPolicyError");
+    expect(pkg).not.toHaveProperty("UrlFetchUnavailableError");
   });
 
   it("exports the cancellation sentinel with the same shape as the Python package", () => {

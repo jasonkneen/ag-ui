@@ -25,6 +25,7 @@ import {
 } from "@strands-agents/sdk";
 import {
   EventType,
+  aggregateTokenUsage,
   type AssistantMessage as AguiAssistantMessage,
   type BaseEvent,
   type Interrupt as AguiInterrupt,
@@ -32,6 +33,7 @@ import {
   type Message as AguiMessage,
   type ResumeEntry,
   type RunAgentInput,
+  type TokenUsage,
   type ToolCall as AguiToolCall,
   type ToolMessage as AguiToolMessage,
   type UserMessage as AguiUserMessage,
@@ -64,6 +66,7 @@ import {
 import {
   _buildToolResultContent,
   _coerceText,
+  assertUsablePolicy,
   convertAguiContentToStrands,
   convertAguiContentToStrandsDetailed,
   createUrlFetchCache,
@@ -84,6 +87,11 @@ import {
 } from "./session-reconcile";
 import type { PendingFrontendResult } from "./session-reconcile";
 import { DEFAULT_LOGGER, resolveLogger, type Logger } from "./logger";
+import {
+  strandsModelIdentity,
+  tokenUsageFromStrandsUsage,
+  type StrandsModelIdentity,
+} from "./token-usage";
 
 // `_buildToolResultContent` lives in ./utils so reconciliation can build the
 // same content without importing this module, which would be a cycle. This
@@ -443,10 +451,14 @@ class ForcedStop {
    *
    * A forced stop is a failed run, not a short success, so the caller returns
    * on these rather than falling through to STATE_SNAPSHOT and RUN_FINISHED.
+   *
+   * `usage` is the caller's accumulator rather than this reporter's own state:
+   * a forced stop is reached from inside the stream loop, so model calls it
+   * already made are real spend and travel with the failure.
    */
-  *emit(): Generator<BaseEvent, void, void> {
+  *emit(usage: TokenUsage[] = []): Generator<BaseEvent, void, void> {
     if (this._message === undefined) return;
-    yield _runError(this._message, FORCE_STOP_ERROR_CODE);
+    yield _runError(this._message, FORCE_STOP_ERROR_CODE, usage);
   }
 }
 
@@ -2138,9 +2150,12 @@ export class StrandsAgent {
    * Threads with an in-flight run. Strands `Agent.stream()` throws if a
    * second invocation is started on a busy agent; we detect the collision
    * up front and emit a protocol-shaped RUN_ERROR/THREAD_BUSY instead.
-   * Python guards the same collision with the same code and the same text,
-   * but only around an orchestrator, and keyed by thread only when a factory
-   * builds one per run; its single-agent path has no guard of its own.
+   * Python refuses the same per-thread collision before entering its own run
+   * body, with the same code and the same message text. It additionally
+   * guards a shared orchestrator instance across every thread, since such an
+   * instance cannot be multiplexed at all; that arm narrows back to per-thread
+   * when a callable builds a fresh orchestrator per run. It also refuses a run
+   * against an orchestrator parked at an interrupt.
    */
   private readonly _activeRunsByThread = new Set<string>();
   /** Outstanding AG-UI interrupt objects per thread, used to validate
@@ -2221,25 +2236,31 @@ export class StrandsAgent {
       );
     }
 
-    // Detect unconnected MCP clients passed directly into `tools: [...]`.
-    // Strands resolves a connected `McpClient`'s tools into `agent.tools` at
-    // construction time; an unconnected one stays as the bare client and the
-    // resolved tool list never appears here. The fix is on the caller's
-    // side: `await client.connect()` and spread `await client.listTools()`
-    // into the `tools` array.
-    for (const tool of this._templateFields.tools ?? []) {
-      if (
-        tool != null &&
-        typeof (tool as { connect?: unknown }).connect === "function" &&
-        typeof (tool as { name?: unknown }).name !== "string"
-      ) {
-        this._log.warn(
-          `${LOG_PREFIX} an entry in the template Agent's \`tools\` looks like ` +
-            "an unconnected McpClient — its tools will not be available to the " +
-            "model. Call `await client.connect()` and spread the resolved tool " +
-            "list into `tools: [...]` before constructing the Agent.",
-        );
-      }
+    // Detect MCP clients passed directly into `tools: [...]`, whose tools are
+    // therefore absent from the resolved list this adapter clones.
+    //
+    // Strands routes an `McpClient` out of `tools` into an internal client
+    // list rather than into the tool registry, and registers its tools only
+    // inside `Agent.initialize()`, which runs on the first invocation. The
+    // template Agent is never invoked, so the `agent.tools` list cloned onto
+    // every per-thread agent never gains them. Connecting the client first
+    // changes nothing, because `listTools()` connects lazily; the distinction
+    // is resolved-versus-unresolved, not connected-versus-unconnected.
+    //
+    // The client list is private, so it is read through `_readTemplateField`,
+    // which tries the public name before the underscore one and returns
+    // `undefined` rather than throwing when neither is there.
+    const templateMcpClients = _readTemplateField(agentCore, "mcpClients");
+    if (Array.isArray(templateMcpClients) && templateMcpClients.length > 0) {
+      this._log.warn(
+        `${LOG_PREFIX} the template Agent's \`tools\` holds ` +
+          `${templateMcpClients.length} McpClient ` +
+          `${templateMcpClients.length === 1 ? "entry" : "entries"} whose ` +
+          "tools are not in `agent.tools`, so they will not be available to " +
+          "the model. Resolve them yourself and spread the result in: " +
+          "`await client.connect()`, then `tools: [...(await " +
+          "client.listTools())]`. Drop the client from `tools` once you do.",
+      );
     }
   }
 
@@ -2763,7 +2784,42 @@ export class StrandsAgent {
     // remote attachment in the thread is downloaded once per conversion.
     const fetchCache = createUrlFetchCache();
 
-    const fetchOptions = { fetchCache, signal: runAbort.signal };
+    // Checked once here, not per attachment, and before the first fetch.
+    // `fetchUrlContent` refuses an unusable policy too, but the replay path
+    // converts inside a try/catch that reports a throw as "conversion failed;
+    // falling back to text", so a misconfigured adapter would otherwise show
+    // up as messages quietly stripped of their attachments, once per message,
+    // with the reason only in a log line. A configuration mistake belongs to
+    // the run, so it ends the run and says which field is wrong. The one thing
+    // it must never do is fall back to the default policy: that would ignore
+    // an intended restriction.
+    //
+    // Single-agent runs only. The orchestrator path takes text alone (see the
+    // prompt extraction in `_runOrchestrator`), so it fetches nothing and has
+    // no policy to check.
+    const urlFetchPolicy = this.config.urlFetchPolicy;
+    if (urlFetchPolicy !== undefined) {
+      try {
+        assertUsablePolicy(urlFetchPolicy);
+      } catch (e) {
+        const msg = _errorMessage(e);
+        this._log.error(
+          `${LOG_PREFIX} config.urlFetchPolicy is unusable: ${msg}`,
+          e,
+        );
+        yield _runError(
+          `Unusable urlFetchPolicy: ${msg}`,
+          "URL_FETCH_POLICY_INVALID",
+        );
+        return;
+      }
+    }
+
+    const fetchOptions = {
+      fetchCache,
+      signal: runAbort.signal,
+      urlFetchPolicy,
+    };
 
     // Get or create agent instance for this thread.
     const agentResult = await this._ensureAgent(
@@ -2882,6 +2938,21 @@ export class StrandsAgent {
         }`,
       );
     }
+
+    // Provider-reported usage, one entry per model call, aggregated onto this
+    // run's terminal event. A local rather than per-thread state, so it is
+    // seeded per run by construction: a second sequential run on the same
+    // thread enters this method again and cannot inherit the first's counts.
+    //
+    // Declared outside the try so the terminal RUN_ERROR in its catch reports
+    // the spend a failed run had already made.
+    const runUsage: TokenUsage[] = [];
+    // One read of the model's labels for the whole run: the per-thread agent's
+    // model is fixed for the invocation, and `modelMetadataEvent` carries usage
+    // without saying which model produced it.
+    const modelIdentity = strandsModelIdentity(
+      (strandsAgent as { model?: unknown }).model,
+    );
 
     try {
       // Seed the running ``MessagesSnapshotEvent`` payload from the full
@@ -4712,6 +4783,20 @@ export class StrandsAgent {
             continue;
           }
 
+          // Per-call token usage. One entry per model invocation, which is why
+          // this reads the metadata event rather than the terminal result's
+          // pre-summed `accumulatedUsage`. No `continue`: the same event is
+          // deliberately forwarded as RAW below, since its latency metrics have
+          // no AG-UI equivalent and dropping them would trade one report for
+          // another.
+          if (kind === "modelMetadataEvent") {
+            const entry = tokenUsageFromStrandsUsage(
+              (event as { usage?: unknown }).usage,
+              modelIdentity,
+            );
+            if (entry) runUsage.push(entry);
+          }
+
           // Terminal `AgentResult`. Mirrors Python's `"result" in event`
           // branch: a non-normal stop gets a hint event so a client can say
           // why an answer is short or empty, instead of the run reading as an
@@ -4879,7 +4964,7 @@ export class StrandsAgent {
       // Same code and same message as Python, and in the same position
       // relative to the closeout events above.
       if (forcedStop.pending) {
-        yield* forcedStop.emit();
+        yield* forcedStop.emit(runUsage);
         return;
       }
 
@@ -4903,7 +4988,7 @@ export class StrandsAgent {
         );
         _abandonUnadvertisedCheckpoint(strandsAgent);
         this._pendingInterruptsByThread.delete(threadId);
-        yield _interruptReconciliationError();
+        yield _interruptReconciliationError(runUsage);
         return;
       }
       // An exact stub the resume WILL repair still repairs only through the
@@ -4913,7 +4998,7 @@ export class StrandsAgent {
         if (!sessionManager) {
           _abandonUnadvertisedCheckpoint(strandsAgent);
           this._pendingInterruptsByThread.delete(threadId);
-          yield _interruptSessionRequiredError();
+          yield _interruptSessionRequiredError(runUsage);
           return;
         }
         if (
@@ -4925,7 +5010,7 @@ export class StrandsAgent {
         ) {
           _abandonUnadvertisedCheckpoint(strandsAgent);
           this._pendingInterruptsByThread.delete(threadId);
-          yield _interruptSessionCapabilityError();
+          yield _interruptSessionCapabilityError(runUsage);
           return;
         }
       }
@@ -4972,6 +5057,9 @@ export class StrandsAgent {
               `${LOG_PREFIX} Failed to persist interrupt snapshot: ${_errorMessage(e)}`,
             );
           }
+          // An interrupted run is a finished run as far as usage goes: the
+          // model calls that got it here were real, and the resume that
+          // continues the turn reports its own.
           yield {
             type: EventType.RUN_FINISHED,
             threadId: inputData.threadId,
@@ -4980,6 +5068,7 @@ export class StrandsAgent {
               type: "interrupt",
               interrupts: aguiInterrupts,
             },
+            ..._runUsage(runUsage),
           };
           return;
         }
@@ -5023,12 +5112,13 @@ export class StrandsAgent {
         threadId: inputData.threadId,
         runId: inputData.runId,
         outcome: { type: "success" },
+        ..._runUsage(runUsage),
         ...(pausedWithNothingToReport ? { [PAUSED_PARKED]: true } : {}),
       };
     } catch (e) {
       const code = _terminalErrorCode(e);
       this._log.error(`${LOG_PREFIX} _runSingleAgent failed:`, e);
-      yield _runError(_errorMessage(e), code);
+      yield _runError(_errorMessage(e), code, runUsage);
     }
   }
 
@@ -5289,6 +5379,20 @@ export class StrandsAgent {
     inputData: RunAgentInput,
     threadId: string,
   ): AsyncGenerator<BaseEvent, void, void> {
+    // Provider-reported usage for the whole orchestrator run, one entry per
+    // model call. Local, so it is seeded per run the same way the single-agent
+    // path's is, and declared outside the try so the terminal RUN_ERROR in its
+    // catch reports what the nodes that did run had already spent.
+    const runUsage: TokenUsage[] = [];
+    // Labels per node, since a Graph or Swarm can run a different model at each
+    // one and summing them together would report spend against a model that
+    // never made the call. A node's `beforeModelCallEvent` carries the `Model`
+    // and arrives before that node's `modelMetadataEvent`, which is the only
+    // place the pairing is available: the metadata event itself carries counts
+    // and nothing that identifies the model. Only the labels are kept, never
+    // the model object.
+    const nodeIdentities = new Map<string, StrandsModelIdentity>();
+
     yield _runStarted(inputData);
     try {
       const initialSnapshot = _stateSnapshotPayload(inputData.state);
@@ -5471,6 +5575,21 @@ export class StrandsAgent {
               }
               continue;
             }
+            if (innerKind === "beforeModelCallEvent") {
+              nodeIdentities.set(
+                ev.nodeId ?? "",
+                strandsModelIdentity((inner as { model?: unknown }).model),
+              );
+              continue;
+            }
+            if (innerKind === "modelMetadataEvent") {
+              const entry = tokenUsageFromStrandsUsage(
+                (inner as { usage?: unknown }).usage,
+                nodeIdentities.get(ev.nodeId ?? "") ?? {},
+              );
+              if (entry) runUsage.push(entry);
+              continue;
+            }
             if (innerKind === "modelContentBlockDeltaEvent") {
               const delta = (
                 inner as { delta?: { type?: string; text?: string } }
@@ -5556,11 +5675,14 @@ export class StrandsAgent {
         threadId: inputData.threadId,
         runId: inputData.runId,
         outcome: { type: "success" },
+        ..._runUsage(runUsage),
       };
     } catch (e) {
       const code = _terminalErrorCode(e);
       this._log.error(`${LOG_PREFIX} _runOrchestrator failed:`, e);
-      yield _runError(_errorMessage(e), code);
+      // A budget violation escapes mid-run, so the nodes that already ran
+      // report what they spent.
+      yield _runError(_errorMessage(e), code, runUsage);
     }
   }
 
@@ -5671,8 +5793,40 @@ function _runStarted(input: RunAgentInput): BaseEvent {
   };
 }
 
-function _runError(message: string, code: string): BaseEvent {
-  return { type: EventType.RUN_ERROR, message, code };
+/**
+ * A terminal failure, optionally carrying the usage the run had already
+ * accumulated.
+ *
+ * The counts are real spend whatever the run went on to do with them, so a
+ * failure after one or more model calls reports what it used. `usage` is passed
+ * only by the sites a model call can precede; everywhere else the default
+ * leaves the field off, which is what tells a consumer nothing was measured
+ * rather than that nothing was spent.
+ */
+function _runError(
+  message: string,
+  code: string,
+  usage: TokenUsage[] = [],
+): BaseEvent {
+  return {
+    type: EventType.RUN_ERROR,
+    message,
+    code,
+    ..._runUsage(usage),
+  };
+}
+
+/**
+ * The `usage` field for a terminal event, or nothing at all.
+ *
+ * Aggregated per `(provider, model)` through the published shared helper rather
+ * than a local sum, so every AG-UI producer groups identically. An empty result
+ * omits the field: `[]` and a zeroed entry both read as a measured zero, and
+ * "not measured" has to stay distinguishable from "measured as nothing".
+ */
+function _runUsage(entries: TokenUsage[]): { usage?: TokenUsage[] } {
+  const aggregated = aggregateTokenUsage(entries);
+  return aggregated.length > 0 ? { usage: aggregated } : {};
 }
 
 /**
@@ -5856,26 +6010,29 @@ function _continuationToolNameError(toolCallIds: string[]): BaseEvent {
   );
 }
 
-function _interruptReconciliationError(): BaseEvent {
+function _interruptReconciliationError(usage: TokenUsage[] = []): BaseEvent {
   return _runError(
     "Active interrupt tool result reconciliation failed",
     "INTERRUPT_RECONCILIATION_ERROR",
+    usage,
   );
 }
 
-function _interruptSessionRequiredError(): BaseEvent {
+function _interruptSessionRequiredError(usage: TokenUsage[] = []): BaseEvent {
   return _runError(
     "A SessionManager is required for a mixed frontend-proxy/native " +
       "interrupt checkpoint",
     "INTERRUPT_SESSION_REQUIRED",
+    usage,
   );
 }
 
-function _interruptSessionCapabilityError(): BaseEvent {
+function _interruptSessionCapabilityError(usage: TokenUsage[] = []): BaseEvent {
   return _runError(
     "Mixed frontend-proxy/native interrupt state requires a session manager " +
       "exposing saveSnapshot() and an agent exposing messages",
     "INTERRUPT_SESSION_CAPABILITY_ERROR",
+    usage,
   );
 }
 
