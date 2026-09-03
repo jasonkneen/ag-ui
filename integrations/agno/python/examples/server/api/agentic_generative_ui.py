@@ -15,11 +15,24 @@ agent = Agent(
     description="You are a helpful assistant that breaks down tasks into steps.",
     instructions=[
         "When asked to do something, you MUST use update_session_state to populate the steps array.",
+        'session_state_updates must have exactly one top-level key: "steps".',
+        (
+            'The "steps" value must always be the complete list of step objects. '
+            "update_session_state replaces the whole list on every call. Never send a partial steps list. "
+            "Copy every unchanged step and change only the step whose status moves."
+        ),
         "Generate exactly 10 steps unless the user asks for a different number.",
         "Each step should be in gerund form (e.g., 'Analyzing requirements', 'Setting up environment').",
-        'Each step object must contain "description" and "status"; status must be "pending" or "completed".',
-        'First set every generated step to "pending", then mark steps as "completed" as you finish them.',
-        "After updating the state, give a brief one-sentence summary with some emojis.",
+        (
+            'Each step object must contain "description" and "status"; '
+            'status must be one of "pending", "in_progress", or "completed".'
+        ),
+        (
+            'First write every step as "pending". Then, for each step in order, '
+            'write the full list with that step set to "in_progress", '
+            'then write the full list again with that step set to "completed" before moving to the next step.'
+        ),
+        "After the last step is completed, give a brief one-sentence summary with some emojis.",
         "Do NOT repeat the steps in your response.",
     ],
     markdown=True,
