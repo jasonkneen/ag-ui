@@ -104,6 +104,12 @@ export function scriptedAgent(
     model: { name: "stub-model", modelId: "stub-model" },
     tools: [],
     toolRegistry: registry,
+    // An inert hook registry, so a stub can take a run that carries
+    // `context[]`: the adapter refuses such a run on an agent with no
+    // `addHook`, because the context reaches the model only through a hook.
+    // Python's `_CapturingCore` carries a real `HookRegistry` for the same
+    // reason. Override with `addHook: undefined` to drive the refusal.
+    addHook: () => () => {},
     async *stream(_args: unknown) {
       for (const e of events) yield e;
     },
