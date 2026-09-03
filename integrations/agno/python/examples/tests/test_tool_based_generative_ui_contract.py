@@ -180,7 +180,7 @@ def _haiku_validator_results(function_name: str, values: list[str]) -> list[bool
     if "const SAFE_GRADIENT_INNER_FUNCTIONS" not in page:
         raise AssertionError("haiku validators are not defined")
     start = page.index("const SAFE_GRADIENT_INNER_FUNCTIONS")
-    end = page.index("\n\nconst HAIKU_LINE", start)
+    end = page.index("\n\n// A fresh instance per array", start)
     validators = page[start:end]
     validators = validators.replace("value: string", "value")
     validators = validators.replace("): boolean", ")")
@@ -317,8 +317,8 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         compact = re.sub(r"\s+", "", schema)
 
         self.assertEqual(fields, ["japanese", "english", "image_name", "gradient"])
-        self.assertIn("japanese:z.array(HAIKU_LINE).length(3)", compact)
-        self.assertIn("english:z.array(HAIKU_LINE).length(3)", compact)
+        self.assertIn("japanese:z.array(haikuLine()).length(3)", compact)
+        self.assertIn("english:z.array(haikuLine()).length(3)", compact)
         self.assertIn("image_name:z.enum(VALID_IMAGE_NAMES)", compact)
         self.assertIn("gradient:SAFE_GRADIENT", compact)
         self.assertRegex(schema, r"\}\)\s*\.strict\(\);$")
@@ -481,6 +481,24 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         self.assertIn("conic-gradient", gradient)
         self.assertIn("url", gradient)
         self.assertIs(schema["additionalProperties"], False)
+
+    def test_tool_json_schema_inlines_a_string_type_for_every_haiku_line(
+        self,
+    ) -> None:
+        cwd = _dojo_node_modules_root()
+        if cwd is None:
+            self.skipTest("dojo node_modules (zod, zod-to-json-schema) not installed")
+
+        schema = _haiku_tool_json_schema(cwd)
+        properties = schema["properties"]
+        assert isinstance(properties, dict)
+
+        self.assertNotIn('"$ref"', json.dumps(schema))
+        for name in ("japanese", "english"):
+            with self.subTest(field=name):
+                items = properties[name]["items"]
+                self.assertIsInstance(items, dict)
+                self.assertEqual(items["type"], "string")
 
 
 if __name__ == "__main__":

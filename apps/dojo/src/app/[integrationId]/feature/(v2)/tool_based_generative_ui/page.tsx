@@ -148,10 +148,14 @@ function isSafeGradient(value: string): boolean {
   return depth === 0 && css.slice(firstParen + 1, -1).trim().length > 0;
 }
 
-const HAIKU_LINE = z
-  .string()
-  .trim()
-  .refine(isNonBlankHaikuLine, "Haiku lines cannot be blank");
+// A fresh instance per array: zodToJsonSchema turns a reused Zod object into
+// a $ref, which some providers reject in tool parameters.
+function haikuLine() {
+  return z
+    .string()
+    .trim()
+    .refine(isNonBlankHaikuLine, "Haiku lines cannot be blank");
+}
 const SAFE_GRADIENT = z
   .string()
   .refine(
@@ -161,11 +165,11 @@ const SAFE_GRADIENT = z
 const HAIKU_SCHEMA = z
   .object({
     japanese: z
-      .array(HAIKU_LINE)
+      .array(haikuLine())
       .length(3)
       .describe("Exactly three lines of haiku in Japanese"),
     english: z
-      .array(HAIKU_LINE)
+      .array(haikuLine())
       .length(3)
       .describe("Exactly three lines of the haiku translated to English"),
     image_name: z
