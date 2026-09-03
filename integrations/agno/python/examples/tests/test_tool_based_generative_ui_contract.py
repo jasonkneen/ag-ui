@@ -32,6 +32,7 @@ AGENTIC_DOJO_PAGE = (
     / "agentic_generative_ui"
     / "page.tsx"
 )
+DOJO_FILES = REPO_ROOT / "apps" / "dojo" / "src" / "files.json"
 EXPECTED_IMAGE_NAMES = (
     "Osaka_Castle_Turret_Stone_Wall_Pine_Trees_Daytime.jpg",
     "Tokyo_Skyline_Night_Tokyo_Tower_Mount_Fuji_View.jpg",
@@ -79,6 +80,42 @@ def _agent_step_results(values: list[object]) -> list[bool]:
     return result
 
 
+def _generated_agentic_page() -> str:
+    catalog = json.loads(DOJO_FILES.read_text())
+    return next(
+        entry["content"]
+        for entry in catalog["agno::agentic_generative_ui"]
+        if entry["name"] == "page.tsx"
+    )
+
+
+def _task_progress_block(page: str) -> str:
+    start = page.index("function TaskProgress")
+    end = page.index("\n\n// Enhanced Icons", start)
+    return page[start:end]
+
+
+def _active_step_indices(step_lists: list[list[dict[str, str]]]) -> list[int]:
+    page = AGENTIC_DOJO_PAGE.read_text()
+    if "function resolveActiveStepIndex" not in page:
+        raise AssertionError("resolveActiveStepIndex is not defined")
+    start = page.index("function resolveActiveStepIndex")
+    end = page.index("\n\nconst Chat", start)
+    resolver = page[start:end].replace("(steps: AgentStep[]): number", "(steps)")
+    expression = (
+        "console.log(JSON.stringify("
+        f"{json.dumps(step_lists)}.map(resolveActiveStepIndex)))"
+    )
+    result = _run_javascript(resolver, expression)
+    if not isinstance(result, list) or not all(type(item) is int for item in result):
+        raise AssertionError("resolveActiveStepIndex did not return an int list")
+    return result
+
+
+def _step(description: str, status: str) -> dict[str, str]:
+    return {"description": description, "status": status}
+
+
 def _haiku_validator_results(function_name: str, values: list[str]) -> list[bool]:
     page = DOJO_PAGE.read_text()
     if "const SAFE_GRADIENT_INNER_FUNCTIONS" not in page:
@@ -117,6 +154,52 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         ]
 
         self.assertEqual(_agent_step_results(steps), [True, True, True, False])
+
+    def test_active_task_row_is_the_streamed_in_progress_step(self) -> None:
+        step_lists = [
+            [
+                _step("Plan", "pending"),
+                _step("Build", "in_progress"),
+                _step("Launch", "pending"),
+            ],
+            [
+                _step("Plan", "completed"),
+                _step("Build", "in_progress"),
+                _step("Launch", "pending"),
+            ],
+        ]
+
+        self.assertEqual(_active_step_indices(step_lists), [1, 1])
+
+    def test_active_task_row_falls_back_to_the_first_pending_step(self) -> None:
+        step_lists = [
+            [
+                _step("Plan", "completed"),
+                _step("Build", "pending"),
+                _step("Launch", "pending"),
+            ],
+            [_step("Plan", "pending"), _step("Build", "pending")],
+            [_step("Plan", "completed"), _step("Build", "completed")],
+            [],
+        ]
+
+        self.assertEqual(_active_step_indices(step_lists), [1, 0, -1, -1])
+
+    def test_task_progress_rows_follow_the_resolved_active_index(self) -> None:
+        pages = {
+            "source": AGENTIC_DOJO_PAGE.read_text(),
+            "generated": _generated_agentic_page(),
+        }
+
+        for label, page in pages.items():
+            with self.subTest(page=label):
+                block = _task_progress_block(page)
+                self.assertIn(
+                    "const activeStepIndex = resolveActiveStepIndex(steps);", block
+                )
+                self.assertIn("const isActive = index === activeStepIndex;", block)
+                self.assertNotIn("isCurrentPending", block)
+                self.assertNotIn("isFuturePending", block)
 
     def test_frontend_schema_is_the_strict_haiku_contract(self) -> None:
         block = _frontend_tool_block()

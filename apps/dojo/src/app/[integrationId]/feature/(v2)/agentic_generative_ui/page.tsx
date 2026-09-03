@@ -64,6 +64,16 @@ function normalizeAgentSteps(state: unknown): AgentStep[] {
   return state.steps.filter(isAgentStep);
 }
 
+function resolveActiveStepIndex(steps: AgentStep[]): number {
+  const inProgressIndex = steps.findIndex(
+    (step) => step.status === "in_progress",
+  );
+  if (inProgressIndex !== -1) {
+    return inProgressIndex;
+  }
+  return steps.findIndex((step) => step.status === "pending");
+}
+
 const Chat = () => {
   const { theme } = useTheme();
   const { agent } = useAgent({
@@ -123,6 +133,7 @@ function TaskProgress({
     (step) => step.status === "completed",
   ).length;
   const progressPercentage = (completedCount / steps.length) * 100;
+  const activeStepIndex = resolveActiveStepIndex(steps);
 
   return (
     <div className="flex justify-center w-full px-4">
@@ -167,11 +178,7 @@ function TaskProgress({
         <div className="space-y-2">
           {steps.map((step, index) => {
             const isCompleted = step.status === "completed";
-            const isCurrentPending =
-              step.status === "pending" &&
-              index === steps.findIndex((s) => s.status === "pending");
-            const isFuturePending =
-              step.status === "pending" && !isCurrentPending;
+            const isActive = index === activeStepIndex;
 
             return (
               <div
@@ -181,7 +188,7 @@ function TaskProgress({
                     ? theme === "dark"
                       ? "bg-gradient-to-r from-green-900/30 to-emerald-900/20 border border-green-500/30"
                       : "bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200/60"
-                    : isCurrentPending
+                    : isActive
                       ? theme === "dark"
                         ? "bg-gradient-to-r from-blue-900/40 to-purple-900/30 border border-blue-500/50 shadow-lg shadow-blue-500/20"
                         : "bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-200/60 shadow-md shadow-blue-200/50"
@@ -208,7 +215,7 @@ function TaskProgress({
                       ? theme === "dark"
                         ? "bg-gradient-to-br from-green-500 to-emerald-600 shadow-lg shadow-green-500/30"
                         : "bg-gradient-to-br from-green-500 to-emerald-600 shadow-md shadow-green-200"
-                      : isCurrentPending
+                      : isActive
                         ? theme === "dark"
                           ? "bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg shadow-blue-500/30"
                           : "bg-gradient-to-br from-blue-500 to-purple-600 shadow-md shadow-blue-200"
@@ -219,7 +226,7 @@ function TaskProgress({
                 >
                   {isCompleted ? (
                     <CheckIcon />
-                  ) : isCurrentPending ? (
+                  ) : isActive ? (
                     <SpinnerIcon />
                   ) : (
                     <ClockIcon theme={theme} />
@@ -235,7 +242,7 @@ function TaskProgress({
                         ? theme === "dark"
                           ? "text-green-300"
                           : "text-green-700"
-                        : isCurrentPending
+                        : isActive
                           ? theme === "dark"
                             ? "text-blue-300 text-base"
                             : "text-blue-700 text-base"
@@ -246,7 +253,7 @@ function TaskProgress({
                   >
                     {step.description}
                   </div>
-                  {isCurrentPending && (
+                  {isActive && (
                     <div
                       className={`text-sm mt-1 animate-pulse ${
                         theme === "dark" ? "text-blue-400" : "text-blue-600"
@@ -258,7 +265,7 @@ function TaskProgress({
                 </div>
 
                 {/* Animated Background for Current Step */}
-                {isCurrentPending && (
+                {isActive && (
                   <div
                     className={`absolute inset-0 rounded-lg bg-gradient-to-r animate-pulse ${
                       theme === "dark"
