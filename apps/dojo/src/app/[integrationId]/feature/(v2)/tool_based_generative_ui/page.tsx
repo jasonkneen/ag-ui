@@ -160,10 +160,20 @@ const SAFE_GRADIENT = z
   );
 const HAIKU_SCHEMA = z
   .object({
-    japanese: z.array(HAIKU_LINE).length(3),
-    english: z.array(HAIKU_LINE).length(3),
-    image_name: z.enum(VALID_IMAGE_NAMES),
-    gradient: SAFE_GRADIENT,
+    japanese: z
+      .array(HAIKU_LINE)
+      .length(3)
+      .describe("Exactly three lines of haiku in Japanese"),
+    english: z
+      .array(HAIKU_LINE)
+      .length(3)
+      .describe("Exactly three lines of the haiku translated to English"),
+    image_name: z
+      .enum(VALID_IMAGE_NAMES)
+      .describe("One relevant image name chosen from the allowed list"),
+    gradient: SAFE_GRADIENT.describe(
+      "A CSS linear-gradient(...), radial-gradient(...) or conic-gradient(...) using plain colors for the card background. No url(...) or other image functions.",
+    ),
   })
   .strict();
 
@@ -208,6 +218,8 @@ function HaikuDisplay() {
     {
       agentId: "tool_based_generative_ui",
       name: "generate_haiku",
+      description:
+        "Generate a haiku and render it as a card with a Japanese background image and gradient.",
       parameters: HAIKU_SCHEMA,
       followUp: false,
       handler: async (args) => {

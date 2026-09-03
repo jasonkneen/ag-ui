@@ -55,12 +55,13 @@ def _frontend_tool_block() -> str:
     return page[start:end]
 
 
-def _run_javascript(source: str, expression: str) -> object:
+def _run_javascript(source: str, expression: str, cwd: Path | None = None) -> object:
     completed = subprocess.run(
         ["node", "--input-type=module", "--eval", f"{source}\n{expression}"],
         check=True,
         capture_output=True,
         text=True,
+        cwd=cwd,
     )
     return json.loads(completed.stdout)
 
@@ -83,6 +84,34 @@ def _run_typescript(source: str, expression: str) -> object:
         cwd=DOJO_DIR,
     )
     return json.loads(completed.stdout)
+
+
+def _dojo_node_modules_root() -> Path | None:
+    for candidate in (REPO_ROOT / "apps" / "dojo", REPO_ROOT):
+        modules = candidate / "node_modules"
+        if (modules / "zod").is_dir() and (modules / "zod-to-json-schema").is_dir():
+            return candidate
+    return None
+
+
+def _haiku_tool_json_schema(cwd: Path) -> dict[str, object]:
+    page = DOJO_PAGE.read_text()
+    start = page.index("const VALID_IMAGE_NAMES = [")
+    end = page.index(".strict();", start) + len(".strict();")
+    schema = page[start:end]
+    schema = schema.replace("] as const;", "];")
+    schema = schema.replace("value: string", "value")
+    schema = schema.replace("): boolean", ")")
+    source = (
+        'import { z } from "zod";\n'
+        'import { zodToJsonSchema } from "zod-to-json-schema";\n'
+        f"{schema}"
+    )
+    expression = "console.log(JSON.stringify(zodToJsonSchema(HAIKU_SCHEMA, {})))"
+    result = _run_javascript(source, expression, cwd=cwd)
+    if not isinstance(result, dict):
+        raise TypeError("zodToJsonSchema did not return an object schema")
+    return result
 
 
 def _agent_step_results(values: list[object]) -> list[bool]:
@@ -272,7 +301,7 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         for label, page in {"source": source_page, "generated": generated_page}.items():
             with self.subTest(page=label):
                 self.assertIn("gradient: SAFE_GRADIENT", page)
-                self.assertIn("image_name: z.enum(VALID_IMAGE_NAMES)", page)
+                self.assertIn(".enum(VALID_IMAGE_NAMES)", page)
 
     def test_frontend_schema_is_the_strict_haiku_contract(self) -> None:
         block = _frontend_tool_block()
@@ -285,11 +314,13 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         schema = page[schema_start:schema_end]
         fields = re.findall(r"^\s+(\w+): ", schema, flags=re.MULTILINE)
 
+        compact = re.sub(r"\s+", "", schema)
+
         self.assertEqual(fields, ["japanese", "english", "image_name", "gradient"])
-        self.assertIn("japanese: z.array(HAIKU_LINE).length(3)", schema)
-        self.assertIn("english: z.array(HAIKU_LINE).length(3)", schema)
-        self.assertIn("image_name: z.enum(VALID_IMAGE_NAMES)", schema)
-        self.assertIn("gradient: SAFE_GRADIENT", schema)
+        self.assertIn("japanese:z.array(HAIKU_LINE).length(3)", compact)
+        self.assertIn("english:z.array(HAIKU_LINE).length(3)", compact)
+        self.assertIn("image_name:z.enum(VALID_IMAGE_NAMES)", compact)
+        self.assertIn("gradient:SAFE_GRADIENT", compact)
         self.assertRegex(schema, r"\}\)\s*\.strict\(\);$")
 
     def test_haiku_lines_reject_empty_or_whitespace_only_text(self) -> None:
@@ -397,6 +428,59 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
 
     def test_client_tool_keeps_follow_up_disabled(self) -> None:
         self.assertIn("followUp: false", _frontend_tool_block())
+
+    def test_client_tool_registration_describes_the_tool(self) -> None:
+        match = re.search(r'description:\s*"([^"]*)"', _frontend_tool_block())
+
+        self.assertIsNotNone(match, "generate_haiku has no description")
+        assert match is not None
+        self.assertIn("haiku", match.group(1).lower())
+
+    def test_schema_source_describes_every_haiku_field(self) -> None:
+        page = DOJO_PAGE.read_text()
+        schema_start = page.index("const HAIKU_SCHEMA = z")
+        schema_end = page.index(".strict();", schema_start)
+        schema = page[schema_start:schema_end]
+        parts = re.split(r"^ {4}(\w+): ", schema, flags=re.MULTILINE)
+        descriptions: dict[str, str] = {}
+        for name, body in zip(parts[1::2], parts[2::2]):
+            match = re.search(r'\.describe\(\s*"([^"]+)"', body)
+            self.assertIsNotNone(match, f"{name} has no .describe()")
+            assert match is not None
+            descriptions[name] = match.group(1)
+
+        self.assertEqual(
+            sorted(descriptions), ["english", "gradient", "image_name", "japanese"]
+        )
+        self.assertIn("three", descriptions["japanese"].lower())
+        self.assertIn("three", descriptions["english"].lower())
+        self.assertIn("gradient", descriptions["gradient"].lower())
+        self.assertIn("url", descriptions["gradient"].lower())
+
+    def test_tool_json_schema_carries_field_descriptions_to_the_model(self) -> None:
+        cwd = _dojo_node_modules_root()
+        if cwd is None:
+            self.skipTest("dojo node_modules (zod, zod-to-json-schema) not installed")
+
+        schema = _haiku_tool_json_schema(cwd)
+        properties = schema["properties"]
+        assert isinstance(properties, dict)
+
+        self.assertEqual(
+            sorted(properties), ["english", "gradient", "image_name", "japanese"]
+        )
+        for name, field in properties.items():
+            with self.subTest(field=name):
+                self.assertTrue(field.get("description"), f"{name} lacks description")
+        self.assertEqual(properties["image_name"]["enum"], list(EXPECTED_IMAGE_NAMES))
+        self.assertEqual(properties["japanese"]["minItems"], 3)
+        self.assertEqual(properties["japanese"]["maxItems"], 3)
+        gradient = properties["gradient"]["description"].lower()
+        self.assertIn("linear-gradient", gradient)
+        self.assertIn("radial-gradient", gradient)
+        self.assertIn("conic-gradient", gradient)
+        self.assertIn("url", gradient)
+        self.assertIs(schema["additionalProperties"], False)
 
 
 if __name__ == "__main__":
