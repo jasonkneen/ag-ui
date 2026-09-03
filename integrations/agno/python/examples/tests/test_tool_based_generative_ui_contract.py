@@ -32,6 +32,16 @@ AGENTIC_DOJO_PAGE = (
     / "agentic_generative_ui"
     / "page.tsx"
 )
+FEATURE_DIR = AGENTIC_DOJO_PAGE.parents[1]
+PREDICTIVE_DOJO_PAGE = FEATURE_DIR / "predictive_state_updates" / "page.tsx"
+REASONING_DOJO_PAGE = FEATURE_DIR / "agentic_chat_reasoning" / "page.tsx"
+# Tool name -> (page, first declaration the named schema constant depends on).
+# None means the tool passes an inline z.object(...) as its parameters.
+FRONTEND_TOOLS: dict[str, tuple[Path, str | None]] = {
+    "generate_haiku": (DOJO_PAGE, "const VALID_IMAGE_NAMES = ["),
+    "write_document": (PREDICTIVE_DOJO_PAGE, None),
+    "change_background": (REASONING_DOJO_PAGE, None),
+}
 DOJO_FILES = REPO_ROOT / "apps" / "dojo" / "src" / "files.json"
 DOJO_DIR = REPO_ROOT / "apps" / "dojo"
 EXPECTED_IMAGE_NAMES = (
@@ -86,32 +96,131 @@ def _run_typescript(source: str, expression: str) -> object:
     return json.loads(completed.stdout)
 
 
-def _dojo_node_modules_root() -> Path | None:
+def _dojo_node_modules_root() -> Path:
     for candidate in (REPO_ROOT / "apps" / "dojo", REPO_ROOT):
         modules = candidate / "node_modules"
         if (modules / "zod").is_dir() and (modules / "zod-to-json-schema").is_dir():
             return candidate
-    return None
+    raise AssertionError(
+        "zod and zod-to-json-schema are not installed under apps/dojo/node_modules;"
+        " run pnpm install"
+    )
 
 
-def _haiku_tool_json_schema(cwd: Path) -> dict[str, object]:
-    page = DOJO_PAGE.read_text()
-    start = page.index("const VALID_IMAGE_NAMES = [")
-    end = page.index(".strict();", start) + len(".strict();")
-    schema = page[start:end]
-    schema = schema.replace("] as const;", "];")
-    schema = schema.replace("value: string", "value")
-    schema = schema.replace("): boolean", ")")
+def _strip_typescript(source: str) -> str:
+    source = source.replace("] as const;", "];")
+    source = source.replace("value: string", "value")
+    return source.replace("): boolean", ")")
+
+
+def _zod_expression(text: str, start: int) -> str:
+    """Return the balanced Zod expression starting at text[start], chained calls included."""
+    depth = 0
+    quote: str | None = None
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char in "\"'`":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0 and not text[index + 1 :].lstrip().startswith("."):
+                return text[start : index + 1]
+        index += 1
+    raise AssertionError("unbalanced Zod expression")
+
+
+def _frontend_tool_json_schema(tool_name: str) -> tuple[dict[str, object], bool]:
+    """Convert a tool's parameters the way the runtime does: zodToJsonSchema(schema, {})."""
+    page_path, support_start = FRONTEND_TOOLS[tool_name]
+    page = page_path.read_text()
+    tool_start = page.index(f'name: "{tool_name}"')
+    params = page.index("parameters:", tool_start) + len("parameters:")
+    expression_start = params + len(page[params:]) - len(page[params:].lstrip())
+    if page.startswith("z.", expression_start):
+        expression = _zod_expression(page, expression_start)
+        schema_name = "TOOL_SCHEMA"
+        source = f"const {schema_name} = {expression};"
+    else:
+        match = re.match(r"\w+", page[expression_start:])
+        assert match is not None
+        schema_name = match.group()
+        assert support_start is not None, f"{tool_name} needs a support_start marker"
+        declaration = f"const {schema_name} = "
+        declaration_start = page.index(declaration)
+        expression = _zod_expression(page, declaration_start + len(declaration))
+        source_end = declaration_start + len(declaration) + len(expression) + 1
+        source = page[page.index(support_start) : source_end]
+    strict = expression.rstrip().endswith(".strict()")
     source = (
         'import { z } from "zod";\n'
         'import { zodToJsonSchema } from "zod-to-json-schema";\n'
-        f"{schema}"
+        f"{_strip_typescript(source)}"
     )
-    expression = "console.log(JSON.stringify(zodToJsonSchema(HAIKU_SCHEMA, {})))"
-    result = _run_javascript(source, expression, cwd=cwd)
+    expression = f"console.log(JSON.stringify(zodToJsonSchema({schema_name}, {{}})))"
+    result = _run_javascript(source, expression, cwd=_dojo_node_modules_root())
     if not isinstance(result, dict):
         raise TypeError("zodToJsonSchema did not return an object schema")
-    return result
+    return result, strict
+
+
+FORBIDDEN_SCHEMA_KEYS = ("$ref", "definitions", "$defs")
+SUBSCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf")
+
+
+def _schema_invariant_violations(
+    schema: dict[str, object], *, strict: bool
+) -> list[str]:
+    """Walk a converted tool schema and list every invariant break with its JSON path."""
+    violations: list[str] = []
+    if strict and schema.get("additionalProperties") is not False:
+        violations.append("$.additionalProperties: strict schema must set false")
+
+    def walk(node: object, path: str) -> None:
+        if not isinstance(node, dict):
+            violations.append(f"{path}: schema node is not an object")
+            return
+        for key in FORBIDDEN_SCHEMA_KEYS:
+            if key in node:
+                violations.append(f"{path}.{key}: forbidden key")
+        if "type" not in node:
+            violations.append(f"{path}: missing type")
+        if node.get("type") == "array" and "items" not in node:
+            violations.append(f"{path}: missing items")
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for name, child in properties.items():
+                child_path = f"{path}.properties.{name}"
+                description = (
+                    child.get("description") if isinstance(child, dict) else None
+                )
+                if not (isinstance(description, str) and description.strip()):
+                    violations.append(f"{child_path}: missing description")
+                walk(child, child_path)
+        if "items" in node:
+            items = node["items"]
+            if isinstance(items, list):
+                for position, item in enumerate(items):
+                    walk(item, f"{path}.items[{position}]")
+            else:
+                walk(items, f"{path}.items")
+        if isinstance(node.get("additionalProperties"), dict):
+            walk(node["additionalProperties"], f"{path}.additionalProperties")
+        for key in SUBSCHEMA_LIST_KEYS:
+            members = node.get(key)
+            if isinstance(members, list):
+                for position, member in enumerate(members):
+                    walk(member, f"{path}.{key}[{position}]")
+
+    walk(schema, "$")
+    return violations
 
 
 def _agent_step_results(values: list[object]) -> list[bool]:
@@ -458,11 +567,7 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
         self.assertIn("url", descriptions["gradient"].lower())
 
     def test_tool_json_schema_carries_field_descriptions_to_the_model(self) -> None:
-        cwd = _dojo_node_modules_root()
-        if cwd is None:
-            self.skipTest("dojo node_modules (zod, zod-to-json-schema) not installed")
-
-        schema = _haiku_tool_json_schema(cwd)
+        schema, _ = _frontend_tool_json_schema("generate_haiku")
         properties = schema["properties"]
         assert isinstance(properties, dict)
 
@@ -485,11 +590,7 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
     def test_tool_json_schema_inlines_a_string_type_for_every_haiku_line(
         self,
     ) -> None:
-        cwd = _dojo_node_modules_root()
-        if cwd is None:
-            self.skipTest("dojo node_modules (zod, zod-to-json-schema) not installed")
-
-        schema = _haiku_tool_json_schema(cwd)
+        schema, _ = _frontend_tool_json_schema("generate_haiku")
         properties = schema["properties"]
         assert isinstance(properties, dict)
 
@@ -499,6 +600,78 @@ class ToolBasedGenerativeUIContractTests(unittest.TestCase):
                 items = properties[name]["items"]
                 self.assertIsInstance(items, dict)
                 self.assertEqual(items["type"], "string")
+
+    def test_schema_invariant_walker_reports_each_violation_with_its_path(
+        self,
+    ) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "ok": {"type": "string", "description": "fine"},
+                "undescribed": {"type": "string"},
+                "untyped": {},
+                "choice": {"anyOf": [{"type": "string"}, {"type": "number"}]},
+                "lines": {"type": "array", "items": {"$ref": "#/definitions/line"}},
+                "bare_list": {"type": "array", "description": "no items"},
+            },
+            "definitions": {"line": {"type": "string"}},
+            "additionalProperties": True,
+        }
+
+        violations = _schema_invariant_violations(schema, strict=True)
+
+        self.assertEqual(
+            violations,
+            [
+                "$.additionalProperties: strict schema must set false",
+                "$.definitions: forbidden key",
+                "$.properties.undescribed: missing description",
+                "$.properties.untyped: missing description",
+                "$.properties.untyped: missing type",
+                "$.properties.choice: missing description",
+                "$.properties.choice: missing type",
+                "$.properties.lines: missing description",
+                "$.properties.lines.items.$ref: forbidden key",
+                "$.properties.lines.items: missing type",
+                "$.properties.bare_list: missing items",
+            ],
+        )
+
+    def test_schema_invariant_walker_accepts_a_converged_schema(self) -> None:
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "lines": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lines",
+                },
+            },
+            "required": ["lines"],
+            "additionalProperties": False,
+        }
+
+        self.assertEqual(_schema_invariant_violations(schema, strict=True), [])
+        self.assertEqual(_schema_invariant_violations(schema, strict=False), [])
+
+    def test_generate_haiku_tool_json_schema_holds_every_invariant(self) -> None:
+        schema, strict = _frontend_tool_json_schema("generate_haiku")
+
+        self.assertTrue(strict)
+        self.assertEqual(_schema_invariant_violations(schema, strict=strict), [])
+
+    def test_write_document_tool_json_schema_holds_every_invariant(self) -> None:
+        schema, strict = _frontend_tool_json_schema("write_document")
+
+        self.assertEqual(sorted(schema["properties"]), ["document"])
+        self.assertEqual(_schema_invariant_violations(schema, strict=strict), [])
+
+    def test_change_background_tool_json_schema_holds_every_invariant(self) -> None:
+        schema, strict = _frontend_tool_json_schema("change_background")
+
+        self.assertEqual(sorted(schema["properties"]), ["background"])
+        self.assertEqual(_schema_invariant_violations(schema, strict=strict), [])
 
 
 if __name__ == "__main__":
