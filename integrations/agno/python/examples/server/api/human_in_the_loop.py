@@ -10,7 +10,6 @@ from agno.models.openai import OpenAIChat
 from agno.os import AgentOS
 from agno.os.interfaces.agui import AGUI
 
-
 agent = Agent(
     db=InMemoryDb(),
     model=OpenAIChat(id="gpt-4o"),
