@@ -316,16 +316,50 @@ well-known `64:ff9b::/96` and `64:ff9b:1::/48`. A run whose media all fail
 conversion with no text fallback ends with
 `RUN_ERROR { code: "MEDIA_RESOLUTION_FAILED" }`.
 
-**This bridge uses the default policy and offers no way to change it.**
-`StrandsAgentConfig` has no `urlFetchPolicy` field and nothing threads one
-through, so a deployment whose attachments live on a private CDN or behind split
-DNS cannot opt in here. The Python adapter can, through
-`StrandsAgentConfig.url_fetch_policy`. `UrlFetchPolicy`,
-`UrlFetchPolicyError` and `DEFAULT_URL_FETCH_POLICY` are not reachable from this
-package either: each carries `export` in `src/utils.ts`, but neither the root
-entry nor `@ag-ui/aws-strands/server` re-exports them and the `exports` map has
-no deep path, so the values quoted above are the only published statement of the
-default. That gap is a real divergence, not a documentation oversight.
+A deployment whose attachments live on a private CDN or behind split DNS opts
+in through `StrandsAgentConfig.urlFetchPolicy`, the counterpart to Python's
+`url_fetch_policy`. `UrlFetchPolicy` is an interface rather than a class, so an
+override is a spread over the exported default rather than a constructor call:
+
+```ts
+import {
+  DEFAULT_URL_FETCH_POLICY,
+  StrandsAgent,
+  type UrlFetchPolicy,
+} from "@ag-ui/aws-strands";
+
+const policy: UrlFetchPolicy = {
+  ...DEFAULT_URL_FETCH_POLICY,
+  allowPrivateNetworks: true,
+  maxBytes: 100 * 1024 * 1024,
+  // Narrowing is allowed; widening is not (see below).
+  allowedSchemes: new Set(["https"]),
+};
+
+const agent = new StrandsAgent({
+  agent: strandsAgent,
+  name: "my-agent",
+  config: { urlFetchPolicy: policy },
+});
+```
+
+Leaving `urlFetchPolicy` unset is the same as `DEFAULT_URL_FETCH_POLICY`, and
+the opt-in is always the host's, never anything a client can put in a
+`RunAgentInput`. Link-local addresses and the cloud metadata endpoints stay
+blocked under `allowPrivateNetworks`, and `allowedSchemes` can only be
+narrowed, never widened: an `http`/`https` request goes out over a transport
+pinned to the addresses that passed validation, while any other scheme would
+resolve the host again at connection time. `DEFAULT_URL_FETCH_POLICY` and
+`UrlFetchPolicyError` are exported from the root entry as values, with
+`UrlFetchPolicy` and `SchemeAllowlist` as types, so an override can be both
+written and typed; `UrlFetchUnavailableError` stays internal, as it does in
+Python.
+
+An unusable policy ends the run with
+`RUN_ERROR { code: "URL_FETCH_POLICY_INVALID" }` before any attachment is
+fetched, rather than reverting to the default. That covers a limit below one, a
+fractional redirect cap, a non-boolean `allowPrivateNetworks`, and a scheme
+outside `http`/`https`.
 
 The two policies are not the same shape either. Python bounds a whole run as
 well as a single attachment, through `max_attachments`, `max_total_bytes` and

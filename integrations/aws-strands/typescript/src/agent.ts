@@ -62,6 +62,7 @@ import {
 import {
   _buildToolResultContent,
   _coerceText,
+  assertUsablePolicy,
   convertAguiContentToStrands,
   convertAguiContentToStrandsDetailed,
   createUrlFetchCache,
@@ -2761,7 +2762,42 @@ export class StrandsAgent {
     // remote attachment in the thread is downloaded once per conversion.
     const fetchCache = createUrlFetchCache();
 
-    const fetchOptions = { fetchCache, signal: runAbort.signal };
+    // Checked once here, not per attachment, and before the first fetch.
+    // `fetchUrlContent` refuses an unusable policy too, but the replay path
+    // converts inside a try/catch that reports a throw as "conversion failed;
+    // falling back to text", so a misconfigured adapter would otherwise show
+    // up as messages quietly stripped of their attachments, once per message,
+    // with the reason only in a log line. A configuration mistake belongs to
+    // the run, so it ends the run and says which field is wrong. The one thing
+    // it must never do is fall back to the default policy: that would ignore
+    // an intended restriction.
+    //
+    // Single-agent runs only. The orchestrator path takes text alone (see the
+    // prompt extraction in `_runOrchestrator`), so it fetches nothing and has
+    // no policy to check.
+    const urlFetchPolicy = this.config.urlFetchPolicy;
+    if (urlFetchPolicy !== undefined) {
+      try {
+        assertUsablePolicy(urlFetchPolicy);
+      } catch (e) {
+        const msg = _errorMessage(e);
+        this._log.error(
+          `${LOG_PREFIX} config.urlFetchPolicy is unusable: ${msg}`,
+          e,
+        );
+        yield _runError(
+          `Unusable urlFetchPolicy: ${msg}`,
+          "URL_FETCH_POLICY_INVALID",
+        );
+        return;
+      }
+    }
+
+    const fetchOptions = {
+      fetchCache,
+      signal: runAbort.signal,
+      urlFetchPolicy,
+    };
 
     // Get or create agent instance for this thread.
     const agentResult = await this._ensureAgent(

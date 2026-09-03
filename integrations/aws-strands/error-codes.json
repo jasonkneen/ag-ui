@@ -205,6 +205,12 @@
         ]
       },
       "note": "Python rejects a resume entry naming an interrupt it never issued in its resume preflight, under INTERRUPT_RESUME_ERROR, so it never produces this second message."
+    },
+    {
+      "code": "URL_FETCH_POLICY_INVALID",
+      "sides": ["typescript"],
+      "messages": ["Unusable urlFetchPolicy: {}"],
+      "note": "TypeScript only, and structurally so. Both bridges expose the URL fetch policy through configuration (urlFetchPolicy / url_fetch_policy), but Python's is a frozen dataclass that validates in __post_init__, so an unusable one raises ValueError where the host constructs it and no run ever starts with it. A TypeScript interface has no constructor to validate in, so the adapter checks the configured policy itself, once per run, before the first attachment is fetched, and reports it here. The interpolated text is the sentence naming the offending field, from the same check fetchUrlContent applies per fetch."
     }
   ],
   "sharedMessageConstants": {
