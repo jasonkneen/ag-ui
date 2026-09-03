@@ -37,7 +37,7 @@ const AgenticChat: React.FC<AgenticChatProps> = ({ params }) => {
       showDevConsole={false}
       agent="agentic_chat_reasoning"
     >
-      <Chat integrationId={integrationId} />
+      <Chat />
     </CopilotKit>
   );
 };
@@ -46,21 +46,17 @@ interface AgentState {
   model: string;
 }
 
-const Chat = ({ integrationId }: { integrationId: string }) => {
-  const [background, setBackground] = useState<string>(
-    "--copilot-kit-background-color",
-  );
+const Chat = () => {
+  const [background, setBackground] = useState<string>("--copilot-kit-background-color");
   const { agent } = useAgent({
     agentId: "agentic_chat_reasoning",
     updates: [UseAgentUpdate.OnStateChanged],
   });
 
   const agentState = agent.state as AgentState | undefined;
-  const supportsReasoningModelSelection = integrationId !== "agno";
 
-  const selectedModel = supportsReasoningModelSelection
-    ? agentState?.model || "OpenAI"
-    : "OpenAI o4-mini";
+  // Initialize model if not set
+  const selectedModel = agentState?.model || "OpenAI";
 
   const handleModelChange = (model: string) => {
     agent.setState({ model });
@@ -85,9 +81,9 @@ const Chat = ({ integrationId }: { integrationId: string }) => {
     name: "change_background",
     description:
       "Change the background color of the chat. Can be anything that the CSS background attribute accepts. Regular colors, linear of radial gradients etc.",
-    parameters: z.object({
+     parameters: z.object({
       background: z.string().describe("The background. Prefer gradients."),
-    }),
+    })  ,
     handler: async ({ background }: { background: string }) => {
       setBackground(background);
     },
@@ -102,42 +98,27 @@ const Chat = ({ integrationId }: { integrationId: string }) => {
             <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
               Reasoning Model:
             </span>
-            {supportsReasoningModelSelection ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    className="w-[140px] justify-between"
-                  >
-                    {selectedModel}
-                    <ChevronDown className="h-4 w-4 opacity-50" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="w-[140px]">
-                  <DropdownMenuLabel>Select Model</DropdownMenuLabel>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => handleModelChange("OpenAI")}>
-                    OpenAI
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={() => handleModelChange("Anthropic")}
-                  >
-                    Anthropic
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => handleModelChange("Gemini")}>
-                    Gemini
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ) : (
-              <Button
-                variant="outline"
-                className="w-[140px] justify-center"
-                disabled
-              >
-                {selectedModel}
-              </Button>
-            )}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" className="w-[140px] justify-between">
+                  {selectedModel}
+                  <ChevronDown className="h-4 w-4 opacity-50" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent className="w-[140px]">
+                <DropdownMenuLabel>Select Model</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => handleModelChange("OpenAI")}>
+                  OpenAI
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleModelChange("Anthropic")}>
+                  Anthropic
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleModelChange("Gemini")}>
+                  Gemini
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </div>

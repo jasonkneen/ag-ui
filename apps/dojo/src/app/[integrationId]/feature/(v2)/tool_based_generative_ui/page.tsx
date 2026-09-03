@@ -1,7 +1,7 @@
 "use client";
 import React, { useState } from "react";
 import "@copilotkit/react-core/v2/styles.css";
-import {
+import { 
   useFrontendTool,
   useConfigureSuggestions,
   CopilotSidebar,
@@ -30,9 +30,7 @@ interface Haiku {
   gradient: string;
 }
 
-export default function ToolBasedGenerativeUI({
-  params,
-}: ToolBasedGenerativeUIProps) {
+export default function ToolBasedGenerativeUI({ params }: ToolBasedGenerativeUIProps) {
   const { integrationId } = React.use(params);
   const { chatDefaultOpen } = useURLParams();
 
@@ -80,163 +78,14 @@ const VALID_IMAGE_NAMES = [
   "Senso-ji_Temple_Asakusa_Cherry_Blossoms_Kimono_Umbrella.jpg",
   "Cherry_Blossoms_Sakura_Night_View_City_Lights_Japan.jpg",
   "Mount_Fuji_Lake_Reflection_Cherry_Blossoms_Sakura_Spring.jpg",
-] as const;
-
-const SAFE_GRADIENT_INNER_FUNCTIONS = new Set([
-  "rgb",
-  "rgba",
-  "hsl",
-  "hsla",
-  "hwb",
-  "lab",
-  "lch",
-  "oklab",
-  "oklch",
-  "color",
-  "color-mix",
-  "calc",
-  "min",
-  "max",
-  "clamp",
-]);
-
-function isNonBlankHaikuLine(value: string): boolean {
-  return value.trim().length > 0;
-}
-
-function isSafeGradient(value: string): boolean {
-  const css = value.trim();
-  const root = /^(?:linear|radial|conic)-gradient\s*\(/i.exec(css);
-  if (!root) return false;
-
-  const firstParen = css.indexOf("(", root[0].length - 1);
-  let depth = 0;
-
-  for (let index = firstParen; index < css.length; index++) {
-    const character = css[index];
-    if (
-      character === "\\" ||
-      character === '"' ||
-      character === "'" ||
-      character === ";" ||
-      character === "{" ||
-      character === "}" ||
-      css.startsWith("/*", index)
-    ) {
-      return false;
-    }
-
-    if (character === "(") {
-      if (depth > 0) {
-        const nameEnd = index;
-        let nameStart = index - 1;
-        while (nameStart >= 0 && /[a-z0-9-]/i.test(css[nameStart])) {
-          nameStart--;
-        }
-        const name = css.slice(nameStart + 1, nameEnd).toLowerCase();
-        if (!SAFE_GRADIENT_INNER_FUNCTIONS.has(name)) return false;
-      }
-      depth++;
-    } else if (character === ")") {
-      depth--;
-      if (depth < 0 || (depth === 0 && index !== css.length - 1)) {
-        return false;
-      }
-    }
-  }
-
-  return depth === 0 && css.slice(firstParen + 1, -1).trim().length > 0;
-}
-
-// A fresh instance per array: zodToJsonSchema turns a reused Zod object into
-// a $ref, which some providers reject in tool parameters.
-function haikuLine() {
-  return z
-    .string()
-    .trim()
-    .refine(isNonBlankHaikuLine, "Haiku lines cannot be blank");
-}
-const SAFE_GRADIENT = z
-  .string()
-  .refine(
-    isSafeGradient,
-    "Use a linear, radial, or conic CSS gradient without URLs",
-  );
-const HAIKU_SCHEMA = z
-  .object({
-    japanese: z
-      .array(haikuLine())
-      .length(3)
-      .describe("Exactly three lines of haiku in Japanese"),
-    english: z
-      .array(haikuLine())
-      .length(3)
-      .describe("Exactly three lines of the haiku translated to English"),
-    image_name: z
-      .enum(VALID_IMAGE_NAMES)
-      .describe("One relevant image name chosen from the allowed list"),
-    gradient: SAFE_GRADIENT.describe(
-      "A CSS linear-gradient(...), radial-gradient(...) or conic-gradient(...) using plain colors for the card background. No url(...) or other image functions.",
-    ),
-  })
-  .strict();
-
-// The runtime hands the handler raw JSON, so the same strict schema that gates
-// the streaming preview must gate what gets stored as a haiku.
-function parseHaikuToolArgs(
-  args: unknown,
-): { ok: true; haiku: Haiku } | { ok: false; message: string } {
-  const parsed = HAIKU_SCHEMA.safeParse(args);
-  if (parsed.success) return { ok: true, haiku: parsed.data };
-  const fields = Array.from(
-    new Set(
-      parsed.error.issues.flatMap((issue) =>
-        issue.code === "unrecognized_keys"
-          ? issue.keys
-          : [issue.path.join(".") || "arguments"],
-      ),
-    ),
-  );
-  return {
-    ok: false,
-    message: `generate_haiku rejected these fields: ${fields.join(", ")}. Fix them and call the tool again.`,
-  };
-}
-
-// Preview arguments stream in field by field, and some backends send only the
-// haiku text, so the card renders as soon as there are Japanese lines. Only the
-// values that reach CSS or an image lookup are sanitized here; the strict schema
-// still gates what the handler stores.
-function toPreviewHaiku(args: Partial<Haiku>): Haiku | null {
-  const japanese = (args.japanese ?? []).filter(
-    (line): line is string => typeof line === "string",
-  );
-  if (japanese.length === 0) return null;
-  const english = (args.english ?? []).filter(
-    (line): line is string => typeof line === "string",
-  );
-  const imageName =
-    typeof args.image_name === "string" &&
-    (VALID_IMAGE_NAMES as readonly string[]).includes(args.image_name)
-      ? args.image_name
-      : null;
-  const gradient =
-    typeof args.gradient === "string" && isSafeGradient(args.gradient)
-      ? args.gradient
-      : "";
-  return { japanese, english, image_name: imageName, gradient };
-}
+];
 
 function HaikuDisplay() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [haikus, setHaikus] = useState<Haiku[]>([
     {
       japanese: ["仮の句よ", "まっさらながら", "花を呼ぶ"],
-      english: [
-        "A placeholder verse—",
-        "even in a blank canvas,",
-        "it beckons flowers.",
-      ],
+      english: ["A placeholder verse—", "even in a blank canvas,", "it beckons flowers."],
       image_name: null,
       gradient: "",
     },
@@ -246,24 +95,30 @@ function HaikuDisplay() {
     {
       agentId: "tool_based_generative_ui",
       name: "generate_haiku",
-      description:
-        "Generate a haiku and render it as a card with a Japanese background image and gradient.",
-      parameters: HAIKU_SCHEMA,
+       parameters: z.object({
+        japanese: z.array(z.string()).describe("3 lines of haiku in Japanese"),
+        english: z.array(z.string()).describe("3 lines of haiku translated to English"),
+        image_name: z.string().describe(`One relevant image name from: ${VALID_IMAGE_NAMES.join(", ")}`),
+        gradient: z.string().describe("CSS Gradient color for the background"),
+      })  ,
       followUp: false,
-      handler: async (args) => {
-        const parsed = parseHaikuToolArgs(args);
-        if (!parsed.ok) return parsed.message;
+      handler: async ({ japanese, english, image_name, gradient }: { japanese: string[]; english: string[]; image_name: string; gradient: string }) => {
+        const newHaiku: Haiku = {
+          japanese: japanese || [],
+          english: english || [],
+          image_name: image_name || null,
+          gradient: gradient || "",
+        };
         setHaikus((prev) => [
-          parsed.haiku,
+          newHaiku,
           ...prev.filter((h) => h.english[0] !== "A placeholder verse—"),
         ]);
         setActiveIndex(0);
         return "Haiku generated!";
       },
       render: ({ args }: { args: Partial<Haiku> }) => {
-        const preview = toPreviewHaiku(args);
-        if (!preview) return <></>;
-        return <HaikuCard haiku={preview} />;
+        if (!args.japanese) return <></>;
+        return <HaikuCard haiku={args as Haiku} />;
       },
     },
     [haikus],
@@ -294,7 +149,7 @@ function HaikuDisplay() {
   );
 }
 
-function HaikuCard({ haiku }: { haiku: Haiku }) {
+function HaikuCard({ haiku }: { haiku: Partial<Haiku> }) {
   return (
     <div
       data-testid="haiku-card"

@@ -2,14 +2,12 @@
 import React from "react";
 import "@copilotkit/react-core/v2/styles.css";
 import "./style.css";
-import {
+import { 
   useAgent,
   UseAgentUpdate,
   useConfigureSuggestions,
-  useRenderTool,
   CopilotChat,
 } from "@copilotkit/react-core/v2";
-import { z } from "zod";
 import { useTheme } from "next-themes";
 import { CopilotKit } from "@copilotkit/react-core";
 
@@ -19,9 +17,7 @@ interface AgenticGenerativeUIProps {
   }>;
 }
 
-const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({
-  params,
-}) => {
+const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({ params }) => {
   const { integrationId } = React.use(params);
   return (
     <CopilotKit
@@ -34,46 +30,11 @@ const AgenticGenerativeUI: React.FC<AgenticGenerativeUIProps> = ({
   );
 };
 
-interface AgentStep {
-  description: string;
-  status: "pending" | "in_progress" | "completed";
-}
-
-function isAgentStep(value: unknown): value is AgentStep {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  return (
-    "description" in value &&
-    typeof value.description === "string" &&
-    "status" in value &&
-    (value.status === "pending" ||
-      value.status === "in_progress" ||
-      value.status === "completed")
-  );
-}
-
-function normalizeAgentSteps(state: unknown): AgentStep[] {
-  if (typeof state !== "object" || state === null || !("steps" in state)) {
-    return [];
-  }
-
-  if (!Array.isArray(state.steps)) {
-    return [];
-  }
-
-  return state.steps.filter(isAgentStep);
-}
-
-function resolveActiveStepIndex(steps: AgentStep[]): number {
-  const inProgressIndex = steps.findIndex(
-    (step) => step.status === "in_progress",
-  );
-  if (inProgressIndex !== -1) {
-    return inProgressIndex;
-  }
-  return steps.findIndex((step) => step.status === "pending");
+interface AgentState {
+  steps: {
+    description: string;
+    status: "pending" | "completed";
+  }[];
 }
 
 const Chat = () => {
@@ -83,14 +44,7 @@ const Chat = () => {
     updates: [UseAgentUpdate.OnStateChanged],
   });
 
-  // The progress card below renders the streamed state, so hide the raw
-  // state-update tool calls that would otherwise show as default tool cards.
-  useRenderTool({
-    name: "update_session_state",
-    agentId: "agentic_generative_ui",
-    parameters: z.record(z.string(), z.unknown()),
-    render: () => <></>,
-  });
+  const agentState = agent.state as AgentState | undefined;
 
   useConfigureSuggestions({
     suggestions: [
@@ -106,7 +60,7 @@ const Chat = () => {
     available: "always",
   });
 
-  const steps = normalizeAgentSteps(agent.state);
+  const steps = agentState?.steps;
 
   return (
     <div className="flex justify-center items-center h-full w-full">
@@ -115,7 +69,7 @@ const Chat = () => {
           agentId="agentic_generative_ui"
           className="h-full rounded-2xl max-w-6xl mx-auto"
           messageView={{
-            children: ({ messageElements, interruptElement }) => (
+            children: ({ messageElements, interruptElement }  ) => (
               <div data-testid="copilot-message-list" className="flex flex-col">
                 {messageElements}
                 {steps && steps.length > 0 && (
@@ -133,18 +87,9 @@ const Chat = () => {
   );
 };
 
-function TaskProgress({
-  steps,
-  theme,
-}: {
-  steps: AgentStep[];
-  theme?: string;
-}) {
-  const completedCount = steps.filter(
-    (step) => step.status === "completed",
-  ).length;
+function TaskProgress({ steps, theme }: { steps: AgentState["steps"]; theme?: string }) {
+  const completedCount = steps.filter((step) => step.status === "completed").length;
   const progressPercentage = (completedCount / steps.length) * 100;
-  const activeStepIndex = resolveActiveStepIndex(steps);
 
   return (
     <div className="flex justify-center w-full px-4">
@@ -162,9 +107,7 @@ function TaskProgress({
             <h3 className="text-xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
               Task Progress
             </h3>
-            <div
-              className={`text-sm ${theme === "dark" ? "text-slate-400" : "text-gray-500"}`}
-            >
+            <div className={`text-sm ${theme === "dark" ? "text-slate-400" : "text-gray-500"}`}>
               {completedCount}/{steps.length} Complete
             </div>
           </div>
@@ -189,7 +132,10 @@ function TaskProgress({
         <div className="space-y-2">
           {steps.map((step, index) => {
             const isCompleted = step.status === "completed";
-            const isActive = index === activeStepIndex;
+            const isCurrentPending =
+              step.status === "pending" &&
+              index === steps.findIndex((s) => s.status === "pending");
+            const isFuturePending = step.status === "pending" && !isCurrentPending;
 
             return (
               <div
@@ -199,7 +145,7 @@ function TaskProgress({
                     ? theme === "dark"
                       ? "bg-gradient-to-r from-green-900/30 to-emerald-900/20 border border-green-500/30"
                       : "bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200/60"
-                    : isActive
+                    : isCurrentPending
                       ? theme === "dark"
                         ? "bg-gradient-to-r from-blue-900/40 to-purple-900/30 border border-blue-500/50 shadow-lg shadow-blue-500/20"
                         : "bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-200/60 shadow-md shadow-blue-200/50"
@@ -226,7 +172,7 @@ function TaskProgress({
                       ? theme === "dark"
                         ? "bg-gradient-to-br from-green-500 to-emerald-600 shadow-lg shadow-green-500/30"
                         : "bg-gradient-to-br from-green-500 to-emerald-600 shadow-md shadow-green-200"
-                      : isActive
+                      : isCurrentPending
                         ? theme === "dark"
                           ? "bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg shadow-blue-500/30"
                           : "bg-gradient-to-br from-blue-500 to-purple-600 shadow-md shadow-blue-200"
@@ -237,7 +183,7 @@ function TaskProgress({
                 >
                   {isCompleted ? (
                     <CheckIcon />
-                  ) : isActive ? (
+                  ) : isCurrentPending ? (
                     <SpinnerIcon />
                   ) : (
                     <ClockIcon theme={theme} />
@@ -253,7 +199,7 @@ function TaskProgress({
                         ? theme === "dark"
                           ? "text-green-300"
                           : "text-green-700"
-                        : isActive
+                        : isCurrentPending
                           ? theme === "dark"
                             ? "text-blue-300 text-base"
                             : "text-blue-700 text-base"
@@ -264,7 +210,7 @@ function TaskProgress({
                   >
                     {step.description}
                   </div>
-                  {isActive && (
+                  {isCurrentPending && (
                     <div
                       className={`text-sm mt-1 animate-pulse ${
                         theme === "dark" ? "text-blue-400" : "text-blue-600"
@@ -276,7 +222,7 @@ function TaskProgress({
                 </div>
 
                 {/* Animated Background for Current Step */}
-                {isActive && (
+                {isCurrentPending && (
                   <div
                     className={`absolute inset-0 rounded-lg bg-gradient-to-r animate-pulse ${
                       theme === "dark"
@@ -313,18 +259,8 @@ function TaskProgress({
 // Enhanced Icons
 function CheckIcon() {
   return (
-    <svg
-      className="w-4 h-4 text-white"
-      fill="none"
-      stroke="currentColor"
-      viewBox="0 0 24 24"
-    >
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth={3}
-        d="M5 13l4 4L19 7"
-      />
+    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
     </svg>
   );
 }
@@ -337,14 +273,7 @@ function SpinnerIcon() {
       fill="none"
       viewBox="0 0 24 24"
     >
-      <circle
-        className="opacity-25"
-        cx="12"
-        cy="12"
-        r="10"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
       <path
         className="opacity-75"
         fill="currentColor"

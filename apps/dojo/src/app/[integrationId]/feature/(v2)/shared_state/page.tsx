@@ -26,14 +26,8 @@ export default function SharedState({ params }: SharedStateProps) {
   const { isMobile } = useMobileView();
   const { chatDefaultOpen } = useURLParams();
   const defaultChatHeight = 50;
-  const {
-    isChatOpen,
-    setChatHeight,
-    setIsChatOpen,
-    isDragging,
-    chatHeight,
-    handleDragStart,
-  } = useMobileChat(defaultChatHeight);
+  const { isChatOpen, setChatHeight, setIsChatOpen, isDragging, chatHeight, handleDragStart } =
+    useMobileChat(defaultChatHeight);
 
   const chatTitle = "AI Recipe Assistant";
   const chatDescription = "Ask me to craft recipes";
@@ -63,9 +57,7 @@ export default function SharedState({ params }: SharedStateProps) {
                 <div className="flex items-center gap-3">
                   <div>
                     <div className="font-medium text-gray-900">{chatTitle}</div>
-                    <div className="text-sm text-gray-500">
-                      {chatDescription}
-                    </div>
+                    <div className="text-sm text-gray-500">{chatDescription}</div>
                   </div>
                 </div>
                 <div
@@ -144,10 +136,7 @@ export default function SharedState({ params }: SharedStateProps) {
 
             {/* Backdrop */}
             {isChatOpen && (
-              <div
-                className="fixed inset-0 z-30"
-                onClick={() => setIsChatOpen(false)}
-              />
+              <div className="fixed inset-0 z-30" onClick={() => setIsChatOpen(false)} />
             )}
           </>
         ) : (
@@ -271,9 +260,7 @@ function Recipe() {
   }, []);
 
   const [recipe, setRecipe] = useState(INITIAL_STATE.recipe);
-  const [editingInstructionIndex, setEditingInstructionIndex] = useState<
-    number | null
-  >(null);
+  const [editingInstructionIndex, setEditingInstructionIndex] = useState<number | null>(null);
   const newInstructionRef = useRef<HTMLTextAreaElement>(null);
 
   const updateRecipe = (partialRecipe: Partial<Recipe>) => {
@@ -309,13 +296,10 @@ function Recipe() {
     if (
       agentState &&
       agentState.recipe &&
-      (agentState.recipe as unknown as Record<string, unknown>)[key] !==
-        undefined &&
+      (agentState.recipe as unknown as Record<string, unknown>)[key] !== undefined &&
       (agentState.recipe as unknown as Record<string, unknown>)[key] !== null
     ) {
-      let agentValue = (
-        agentState.recipe as unknown as Record<string, unknown>
-      )[key];
+      let agentValue = (agentState.recipe as unknown as Record<string, unknown>)[key];
       const recipeValue = (recipe as unknown as Record<string, unknown>)[key];
 
       // Check if agentValue is a string and replace \n with actual newlines
@@ -324,8 +308,7 @@ function Recipe() {
       }
 
       if (JSON.stringify(agentValue) !== JSON.stringify(recipeValue)) {
-        (newRecipeState as unknown as Record<string, unknown>)[key] =
-          agentValue;
+        (newRecipeState as unknown as Record<string, unknown>)[key] = agentValue;
         newChangedKeys.push(key);
       }
     }
@@ -352,9 +335,7 @@ function Recipe() {
     });
   };
 
-  const handleSkillLevelChange = (
-    event: React.ChangeEvent<HTMLSelectElement>,
-  ) => {
+  const handleSkillLevelChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     updateRecipe({
       skill_level: event.target.value as SkillLevel,
     });
@@ -367,16 +348,12 @@ function Recipe() {
       });
     } else {
       updateRecipe({
-        special_preferences: recipe.special_preferences.filter(
-          (p) => p !== preference,
-        ),
+        special_preferences: recipe.special_preferences.filter((p) => p !== preference),
       });
     }
   };
 
-  const handleCookingTimeChange = (
-    event: React.ChangeEvent<HTMLSelectElement>,
-  ) => {
+  const handleCookingTimeChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     updateRecipe({
       cooking_time: cookingTimeValues[Number(event.target.value)].label,
     });
@@ -385,18 +362,11 @@ function Recipe() {
   const addIngredient = () => {
     // Pick a random food emoji from our valid list
     updateRecipe({
-      ingredients: [
-        ...recipe.ingredients,
-        { icon: "🍴", name: "", amount: "" },
-      ],
+      ingredients: [...recipe.ingredients, { icon: "🍴", name: "", amount: "" }],
     });
   };
 
-  const updateIngredient = (
-    index: number,
-    field: keyof Ingredient,
-    value: string,
-  ) => {
+  const updateIngredient = (index: number, field: keyof Ingredient, value: string) => {
     const updatedIngredients = [...recipe.ingredients];
     updatedIngredients[index] = {
       ...updatedIngredients[index],
@@ -421,12 +391,8 @@ function Recipe() {
 
     // Focus the new instruction after render
     setTimeout(() => {
-      const textareas = document.querySelectorAll(
-        ".instructions-container textarea",
-      );
-      const newTextarea = textareas[
-        textareas.length - 1
-      ] as HTMLTextAreaElement;
+      const textareas = document.querySelectorAll(".instructions-container textarea");
+      const newTextarea = textareas[textareas.length - 1] as HTMLTextAreaElement;
       if (newTextarea) {
         newTextarea.focus();
       }
@@ -458,7 +424,6 @@ function Recipe() {
   return (
     <form
       data-testid="recipe-card"
-      onSubmit={(event) => event.preventDefault()}
       style={isMobile ? { marginBottom: "100px" } : {}}
       className="recipe-card"
     >
@@ -476,10 +441,7 @@ function Recipe() {
             <span className="meta-icon">🕒</span>
             <select
               className="meta-select"
-              value={
-                cookingTimeValues.find((t) => t.label === recipe.cooking_time)
-                  ?.value ?? 3
-              }
+              value={cookingTimeValues.find((t) => t.label === recipe.cooking_time)?.value || 3}
               onChange={handleCookingTimeChange}
               style={{
                 backgroundImage:
@@ -559,35 +521,22 @@ function Recipe() {
             + Add Ingredient
           </button>
         </div>
-        <div
-          data-testid="ingredients-container"
-          className="ingredients-container"
-        >
+        <div data-testid="ingredients-container" className="ingredients-container">
           {recipe.ingredients.map((ingredient, index) => (
-            <div
-              key={index}
-              data-testid="ingredient-card"
-              className="ingredient-card"
-            >
-              <div className="ingredient-icon">
-                {getProperIcon(ingredient.icon)}
-              </div>
+            <div key={index} data-testid="ingredient-card" className="ingredient-card">
+              <div className="ingredient-icon">{getProperIcon(ingredient.icon)}</div>
               <div className="ingredient-content">
                 <input
                   type="text"
                   value={ingredient.name || ""}
-                  onChange={(e) =>
-                    updateIngredient(index, "name", e.target.value)
-                  }
+                  onChange={(e) => updateIngredient(index, "name", e.target.value)}
                   placeholder="Ingredient name"
                   className="ingredient-name-input"
                 />
                 <input
                   type="text"
                   value={ingredient.amount || ""}
-                  onChange={(e) =>
-                    updateIngredient(index, "amount", e.target.value)
-                  }
+                  onChange={(e) => updateIngredient(index, "amount", e.target.value)}
                   placeholder="Amount"
                   className="ingredient-amount-input"
                 />
@@ -610,27 +559,18 @@ function Recipe() {
         {changedKeysRef.current.includes("instructions") && <Ping />}
         <div className="section-header">
           <h2 className="section-title">Instructions</h2>
-          <button
-            type="button"
-            className="add-step-button"
-            onClick={addInstruction}
-          >
+          <button type="button" className="add-step-button" onClick={addInstruction}>
             + Add Step
           </button>
         </div>
-        <div
-          data-testid="instructions-container"
-          className="instructions-container"
-        >
+        <div data-testid="instructions-container" className="instructions-container">
           {recipe.instructions.map((instruction, index) => (
             <div key={index} className="instruction-item">
               {/* Number Circle */}
               <div className="instruction-number">{index + 1}</div>
 
               {/* Vertical Line */}
-              {index < recipe.instructions.length - 1 && (
-                <div className="instruction-line" />
-              )}
+              {index < recipe.instructions.length - 1 && <div className="instruction-line" />}
 
               {/* Instruction Content */}
               <div
@@ -645,16 +585,11 @@ function Recipe() {
                   className="instruction-textarea"
                   value={instruction || ""}
                   onChange={(e) => updateInstruction(index, e.target.value)}
-                  placeholder={
-                    !instruction ? "Enter cooking instruction..." : ""
-                  }
+                  placeholder={!instruction ? "Enter cooking instruction..." : ""}
                   onFocus={() => setEditingInstructionIndex(index)}
                   onBlur={(e) => {
                     // Only blur if clicking outside this instruction
-                    if (
-                      !e.relatedTarget ||
-                      !e.currentTarget.contains(e.relatedTarget as Node)
-                    ) {
+                    if (!e.relatedTarget || !e.currentTarget.contains(e.relatedTarget as Node)) {
                       setEditingInstructionIndex(null);
                     }
                   }}
