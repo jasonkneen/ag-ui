@@ -2,6 +2,7 @@
 
 export {
   StrandsAgent,
+  INTERRUPT_CANCELLED,
   buildSnapshotMessages,
   buildStrandsSeed,
   convertMessagesForStrandsSeed,

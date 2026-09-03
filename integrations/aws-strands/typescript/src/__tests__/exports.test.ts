@@ -12,6 +12,7 @@ describe("public export surface", () => {
       "buildSnapshotMessages",
       "buildStrandsSeed",
       "convertMessagesForStrandsSeed",
+      "INTERRUPT_CANCELLED",
       "buildContextExtras",
       "convertAguiContentToStrands",
       "flattenContentToText",
@@ -52,5 +53,24 @@ describe("public export surface", () => {
     for (const name of serverOnly) {
       expect(pkg).not.toHaveProperty(name);
     }
+  });
+
+  it("exports the cancellation sentinel with the same shape as the Python package", () => {
+    // A tool checks `.cancelled` on what it receives, so the value is part of
+    // the contract, not just the name.
+    expect(pkg.INTERRUPT_CANCELLED).toEqual({ cancelled: true });
+  });
+
+  it("exports the cancellation sentinel frozen", () => {
+    // Frozen so a consumer cannot mutate the exported shape others match
+    // against. Python keeps its own export a plain dict, because callers
+    // serialize it, and builds each emitted answer fresh instead.
+    expect(Object.isFrozen(pkg.INTERRUPT_CANCELLED)).toBe(true);
+    expect(() => {
+      (
+        pkg.INTERRUPT_CANCELLED as unknown as Record<string, unknown>
+      ).cancelled = false;
+    }).toThrow();
+    expect(pkg.INTERRUPT_CANCELLED).toEqual({ cancelled: true });
   });
 });
