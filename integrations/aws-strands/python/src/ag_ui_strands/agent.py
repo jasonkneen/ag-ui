@@ -1433,6 +1433,14 @@ _STRANDS_USAGE_FIELDS: Tuple[Tuple[str, str], ...] = (
 # ``GeminiModel`` while the TypeScript one lives under ``models/google``, and a
 # derived label would silently split that vendor in two. A class not listed
 # here omits the provider label rather than guessing.
+#
+# Two classes may legitimately share one label. Python ships both
+# ``OpenAIModel`` and ``OpenAIResponsesModel`` for OpenAI's two APIs, where the
+# TypeScript SDK reaches the Responses API through a config on its single
+# ``OpenAIModel``: one vendor either way, so both report ``openai``. Entries
+# with no TypeScript counterpart at all (``litellm``, ``writer``) are the two
+# SDKs shipping different provider classes, not the two bridges disagreeing on
+# a label.
 _STRANDS_PROVIDER_LABELS: Dict[str, str] = {
     "AnthropicModel": "anthropic",
     "BedrockModel": "bedrock",
@@ -1443,6 +1451,7 @@ _STRANDS_PROVIDER_LABELS: Dict[str, str] = {
     "MistralModel": "mistral",
     "OllamaModel": "ollama",
     "OpenAIModel": "openai",
+    "OpenAIResponsesModel": "openai",
     "SageMakerAIModel": "sagemaker",
     "WriterModel": "writer",
 }

@@ -20,9 +20,12 @@ Three rules carry most of the weight and are asserted from both directions:
 
 Most cases drive a REAL ``strands.Agent`` over a scripted ``Model``, so the
 metadata channel itself is proven rather than assumed, and the real multi-agent
-``Graph`` covers the orchestrator path. The two terminal shapes a scripted
-model cannot reach (an interrupt outcome, and the post-stream session gates)
-use a scripted core, as ``test_interrupt.py`` does.
+``Graph`` covers the orchestrator path. Every usage payload on that path is a
+VALID Strands payload, for the reason spelled out on ``_metadata``. What a real
+model cannot deliver goes through a scripted core, as ``test_interrupt.py``
+does: the terminal shapes it cannot reach (an interrupt outcome, the
+post-stream session gates) and the usage payloads that break Strands' own
+required-key contract.
 """
 
 from __future__ import annotations
@@ -104,7 +107,18 @@ class ScriptedModel(Model):
 
 
 def _metadata(usage: Any = None, **extra: Any) -> dict:
-    """The stream event Strands reports one of per model invocation."""
+    """The stream event Strands reports one of per model invocation.
+
+    Every ``usage`` handed to a REAL model here carries ``inputTokens``,
+    ``outputTokens`` and ``totalTokens``, however little the case under test
+    needs them: Strands' own ``Usage`` declares all three ``Required``, and its
+    accumulation and telemetry subscript them bare, so a payload missing one
+    aborts the run inside the SDK on any version that does not happen to
+    default them (1.15 does not, 1.18 does). Trimming a fixture back to the one
+    count a test talks about therefore stops testing this bridge and starts
+    testing which Strands is installed. A payload that cannot carry all three
+    and still make its point goes through ``_ScriptedCore`` instead.
+    """
     payload: dict = {"metrics": {"latencyMs": 12}, **extra}
     if usage is not None:
         payload["usage"] = usage
@@ -228,16 +242,28 @@ async def _run_scripted(turns: list[list[dict]], **model_kwargs) -> list:
 class _ScriptedCore:
     """The ``StrandsAgentCore`` surface the adapter reads, stream scripted.
 
-    Used only for the terminal shapes a scripted model cannot reach: a paused
-    checkpoint, and the post-stream mixed-checkpoint gates.
+    Used for what a scripted model cannot deliver: the terminal shapes a real
+    model never reaches (a paused checkpoint, the post-stream
+    mixed-checkpoint gates), and usage payloads that break Strands' OWN
+    ``Usage`` contract, which its accumulation and telemetry reject before the
+    adapter is reached. Those payloads still arrive off the wire in the wild,
+    so the adapter's read of them is worth pinning, just not through a path
+    that cannot carry them.
     """
 
-    def __init__(self, events: list, *, interrupts=None, session_manager=None):
+    def __init__(
+        self,
+        events: list,
+        *,
+        interrupts=None,
+        session_manager=None,
+        model_id: str = "scripted-1",
+    ):
         self.agent_id = "default"
         self.tool_registry = MagicMock()
         self.tool_registry.registry = {}
         self.state = AgentState()
-        self.model = ScriptedModel([], model_id="scripted-1")
+        self.model = ScriptedModel([], model_id=model_id)
         self.messages: list = []
         self.hooks = HookRegistry()
         self.session_manager = session_manager
@@ -376,21 +402,59 @@ class TestUsageIsOmittedNotZeroed:
 
     @pytest.mark.asyncio
     async def test_a_metadata_event_with_no_usage_key_omits_the_field(self):
-        events = await _run_scripted([[*_turn(), _metadata(None)]])
+        """A metadata event may carry only latency, and that is not usage.
 
+        Driven through a scripted core: Strands' own accumulation subscripts
+        ``metadata["usage"]`` on the versions this package supports, so no
+        real model path can hand the adapter a metadata event without it.
+        """
+        core = _ScriptedCore([_stream_event(None)])
+
+        events = await _collect(_wrap(core))
+
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _usage(events) is None
 
     @pytest.mark.asyncio
     async def test_usage_with_no_usable_count_omits_the_field(self):
-        events = await _run_scripted([_turn(usage={"inputTokens": "lots"})])
+        """All three counts reported, none of them a number, so none survive.
 
+        Driven through a scripted core because Strands accumulates its own
+        run metrics by ``+=``-ing these values, which a string count breaks
+        inside the SDK whichever keys are present. Numeric-but-unusable counts
+        reach the guard over a real model and are covered there.
+        """
+        core = _ScriptedCore(
+            [
+                _stream_event(
+                    {
+                        "inputTokens": "lots",
+                        "outputTokens": "a few",
+                        "totalTokens": "some",
+                    }
+                )
+            ]
+        )
+
+        events = await _collect(_wrap(core))
+
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _usage(events) is None
 
     @pytest.mark.asyncio
     async def test_a_labels_only_entry_is_never_emitted(self):
-        """The model label alone is not usage, so nothing is reported."""
-        events = await _run_scripted([_turn(usage={})], model_id="labelled-model")
+        """The model label alone is not usage, so nothing is reported.
 
+        A usage object with no counts at all breaks Strands' required-key
+        contract, so this one goes through a scripted core rather than a real
+        model, which would abort the run inside the SDK before the adapter saw
+        it.
+        """
+        core = _ScriptedCore([_stream_event({})], model_id="labelled-model")
+
+        events = await _collect(_wrap(core))
+
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _usage(events) is None
 
     @pytest.mark.asyncio
@@ -439,21 +503,46 @@ class TestMalformedProviderCounts:
     @pytest.mark.asyncio
     async def test_the_largest_carriable_count_still_survives(self):
         """The bound is inclusive, so the ceiling itself is not dropped."""
-        events = await _run_scripted([_turn(usage={"inputTokens": _MAX_TOKEN_COUNT})])
+        events = await _run_scripted(
+            [
+                _turn(
+                    usage={
+                        "inputTokens": _MAX_TOKEN_COUNT,
+                        "outputTokens": 7,
+                        "totalTokens": 9,
+                    }
+                )
+            ]
+        )
 
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _usage(events)[0].input_tokens == _MAX_TOKEN_COUNT
 
     @pytest.mark.asyncio
     async def test_an_integer_too_large_to_be_a_float_does_not_abort_the_run(self):
-        """``math.isfinite`` raises OverflowError on this, so order matters."""
+        """``math.isfinite`` raises OverflowError on this, so order matters.
+
+        The other two counts are ordinary and complete, so what the run loses
+        is one count and not the whole entry, and the payload stays valid by
+        Strands' own required-key contract.
+        """
         events = await _run_scripted(
-            [_turn(usage={"inputTokens": 10**400, "outputTokens": 3})]
+            [
+                _turn(
+                    usage={
+                        "inputTokens": 10**400,
+                        "outputTokens": 3,
+                        "totalTokens": 5,
+                    }
+                )
+            ]
         )
 
         assert _terminal(events).type == EventType.RUN_FINISHED
         assert _reported(_usage(events)[0]) == {
             "model": "scripted-1",
             "output_tokens": 3,
+            "total_tokens": 5,
         }
 
     @pytest.mark.asyncio
@@ -478,12 +567,14 @@ class TestMalformedProviderCounts:
     async def test_a_boolean_is_not_a_token_count(self):
         """``bool`` subclasses ``int``, and ``True`` is not one token."""
         events = await _run_scripted(
-            [_turn(usage={"inputTokens": True, "outputTokens": 2})]
+            [_turn(usage={"inputTokens": True, "outputTokens": 2, "totalTokens": 3})]
         )
 
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _reported(_usage(events)[0]) == {
             "model": "scripted-1",
             "output_tokens": 2,
+            "total_tokens": 3,
         }
 
     @pytest.mark.asyncio
@@ -503,8 +594,11 @@ class TestMalformedProviderCounts:
 
     @pytest.mark.asyncio
     async def test_a_float_whole_number_is_accepted(self):
-        events = await _run_scripted([_turn(usage={"inputTokens": 4.0})])
+        events = await _run_scripted(
+            [_turn(usage={"inputTokens": 4.0, "outputTokens": 1, "totalTokens": 5})]
+        )
 
+        assert _terminal(events).type == EventType.RUN_FINISHED
         assert _usage(events)[0].input_tokens == 4
 
 
@@ -590,15 +684,24 @@ class TestUsageLabels:
         assert shipped
         assert shipped <= set(_STRANDS_PROVIDER_LABELS)
 
-    def test_the_labels_are_lowercase_and_unique(self):
+    def test_the_labels_are_lowercase_and_one_vendor_gets_one_label(self):
+        """Two classes may share a label; one vendor may not have two.
+
+        A repeated label is only ever right when the classes really are one
+        vendor's two APIs, which today is OpenAI's Chat Completions and
+        Responses classes. Any other repetition is a vendor spelled twice, so
+        the exception is enumerated here rather than waved through.
+        """
         labels = list(_STRANDS_PROVIDER_LABELS.values())
         assert labels == [label.lower() for label in labels]
-        assert len(labels) == len(set(labels))
+        assert {label for label in labels if labels.count(label) > 1} == {"openai"}
 
     @pytest.mark.asyncio
     async def test_an_unrecognised_model_class_omits_the_provider_label(self):
         """``ScriptedModel`` is nobody's provider, so no provider is claimed."""
-        events = await _run_scripted([_turn(usage={"inputTokens": 1})])
+        events = await _run_scripted(
+            [_turn(usage={"inputTokens": 1, "outputTokens": 1, "totalTokens": 2})]
+        )
 
         entry = _usage(events)[0]
         assert entry.provider is None
@@ -611,13 +714,19 @@ class TestUsageLabels:
                 raise RuntimeError("no config for you")
 
         core = StrandsAgentCore(
-            model=_HostileModel([_turn(usage={"inputTokens": 8})]),
+            model=_HostileModel(
+                [_turn(usage={"inputTokens": 8, "outputTokens": 2, "totalTokens": 10})]
+            ),
             callback_handler=None,
         )
         events = await _collect(_wrap(core))
 
         assert _terminal(events).type == EventType.RUN_FINISHED
-        assert _reported(_usage(events)[0]) == {"input_tokens": 8}
+        assert _reported(_usage(events)[0]) == {
+            "input_tokens": 8,
+            "output_tokens": 2,
+            "total_tokens": 10,
+        }
 
     @pytest.mark.asyncio
     async def test_a_config_without_a_model_id_omits_the_model_label(self):
@@ -626,12 +735,19 @@ class TestUsageLabels:
                 return {"params": {"temperature": 0}}
 
         core = StrandsAgentCore(
-            model=_UnlabelledModel([_turn(usage={"inputTokens": 8})]),
+            model=_UnlabelledModel(
+                [_turn(usage={"inputTokens": 8, "outputTokens": 2, "totalTokens": 10})]
+            ),
             callback_handler=None,
         )
         events = await _collect(_wrap(core))
 
-        assert _reported(_usage(events)[0]) == {"input_tokens": 8}
+        assert _terminal(events).type == EventType.RUN_FINISHED
+        assert _reported(_usage(events)[0]) == {
+            "input_tokens": 8,
+            "output_tokens": 2,
+            "total_tokens": 10,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1028,7 +1144,9 @@ async def test_an_agent_as_tool_sub_agents_own_calls_are_not_counted():
 @pytest.mark.asyncio
 async def test_the_metadata_event_is_still_forwarded_as_raw():
     """Reading usage off this channel must not consume the event."""
-    events = await _run_scripted([_turn(usage={"inputTokens": 1})])
+    events = await _run_scripted(
+        [_turn(usage={"inputTokens": 1, "outputTokens": 1, "totalTokens": 2})]
+    )
 
     raws = [event for event in events if event.type == EventType.RAW]
     assert any("metadata" in (event.event or {}).get("event", {}) for event in raws)
