@@ -405,10 +405,21 @@ export function recordTemplateToolSelection(
  * the next request would narrow again.
  *
  * Strands reads the registry fresh for every model call, so this is called from
- * a hook that fires between one tool batch and the next such read, with the
- * exemption recomputed rather than reused: by then the pending execution the
- * exemption existed for has been consumed. Which hook that is differs by SDK,
- * and the adapter picks it; see the call site.
+ * a hook that fires between one tool batch and the next such read. Which hook
+ * that is differs by SDK, and the adapter picks it; see the call site.
+ *
+ * No exemption is passed. By the time this fires the parked batch has been
+ * dispatched, which is the whole reason the exemption existed, so re-reading
+ * the checkpoint would only ask a question whose answer no longer matters, and
+ * the answer moved between releases: this SDK clears its pending execution
+ * before the tool step in 1.1 and after it in 1.16, so a hook that reads it
+ * holds the exemption on one release and drops it on the other. Asking nothing
+ * is both simpler and the same on every release.
+ *
+ * A run the SDK is cancelling can replay a skipped batch after this fires, and
+ * a tool this narrowing removed would be missing from that replay. The run is
+ * being torn down at that point, and the next request restores whatever a live
+ * checkpoint still needs before anything reads the registry again.
  */
 export function renarrowTemplateTools(
   agent: unknown,
@@ -421,6 +432,6 @@ export function renarrowTemplateTools(
     (agent as { toolRegistry: StrandsToolRegistry }).toolRegistry,
     templateTools,
     allowed as Set<string>,
-    { exemptNames: parkedBatchToolNames(agent), log },
+    { log },
   );
 }

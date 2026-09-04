@@ -383,8 +383,21 @@ class TemplateToolsNarrowingHook(HookProvider):
 
     Strands reads the registry fresh before every model call and announces that
     read through ``BeforeModelCallEvent``, so that is where the narrowing is
-    re-applied, with the exemption recomputed rather than reused: by then the
-    checkpoint the exemption existed for is gone.
+    re-applied.
+
+    No exemption is passed. By the time this fires the parked batch has been
+    dispatched, which is the whole reason the exemption existed, so re-reading
+    the checkpoint would only ask a question whose answer no longer matters,
+    and the answer moved between SDK releases: the TypeScript SDK clears its
+    pending execution at different points in 1.1 and 1.16, so a hook that
+    reads it holds the exemption on one release and drops it on the other.
+    Asking nothing is both simpler and the same on every release.
+
+    A run the SDK is cancelling can replay a skipped batch after this fires,
+    and a tool this narrowing removed would be missing from that replay. The
+    run is being torn down at that point, and the next request restores
+    whatever a live checkpoint still needs before anything reads the registry
+    again.
     """
 
     def __init__(self, template_tools: Sequence[Any]) -> None:
@@ -404,5 +417,4 @@ class TemplateToolsNarrowingHook(HookProvider):
             agent.tool_registry,
             self._template_tools,
             allowed,
-            exempt_names=parked_batch_tool_names(agent),
         )

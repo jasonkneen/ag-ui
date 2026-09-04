@@ -2398,8 +2398,6 @@ export class StrandsAgent {
       // the registry a moment too late to affect the specs it was narrowing
       // for. Python's loop dispatches before that read, and its half of this
       // hook uses `BeforeModelCallEvent`; it has no `AfterToolsEvent` to use.
-      // The exemption is recomputed rather than reused, because by this point
-      // the pending execution the exemption existed for has been consumed.
       if (this.config.templateToolsProvider) {
         const built = strandsAgent;
         built.addHook(AfterToolsEvent, () => {
