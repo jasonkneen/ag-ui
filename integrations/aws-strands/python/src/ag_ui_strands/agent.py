@@ -10,6 +10,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import collections.abc
 from copy import deepcopy
 import types
@@ -44,6 +45,10 @@ from strands.types.interrupt import InterruptResponseContent
 # "session_manager" is excluded: it is supplied per-thread via
 # StrandsAgentConfig.session_manager_provider (see run()). Forwarding a
 # template-level session_manager would make every thread share one session_id.
+# "plugins" is excluded: Agent consumes the list during init, registering each
+# plugin's hooks and tools into its own registries and keeping only a registry
+# bound to that agent, so there is no list to read back. Callers supply them
+# per-thread through the explicit StrandsAgent(plugins=...) kwarg.
 _AGUI_EXPLICIT_PARAMS = {
     "self",
     "model",
@@ -52,6 +57,7 @@ _AGUI_EXPLICIT_PARAMS = {
     "messages",
     "hooks",
     "session_manager",
+    "plugins",
 }
 
 
@@ -169,6 +175,63 @@ def _registry_contents(holder: Any) -> Any:
             if isinstance(value, (list, tuple)):
                 return list(value)
     return _MISSING
+
+
+# Whether the installed Strands takes ``plugins`` on its Agent constructor.
+# The plugin system arrived after this package's declared strands-agents floor,
+# so the adapter's own ``plugins=`` kwarg can be handed a release with nowhere
+# to put it. Probed off the signature rather than compared against a version,
+# for the same reason the forwarding probe is: what matters is the parameter
+# being there, not which release put it there.
+_STRANDS_ACCEPTS_PLUGINS = (
+    "plugins" in inspect.signature(StrandsAgentCore.__init__).parameters
+)
+
+
+# Strands namespaces the plugins it registers on every Agent itself, and
+# registers them whether or not the caller passed any. Anything under this
+# prefix is therefore the SDK's, not a setting to report as dropped.
+_SDK_PLUGIN_NAME_PREFIX = "strands:"
+
+
+def _template_plugin_names(agent: Any) -> List[str]:
+    """Names of the plugins the caller put on the template.
+
+    ``plugins`` is handled through an explicit kwarg, so the generic probe
+    skips it and would never report it. Reading the registry here is what
+    lets a caller who set plugins on the template be told they do not carry,
+    instead of getting silence.
+
+    Strands' own plugins are filtered out by name. Every Agent is built with
+    at least one of them, so counting them would warn every caller about a
+    setting nobody made. A caller plugin that borrowed the SDK's prefix would
+    be missed by this, which is the harmless direction: the cost is one
+    warning not said, against a warning said to everyone.
+    """
+    for attr in _candidate_attributes("plugins"):
+        try:
+            holder = getattr(agent, attr, None)
+        except Exception:  # noqa: BLE001 - a raising property is not a plugin list
+            continue
+        if holder is None:
+            continue
+        if isinstance(holder, (list, tuple)):
+            contents: Any = holder
+        else:
+            contents = _registry_contents(holder)
+        if contents is _MISSING or not contents:
+            continue
+        names = []
+        for plugin in contents:
+            name = getattr(plugin, "name", None)
+            # An entry with no readable name cannot be attributed to the SDK,
+            # so it counts as the caller's rather than being dropped silently.
+            label = name if isinstance(name, str) else type(plugin).__name__
+            if not label.startswith(_SDK_PLUGIN_NAME_PREFIX):
+                names.append(label)
+        if names:
+            return names
+    return []
 
 
 def _element_type(annotation: Any) -> Any:
@@ -872,7 +935,12 @@ def _extract_interrupts(agent: Any, terminal_result: Any) -> Tuple[list, bool]:
     return [], False
 
 
-def _interrupt_session_required_error() -> "RunErrorEvent":
+# ``usage`` is optional because both of these are raised from two places: a
+# preflight gate, which has no model call behind it, and the post-stream gate,
+# which does.
+def _interrupt_session_required_error(
+    usage: "List[TokenUsage] | None" = None,
+) -> "RunErrorEvent":
     return RunErrorEvent(
         type=EventType.RUN_ERROR,
         message=(
@@ -880,10 +948,13 @@ def _interrupt_session_required_error() -> "RunErrorEvent":
             "interrupt checkpoint"
         ),
         code="INTERRUPT_SESSION_REQUIRED",
+        usage=usage,
     )
 
 
-def _interrupt_session_capability_error() -> "RunErrorEvent":
+def _interrupt_session_capability_error(
+    usage: "List[TokenUsage] | None" = None,
+) -> "RunErrorEvent":
     return RunErrorEvent(
         type=EventType.RUN_ERROR,
         message=(
@@ -892,6 +963,7 @@ def _interrupt_session_capability_error() -> "RunErrorEvent":
             "list_messages() and update_message()"
         ),
         code="INTERRUPT_SESSION_CAPABILITY_ERROR",
+        usage=usage,
     )
 
 
@@ -1341,7 +1413,9 @@ from ag_ui.core import (
     ToolCallResultEvent,
     ToolCallStartEvent,
     ToolMessage,
+    TokenUsage,
     UserMessage,
+    aggregate_token_usage,
 )
 
 from ag_ui_a2ui_toolkit import split_a2ui_schema_context
@@ -1363,6 +1437,14 @@ from .client_proxy_tool import (
     registered_proxy_names,
     sync_proxy_tools,
     waits_for_frontend_call,
+)
+from .template_tools import (
+    TemplateToolsNarrowingHook,
+    apply_template_tool_selection,
+    index_template_tools,
+    parked_batch_tool_names,
+    record_template_tool_selection,
+    resolve_template_tool_selection,
 )
 from .frontend_tool_interrupt import (
     frontend_tool_response_schema,
@@ -1395,6 +1477,158 @@ from .utils import (
     dumps_wire,
     flatten_content_to_text,
 )
+
+
+# The largest token count every AG-UI binding can carry. Proto int64 reaches
+# further, but the TypeScript protobuf decoder stops at MAX_SAFE_INTEGER, so
+# that is the real ceiling. Mirrors the SDK's own limit.
+_MAX_TOKEN_COUNT = 2**53 - 1
+
+# Strands ``Usage`` (camelCase) -> AG-UI ``TokenUsage`` (snake_case).
+# ``cacheWriteInputTokens`` is absent on purpose: AG-UI has no slot for it and
+# folding it into a neighbouring count would overstate that count. Strands
+# reports no reasoning-token count at all, so ``reasoning_tokens`` is never set
+# from this channel.
+_STRANDS_USAGE_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("input_tokens", "inputTokens"),
+    ("output_tokens", "outputTokens"),
+    ("total_tokens", "totalTokens"),
+    ("cached_input_tokens", "cacheReadInputTokens"),
+)
+
+# Model class name -> canonical provider label, shared verbatim with the
+# TypeScript bridge so one vendor reports one label whichever bridge served the
+# run. A table rather than a derivation from the class name because the two
+# SDKs do not name these classes identically: Python's Google model is
+# ``GeminiModel`` while the TypeScript one lives under ``models/google``, and a
+# derived label would silently split that vendor in two. A class not listed
+# here omits the provider label rather than guessing.
+#
+# Two classes may legitimately share one label. Python ships both
+# ``OpenAIModel`` and ``OpenAIResponsesModel`` for OpenAI's two APIs, where the
+# TypeScript SDK reaches the Responses API through a config on its single
+# ``OpenAIModel``: one vendor either way, so both report ``openai``. Entries
+# with no TypeScript counterpart at all (``litellm``, ``writer``) are the two
+# SDKs shipping different provider classes, not the two bridges disagreeing on
+# a label.
+_STRANDS_PROVIDER_LABELS: Dict[str, str] = {
+    "AnthropicModel": "anthropic",
+    "BedrockModel": "bedrock",
+    "GeminiModel": "google",
+    "LiteLLMModel": "litellm",
+    "LlamaAPIModel": "llamaapi",
+    "LlamaCppModel": "llamacpp",
+    "MistralModel": "mistral",
+    "OllamaModel": "ollama",
+    "OpenAIModel": "openai",
+    "OpenAIResponsesModel": "openai",
+    "SageMakerAIModel": "sagemaker",
+    "WriterModel": "writer",
+}
+
+
+def _usage_count(value: Any) -> "int | None":
+    """Accept a provider count only if the wire can carry it, else drop it.
+
+    Providers do report strings, ``None``s and ``NaN``s next to their counts,
+    and ``TokenUsage`` validates ``ge=0`` in the producer's own constructor: an
+    unguarded value would raise while BUILDING the terminal event and cost the
+    caller a whole successful run over one token count. Dropping the count
+    keeps the rest of the entry.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # ``bool`` subclasses ``int``, and ``True`` is not a token count.
+        return None
+    if isinstance(value, int):
+        # Settled before any float check: ``math.isfinite`` coerces to float
+        # and raises OverflowError on a large int, which would abort the run
+        # from inside the guard that exists to protect it.
+        return value if 0 <= value <= _MAX_TOKEN_COUNT else None
+    if not math.isfinite(value):
+        return None
+    if value < 0 or value > _MAX_TOKEN_COUNT or int(value) != value:
+        return None
+    return int(value)
+
+
+def _model_usage_labels(model: Any) -> "Tuple[str | None, str | None]":
+    """Provider and model labels for a Strands model instance.
+
+    Read defensively at every step. ``get_config`` belongs to the integrator on
+    a custom model, so it may be missing, may raise, and may return something
+    that is not a mapping. A label that cannot be read is omitted; it never
+    fails the run.
+    """
+    if model is None:
+        return None, None
+    provider = _STRANDS_PROVIDER_LABELS.get(type(model).__name__)
+    get_config = getattr(model, "get_config", None)
+    config: Any = None
+    if callable(get_config):
+        try:
+            config = get_config()
+        except Exception:
+            logger.debug("model get_config failed while labelling usage", exc_info=True)
+    model_id = _plain_mapping(config).get("model_id")
+    return provider, model_id if isinstance(model_id, str) and model_id else None
+
+
+def _record_metadata_usage(
+    entries: List[Any], metadata_holder: Any, model: Any
+) -> None:
+    """Append this metadata event's usage, when it reports a usable count.
+
+    Strands emits one metadata event per model invocation, so a multi-cycle run
+    accumulates one entry per call and they are folded into one entry per
+    (provider, model) at the terminal event. Read from this channel rather than
+    ``AgentResult.metrics.accumulated_usage``, which is pre-summed and seeded
+    with zeros and so cannot tell "the provider reported nothing" apart from
+    "the provider reported zero".
+
+    Only counts and the two labels are copied: ``TokenUsage`` feeds anonymous
+    telemetry, so no prompt, completion, trace or latency may ride along.
+    """
+    usage = _plain_mapping(_plain_mapping(metadata_holder).get("metadata")).get("usage")
+    counts = {
+        agui_key: _usage_count(_plain_mapping(usage).get(strands_key))
+        for agui_key, strands_key in _STRANDS_USAGE_FIELDS
+    }
+    if all(value is None for value in counts.values()):
+        # A labels-only entry is not usage. Adding nothing keeps an unreported
+        # run's field omitted rather than present as zeros.
+        return
+    provider, model_id = _model_usage_labels(model)
+    fields: Dict[str, Any] = {
+        key: value for key, value in counts.items() if value is not None
+    }
+    if provider is not None:
+        fields["provider"] = provider
+    if model_id is not None:
+        fields["model"] = model_id
+    entries.append(TokenUsage(**fields))
+
+
+def _collect_run_usage(entries: Sequence[Any]) -> "List[TokenUsage] | None":
+    """Fold a run's per-call entries into its terminal event's ``usage``.
+
+    ``None`` (an omitted field) when nothing was reported, so a consumer reads
+    a missing field as "not measured" rather than as zero. Aggregation is the
+    SDK's shared helper, so both bridges emit the same shape.
+    """
+    return aggregate_token_usage(list(entries)) or None
+
+
+def _orchestrator_node_model(orchestrator: Any, node_id: Any) -> Any:
+    """The model behind an orchestrator node, for usage labelling.
+
+    The metadata event carries no agent handle, but the node id it arrives
+    under does resolve: Graph and Swarm both key ``nodes`` by id and hold the
+    leaf on ``executor``. A nested orchestrator resolves to the inner Graph or
+    Swarm instead, which has no model, so those entries stay label-less and
+    still aggregate truthfully.
+    """
+    node = _plain_mapping(getattr(orchestrator, "nodes", None)).get(node_id)
+    return getattr(getattr(node, "executor", node), "model", None)
 
 
 def _resume_fingerprint(resume_entries: list[ResumeEntry]) -> str:
@@ -2997,6 +3231,7 @@ class StrandsAgent:
         description: str = "",
         config: "StrandsAgentConfig | None" = None,
         hooks: "list | None" = None,
+        plugins: "list | None" = None,
         agents_by_thread: "Dict[str, Any] | None" = None,
     ):
         # Detect a multi-agent orchestrator structurally. A Graph or Swarm has
@@ -3065,9 +3300,18 @@ class StrandsAgent:
             self._unreadable_params = []
             self._template_owned_params = []
 
-        # Params wired to the template are a known structural limit, not a
-        # surprise, so they are recorded without a warning. Params this adapter
-        # could not read at all are the ones worth interrupting for.
+        # ``plugins`` is handled explicitly, so the generic probe above skips
+        # it and cannot report it. A template built with plugins is still a
+        # dropped setting, so record it here and let it be reported through the
+        # same route as every other param that will not carry.
+        if self._orchestrator is None and _template_plugin_names(agent):
+            self._template_owned_params.append("plugins")
+
+        # Both kinds of param will fail to reach per-thread agents, and both
+        # are reported when a thread is built. They are kept apart because they
+        # ask for different reading: an unreadable param is a gap in this
+        # adapter that a later release may close, while one the SDK wired to
+        # the agent that received it will never carry.
         self._unforwardable_params = [
             *self._unreadable_params,
             *self._template_owned_params,
@@ -3096,6 +3340,43 @@ class StrandsAgent:
         # observability / loop-cap / policy-enforcement hook actually fires.
         self._hooks = list(hooks) if hooks else []
 
+        # Plugins forwarded to each per-thread StrandsAgentCore.
+        #
+        # A dedicated kwarg for the same reason ``hooks`` has one, one step
+        # further along. Strands consumes the plugin list during init: it calls
+        # each plugin's ``init_agent`` and registers its hooks and tools into
+        # that agent's registries, keeping only a registry bound to that agent.
+        # There is no list left to read back, and the registry cannot be handed
+        # to a second agent. Since the template never serves a request, a
+        # plugin registered there never runs against the agents that do, and a
+        # plugin whose whole behaviour lives in ``init_agent`` silently does
+        # nothing. Taking them from the caller instead lets every per-thread
+        # agent build its own.
+        self._plugins = list(plugins) if plugins else []
+        # Refused at wrap time rather than on the first request. Without this
+        # the kwarg reaches a constructor with no parameter for it and Strands
+        # raises a bare TypeError from inside per-thread construction, which
+        # escapes the run generator: the caller sees a traceback pointing at
+        # the SDK rather than at the argument they passed, and only once a
+        # request arrives. This is a static misconfiguration, knowable the
+        # moment the wrapper is built, so it is answered there.
+        # Not raised for an orchestrator, which never builds a per-thread agent
+        # and so ignores plugins on every release. Refusing only the old ones
+        # there would report a version problem for something the new ones do
+        # not do either.
+        if (
+            self._plugins
+            and self._orchestrator is None
+            and not _STRANDS_ACCEPTS_PLUGINS
+        ):
+            raise TypeError(
+                "plugins= was supplied, but the installed strands-agents "
+                f"({distribution_version('strands-agents')}) has no `plugins` "
+                "parameter on Agent, so they cannot be forwarded to per-thread "
+                "agents. Upgrade strands-agents to a release that supports "
+                "plugins, or drop the argument."
+            )
+
         self.name = name
         self.description = description
         self.config = config or StrandsAgentConfig()
@@ -3109,6 +3390,14 @@ class StrandsAgent:
         }
         if interrupt_tools:
             self._hooks = [StrandsInterruptHook(interrupt_tools), *self._hooks]
+
+        # Re-narrow the per-request tool filter before each model call. The
+        # parked-batch exemption holds a denied tool registered so a resume can
+        # reach it, and Strands then continues the same run against the same
+        # registry; without this the run would keep advertising what the
+        # request denied until the next request narrowed again.
+        if self.config.template_tools_provider is not None:
+            self._hooks = [*self._hooks, TemplateToolsNarrowingHook(self._tools)]
 
         # Detect the common footgun: session_manager set on the template Agent
         # (stored as `_session_manager` by Strands) with no per-thread provider.
@@ -3311,6 +3600,10 @@ class StrandsAgent:
         # Native interrupts raised during this run, reported on RUN_FINISHED so
         # the client knows the run paused rather than completed.
         native_interrupts: List[Any] = []
+        # Provider-reported usage, one entry per model call in the order the
+        # nodes reported it. Local to this generator, so a second sequential
+        # run cannot inherit the first run's counts.
+        run_usage: List[Any] = []
         # Leaf conversation state to rewind to when this run does not pause.
         baseline: "List[Tuple[list, list]] | None" = None
         # Set only once an interrupt outcome has actually been committed. While
@@ -3496,6 +3789,15 @@ class StrandsAgent:
                           node_id, inner = _unwrap_multiagent_node_stream(event)
                           if inner is None:
                               continue
+                          # A node's model reports usage on the same metadata
+                          # event the single-agent loop reads, one wrapper
+                          # deeper. Labelled from the node that raised it, so a
+                          # multi-model orchestrator keeps its models apart.
+                          _record_metadata_usage(
+                              run_usage,
+                              inner.get("event"),
+                              _orchestrator_node_model(orchestrator, node_id),
+                          )
                           if inner.get("data"):
                               for text_event in nodes.text(node_id, inner["data"]):
                                   yield text_event
@@ -3550,6 +3852,9 @@ class StrandsAgent:
                   thread_id=input_data.thread_id,
                   run_id=input_data.run_id,
                   outcome=outcome,
+                  # An interrupted run is a finished run for usage purposes:
+                  # the model calls its nodes already made were real.
+                  usage=_collect_run_usage(run_usage),
               )
           except Exception as e:
               code = _terminal_error_code(e)
@@ -3561,7 +3866,12 @@ class StrandsAgent:
               for closing in _close_open_multiagent(nodes, open_steps, failed=True):
                   yield closing
               yield RunErrorEvent(
-                  type=EventType.RUN_ERROR, message=str(e), code=code
+                  type=EventType.RUN_ERROR,
+                  message=str(e),
+                  code=code,
+                  # Partial usage: a node that failed after earlier nodes
+                  # completed still spent their tokens.
+                  usage=_collect_run_usage(run_usage),
               )
         finally:
             # Runs for normal completion, exceptions, cancellation and
@@ -3580,25 +3890,57 @@ class StrandsAgent:
         Said once per param, and only about params this thread's kwargs did not
         supply, so acting on it makes it stop without the first thread becoming
         the policy for every later one.
+
+        The two kinds get their own message. An unreadable param is a gap in
+        this adapter, and a caller reading that can reasonably wait for a later
+        release to close it. A param the SDK wired to the agent that received
+        it is a structural limit rather than a gap: no adapter release will
+        carry it, so the per-thread route is the whole answer rather than a
+        stopgap. One sentence for both would send half the readers after a fix
+        that is not coming.
         """
-        still_missing = sorted(
-            name
-            for name in self._unreadable_params
-            if name not in core_kwargs and name not in self._reported_uncarried
-        )
-        if not still_missing:
-            return
-        self._reported_uncarried.update(still_missing)
-        # Phrased as a capability, not an accusation: an unreadable param is
-        # unreadable whether or not the caller set one, so this cannot say that
-        # anything was actually lost.
-        logger.warning(
-            "this Strands release stores these Agent constructor params where the "
-            "adapter cannot read them back, so a value set on the template through "
-            "them will not reach per-thread agents: %s. Supply them per thread "
-            "with StrandsAgentConfig.thread_agent_kwargs.",
-            ", ".join(still_missing),
-        )
+
+        def _unreported(names: List[str]) -> List[str]:
+            return sorted(
+                name
+                for name in names
+                if name not in core_kwargs and name not in self._reported_uncarried
+            )
+
+        unreadable = _unreported(self._unreadable_params)
+        template_owned = _unreported(self._template_owned_params)
+        self._reported_uncarried.update(unreadable)
+        self._reported_uncarried.update(template_owned)
+
+        if unreadable:
+            # Phrased as a capability, not an accusation: an unreadable param
+            # is unreadable whether or not the caller set one, so this cannot
+            # say that anything was actually lost.
+            logger.warning(
+                "this Strands release stores these Agent constructor params where the "
+                "adapter cannot read them back, so a value set on the template through "
+                "them will not reach per-thread agents: %s. Supply them per thread "
+                "with StrandsAgentConfig.thread_agent_kwargs.",
+                ", ".join(unreadable),
+            )
+        if template_owned:
+            # ``plugins`` is the one of these with a dedicated kwarg, so point
+            # at it rather than making every caller write a hook for the case
+            # the adapter already has an answer to.
+            route = (
+                "Pass them to StrandsAgent(plugins=[...])"
+                if template_owned == ["plugins"]
+                else "Supply them per thread with "
+                "StrandsAgentConfig.thread_agent_kwargs"
+            )
+            logger.warning(
+                "these Agent constructor params are consumed by the Strands Agent "
+                "that received them and cannot be handed to another agent, so a "
+                "value set on the template will not reach per-thread agents: %s. "
+                "%s.",
+                ", ".join(template_owned),
+                route,
+            )
 
     async def run(
         self,
@@ -3825,6 +4167,12 @@ class StrandsAgent:
                     core_kwargs = dict(self._agent_kwargs)
                     if self._hooks:
                         core_kwargs["hooks"] = list(self._hooks)
+                    # Same falsy-omission rule as hooks, for the same reason:
+                    # ``plugins=[]`` is a value a future StrandsAgentCore could
+                    # read as "disable the defaults", which is not what an
+                    # absent setting means.
+                    if self._plugins:
+                        core_kwargs["plugins"] = list(self._plugins)
                     # The caller's per-thread kwargs go on last, so they can
                     # supply what the template cannot carry and override what
                     # it can. See StrandsAgentConfig.thread_agent_kwargs.
@@ -3854,8 +4202,6 @@ class StrandsAgent:
                             return
                         core_kwargs.update(dict(extra or {}))
                     self._report_uncarried_params(core_kwargs)
-                    if self.config.thread_agent_kwargs is None:
-                        self._report_uncarried_params(core_kwargs)
                     # Re-asserted after the caller: these keep threads apart
                     # and a run coherent, so they stay the adapter's to set.
                     for owned in ("model", "system_prompt", "tools", "session_manager"):
@@ -4156,6 +4502,65 @@ class StrandsAgent:
         except Exception as e:
             logger.warning(f"Failed to set agui_context on strands_agent.state: {e}")
 
+        # Filter the tools the template contributed, per request. Applied to
+        # the registry this thread's live agent already owns: that instance
+        # carries the thread's session manager, its interrupt checkpoint and
+        # its history, so rebuilding it to change a tool list would discard a
+        # conversation and any approval waiting inside it.
+        if self.config.template_tools_provider is not None:
+            # Calling the provider and reading its answer are guarded
+            # together. Reading is where a mapping, a bare name or a generator
+            # that raises partway through is caught, and those are provider
+            # mistakes: leaving them outside this arm would let them bypass the
+            # documented code and, on the TypeScript side, end the stream with
+            # nothing terminal behind it.
+            try:
+                template_tool_allowed = resolve_template_tool_selection(
+                    await maybe_await(
+                        self.config.template_tools_provider(input_data)
+                    ),
+                    index_template_tools(self._tools),
+                )
+            except Exception as e:  # noqa: BLE001 - surfaced as RUN_ERROR
+                logger.error(
+                    "template_tools_provider failed: %s", e, exc_info=True
+                )
+                # Deliberately terminal rather than unfiltered: a filter that
+                # fails open hands the model tools the caller meant to withhold.
+                ev_started, ev_error = _error_events(
+                    input_data,
+                    "Failed to resolve the template tools for this request: "
+                    f"{e}",
+                    "TEMPLATE_TOOLS_PROVIDER_ERROR",
+                )
+                yield ev_started
+                yield ev_error
+                return
+            # Guarded separately, and not as a provider error: past this point
+            # a failure is this adapter's, and it still must not escape as a
+            # stream that stops with nothing terminal behind it.
+            try:
+                apply_template_tool_selection(
+                    strands_agent.tool_registry,
+                    self._tools,
+                    template_tool_allowed,
+                    exempt_names=parked_batch_tool_names(strands_agent),
+                )
+            except Exception as e:  # noqa: BLE001 - surfaced as RUN_ERROR
+                logger.error(
+                    "Applying the template tool filter failed: %s", e, exc_info=True
+                )
+                ev_started, ev_error = _error_events(
+                    input_data, str(e), _terminal_error_code(e)
+                )
+                yield ev_started
+                yield ev_error
+                return
+            # Published for the re-narrowing hook: the exemption above holds a
+            # denied tool registered so a resume can reach it, and Strands then
+            # continues the same run from this registry.
+            record_template_tool_selection(strands_agent, template_tool_allowed)
+
         # Sync proxy tools from client-defined tools. A proxy parked in a live
         # frontend-tool interrupt is exempt from removal: Strands is about to
         # resume that tool, and an absent registry entry turns the client's
@@ -4369,6 +4774,13 @@ class StrandsAgent:
             _resume_prompt = interrupt_responses
             # Bookkeeping is cleared only after successful processing below so
             # reconciliation failures leave the checkpoint retryable.
+
+        # Provider-reported usage, one entry per model call in the order the
+        # stream reported it, folded into the terminal event below. Local to
+        # this generator, so a second sequential run starts from nothing.
+        # Declared out here rather than inside the guarded body because the
+        # error paths that report partial usage are its ``except`` clauses.
+        run_usage: List[Any] = []
 
         # ── Start run ─────────────────────────────────────────────────────
         # Start run
@@ -6543,6 +6955,15 @@ class StrandsAgent:
                                         pending_halt = True
 
                         elif "metadata" in inner_event:
+                            # One event per model invocation, so a run that
+                            # loops through several tool cycles accumulates one
+                            # entry per call. Still forwarded as RAW below: the
+                            # metrics and trace this carries are not usage.
+                            _record_metadata_usage(
+                                run_usage,
+                                inner_event,
+                                getattr(strands_agent, "model", None),
+                            )
                             raw_payload = _sanitize_raw_event(
                                 event, run_invocation_state
                             )
@@ -6707,6 +7128,9 @@ class StrandsAgent:
                     type=EventType.RUN_ERROR,
                     message=force_stop_error,
                     code="STRANDS_FORCE_STOP",
+                    # Partial usage: a forced stop lands after the cycles that
+                    # got that far had already been paid for.
+                    usage=_collect_run_usage(run_usage),
                 )
                 return
 
@@ -6715,12 +7139,16 @@ class StrandsAgent:
             # repository boundary needed for a safe resume is available.
             if active_proxy_placeholder_ids(strands_agent):
                 if session_manager is None:
-                    yield _interrupt_session_required_error()
+                    yield _interrupt_session_required_error(
+                        _collect_run_usage(run_usage)
+                    )
                     return
                 if not _supports_repository_reconciliation(
                     session_manager, strands_agent
                 ):
-                    yield _interrupt_session_capability_error()
+                    yield _interrupt_session_capability_error(
+                        _collect_run_usage(run_usage)
+                    )
                     return
 
             # Final state snapshot before finishing
@@ -6769,6 +7197,9 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                     outcome=pending_interrupt_outcome,
+                    # An interrupted run is a finished run for usage purposes:
+                    # the model calls it already made were real.
+                    usage=_collect_run_usage(run_usage),
                 )
             else:
                 # Store fingerprint for idempotency only after successful
@@ -6794,6 +7225,7 @@ class StrandsAgent:
                     thread_id=input_data.thread_id,
                     run_id=input_data.run_id,
                     outcome=RunFinishedSuccessOutcome(type="success"),
+                    usage=_collect_run_usage(run_usage),
                 )
 
         except _FrontendToolIdentityError as e:
@@ -6801,6 +7233,7 @@ class StrandsAgent:
                 type=EventType.RUN_ERROR,
                 message=str(e),
                 code="FRONTEND_TOOL_IDENTITY_ERROR",
+                usage=_collect_run_usage(run_usage),
             )
         except Exception as e:
             import traceback
@@ -6808,5 +7241,11 @@ class StrandsAgent:
             code = _terminal_error_code(e)
             traceback.print_exc()
             yield RunErrorEvent(
-                type=EventType.RUN_ERROR, message=str(e), code=code
+                type=EventType.RUN_ERROR,
+                message=str(e),
+                code=code,
+                # Partial usage: a run that failed after one or more model
+                # calls still spent those tokens. Omitted when it died before
+                # any call reported usage.
+                usage=_collect_run_usage(run_usage),
             )

@@ -14,6 +14,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import * as pkg from "../index";
 import { INTERRUPT_CANCELLED } from "../index";
 import {
   collect,
@@ -198,5 +199,64 @@ describe("README claims that the code has to back", () => {
       undocumented,
       `the README does not document published approval metadata keys: ${undocumented.join(", ")}`,
     ).toEqual([]);
+  });
+
+  it("imports only names the package entry actually exports", () => {
+    // The URL fetch policy section is written as code a reader will paste, and
+    // its whole point is that the override is spelled by spreading the
+    // exported default. A renamed export would leave a snippet that does not
+    // compile, which prose review does not catch.
+    const imports = [
+      ...readme.matchAll(
+        /import\s*\{([^}]*)\}\s*from\s*"@ag-ui\/aws-strands"/g,
+      ),
+    ].flatMap((match) =>
+      match[1]!
+        .split(",")
+        .map((name) => name.trim().replace(/^type\s+/, ""))
+        .filter((name) => name.length > 0),
+    );
+    expect(imports, "no package import found in the README to check").toContain(
+      "DEFAULT_URL_FETCH_POLICY",
+    );
+
+    // Checked against the entry's SOURCE, not only against the module object:
+    // a type export is erased at runtime, and README snippets import types
+    // without always marking them `type`. The one value the section's whole
+    // idiom rests on is checked at runtime as well.
+    // Comments stripped: this file's export block explains itself by naming
+    // the neighbours it deliberately leaves out, and a mention there is not
+    // an export.
+    const entry = readFileSync(join(root, "src", "index.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    const missing = [...new Set(imports)].filter(
+      (name) => !new RegExp(`\\b${name}\\b`).test(entry),
+    );
+    expect(
+      missing,
+      "the README imports names the package entry does not export",
+    ).toEqual([]);
+    expect(pkg.DEFAULT_URL_FETCH_POLICY).toBeDefined();
+  });
+
+  it("documents the URL fetch defaults the code actually applies", () => {
+    const anchor = readme.indexOf("## Fetching URL content sources");
+    expect(
+      anchor,
+      "the README no longer documents URL fetching",
+    ).toBeGreaterThan(-1);
+    const section = readme.slice(anchor, readme.indexOf("\n## ", anchor + 1));
+
+    // Only the two claims a test can settle: which schemes the default
+    // fetches, and that the private network is off until a host turns it on.
+    for (const scheme of pkg.DEFAULT_URL_FETCH_POLICY.allowedSchemes) {
+      expect(
+        section.includes(scheme),
+        `the section does not name the '${scheme}' scheme the default allows`,
+      ).toBe(true);
+    }
+    expect(pkg.DEFAULT_URL_FETCH_POLICY.allowPrivateNetworks).toBe(false);
+    expect(section).toContain("allowPrivateNetworks");
   });
 });
