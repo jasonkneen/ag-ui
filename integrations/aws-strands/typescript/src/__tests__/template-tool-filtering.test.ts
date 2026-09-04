@@ -18,17 +18,26 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { EventType, type BaseEvent, type RunAgentInput } from "@ag-ui/core";
-import { Agent as StrandsAgentCore, type Tool } from "@strands-agents/sdk";
+import {
+  Agent as StrandsAgentCore,
+  BeforeModelCallEvent,
+  type Tool,
+} from "@strands-agents/sdk";
 
 import { StrandsAgent } from "../agent";
 import type { StrandsAgentConfig } from "../config";
 import {
+  EXEMPT_EVERY_TEMPLATE_TOOL,
   indexTemplateTools,
   parkedBatchToolNames,
   resolveTemplateToolSelection,
   syncTemplateTools,
 } from "../template-tools";
-import type { StrandsToolRegistry } from "../client-proxy-tool";
+import {
+  createProxyTool,
+  isProxyTool,
+  type StrandsToolRegistry,
+} from "../client-proxy-tool";
 import {
   collect,
   errorCodes,
@@ -304,10 +313,9 @@ describe("a parked call is not orphaned", () => {
     );
 
     expect(threadAgent(agent)).toBe(core);
-    expect(
-      core.toolRegistry.get(DELETE),
-      "the tool the resume routes back into was filtered out from under it",
-    ).toBeDefined();
+    // The resume reaching the tool is the assertion. Dropping the exemption
+    // makes Strands refuse the tool as absent from the registry, which surfaces
+    // here as the approved tool never running.
     expect(errorCodes(second)).toEqual([]);
     expect(del.calls, "the approved tool never ran").toHaveLength(1);
   });
@@ -421,6 +429,284 @@ describe("a pause is out of the filter's reach on a plain turn", () => {
     expect(threadAgent(agent)).toBe(core);
     expect(del.calls).toHaveLength(1);
     expect(consulted).toEqual(["run-1", "run-3"]);
+  });
+});
+
+describe("the return contract", () => {
+  const quiet = { debug() {}, warn() {}, error() {} };
+
+  async function errorFor(
+    provider: StrandsAgentConfig["templateToolsProvider"],
+  ) {
+    const { agent, model } = twoToolAgent({
+      templateToolsProvider: provider,
+      logger: quiet,
+    });
+    const events = await collect(agent, userTurn());
+    const error = events.find((e) => e.type === EventType.RUN_ERROR) as
+      | (BaseEvent & { code?: string; message?: string })
+      | undefined;
+    return { error, model };
+  }
+
+  it("refuses a Map rather than reading it as an allow-list", async () => {
+    // The mistake Python failed silently and permissively on: iterating a
+    // permission map yields its keys, so every name would be allowed including
+    // the ones mapped to false. Refusing it is also what keeps one return
+    // contract across the two bridges.
+    const { error, model } = await errorFor(
+      () =>
+        new Map([
+          [READ, true],
+          [DELETE, false],
+        ]) as never,
+    );
+    expect(error?.code).toBe("TEMPLATE_TOOLS_PROVIDER_ERROR");
+    expect(error?.message).toContain("values went unread");
+    expect(model.calls, "the model ran unfiltered").toBe(0);
+  });
+
+  it("refuses a plain object with the same error, not a bare TypeError", async () => {
+    const { error } = await errorFor(
+      () => ({ [READ]: true, [DELETE]: false }) as never,
+    );
+    expect(error?.code).toBe("TEMPLATE_TOOLS_PROVIDER_ERROR");
+    expect(error?.message).toContain("not a container");
+  });
+
+  it("refuses a bare name rather than reading it one character at a time", async () => {
+    const { error } = await errorFor(() => READ as never);
+    expect(error?.code).toBe("TEMPLATE_TOOLS_PROVIDER_ERROR");
+    expect(error?.message).toContain("one character at a time");
+  });
+
+  it("refuses a non-container", async () => {
+    const { error } = await errorFor(() => 42 as never);
+    expect(error?.code).toBe("TEMPLATE_TOOLS_PROVIDER_ERROR");
+  });
+
+  it("reports a generator that throws partway through iteration", async () => {
+    // The provider's answer is read inside the guarded arm, not after it. A
+    // generator constructs without running its body, so reading it outside the
+    // boundary skipped the documented code and ended the stream after
+    // RUN_STARTED with nothing terminal behind it.
+    const { error, model } = await errorFor(function* () {
+      yield READ;
+      throw new Error("directory lookup failed");
+    });
+    expect(error?.code).toBe("TEMPLATE_TOOLS_PROVIDER_ERROR");
+    expect(error?.message).toContain("directory lookup failed");
+    expect(model.calls).toBe(0);
+  });
+
+  it("accepts a generator of names", async () => {
+    const { agent, model } = twoToolAgent({
+      templateToolsProvider: function* () {
+        yield READ;
+      },
+    });
+    await collect(agent, userTurn());
+    expect(offered(model)).toEqual(new Set([READ]));
+  });
+
+  it("accepts a Set of names", async () => {
+    const { agent, model } = twoToolAgent({
+      templateToolsProvider: () => new Set([READ]),
+    });
+    await collect(agent, userTurn());
+    expect(offered(model)).toEqual(new Set([READ]));
+  });
+});
+
+describe("the exemption does not outlive the checkpoint", () => {
+  it("narrows again before the next model call in the same run", async () => {
+    // Strands keeps running after a resume, from this same registry: it
+    // re-dispatches the batch, clears the checkpoint and calls the model again
+    // within the same run. Without a re-narrowing that call would still
+    // advertise the tool the request denied.
+    const del = recordingTool(DELETE);
+    const read = recordingTool(READ);
+    const { agent, model } = realStrandsAgent(
+      [
+        modelTurn.toolUse({ toolUseId: "tu-1", name: DELETE, input: {} }),
+        modelTurn.text("done"),
+      ],
+      {
+        tools: [read.tool, del.tool],
+        config: {
+          toolBehaviors: { [DELETE]: { interruptOnCall: true } },
+          templateToolsProvider: (input) =>
+            input.runId === "run-1" ? null : [READ],
+        },
+      },
+    );
+
+    const first = await collect(agent, userTurn());
+    const interruptId = interruptsOf(first)[0].id;
+    const offeredBeforeResume = model.offeredToolNames.length;
+
+    const resumed = await collect(
+      agent,
+      userTurn({
+        runId: "run-2",
+        resume: [
+          { interruptId, status: "resolved", payload: { approved: true } },
+        ] as never,
+      }),
+    );
+
+    expect(errorCodes(resumed)).toEqual([]);
+    expect(
+      model.offeredToolNames.length,
+      "the resume never reached another model call, so this asserts nothing",
+    ).toBeGreaterThan(offeredBeforeResume);
+    for (const seen of model.offeredToolNames.slice(offeredBeforeResume)) {
+      expect(
+        seen,
+        "a model call after the resume still advertised the denied tool",
+      ).toEqual(new Set([READ]));
+    }
+  });
+
+  it("holds nothing for a pause raised before any tool ran", () => {
+    expect(
+      parkedBatchToolNames({ _interruptState: { activated: true } }),
+    ).toEqual(new Set());
+  });
+
+  it("holds everything for a parked batch it cannot read", () => {
+    expect(
+      parkedBatchToolNames({
+        _interruptState: {
+          activated: true,
+          pendingToolExecution: { assistantMessageData: "not a message" },
+        },
+      }),
+    ).toBe(EXEMPT_EVERY_TEMPLATE_TOOL);
+  });
+});
+
+describe("the ordering against the proxy sync", () => {
+  const clientTool = {
+    name: DELETE,
+    description: "A client tool of the same name",
+    parameters: { type: "object", properties: {} },
+  };
+
+  it("keeps an allowed tool when the client drops a colliding name", async () => {
+    // Neither producer ended up holding the name, for exactly one request. A
+    // client tool sharing a template tool's name takes the registry slot while
+    // the template tool is filtered out; when the provider allows the template
+    // tool again and the client has stopped declaring its own, the template
+    // sync used to decline to touch the proxy and the proxy sync then removed
+    // it as stale, leaving the allowed tool registered nowhere.
+    const byRun: Record<string, string[] | null> = {
+      "run-1": [READ],
+      "run-2": null,
+    };
+    const { agent, model } = twoToolAgent({
+      templateToolsProvider: (input) => byRun[input.runId],
+    });
+
+    await collect(agent, userTurn({ tools: [clientTool] as never }));
+    const core = threadAgent(agent)!;
+
+    await collect(agent, userTurn({ runId: "run-2" }));
+    expect(threadAgent(agent)).toBe(core);
+    expect(
+      core.toolRegistry.get(DELETE),
+      "the provider allowed the tool and it is registered nowhere",
+    ).toBeDefined();
+    expect(offered(model)).toEqual(new Set([READ, DELETE]));
+  });
+
+  it("does not let a client tool shadow an allowed template tool", async () => {
+    const byRun: Record<string, string[] | null> = {
+      "run-1": [READ],
+      "run-2": null,
+    };
+    const { agent } = twoToolAgent({
+      templateToolsProvider: (input) => byRun[input.runId],
+      logger: { debug() {}, warn() {}, error() {} },
+    });
+
+    await collect(agent, userTurn({ tools: [clientTool] as never }));
+    const core = threadAgent(agent)!;
+    expect(isProxyTool(core.toolRegistry.get(DELETE))).toBe(true);
+
+    await collect(
+      agent,
+      userTurn({ runId: "run-2", tools: [clientTool] as never }),
+    );
+    expect(isProxyTool(core.toolRegistry.get(DELETE))).toBe(false);
+  });
+});
+
+describe("ownership is not pure identity", () => {
+  it("lets a rebuilt wrapper deny a cached thread's tools", async () => {
+    // The shape `agentsByThread` exists for: a request-scoped wrapper is
+    // rebuilt per request while the cached thread agent keeps the registry it
+    // already had. A template whose tools are built per request then hands each
+    // new wrapper equivalent but not identical objects, and ownership by object
+    // identity alone would read every one of them as another producer's entry,
+    // so a deny-everything answer would remove nothing at all.
+    const agentsByThread = new Map<string, StrandsAgentCore>();
+    const byRun: Record<string, string[] | null> = {
+      "run-1": null,
+      "run-2": [],
+    };
+    // Registered ahead of the adapter's own re-narrowing hook, which is added
+    // after, so this snapshot is the registry the request path left behind
+    // rather than the one the hook went on to correct.
+    const seenBeforeModelCall: Set<string>[] = [];
+
+    function build(): StrandsAgent {
+      const template = new StrandsAgentCore({
+        model: new ScriptedModel([modelTurn.text("hi")]),
+        tools: [recordingTool(READ).tool, recordingTool(DELETE).tool] as never,
+        printer: false,
+      });
+      const wrapper = new StrandsAgent({
+        agent: template,
+        name: "rebuilt-wrapper",
+        agentsByThread,
+        config: {
+          templateToolsProvider: (input) => byRun[input.runId],
+        },
+      });
+      return wrapper;
+    }
+
+    const first = build();
+    // The snapshot hook has to reach the per-thread agent before the adapter's
+    // own, which is added when that agent is built, so it goes on the template
+    // the first wrapper clones from.
+    const firstThreadAgentHook = (built: StrandsAgentCore) =>
+      built.addHook(BeforeModelCallEvent, () => {
+        seenBeforeModelCall.push(
+          new Set(built.toolRegistry.list().map((t) => t.name)),
+        );
+      });
+
+    await collect(first, userTurn());
+    const core = agentsByThread.get("thread-1")!;
+    expect(new Set(core.toolRegistry.list().map((t) => t.name))).toEqual(
+      new Set([READ, DELETE]),
+    );
+    firstThreadAgentHook(core);
+
+    const second = build();
+    const secondTools = (
+      second as unknown as { _templateFields: { tools: Tool[] } }
+    )._templateFields.tools;
+    expect(
+      secondTools.every((t) => core.toolRegistry.get(t.name) !== t),
+      "the rebuilt template reused its tool objects, so this asserts nothing",
+    ).toBe(true);
+
+    await collect(second, userTurn({ runId: "run-2" }));
+    expect(agentsByThread.get("thread-1")).toBe(core);
+    expect(core.toolRegistry.list()).toEqual([]);
   });
 });
 
@@ -556,20 +842,81 @@ describe("syncTemplateTools", () => {
     expect(reg.get(DELETE)).toBe(original);
   });
 
-  it("leaves an entry another producer owns alone", () => {
+  it("leaves a denied name held by a client proxy alone", () => {
     const { registry: reg, tools } = registry();
     reg.remove(DELETE);
-    const impostor = fakeTool(
-      DELETE,
-      "another producer's tool",
-    ) as unknown as Tool;
-    reg.add(impostor);
+    const proxy = createProxyTool({
+      name: DELETE,
+      description: "A client tool of the same name",
+      parameters: { type: "object", properties: {} },
+    } as never);
+    reg.add(proxy);
 
-    syncTemplateTools(reg, tools, [READ]);
-    expect(reg.get(DELETE)).toBe(impostor);
+    expect(syncTemplateTools(reg, tools, [READ])).toEqual(new Set([READ]));
+    expect(reg.get(DELETE)).toBe(proxy);
+  });
 
-    syncTemplateTools(reg, tools, null);
-    expect(reg.get(DELETE)).toBe(impostor);
+  it("reclaims an allowed name held by a client proxy", () => {
+    // Native tools win a name collision, and the proxy sync runs after this.
+    // Leaving the proxy would shadow the tool the provider just allowed, and if
+    // the client has stopped declaring it the proxy sync would then remove the
+    // name outright, leaving an allowed tool registered nowhere.
+    const { registry: reg, tools } = registry();
+    const templateTool = reg.get(DELETE);
+    reg.remove(DELETE);
+    reg.add(
+      createProxyTool({
+        name: DELETE,
+        description: "A client tool of the same name",
+        parameters: { type: "object", properties: {} },
+      } as never),
+    );
+
+    expect(syncTemplateTools(reg, tools, null)).toEqual(
+      new Set([READ, DELETE]),
+    );
+    expect(reg.get(DELETE)).toBe(templateTool);
+  });
+
+  it("does not reclaim a name the parked batch is answering", () => {
+    const { registry: reg, tools } = registry();
+    reg.remove(DELETE);
+    const proxy = createProxyTool({
+      name: DELETE,
+      description: "A client tool of the same name",
+      parameters: { type: "object", properties: {} },
+    } as never);
+    reg.add(proxy);
+
+    syncTemplateTools(reg, tools, null, { exemptNames: new Set([DELETE]) });
+    expect(reg.get(DELETE)).toBe(proxy);
+  });
+
+  it("treats an equivalent but not identical template entry as ours", () => {
+    // Ownership cannot rest on object identity alone. With an external
+    // `agentsByThread` map the wrapper is rebuilt per request while the cached
+    // thread agent keeps its registry, so a template whose tools are built per
+    // request hands the adapter equivalent but not identical objects. Reading
+    // that as another producer's entry would make a deny-everything answer
+    // remove nothing.
+    const { registry: reg } = registry();
+    const rebuiltRead = recordingTool(READ).tool;
+    const rebuiltDelete = recordingTool(DELETE).tool;
+    expect(reg.get(DELETE)).not.toBe(rebuiltDelete);
+
+    const kept = syncTemplateTools(reg, [rebuiltRead, rebuiltDelete], [READ]);
+    expect(reg.get(DELETE)).toBeUndefined();
+    expect(kept).toEqual(new Set([READ]));
+  });
+
+  it("holds every template tool for an unreadable parked batch", () => {
+    const { registry: reg, tools } = registry();
+    expect(syncTemplateTools(reg, tools, [READ])).toEqual(new Set([READ]));
+    expect(
+      syncTemplateTools(reg, tools, [READ], {
+        exemptNames: EXEMPT_EVERY_TEMPLATE_TOOL,
+      }),
+    ).toEqual(new Set([READ, DELETE]));
   });
 
   it("keeps an exempt name however the selection reads", () => {

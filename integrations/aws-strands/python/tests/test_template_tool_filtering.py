@@ -18,13 +18,17 @@ import pytest
 from ag_ui.core import EventType, RunAgentInput, Tool, UserMessage
 from strands import Agent as StrandsAgentCore
 from strands import tool
+from strands.hooks import BeforeModelCallEvent, HookProvider
 from strands.interrupt import Interrupt as StrandsInterrupt
 from strands.models.model import Model as StrandsModel
 from strands.tools.registry import ToolRegistry
 
 from ag_ui_strands.agent import StrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig, ToolBehavior
+from ag_ui_strands.client_proxy_tool import _is_proxy, create_proxy_tool
 from ag_ui_strands.template_tools import (
+    EXEMPT_EVERY_TEMPLATE_TOOL,
+    TemplateToolsSelectionError,
     index_template_tools,
     parked_batch_tool_names,
     resolve_template_tool_selection,
@@ -406,11 +410,12 @@ class TestAParkedCallIsNotOrphaned:
         )
 
         assert agent._agents_by_thread[THREAD_ID] is core
-        assert "delete_record" in core.tool_registry.registry, (
-            "the tool the resume routes back into was filtered out from under it"
-        )
+        # The resume reaching the tool is the assertion. Dropping the exemption
+        # makes Strands report the tool as absent from the registry, which
+        # surfaces here as the approved tool never running.
         assert [e for e in events if e.type == EventType.RUN_ERROR] == []
         assert [e for e in events if e.type == EventType.RUN_FINISHED]
+        assert model.called_delete
 
     async def test_a_plain_turn_against_a_pause_is_refused_before_the_filter_runs(
         self,
@@ -540,6 +545,338 @@ class TestFilteringRemovesTheCapability:
         assert [e for e in events if e.type == EventType.RUN_ERROR] == []
 
 
+class TestTheReturnContract:
+    async def test_a_mapping_is_refused_rather_than_read_as_an_allow_list(self):
+        """The one failure that was silent and permissive.
+
+        A permission map is a natural thing to reach for on a hook shaped like
+        this, and iterating it yields its keys: every name would be allowed,
+        including the ones mapped to False, and nothing would say so.
+        """
+        from tests.error_code_table import assert_contract_error
+
+        model = RecordingModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: {
+                    "read_docs": True,
+                    "delete_record": False,
+                }
+            ),
+        )
+
+        events = await drain(agent, run_input("r1"))
+
+        error = next(e for e in events if e.type == EventType.RUN_ERROR)
+        assert_contract_error(error, "TEMPLATE_TOOLS_PROVIDER_ERROR")
+        assert "values went unread" in error.message
+        assert model.offered_tool_names == [], "the model ran unfiltered"
+
+    async def test_a_bare_name_is_refused_rather_than_read_one_character_at_a_time(
+        self,
+    ):
+        from tests.error_code_table import assert_contract_error
+
+        agent = make_agent(
+            RecordingModel(),
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: "read_docs"
+            ),
+        )
+        error = next(
+            e
+            for e in await drain(agent, run_input("r1"))
+            if e.type == EventType.RUN_ERROR
+        )
+        assert_contract_error(error, "TEMPLATE_TOOLS_PROVIDER_ERROR")
+        assert "one character at a time" in error.message
+
+    async def test_a_non_container_is_refused(self):
+        from tests.error_code_table import assert_contract_error
+
+        agent = make_agent(
+            RecordingModel(),
+            config=StrandsAgentConfig(template_tools_provider=lambda data: 42),
+        )
+        assert_contract_error(
+            next(
+                e
+                for e in await drain(agent, run_input("r1"))
+                if e.type == EventType.RUN_ERROR
+            ),
+            "TEMPLATE_TOOLS_PROVIDER_ERROR",
+        )
+
+    async def test_a_generator_that_raises_partway_reports_the_provider_error(self):
+        """The provider's answer is read inside the guarded arm, not after it.
+
+        A generator constructs without running its body, so a provider can hand
+        back something that fails only on first iteration. Reading it outside
+        the boundary bypassed the documented code entirely.
+        """
+        from tests.error_code_table import assert_contract_error
+
+        def provider(data: RunAgentInput):
+            def entries():
+                yield "read_docs"
+                raise RuntimeError("directory lookup failed")
+
+            return entries()
+
+        model = RecordingModel()
+        agent = make_agent(
+            model, config=StrandsAgentConfig(template_tools_provider=provider)
+        )
+
+        events = await drain(agent, run_input("r1"))
+        error = next(e for e in events if e.type == EventType.RUN_ERROR)
+        assert_contract_error(error, "TEMPLATE_TOOLS_PROVIDER_ERROR")
+        assert "directory lookup failed" in error.message
+        assert model.offered_tool_names == []
+
+    async def test_a_generator_of_names_is_accepted(self):
+        model = RecordingModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: (n for n in ["read_docs"])
+            ),
+        )
+        await drain(agent, run_input("r1"))
+        assert model.offered_tool_names[-1] == {"read_docs"}
+
+
+class TestTheExemptionDoesNotOutliveTheCheckpoint:
+    async def test_the_denied_batch_is_narrowed_again_before_the_next_model_call(
+        self,
+    ):
+        """Strands keeps running after a resume, from this same registry.
+
+        The exemption holds a denied tool registered so the human's answer can
+        reach it. Strands then re-dispatches the batch, clears the checkpoint
+        and calls the model again within the same run. Without a re-narrowing
+        that call would still advertise the tool the request denied.
+        """
+        model = DeleteThenAnswerModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                tool_behaviors={"delete_record": ToolBehavior(interrupt_on_call=True)},
+                template_tools_provider=lambda data: (
+                    None if data.run_id == "r1" else ["read_docs"]
+                ),
+            ),
+        )
+
+        await drain(agent, run_input("r1"))
+        parked = list(agent._pending_interrupts_by_thread[THREAD_ID])
+        offered_before_resume = len(model.offered_tool_names)
+
+        from ag_ui_strands import ResumeEntry
+
+        events = await drain(
+            agent,
+            run_input(
+                "r2",
+                resume=[
+                    ResumeEntry(
+                        interrupt_id=parked[0],
+                        status="resolved",
+                        payload={"approved": True},
+                    )
+                ],
+            ),
+        )
+
+        assert [e for e in events if e.type == EventType.RUN_ERROR] == []
+        assert len(model.offered_tool_names) > offered_before_resume, (
+            "the resume never reached another model call, so this asserts nothing"
+        )
+        for offered in model.offered_tool_names[offered_before_resume:]:
+            assert offered == {"read_docs"}, (
+                "a model call after the resume still advertised the denied tool"
+            )
+
+    async def test_an_unreadable_parked_batch_holds_every_template_tool(self):
+        """The conservative direction, for a shape this adapter cannot read.
+
+        An activated checkpoint whose tool batch does not decode is an SDK
+        shape this code does not know. Filtering anyway risks breaking a
+        resume a human is waiting on; holding everything costs one unfiltered
+        turn.
+        """
+        model = RecordingModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: ["read_docs"]
+            ),
+        )
+        await drain(agent, run_input("r1"))
+        core = agent._agents_by_thread[THREAD_ID]
+        assert set(core.tool_registry.registry) == {"read_docs"}
+
+        state = InterruptStateStub(
+            interrupts={"i1": StrandsInterrupt("i1", "generic")}
+        )
+        state.activate({"tool_use_message": "not a message"})
+        core._interrupt_state = state
+
+        assert parked_batch_tool_names(core) is EXEMPT_EVERY_TEMPLATE_TOOL
+        sync_template_tools(
+            core.tool_registry,
+            agent._tools,
+            ["read_docs"],
+            exempt_names=parked_batch_tool_names(core),
+        )
+        assert set(core.tool_registry.registry) == {"read_docs", "delete_record"}
+
+    async def test_a_pause_with_no_tool_batch_holds_nothing(self):
+        """An interrupt raised before any tool ran has no batch to protect."""
+        state = InterruptStateStub()
+        state.activate({"responses": []})
+
+        class _Agent:
+            _interrupt_state = state
+
+        assert parked_batch_tool_names(_Agent()) == set()
+
+
+class TestTheOrderingAgainstTheProxySync:
+    async def test_an_allowed_tool_survives_a_client_dropping_a_colliding_name(
+        self,
+    ):
+        """Neither producer ended up holding the name, for exactly one request.
+
+        A client tool sharing a template tool's name takes the registry slot
+        while the template tool is filtered out. When the provider allows the
+        template tool again and the client has stopped declaring its own, the
+        template sync used to decline to touch the proxy and the proxy sync
+        then removed it as stale, leaving the allowed tool registered nowhere.
+        """
+        client_tool = Tool(
+            name="delete_record",
+            description="A client tool of the same name",
+            parameters={"type": "object", "properties": {}},
+        )
+        allowed_by_run = {"r1": ["read_docs"], "r2": None}
+        model = RecordingModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: allowed_by_run[data.run_id]
+            ),
+        )
+
+        await drain(agent, run_input("r1", tools=[client_tool]))
+        core = agent._agents_by_thread[THREAD_ID]
+
+        await drain(agent, run_input("r2"))
+        assert agent._agents_by_thread[THREAD_ID] is core
+        assert "delete_record" in core.tool_registry.registry, (
+            "the provider allowed the tool and it is registered nowhere"
+        )
+        assert model.offered_tool_names[-1] == {"read_docs", "delete_record"}
+
+    async def test_a_client_tool_cannot_shadow_an_allowed_template_tool(self):
+        """Native tools win a name collision, filter or no filter."""
+        client_tool = Tool(
+            name="delete_record",
+            description="A client tool of the same name",
+            parameters={"type": "object", "properties": {}},
+        )
+        allowed_by_run = {"r1": ["read_docs"], "r2": None}
+        model = RecordingModel()
+        agent = make_agent(
+            model,
+            config=StrandsAgentConfig(
+                template_tools_provider=lambda data: allowed_by_run[data.run_id]
+            ),
+        )
+
+        await drain(agent, run_input("r1", tools=[client_tool]))
+        core = agent._agents_by_thread[THREAD_ID]
+        assert _is_proxy(core.tool_registry.registry["delete_record"])
+
+        await drain(agent, run_input("r2", tools=[client_tool]))
+        assert not _is_proxy(core.tool_registry.registry["delete_record"])
+
+
+class TestOwnershipIsNotPureIdentity:
+    async def test_a_rebuilt_wrapper_can_still_deny_a_cached_threads_tools(self):
+        """The shape ``agents_by_thread`` exists for.
+
+        A request-scoped wrapper is rebuilt per request while the cached thread
+        agent keeps the registry it already had. A template whose tools are
+        built per request then hands each new wrapper equivalent but not
+        identical objects, and ownership by object identity alone would read
+        every one of them as another producer's entry, so a deny-everything
+        answer would remove nothing at all.
+        """
+        agents_by_thread: dict = {}
+        allowed_by_run = {"r1": None, "r2": []}
+        # Registered ahead of the adapter's own re-narrowing hook, which is
+        # appended last, so this snapshot is the registry the request path left
+        # behind rather than the one the hook went on to correct.
+        seen_before_model_call: list[set[str]] = []
+
+        class _Snapshot(HookProvider):
+            def register_hooks(self, registry, **_kwargs):
+                registry.add_callback(BeforeModelCallEvent, self._record)
+
+            def _record(self, event):
+                seen_before_model_call.append(
+                    set(event.agent.tool_registry.registry)
+                )
+
+        def build_agent() -> StrandsAgent:
+            # Rebuilt per request, tools included: the case that breaks pure
+            # identity. Module-level tools would be the same objects every time
+            # and the bug would be invisible.
+            @tool(name="read_docs")
+            def read(topic: str) -> str:
+                """Read the documentation for a topic."""
+                return topic
+
+            @tool(name="delete_record")
+            def delete(record_id: str) -> str:
+                """Delete a record."""
+                return record_id
+
+            core = StrandsAgentCore(
+                model=RecordingModel(),
+                tools=[read, delete],
+                system_prompt="Help the user.",
+            )
+            return StrandsAgent(
+                core,
+                name="rebuilt-wrapper",
+                agents_by_thread=agents_by_thread,
+                hooks=[_Snapshot()],
+                config=StrandsAgentConfig(
+                    template_tools_provider=lambda data: allowed_by_run[data.run_id]
+                ),
+            )
+
+        first = build_agent()
+        await drain(first, run_input("r1"))
+        core = agents_by_thread[THREAD_ID]
+        assert set(core.tool_registry.registry) == {"read_docs", "delete_record"}
+
+        second = build_agent()
+        assert all(
+            core.tool_registry.registry[t.tool_name] is not t for t in second._tools
+        ), "the rebuilt template reused its tool objects, so this asserts nothing"
+
+        await drain(second, run_input("r2"))
+        assert agents_by_thread[THREAD_ID] is core
+        assert seen_before_model_call[-1] == set(), (
+            "a deny-everything answer removed nothing from the cached thread"
+        )
+        assert set(core.tool_registry.registry) == set()
+
+
 class TestTheProviderFailureMode:
     async def test_a_raising_provider_ends_the_run_rather_than_running_unfiltered(
         self, caplog
@@ -608,9 +945,12 @@ class TestNoProviderConfigured:
         import ag_ui_strands.agent as agent_module
 
         def explode(*args, **kwargs):  # pragma: no cover - must not be reached
-            raise AssertionError("sync_template_tools ran with no provider configured")
+            raise AssertionError(
+                "the template-tool sync ran with no provider configured"
+            )
 
-        monkeypatch.setattr(agent_module, "sync_template_tools", explode)
+        monkeypatch.setattr(agent_module, "apply_template_tool_selection", explode)
+        monkeypatch.setattr(agent_module, "resolve_template_tool_selection", explode)
         agent = make_agent(RecordingModel())
         events = await drain(agent, run_input("r1"))
         assert [e for e in events if e.type == EventType.RUN_ERROR] == []
@@ -670,15 +1010,82 @@ class TestSyncTemplateTools:
         sync_template_tools(registry, [read_docs, delete_record], None)
         assert registry.registry["delete_record"] is original
 
-    def test_an_entry_another_producer_owns_is_left_alone(self):
+    def test_a_denied_name_held_by_a_client_proxy_is_left_alone(self):
         registry = self._registry()
-        registry.registry["delete_record"] = "not ours"
+        proxy = create_proxy_tool(
+            Tool(
+                name="delete_record",
+                description="A client tool of the same name",
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+        registry.registry["delete_record"] = proxy
 
-        sync_template_tools(registry, [read_docs, delete_record], ["read_docs"])
-        assert registry.registry["delete_record"] == "not ours"
+        kept = sync_template_tools(registry, [read_docs, delete_record], ["read_docs"])
+        assert registry.registry["delete_record"] is proxy
+        assert kept == {"read_docs"}
 
-        sync_template_tools(registry, [read_docs, delete_record], None)
-        assert registry.registry["delete_record"] == "not ours"
+    def test_an_allowed_name_held_by_a_client_proxy_is_reclaimed(self):
+        """Native tools win a name collision, and the proxy sync runs after.
+
+        Leaving the proxy would shadow the tool the provider just allowed, and
+        if the client has stopped declaring it the proxy sync would then remove
+        the name outright, leaving an allowed tool registered nowhere.
+        """
+        registry = self._registry()
+        template_tool = registry.registry["delete_record"]
+        registry.registry["delete_record"] = create_proxy_tool(
+            Tool(
+                name="delete_record",
+                description="A client tool of the same name",
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+
+        kept = sync_template_tools(registry, [read_docs, delete_record], None)
+        assert registry.registry["delete_record"] is template_tool
+        assert kept == {"read_docs", "delete_record"}
+
+    def test_a_parked_proxy_holding_a_name_is_not_reclaimed(self):
+        registry = self._registry()
+        proxy = create_proxy_tool(
+            Tool(
+                name="delete_record",
+                description="A client tool of the same name",
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+        registry.registry["delete_record"] = proxy
+
+        sync_template_tools(
+            registry,
+            [read_docs, delete_record],
+            None,
+            exempt_names={"delete_record"},
+        )
+        assert registry.registry["delete_record"] is proxy
+
+    def test_an_equivalent_but_not_identical_template_entry_is_still_ours(self):
+        """Ownership cannot rest on object identity alone.
+
+        With an external ``agents_by_thread`` map the wrapper is rebuilt per
+        request while the cached thread agent keeps its registry, so a template
+        whose tools are built per request hands the adapter equivalent but not
+        identical objects. Reading that as another producer's entry would make
+        a deny-everything answer remove nothing.
+        """
+
+        @tool(name="delete_record")
+        def rebuilt(record_id: str) -> str:
+            """A second instance of the same template tool."""
+            return record_id
+
+        registry = self._registry()
+        assert registry.registry["delete_record"] is not rebuilt
+
+        kept = sync_template_tools(registry, [read_docs, rebuilt], ["read_docs"])
+        assert "delete_record" not in registry.registry
+        assert kept == {"read_docs"}
 
     def test_exempt_names_are_kept_however_the_selection_reads(self):
         registry = self._registry()

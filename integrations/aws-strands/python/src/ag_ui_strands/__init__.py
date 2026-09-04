@@ -18,7 +18,11 @@ from .a2ui_tool import (
 )
 from .citations import CITATIONS_METADATA_KEY
 from .client_proxy_tool import create_proxy_tool, sync_proxy_tools
-from .template_tools import sync_template_tools
+from .template_tools import (
+    EXEMPT_EVERY_TEMPLATE_TOOL,
+    TemplateToolsSelectionError,
+    sync_template_tools,
+)
 from .utils import (
     DEFAULT_URL_FETCH_POLICY,
     InvocationStateProvider,
@@ -60,6 +64,8 @@ __all__ = [
     "create_proxy_tool",
     "sync_proxy_tools",
     "sync_template_tools",
+    "TemplateToolsSelectionError",
+    "EXEMPT_EVERY_TEMPLATE_TOOL",
     "create_strands_app",
     "UrlFetchPolicy",
     "UrlFetchPolicyError",

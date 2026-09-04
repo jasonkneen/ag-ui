@@ -8,6 +8,7 @@ import { createHash, randomUUID } from "crypto";
 
 import {
   Agent as StrandsAgentCore,
+  AfterToolsEvent,
   BeforeToolCallEvent,
   InterruptResponseContent,
   Message as StrandsMessage,
@@ -56,8 +57,15 @@ import {
   jsonRoundTrip,
 } from "./citations";
 import { isProxyTool, syncProxyTools } from "./client-proxy-tool";
-import { parkedBatchToolNames, syncTemplateTools } from "./template-tools";
-import type { TemplateToolSelectionEntry } from "./template-tools";
+import {
+  applyTemplateToolSelection,
+  indexTemplateTools,
+  parkedBatchToolNames,
+  recordTemplateToolSelection,
+  renarrowTemplateTools,
+  resolveTemplateToolSelection,
+} from "./template-tools";
+import type { TemplateToolSelection } from "./template-tools";
 import {
   planA2UIInjection,
   isAutoInjectedA2UITool,
@@ -2378,6 +2386,31 @@ export class StrandsAgent {
           callerConfig,
         ),
       );
+      // Re-narrow the per-request tool filter once a tool batch has run. The
+      // parked-batch exemption holds a denied tool registered so a resume can
+      // reach it, and Strands then continues the same run against the same
+      // registry; without this the run would keep advertising what the request
+      // denied until the next request narrowed again.
+      //
+      // `AfterToolsEvent`, not `BeforeModelCallEvent`: this SDK reads the tool
+      // specs off the registry as the first statement of its model call and
+      // dispatches `BeforeModelCallEvent` after, so a hook there would narrow
+      // the registry a moment too late to affect the specs it was narrowing
+      // for. Python's loop dispatches before that read, and its half of this
+      // hook uses `BeforeModelCallEvent`; it has no `AfterToolsEvent` to use.
+      // The exemption is recomputed rather than reused, because by this point
+      // the pending execution the exemption existed for has been consumed.
+      if (this.config.templateToolsProvider) {
+        const built = strandsAgent;
+        built.addHook(AfterToolsEvent, () => {
+          renarrowTemplateTools(
+            built,
+            this._templateFields.tools ?? [],
+            this._log,
+          );
+        });
+      }
+
       // Register interruptOnCall hooks on the per-thread agent.
       const behaviors = this.config.toolBehaviors;
       if (behaviors) {
@@ -2839,10 +2872,20 @@ export class StrandsAgent {
     // rebuilding it to change a tool list would discard a conversation and any
     // approval waiting inside it.
     if (this.config.templateToolsProvider) {
-      let selection: Iterable<TemplateToolSelectionEntry> | null | undefined;
+      // Calling the provider and reading its answer are guarded together.
+      // Reading is where a Map, a bare name or a generator that throws partway
+      // through is caught, and those are provider mistakes: leaving them
+      // outside this arm let them bypass the documented code and end the
+      // stream after RUN_STARTED with nothing terminal behind it.
+      let allowed: Set<string> | null;
       try {
-        selection = await maybeAwait(
+        const selection: TemplateToolSelection = await maybeAwait(
           this.config.templateToolsProvider(inputData),
+        );
+        allowed = resolveTemplateToolSelection(
+          selection,
+          indexTemplateTools(this._templateFields.tools ?? []),
+          this._log,
         );
       } catch (e) {
         const msg = _errorMessage(e);
@@ -2858,15 +2901,33 @@ export class StrandsAgent {
         );
         return;
       }
-      syncTemplateTools(
-        strandsAgent.toolRegistry,
-        this._templateFields.tools ?? [],
-        selection,
-        {
-          exemptNames: parkedBatchToolNames(strandsAgent),
-          log: this._log,
-        },
-      );
+      // Guarded separately, and not as a provider error: past this point a
+      // failure is this adapter's, and this block runs before the main
+      // try/catch below, so it still must not escape as a stream that stops
+      // with nothing terminal behind it.
+      try {
+        applyTemplateToolSelection(
+          strandsAgent.toolRegistry,
+          this._templateFields.tools ?? [],
+          allowed,
+          {
+            exemptNames: parkedBatchToolNames(strandsAgent),
+            log: this._log,
+          },
+        );
+        // Published for the re-narrowing hook: the exemption above holds a
+        // denied tool registered so a resume can reach it, and Strands then
+        // continues the same run from this registry.
+        recordTemplateToolSelection(strandsAgent, allowed);
+      } catch (e) {
+        const msg = _errorMessage(e);
+        this._log.error(
+          `${LOG_PREFIX} applying the template tool filter failed: ${msg}`,
+          e,
+        );
+        yield _runError(msg, _terminalErrorCode(e));
+        return;
+      }
     }
 
     // Sync proxy tools from client-defined tools.
