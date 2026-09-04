@@ -308,7 +308,10 @@ function haveUv(): boolean {
 }
 
 async function buildFixture(
-  { withDependent = false }: { withDependent?: boolean } = {},
+  {
+    withDependent = false,
+    virtualReleased = false,
+  }: { withDependent?: boolean; virtualReleased?: boolean } = {},
 ): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), "prepare-release-fixture-"));
   mkdirSync(join(root, "scripts/release"), { recursive: true });
@@ -345,10 +348,12 @@ async function buildFixture(
       'requires-python = ">=3.10"',
       "dependencies = []",
       "",
-      "[build-system]",
-      'requires = ["hatchling"]',
-      'build-backend = "hatchling.build"',
-      "",
+      // `package = false` makes this a VIRTUAL project, which changes the source
+      // form a consumer's lock records for it from `directory` to `virtual`.
+      // A virtual project has no build backend -- it is not installable.
+      ...(virtualReleased
+        ? ["[tool.uv]", "package = false", ""]
+        : ["[build-system]", 'requires = ["hatchling"]', 'build-backend = "hatchling.build"', ""]),
     ].join("\n"),
   );
 
@@ -400,7 +405,12 @@ async function buildFixture(
 function pathDepVersion(lockPath: string, relDir: string): string | null {
   const blocks = readFileSync(lockPath, "utf8").split("[[package]]");
   for (const block of blocks) {
-    if (!block.includes(`source = { directory = "${relDir}" }`)) continue;
+    // uv writes `directory`, `editable` or `virtual` depending on the target; the
+    // embedded version goes stale either way, so accept all three here.
+    const isPathSource = ["directory", "editable", "virtual"].some((form) =>
+      block.includes(`source = { ${form} = "${relDir}" }`),
+    );
+    if (!isPathSource) continue;
     const match = block.match(/^version = "([^"]+)"/m);
     if (match) return match[1];
   }
@@ -541,6 +551,56 @@ test(
         "fixture-pkg/uv.lock",
       ],
       "dependent uv.lock missing from `files`",
+    );
+
+    rmSync(root, { recursive: true, force: true });
+  },
+);
+
+// uv records a path dependency in three different source forms, and the matcher
+// that finds dependents has to know all three or it silently skips one:
+//
+//     source = { directory = "../pkg" }   non-editable path source
+//     source = { editable  = "../pkg" }   editable path source
+//     source = { virtual   = "../pkg" }   target sets `[tool.uv] package = false`
+//
+// `virtual` is the easy one to miss, because it is the form that does NOT
+// correspond to something installable -- but uv still records `version = "..."`
+// for it, so it still goes stale on a bump and still fails `uv lock --check`.
+// Reported on #2555 review with a reproduction; this is that reproduction as a
+// test. Before the fix the matcher covered only directory|editable, so the
+// dependent below kept the old version and never reached `files`.
+test(
+  "a Python version bump re-locks a dependent that records the `virtual` path form",
+  { timeout: 120_000, skip: haveUv() ? false : "uv not on PATH" },
+  async () => {
+    const root = await buildFixture({ withDependent: true, virtualReleased: true });
+    const depLock = join(root, "fixture-dep/uv.lock");
+
+    // Guard the fixture itself: if uv ever stops emitting `virtual` here, this
+    // test would pass for the wrong reason, so assert the form is really present.
+    assert.match(
+      readFileSync(depLock, "utf8"),
+      /source = \{ virtual = "\.\.\/fixture-pkg" \}/,
+      "fixture did not produce a `virtual` path source -- test would be vacuous",
+    );
+    assert.equal(pathDepVersion(depLock, "../fixture-pkg"), "0.1.0", "dependent seed lock");
+
+    const result = await runPrepareRelease(["--scope", "fixture-py", "--bump", "minor"], {
+      PREPARE_RELEASE_ROOT: root,
+    });
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+
+    assert.equal(
+      pathDepVersion(depLock, "../fixture-pkg"),
+      "0.2.0",
+      "dependent uv.lock not re-locked through the `virtual` source form",
+    );
+
+    const output = JSON.parse(result.stdout);
+    assert.ok(
+      output.files.includes("fixture-dep/uv.lock"),
+      `dependent uv.lock missing from \`files\`: ${JSON.stringify(output.files)}`,
     );
 
     rmSync(root, { recursive: true, force: true });

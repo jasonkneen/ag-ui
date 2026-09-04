@@ -464,11 +464,17 @@ function findPathDependentLocks(repoRoot: string, pkgDir: string): string[] {
 
   return found.filter((lockPath) => {
     const lockDir = path.dirname(lockPath);
-    // `directory` is what uv writes for a non-editable path source; `editable`
-    // for an editable one. Both embed the version, so both go stale.
+    // uv has three directory-based source forms, and all three embed the
+    // dependency's version, so all three go stale on a bump:
+    //   directory -- a non-editable path source
+    //   editable  -- an editable path source
+    //   virtual   -- a path source whose target sets `[tool.uv] package = false`
+    // `virtual` is easy to miss because it is the one that does not correspond to
+    // something installable, but uv still records `version = "..."` for it and
+    // still fails `uv lock --check` when that version moves.
     const sources = fs
       .readFileSync(lockPath, "utf-8")
-      .matchAll(/^source = \{ (?:directory|editable) = "([^"]+)" \}$/gm);
+      .matchAll(/^source = \{ (?:directory|editable|virtual) = "([^"]+)" \}$/gm);
     for (const [, rel] of sources) {
       if (path.resolve(lockDir, rel) === pkgDir) return true;
     }
