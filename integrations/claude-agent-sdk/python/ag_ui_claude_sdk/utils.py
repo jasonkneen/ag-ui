@@ -213,8 +213,10 @@ def _legacy_binary_block(block: BinaryInputContent, index: int) -> Dict[str, Any
     raise ValueError(f"content[{index}].mime_type is not supported")
 
 
-def _convert_content_block(block: Any, index: int) -> Dict[str, Any]:
+def _convert_content_block(block: Any, index: int) -> Optional[Dict[str, Any]]:
     if isinstance(block, TextInputContent):
+        if not block.text.strip():
+            return None
         return {
             "type": "text",
             "text": block.text,
@@ -309,7 +311,11 @@ def process_messages(input_data: RunAgentInput) -> Tuple[ClaudePrompt, bool]:
             user_message = content
             has_user_content = bool(content)
         elif isinstance(content, list):
-            blocks = [_convert_content_block(block, index) for index, block in enumerate(content)]
+            blocks = []
+            for index, block in enumerate(content):
+                converted = _convert_content_block(block, index)
+                if converted is not None:
+                    blocks.append(converted)
             if blocks:
                 user_message = _structured_user_message(
                     blocks,

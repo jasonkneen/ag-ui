@@ -243,7 +243,7 @@ function legacyBinaryBlock(
 function convertContentBlock(
   block: InputContent,
   index: number,
-): ContentBlockParam {
+): ContentBlockParam | undefined {
   if (!block || typeof block !== "object" || typeof block.type !== "string") {
     throw new Error(
       `[ClaudeAdapter] content[${index}] must be a typed content object`,
@@ -251,11 +251,14 @@ function convertContentBlock(
   }
 
   switch (block.type) {
-    case "text":
+    case "text": {
+      const text = requireText(block.text, `content[${index}].text`);
+      if (text.trim().length === 0) return undefined;
       return {
         type: "text",
-        text: requireText(block.text, `content[${index}].text`),
+        text,
       };
+    }
     case "image":
       return imageBlock(block.source, `content[${index}].source`);
     case "document":
@@ -324,9 +327,11 @@ export function processMessages(input: RunAgentInput): ProcessMessagesResult {
       userMessage = content;
       hasUserContent = content.length > 0;
     } else if (Array.isArray(content)) {
-      const blocks = content.map((block, index) =>
-        convertContentBlock(block, index),
-      );
+      const blocks: ContentBlockParam[] = [];
+      content.forEach((block, index) => {
+        const converted = convertContentBlock(block, index);
+        if (converted) blocks.push(converted);
+      });
       if (blocks.length > 0) {
         userMessage = structuredUserMessage(
           blocks,

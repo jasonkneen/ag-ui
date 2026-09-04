@@ -158,6 +158,23 @@ class TestProcessMessages:
         assert user_msg == ""
         assert pending is False
 
+    def test_skips_empty_text_blocks(self, make_input):
+        inp = make_input(
+            messages=[
+                {
+                    "id": "1",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "   "},
+                    ],
+                }
+            ]
+        )
+        user_msg, pending = process_messages(inp)
+        assert user_msg == ""
+        assert pending is False
+
     @pytest.mark.asyncio
     async def test_preserves_ordered_text_image_and_pdf(self, make_input):
         inp = make_input(

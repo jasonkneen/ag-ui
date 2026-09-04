@@ -58,6 +58,7 @@ async function collectPrompt(prompt: unknown): Promise<unknown> {
 
 async function runAdapter(messages: unknown[], threadId = "thread-media") {
   const adapter = new ClaudeAgentAdapter({ model: "claude-haiku-4-5" });
+  const events: Array<Record<string, unknown>> = [];
   await new Promise<void>((resolve, reject) => {
     adapter
       .run({
@@ -67,8 +68,13 @@ async function runAdapter(messages: unknown[], threadId = "thread-media") {
         tools: [],
         context: [],
       } as never)
-      .subscribe({ error: reject, complete: resolve });
+      .subscribe({
+        next: (event) => events.push(event as Record<string, unknown>),
+        error: reject,
+        complete: resolve,
+      });
   });
+  return events;
 }
 
 describe("ClaudeAgentAdapter multimodal input", () => {
@@ -231,6 +237,47 @@ describe("ClaudeAgentAdapter multimodal input", () => {
         ],
       } as never),
     ).toThrow("opaque file id");
+  });
+
+  it("emits AG-UI error events when adapter input conversion fails", async () => {
+    const events = await runAdapter([
+      {
+        id: "1",
+        role: "user",
+        content: [
+          {
+            type: "audio",
+            source: {
+              type: "data",
+              value: "Ynl0ZXM=",
+              mimeType: "audio/mp4",
+            },
+          },
+        ],
+      },
+    ]);
+
+    expect(events.map((event) => event.type)).toEqual([
+      "RUN_STARTED",
+      "RUN_ERROR",
+    ]);
+    expect(events[1].message).toContain("type audio is not supported");
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send empty text blocks to query", async () => {
+    await runAdapter([
+      {
+        id: "1",
+        role: "user",
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: "   " },
+        ],
+      },
+    ]);
+
+    expect(queryMock.mock.calls[0][0].prompt).toBe("");
   });
 
   it("keeps plain string prompts unchanged", async () => {
