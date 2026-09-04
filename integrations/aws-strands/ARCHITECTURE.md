@@ -170,6 +170,7 @@ This document explains how the AWS Strands integration inside `integrations/aws-
 | `tool_behaviors: Dict[str, ToolBehavior]` | Per-tool overrides keyed by the Strands tool name.                                                                                                                                     |
 | `state_context_builder`                   | Callable that enriches the outgoing prompt with the current shared state (useful for reiterating plan steps, recipes, etc.).                                                           |
 | `session_manager_provider`                | Factory invoked once per thread to produce a per-thread `SessionManager`.                                                                                                              |
+| `template_tools_provider`                 | Per-request choice of which of the template agent's tools this request may see, applied to the live per-thread registry. TypeScript's equivalent field is `templateToolsProvider`.     |
 | `thread_agent_kwargs`                     | Callable returning extra constructor kwargs for one thread's `StrandsAgentCore`. TypeScript's `threadAgentConfig` returns a partial `AgentConfig` instead.                             |
 | `emit_messages_snapshot`                  | Global opt-out of the four-point `MESSAGES_SNAPSHOT` emission. Default `True`.                                                                                                         |
 | `replay_history_into_strands`             | Global opt-out of the per-run Strands history reconciliation. Default `True`.                                                                                                          |
@@ -247,6 +248,7 @@ typescript/src/
 ├── logger.ts             ← injectable Logger interface + internal default
 ├── server.ts             ← createStrandsApp factory + CORS/auth wiring
 ├── session-reconcile.ts  ← port of session_reconcile.py, snapshot-shaped
+├── template-tools.ts     ← per-request filter over the template agent's tools
 ├── types.ts              ← internal SeenToolCall bookkeeping
 ├── utils.ts              ← content conversion + UrlFetchPolicy
 └── index.ts              ← public exports
