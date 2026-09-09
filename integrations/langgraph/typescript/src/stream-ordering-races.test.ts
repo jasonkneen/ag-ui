@@ -414,6 +414,168 @@ describe("load-dependent stream ordering", () => {
     expect(boundarySnapshot?.snapshot.total).toBe(8);
   });
 
+  it("does not let helper callback output reject reduced root values", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const reply: LangGraphMessage = {
+      id: "reply-1",
+      type: "ai",
+      content: "I will find experiences next",
+    };
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "writer", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "writer", langgraph_checkpoint_ns: "" },
+          { output: { temporary: "working" } },
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "writer", langgraph_checkpoint_ns: "" },
+          { output: { messages: [reply], total: 1 } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer",
+          },
+          {},
+        ),
+        valuesChunk({ messages: [user, reply], total: 8 }),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          {},
+        ),
+      ],
+      threadState({ messages: [user], total: 7 }),
+    );
+
+    const messagesSnapshot = events.find(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(messagesSnapshot?.messages.map((message) => message.id)).toEqual([
+      "user-1",
+      "reply-1",
+    ]);
+    const boundarySnapshot = events.find(
+      (event): event is StateSnapshotEvent =>
+        event.type === EventType.STATE_SNAPSHOT && event.rawEvent === undefined,
+    );
+    expect(boundarySnapshot?.snapshot.total).toBe(8);
+  });
+
+  it("reads reduced state before a second subgraph in events-only mode", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const childReply: LangGraphMessage = {
+      id: "child-1",
+      type: "ai",
+      content: "I found the first result",
+    };
+    const writerReply: LangGraphMessage = {
+      id: "writer-1",
+      type: "ai",
+      content: "I will find the second result",
+    };
+    const afterFirstChild = threadState({
+      messages: [user, childReply],
+      total: 7,
+    });
+    const afterWriter = threadState({
+      messages: [user, childReply, writerReply],
+      total: 8,
+    });
+    vi.spyOn(agent.client.threads, "getHistory").mockResolvedValue([
+      afterFirstChild,
+    ]);
+    vi.spyOn(agent.client.threads, "getState").mockResolvedValue(afterWriter);
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "supervisor", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child1",
+            langgraph_checkpoint_ns: "child1:outer|inner:task",
+          },
+          {},
+        ),
+        eventChunk(
+          "on_chain_end",
+          {
+            langgraph_node: "child1",
+            langgraph_checkpoint_ns: "child1:outer|inner:task",
+          },
+          { output: { messages: [childReply] } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "writer",
+            langgraph_checkpoint_ns: "writer:task",
+            langgraph_step: 2,
+          },
+          {},
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "writer", langgraph_checkpoint_ns: "writer:task" },
+          { output: { messages: [writerReply], total: 1 } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child2",
+            langgraph_checkpoint_ns: "child2:outer|inner:task",
+          },
+          {},
+        ),
+      ],
+      threadState({ messages: [user], total: 7 }),
+      { streamMode: ["events"] },
+    );
+
+    const messagesSnapshots = events.filter(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(
+      messagesSnapshots.at(-1)?.messages.map((message) => message.id),
+    ).toEqual(["user-1", "child-1", "writer-1"]);
+    const boundarySnapshots = events.filter(
+      (event): event is StateSnapshotEvent =>
+        event.type === EventType.STATE_SNAPSHOT && event.rawEvent === undefined,
+    );
+    expect(boundarySnapshots.at(-1)?.snapshot.total).toBe(8);
+  });
+
   it("uses committed root values when a subgraph returns with exit durability", async () => {
     const agent = createAgent();
     const user: LangGraphMessage = {

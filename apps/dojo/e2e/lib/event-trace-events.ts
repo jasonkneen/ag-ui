@@ -338,6 +338,17 @@ function stabilizeMirroredModelChunks(events: TraceEvent[]) {
   const redundantMessageIndexes = new Set<number>();
   const consumedEventIndexes = new Set<number>();
 
+  const stateChangedBetween = (leftIndex: number, rightIndex: number) => {
+    const start = Math.min(leftIndex, rightIndex) + 1;
+    const end = Math.max(leftIndex, rightIndex);
+    return events
+      .slice(start, end)
+      .some(
+        (event) =>
+          event.type === "STATE_SNAPSHOT" || event.type === "STATE_DELTA",
+      );
+  };
+
   for (let index = 0; index < events.length; index += 1) {
     const messageMirror = mirrors[index];
     if (messageMirror?.streamMode !== "messages") continue;
@@ -352,7 +363,8 @@ function stabilizeMirroredModelChunks(events: TraceEvent[]) {
         isDeepStrictEqual(
           Reflect.get(events[candidateIndex], "snapshot"),
           Reflect.get(events[index], "snapshot"),
-        ),
+        ) &&
+        !stateChangedBetween(index, candidateIndex),
     );
 
     if (matchingEventIndex !== -1) {
@@ -361,35 +373,7 @@ function stabilizeMirroredModelChunks(events: TraceEvent[]) {
     }
   }
 
-  const deduplicated = events.filter(
-    (_, index) => !redundantMessageIndexes.has(index),
-  );
-  const stabilized: TraceEvent[] = [];
-
-  for (let index = 0; index < deduplicated.length; index += 1) {
-    const first = mirroredModelChunk(deduplicated[index]);
-    const second = mirroredModelChunk(deduplicated[index + 1]);
-
-    const isMirrorPair =
-      first !== undefined &&
-      second !== undefined &&
-      first.streamMode !== second.streamMode &&
-      first.chunkId === second.chunkId;
-
-    if (
-      isMirrorPair &&
-      first.streamMode === "events" &&
-      second.streamMode === "messages"
-    ) {
-      stabilized.push(deduplicated[index + 1], deduplicated[index]);
-      index += 1;
-      continue;
-    }
-
-    stabilized.push(deduplicated[index]);
-  }
-
-  return stabilized;
+  return events.filter((_, index) => !redundantMessageIndexes.has(index));
 }
 
 /**

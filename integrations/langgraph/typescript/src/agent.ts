@@ -1116,9 +1116,11 @@ export class LangGraphAgent extends AbstractAgent {
         // LangGraph JS doesn't emit `values` chunks with the latest state between
         // tool execution and run end, so without this update, intermediate
         // STATE_SNAPSHOTs go stale after a tool Command updates state.
-        // A root on_chain_end also advances the ordered root cache: when values
-        // mode is omitted, the next subgraph boundary snapshots straight from
-        // that cache, so it must carry the same merged output.
+        // Before events mode becomes active, a root on_chain_end also advances
+        // the ordered root cache: without events or values mode, this callback
+        // output is the only boundary signal available. During events mode,
+        // callback outputs are provisional updates that have not passed through
+        // reducers, so they must stay separate from the ordered root boundary.
         if (
           eventType === LangGraphEventTypes.OnChainEnd &&
           chunkData.data?.output != null
@@ -1142,7 +1144,10 @@ export class LangGraphAgent extends AbstractAgent {
           }
           if (outputUpdate) {
             latestStateValues = { ...latestStateValues, ...outputUpdate };
-            if (currentSubgraph === ROOT_SUBGRAPH_NAME) {
+            if (
+              currentSubgraph === ROOT_SUBGRAPH_NAME &&
+              !this.eventsStreamActive
+            ) {
               latestRootStateValues = {
                 ...latestRootStateValues,
                 ...outputUpdate,
@@ -1152,6 +1157,16 @@ export class LangGraphAgent extends AbstractAgent {
           }
         }
         if (eventType === LangGraphEventTypes.OnChainEnd) {
+          if (
+            currentSubgraph === ROOT_SUBGRAPH_NAME &&
+            this.eventsStreamActive
+          ) {
+            // The root step has advanced, but its callback output is only an
+            // update. Until reduced values arrive, force the next subgraph
+            // boundary to read committed state instead of treating that update
+            // as a complete snapshot.
+            hasOrderedRootStateValues = false;
+          }
           // `values` carries the fully reduced root state for a completed graph
           // step. Before a chain completes it may race ahead of events-mode,
           // but after completion it is the authoritative boundary and must

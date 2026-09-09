@@ -5,6 +5,7 @@ import {
   normalizeEventTrace,
   parseEventTraceSse,
 } from "./event-trace-events";
+import { assertEventTraceMatches } from "./event-trace-update";
 
 test("parses every ordered non-RAW event without deduplicating snapshots", () => {
   const events = parseEventTraceSse(
@@ -445,6 +446,72 @@ test("preserves repeated snapshots unless both snapshot and mirrored model chunk
     2,
   );
   assert.equal(normalizeEventTrace([ordinaryRepeat, ordinaryRepeat]).length, 2);
+});
+
+test("preserves the order of different snapshots sharing a model message ID", () => {
+  const messagesSnapshot = {
+    type: "STATE_SNAPSHOT",
+    snapshot: { count: 1 },
+    rawEvent: {
+      event: "messages",
+      data: [{ id: "chunk-id", content: "first" }, {}],
+    },
+  };
+  const eventsSnapshot = {
+    type: "STATE_SNAPSHOT",
+    snapshot: { count: 2 },
+    rawEvent: {
+      event: "events",
+      data: {
+        event: "on_chat_model_stream",
+        data: { chunk: { id: "chunk-id", content: "second" } },
+      },
+    },
+  };
+  const ordered = normalizeEventTrace([messagesSnapshot, eventsSnapshot]);
+  const reversed = normalizeEventTrace([eventsSnapshot, messagesSnapshot]);
+
+  assert.notDeepEqual(ordered, reversed);
+  assert.throws(() => assertEventTraceMatches(reversed, ordered));
+});
+
+test("preserves a delayed mirror after intervening state changed", () => {
+  const snapshot = { count: 1 };
+  const chunk = { id: "chunk-id", content: "first" };
+  const eventsSnapshot = {
+    type: "STATE_SNAPSHOT",
+    snapshot,
+    rawEvent: {
+      event: "events",
+      data: {
+        event: "on_chat_model_stream",
+        data: { chunk },
+      },
+    },
+  };
+  const stateDelta = {
+    type: "STATE_DELTA",
+    delta: [{ op: "replace", path: "/count", value: 2 }],
+  };
+  const delayedMessagesSnapshot = {
+    type: "STATE_SNAPSHOT",
+    snapshot,
+    rawEvent: {
+      event: "messages",
+      data: [chunk, {}],
+    },
+  };
+  const withRestoration = normalizeEventTrace([
+    eventsSnapshot,
+    stateDelta,
+    delayedMessagesSnapshot,
+  ]);
+  const withoutRestoration = normalizeEventTrace([eventsSnapshot, stateDelta]);
+
+  assert.notDeepEqual(withRestoration, withoutRestoration);
+  assert.throws(() =>
+    assertEventTraceMatches(withRestoration, withoutRestoration),
+  );
 });
 
 test("retains the complete SSE response when a data frame is malformed", () => {
