@@ -899,6 +899,7 @@ export class LangGraphAgent extends AbstractAgent {
     // chunk, including a first subgraph event that arrives before values mode.
     let latestRootStateValues = state.values;
     let hasOrderedRootStateValues = true;
+    let rootValuesCanAdvanceBoundary = false;
     let updatedState = state;
 
     try {
@@ -990,16 +991,26 @@ export class LangGraphAgent extends AbstractAgent {
             ...latestStateValues,
             ...chunk.data,
           };
+          const preservesRootBoundaryShape = Object.keys(
+            latestRootStateValues ?? {},
+          ).every((key) =>
+            Object.prototype.hasOwnProperty.call(chunk.data, key),
+          );
           // Before events-mode model streaming begins, `values` is the only
           // ordered root boundary available. Once events-mode is active,
           // multiplexed `values` can race ahead of the event currently being
-          // processed. Keep that newer state available for ordinary snapshots,
-          // but advance subgraph boundaries only from causal on_chain_end
-          // output below so future messages/state cannot leak early.
-          if (!this.eventsStreamActive) {
+          // processed. A chain completion makes the next root `values` pulse a
+          // candidate, but subgraph multiplexing can still surface an empty or
+          // partial pulse. Only let a candidate replace the ordered boundary
+          // when it preserves every state channel already present there.
+          if (
+            !this.eventsStreamActive ||
+            (rootValuesCanAdvanceBoundary && preservesRootBoundaryShape)
+          ) {
             latestRootStateValues = chunk.data;
             hasOrderedRootStateValues = true;
           }
+          rootValuesCanAdvanceBoundary = false;
           continue;
         } else if (
           subgraphsStreamEnabled &&
@@ -1139,6 +1150,13 @@ export class LangGraphAgent extends AbstractAgent {
               hasOrderedRootStateValues = true;
             }
           }
+        }
+        if (eventType === LangGraphEventTypes.OnChainEnd) {
+          // `values` carries the fully reduced root state for a completed graph
+          // step. Before a chain completes it may race ahead of events-mode,
+          // but after completion it is the authoritative boundary and must
+          // replace provisional node-output updates.
+          rootValuesCanAdvanceBoundary = true;
         }
 
         if (

@@ -11,11 +11,15 @@ import type {
   Message as LangGraphMessage,
   MessagesTupleStreamEvent,
   ThreadState,
+  ValuesStreamEvent,
 } from "@langchain/langgraph-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { LangGraphAgent, type ProcessedEvents } from "./agent";
 
-type StreamChunk = EventsStreamEvent | MessagesTupleStreamEvent;
+type StreamChunk =
+  | EventsStreamEvent
+  | MessagesTupleStreamEvent
+  | ValuesStreamEvent<ThreadState["values"]>;
 
 const TEST_ASSISTANT: Assistant = {
   assistant_id: "assistant-1",
@@ -29,7 +33,14 @@ const TEST_ASSISTANT: Assistant = {
   name: "test assistant",
 };
 
-function threadState(values: Record<string, unknown>): ThreadState {
+function createAgent() {
+  return new LangGraphAgent({
+    deploymentUrl: "http://localhost:2024",
+    graphId: "test-graph",
+  });
+}
+
+function threadState(values: ThreadState["values"]): ThreadState {
   return {
     values,
     next: [],
@@ -48,8 +59,8 @@ function threadState(values: Record<string, unknown>): ThreadState {
 
 function eventChunk(
   event: string,
-  metadata: Record<string, unknown>,
-  data: unknown,
+  metadata: EventsStreamEvent["data"]["metadata"],
+  data: EventsStreamEvent["data"]["data"],
 ): EventsStreamEvent {
   return {
     event: "events",
@@ -65,11 +76,13 @@ function eventChunk(
   };
 }
 
-function valuesChunk(values: Record<string, unknown>): EventsStreamEvent {
+function valuesChunk(
+  values: ThreadState["values"],
+): ValuesStreamEvent<ThreadState["values"]> {
   return {
     event: "values",
     data: values,
-  } as unknown as EventsStreamEvent;
+  };
 }
 
 function lateMessageTuple(): MessagesTupleStreamEvent {
@@ -88,6 +101,9 @@ async function runUntilStreamError(
   agent: LangGraphAgent,
   chunks: StreamChunk[],
   initialState: ThreadState,
+  forwardedProps: NonNullable<
+    Parameters<LangGraphAgent["run"]>[0]["forwardedProps"]
+  > = {},
 ) {
   const streamError = new Error("stop after inspected chunk");
   async function* streamResponse(): AsyncGenerator<StreamChunk> {
@@ -111,7 +127,7 @@ async function runUntilStreamError(
         messages: [],
         tools: [],
         context: [],
-        forwardedProps: {},
+        forwardedProps,
       })
       .subscribe({
         next: (event) => events.push(event),
@@ -127,10 +143,7 @@ async function runUntilStreamError(
 
 describe("load-dependent stream ordering", () => {
   it("does not let a late ignored messages tuple trigger a state snapshot", async () => {
-    const agent = new LangGraphAgent({
-      deploymentUrl: "http://localhost:2024",
-      graphId: "test-graph",
-    });
+    const agent = createAgent();
     const state = threadState({ messages: [] });
 
     const events = await runUntilStreamError(
@@ -171,10 +184,7 @@ describe("load-dependent stream ordering", () => {
   });
 
   it("uses the pre-entry root state when live thread state is ahead", async () => {
-    const agent = new LangGraphAgent({
-      deploymentUrl: "http://localhost:2024",
-      graphId: "test-graph",
-    });
+    const agent = createAgent();
     const user: LangGraphMessage = {
       id: "user-1",
       type: "human",
@@ -242,10 +252,7 @@ describe("load-dependent stream ordering", () => {
   });
 
   it("does not let an early root values chunk seed future subgraph state", async () => {
-    const agent = new LangGraphAgent({
-      deploymentUrl: "http://localhost:2024",
-      graphId: "test-graph",
-    });
+    const agent = createAgent();
     const user: LangGraphMessage = {
       id: "user-1",
       type: "human",
@@ -321,11 +328,231 @@ describe("load-dependent stream ordering", () => {
     ]);
   });
 
-  it("seeds the first subgraph boundary from root on_chain_end object output without a values chunk", async () => {
-    const agent = new LangGraphAgent({
-      deploymentUrl: "http://localhost:2024",
-      graphId: "test-graph",
+  it("keeps existing message history when committed root values follow a node output", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const reply: LangGraphMessage = {
+      id: "reply-1",
+      type: "ai",
+      content: "I will find experiences next",
+    };
+    const initialState = threadState({ messages: [user] });
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "planner", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "planner", langgraph_checkpoint_ns: "" },
+          { output: { messages: [reply] } },
+        ),
+        valuesChunk({ messages: [user, reply] }),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          {},
+        ),
+      ],
+      initialState,
+    );
+
+    const messagesSnapshot = events.find(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(messagesSnapshot?.messages.map((message) => message.id)).toEqual([
+      "user-1",
+      "reply-1",
+    ]);
+  });
+
+  it("keeps reducer-accumulated state from committed root values", async () => {
+    const agent = createAgent();
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "planner", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "planner", langgraph_checkpoint_ns: "" },
+          { output: { total: 1 } },
+        ),
+        valuesChunk({ messages: [], total: 8 }),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          {},
+        ),
+      ],
+      threadState({ messages: [], total: 7 }),
+    );
+
+    const boundarySnapshot = events.find(
+      (event): event is StateSnapshotEvent =>
+        event.type === EventType.STATE_SNAPSHOT && event.rawEvent === undefined,
+    );
+    expect(boundarySnapshot?.snapshot.total).toBe(8);
+  });
+
+  it("uses committed root values when a subgraph returns with exit durability", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const reply: LangGraphMessage = {
+      id: "reply-1",
+      type: "ai",
+      content: "I found a hotel",
+    };
+    const getState = vi.spyOn(agent.client.threads, "getState");
+    const getHistory = vi.spyOn(agent.client.threads, "getHistory");
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "supervisor", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          {},
+        ),
+        eventChunk(
+          "on_chain_end",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          { output: { messages: [reply] } },
+        ),
+        valuesChunk({ messages: [user, reply] }),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "next_root",
+            langgraph_checkpoint_ns: "next_root:task",
+            langgraph_step: 3,
+          },
+          {},
+        ),
+      ],
+      threadState({ messages: [user] }),
+      { durability: "exit" },
+    );
+
+    expect(getState).not.toHaveBeenCalled();
+    expect(getHistory).not.toHaveBeenCalled();
+    const messagesSnapshots = events.filter(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(
+      messagesSnapshots.at(-1)?.messages.map((message) => message.id),
+    ).toEqual(["user-1", "reply-1"]);
+  });
+
+  it("does not replace a populated root boundary with an empty values pulse", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const initialState = threadState({
+      messages: [user],
+      itinerary: null,
+      tools: [],
     });
+    const getHistory = vi
+      .spyOn(agent.client.threads, "getHistory")
+      .mockResolvedValue([initialState]);
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "supervisor", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          {},
+        ),
+        eventChunk(
+          "on_chain_end",
+          {
+            langgraph_node: "child",
+            langgraph_checkpoint_ns: "child:outer|inner:task",
+          },
+          { output: initialState.values },
+        ),
+        valuesChunk({}),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "next_root",
+            langgraph_checkpoint_ns: "next_root:task",
+            langgraph_step: 3,
+          },
+          {},
+        ),
+      ],
+      initialState,
+    );
+
+    const messagesSnapshots = events.filter(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(
+      messagesSnapshots.at(-1)?.messages.map((message) => message.id),
+    ).toEqual(["user-1"]);
+    const boundarySnapshots = events.filter(
+      (event): event is StateSnapshotEvent =>
+        event.type === EventType.STATE_SNAPSHOT && event.rawEvent === undefined,
+    );
+    expect(boundarySnapshots.at(-1)?.snapshot).toEqual(initialState.values);
+    expect(getHistory).toHaveBeenCalledWith("thread-1", {
+      limit: 1,
+      metadata: { step: 2 },
+    });
+  });
+
+  it("seeds the first subgraph boundary from root on_chain_end object output without a values chunk", async () => {
+    const agent = createAgent();
     const user: LangGraphMessage = {
       id: "user-1",
       type: "human",
@@ -389,10 +616,7 @@ describe("load-dependent stream ordering", () => {
   });
 
   it("seeds the first subgraph boundary from root on_chain_end Command.update without a values chunk", async () => {
-    const agent = new LangGraphAgent({
-      deploymentUrl: "http://localhost:2024",
-      graphId: "test-graph",
-    });
+    const agent = createAgent();
     const user: LangGraphMessage = {
       id: "user-1",
       type: "human",
