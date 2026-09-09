@@ -3798,16 +3798,50 @@ export class StrandsAgent {
         }
       }
 
-      // Nothing reshapes the history here. The prompt goes to `stream()` and
-      // Strands appends it as its own user turn, which is what the session
-      // store records and what the client sent. When the history it lands on
-      // already ends on the turn that answers the tool call, that is two
-      // consecutive user messages, which is what every other path through this
-      // adapter has always produced and is left alone here. What is NOT left
-      // alone is text inside the turn that answers the tool call: that binds as
-      // assistant(tool_calls) -> user(text) -> tool(result) and OpenAI refuses
-      // it outright. See `model-context.ts`.
-
+      // A cold, replay-disabled agent can already carry these exact answers
+      // in its seed. Omit only the duplicate synthetic prompt: mixing it into
+      // a tool-result turn breaks OpenAI, while appending it breaks Bedrock
+      // role alternation. Preserve new questions, builder additions, and any
+      // answer the native history does not actually carry.
+      const continuationHistory = strandsAgent.messages ?? [];
+      const continuationTail =
+        continuationHistory[continuationHistory.length - 1];
+      if (
+        this.config.replayHistoryIntoStrands === false &&
+        !sessionManager &&
+        !resumeSubmitted &&
+        !hasNewerUserMessage &&
+        frontendResults.length > 0 &&
+        trailingPromptLines.length > 0 &&
+        typeof invokeArgs === "string" &&
+        invokeArgs === trailingPromptLines.map(({ line }) => line).join("\n") &&
+        continuationTail?.role === "user" &&
+        continuationTail.content.some(isToolResultBlock)
+      ) {
+        const seededResults = new Map(
+          continuationHistory.flatMap((message) =>
+            message.content
+              .filter(
+                (block): block is ToolResultBlock =>
+                  block instanceof ToolResultBlock,
+              )
+              .map(
+                (block) =>
+                  [block.toolUseId, block.toJSON().toolResult] as const,
+              ),
+          ),
+        );
+        const carriesEveryAnswer = frontendResults.every((answer) => {
+          const actual = seededResults.get(answer.toolCallId!);
+          const expected = clientResultFields(answer.result);
+          return (
+            actual?.status === expected.status &&
+            JSON.stringify(actual.content) ===
+              JSON.stringify([expected.content])
+          );
+        });
+        if (carriesEveryAnswer) invokeArgs = undefined;
+      }
       // Native ids already in this thread's history, captured after any history
       // replacement above and before the stream appends this run's own calls.
       // A frontend call landing on one of these cannot be told apart from the

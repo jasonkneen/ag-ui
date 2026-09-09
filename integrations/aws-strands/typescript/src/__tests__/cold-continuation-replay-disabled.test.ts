@@ -18,16 +18,15 @@
  * tool messages responding to each 'tool_call_id'", which the bridge reports
  * as a terminal `STRANDS_FORCE_STOP`.
  *
- * The prompt therefore travels as its own turn, which is also what reaches the
- * session store. That leaves two consecutive user messages, which the
- * one-to-one formatters (anthropic, bedrock, gemini) do refuse: a real
- * limitation, pre-existing on every other path through this adapter, and not
- * one this file claims to fix. Repairing it by folding the client's own turn
- * into an older one is what these tests exist to prevent.
+ * When the seed already carries every answer, an unchanged synthetic prompt
+ * adds no information. Omit that duplicate: OpenAI gets adjacent tool replies,
+ * and Bedrock keeps alternating roles. Actual new questions and application
+ * additions still have to reach the model without rewriting earlier questions.
  */
 
 import { describe, it, expect } from "vitest";
 import {
+  BedrockModel,
   type Message as StrandsMessage,
   type ModelStreamEvent,
 } from "@strands-agents/sdk";
@@ -126,62 +125,175 @@ class ProviderRuleModel extends ScriptedModel {
 }
 
 describe("cold frontend-tool continuation with replay disabled", () => {
-  it("keeps the continuation prompt out of the tool-result turn", async () => {
+  it.each([
+    {
+      label: "an empty result",
+      result: { content: "" },
+      expected: { text: "Tool executed successfully with no return value." },
+    },
+    {
+      label: "a text result",
+      result: { content: "approved" },
+      expected: { text: "approved" },
+    },
+    {
+      label: "a JSON result",
+      result: { content: '{"approved":false}' },
+      expected: { json: { approved: false } },
+    },
+    {
+      label: "a failed result",
+      result: { content: "", error: "Denied" },
+      expected: { text: "Failed: Denied" },
+    },
+  ])(
+    "preserves $label through both provider formatters",
+    async ({ result, expected }) => {
+      const { agent, model } = realStrandsAgent([modelTurn.text("done")], {
+        config: { replayHistoryIntoStrands: false },
+      });
+      const input = continuationInput("cold-providers");
+      input.messages[2] = {
+        id: "t1",
+        role: "tool",
+        toolCallId: "tc1",
+        ...result,
+      } as never;
+      expectCompletedRun(await collect(agent, input));
+      expect(model.seenMessages).toHaveLength(1);
+
+      const history = model.seenMessages[0]!;
+      expect(history.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+      expect(textsOf(history[0]!)).toEqual(["call the tool"]);
+      expect(textsOf(history[2]!)).toEqual([]);
+      expect(blocksOf(history[2]!)).toEqual([
+        {
+          toolResult: {
+            toolUseId: "tc1",
+            status: "error" in result ? "error" : "success",
+            content: [expected],
+          },
+        },
+      ]);
+      expectToolCallsAnsweredImmediately(history);
+
+      const openai = await openAIBoundMessages(history);
+      expect(openai.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "tool",
+      ]);
+      expect(openAIAdjacency(openai)).toBe("ok");
+
+      // The SDK's real Converse formatter; no AWS service call is made.
+      const bedrock = new BedrockModel({
+        modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+        clientConfig: { region: "us-east-1" },
+      });
+      const request = (
+        bedrock as unknown as {
+          _formatRequest(
+            messages: StrandsMessage[],
+            options: object,
+          ): {
+            messages: Array<{ role: string }>;
+          };
+        }
+      )._formatRequest(history, {
+        toolSpecs: [
+          {
+            name: "doIt",
+            description: "a frontend tool",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+      });
+      expect(request.messages.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "user",
+      ]);
+    },
+  );
+
+  it("keeps a real follow-up question after the tool result", async () => {
     const { agent, model } = realStrandsAgent([modelTurn.text("done")], {
       config: { replayHistoryIntoStrands: false },
     });
-
-    const events: BaseEvent[] = [];
-    for await (const e of agent.run(continuationInput("cold-1"))) {
-      events.push(e);
-    }
-
-    expectCompletedRun(events);
-    expect(model.seenMessages).toHaveLength(1);
+    const input = continuationInput("cold-question");
+    input.messages.push({
+      id: "u2",
+      role: "user",
+      content: "Write another haiku.",
+    });
+    expectCompletedRun(await collect(agent, input));
 
     const history = model.seenMessages[0]!;
-    expect(history.map((m) => m.role)).toEqual([
-      "user",
-      "assistant",
-      "user",
-      "user",
-    ]);
-
-    // The turn that answers the tool call carries the tool result and nothing
-    // else; the prompt is the turn after it, which is also the turn the store
-    // records.
-    const answering = history[2]!;
-    expect(carriesToolResult(answering)).toBe(true);
-    expect(textsOf(answering)).toEqual([]);
-    expect(textsOf(history[3]!)).toEqual([
-      "doIt executed successfully with no return value.",
-    ]);
     expect(textsOf(history[0]!)).toEqual(["call the tool"]);
-
-    expectToolCallsAnsweredImmediately(history);
+    expect(carriesToolResult(history[2]!)).toBe(true);
+    expect(textsOf(history[3]!).join("\n")).toContain("Write another haiku.");
+    expect(openAIAdjacency(await openAIBoundMessages(history))).toBe("ok");
   });
 
-  it("binds to a request the real OpenAI formatter accepts", async () => {
+  it("keeps additional text supplied by stateContextBuilder", async () => {
+    const { agent, model } = realStrandsAgent([modelTurn.text("done")], {
+      config: {
+        replayHistoryIntoStrands: false,
+        stateContextBuilder: (_input, prompt) =>
+          `${prompt}\nUse a formal tone.`,
+      },
+    });
+    expectCompletedRun(await collect(agent, continuationInput("cold-builder")));
+    const history = model.seenMessages[0]!;
+    expect(textsOf(history[0]!)).toEqual(["call the tool"]);
+    expect(textsOf(history[3]!)).toEqual([
+      "doIt executed successfully with no return value.\nUse a formal tone.",
+    ]);
+    expect(openAIAdjacency(await openAIBoundMessages(history))).toBe("ok");
+  });
+
+  it("still supplies application context when the duplicate is omitted", async () => {
     const { agent, model } = realStrandsAgent([modelTurn.text("done")], {
       config: { replayHistoryIntoStrands: false },
     });
-
-    const events: BaseEvent[] = [];
-    for await (const e of agent.run(continuationInput("cold-openai"))) {
-      events.push(e);
-    }
-    expectCompletedRun(events);
-
-    const bound = await openAIBoundMessages(model.seenMessages[0]!);
-    expect(bound.map((message) => message.role)).toEqual([
-      "user",
-      "assistant",
-      "tool",
-      "user",
-    ]);
-    expect(openAIAdjacency(bound)).toBe("ok");
+    const input = continuationInput("cold-context");
+    input.context = [{ description: "preferred tone", value: "formal" }];
+    expectCompletedRun(await collect(agent, input));
+    const history = model.seenMessages[0]!;
+    expect(history).toHaveLength(3);
+    expect(textsOf(history[0]!).join("\n")).toContain("formal");
+    expect(textsOf(history[0]!).join("\n")).toContain("call the tool");
+    expect(textsOf(history[2]!)).toEqual([]);
+    expect(openAIAdjacency(await openAIBoundMessages(history))).toBe("ok");
   });
 
+  it("still sends a client answer when warm history only has a placeholder", async () => {
+    const { agent, model } = realStrandsAgent(
+      [
+        modelTurn.toolUse({ toolUseId: "tc1", name: "doIt", input: {} }),
+        modelTurn.text("done"),
+      ],
+      { config: { replayHistoryIntoStrands: false } },
+    );
+    const first = continuationInput("warm-placeholder");
+    first.messages = first.messages.slice(0, 1);
+    expectCompletedRun(await collect(agent, first));
+
+    const next = continuationInput(first.threadId);
+    next.runId = "run-2";
+    next.messages[2] = {
+      id: "t1",
+      role: "tool",
+      toolCallId: "tc1",
+      content: '{"approved":false}',
+    };
+    expectCompletedRun(await collect(agent, next));
+    expect(model.seenMessages).toHaveLength(2);
+    const history = model.seenMessages[1]!;
+    expect(history.flatMap(textsOf).join("\n")).toContain(
+      'doIt returned: {"approved":false}',
+    );
+  });
   it("finishes the run under a model that enforces the provider rules", async () => {
     const { agent } = realStrandsAgent([modelTurn.text("done")], {
       config: { replayHistoryIntoStrands: false },
