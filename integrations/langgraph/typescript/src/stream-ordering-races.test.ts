@@ -328,6 +328,90 @@ describe("load-dependent stream ordering", () => {
     ]);
   });
 
+  it("reads the completed root checkpoint when future values race ahead of subgraph entry", async () => {
+    const agent = createAgent();
+    const user: LangGraphMessage = {
+      id: "user-1",
+      type: "human",
+      content: "Plan my trip",
+    };
+    const rootAssistant: LangGraphMessage = {
+      id: "root-1",
+      type: "ai",
+      content: "I will find experiences next",
+    };
+    const futureExperience: LangGraphMessage = {
+      id: "experience-1",
+      type: "ai",
+      content: "Future experiences response",
+    };
+    const preEntryState = threadState({
+      messages: [user, rootAssistant],
+      itinerary: { city: "Amsterdam" },
+    });
+    const getHistory = vi
+      .spyOn(agent.client.threads, "getHistory")
+      .mockResolvedValue([preEntryState]);
+
+    const events = await runUntilStreamError(
+      agent,
+      [
+        eventChunk(
+          "on_chat_model_stream",
+          { langgraph_node: "supervisor", langgraph_checkpoint_ns: "" },
+          { chunk: { content: "", response_metadata: {} } },
+        ),
+        eventChunk(
+          "on_chain_end",
+          { langgraph_node: "supervisor", langgraph_checkpoint_ns: "" },
+          { output: { messages: [rootAssistant] } },
+        ),
+        valuesChunk({
+          messages: [user, rootAssistant, futureExperience],
+          itinerary: { city: "Amsterdam", experience: "Canal tour" },
+        }),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "experiences_agent",
+            langgraph_checkpoint_ns: "experiences_agent:outer",
+            langgraph_step: 2,
+          },
+          {},
+        ),
+        eventChunk(
+          "on_chain_start",
+          {
+            langgraph_node: "experiences_agent_node",
+            langgraph_checkpoint_ns:
+              "experiences_agent:outer|experiences_agent_node:inner",
+            langgraph_step: 1,
+          },
+          {},
+        ),
+      ],
+      threadState({ messages: [user], itinerary: { city: "Amsterdam" } }),
+    );
+
+    expect(getHistory).toHaveBeenCalledWith("thread-1", {
+      limit: 1,
+      metadata: { step: 1 },
+    });
+    const boundarySnapshot = events.find(
+      (event): event is StateSnapshotEvent =>
+        event.type === EventType.STATE_SNAPSHOT && event.rawEvent === undefined,
+    );
+    expect(boundarySnapshot?.snapshot).toEqual(preEntryState.values);
+    const messagesSnapshot = events.find(
+      (event): event is MessagesSnapshotEvent =>
+        event.type === EventType.MESSAGES_SNAPSHOT,
+    );
+    expect(messagesSnapshot?.messages.map((message) => message.id)).toEqual([
+      "user-1",
+      "root-1",
+    ]);
+  });
+
   it("keeps existing message history when committed root values follow a node output", async () => {
     const agent = createAgent();
     const user: LangGraphMessage = {

@@ -901,6 +901,7 @@ export class LangGraphAgent extends AbstractAgent {
     let hasOrderedRootStateValues = true;
     let rootValuesCanAdvanceBoundary = false;
     let hasReturnedFromSubgraph = false;
+    const pendingSubgraphBoundarySteps = new Map<string, number>();
     let updatedState = state;
 
     try {
@@ -1048,24 +1049,46 @@ export class LangGraphAgent extends AbstractAgent {
         // ns format: "" | "node:uuid" | "node:uuid|inner:uuid"
         const ns: string = metadata.langgraph_checkpoint_ns ?? "";
         const nsRoot = ns.split("|")[0].split(":")[0];
+        if (
+          nsRoot &&
+          !ns.includes("|") &&
+          typeof metadata.langgraph_step === "number"
+        ) {
+          pendingSubgraphBoundarySteps.set(nsRoot, metadata.langgraph_step - 1);
+        }
         if (ns.includes("|") && nsRoot) this.subgraphs.add(nsRoot);
         const currentSubgraph =
           nsRoot && this.subgraphs.has(nsRoot) ? nsRoot : ROOT_SUBGRAPH_NAME;
 
         if (currentSubgraph !== this.currentSubgraph) {
           this.currentSubgraph = currentSubgraph;
-          const boundaryCheckpointStep =
-            currentSubgraph === ROOT_SUBGRAPH_NAME &&
-            typeof metadata.langgraph_step === "number"
+          const enteringSubgraph = currentSubgraph !== ROOT_SUBGRAPH_NAME;
+          const boundaryCheckpointStep = enteringSubgraph
+            ? pendingSubgraphBoundarySteps.get(currentSubgraph)
+            : typeof metadata.langgraph_step === "number"
               ? metadata.langgraph_step - 1
               : undefined;
+          const durability = input.forwardedProps?.durability ?? "async";
+          // Root values and event callbacks are multiplexed independently. A
+          // future values pulse can therefore arrive before the first nested
+          // callback reveals that an outer node is a subgraph. When the outer
+          // root step is known, its checkpoint is the causal pre-entry state;
+          // prefer it over an arrival-ordered values cache. Exit durability has
+          // no mid-run checkpoint, so it keeps using the ordered cache.
+          const shouldReadEntryCheckpoint =
+            enteringSubgraph &&
+            boundaryCheckpointStep !== undefined &&
+            durability !== "exit";
           latestStateValues = await this.getStateAndMessagesSnapshots(
             threadId,
             latestRootStateValues,
-            hasOrderedRootStateValues,
+            shouldReadEntryCheckpoint ? false : hasOrderedRootStateValues,
             boundaryCheckpointStep,
-            input.forwardedProps?.durability ?? "async",
+            durability,
           );
+          if (enteringSubgraph) {
+            pendingSubgraphBoundarySteps.delete(currentSubgraph);
+          }
           if (currentSubgraph === ROOT_SUBGRAPH_NAME) {
             // A checkpoint-selected root boundary is ordered by construction
             // and can seed the next subgraph even when no root node runs in
