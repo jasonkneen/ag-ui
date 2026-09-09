@@ -6,6 +6,7 @@ import {
   openChat,
 } from "../../utils/copilot-actions";
 import { CopilotSelectors } from "../../utils/copilot-selectors";
+import { assertFixtureMaterialized } from "../../lib/event-trace-fixture";
 import { agenticChatMultimodalPageEventTrace } from "./agenticChatMultimodalPage.event-trace";
 
 const TEST_IMAGE = path.join(
@@ -22,6 +23,7 @@ test.describe("[Integration] LangGraph FastAPI - Agentic Chat Multimodal", () =>
     await openChat(page);
 
     // Upload a test image — v2 CopilotChat attaches files silently
+    await assertFixtureMaterialized(TEST_IMAGE);
     const fileInput = page.locator('input[type="file"]');
     await fileInput.setInputFiles(TEST_IMAGE);
 
