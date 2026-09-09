@@ -17,6 +17,9 @@ dependencies = [
     "strands-agents>=1.15.0",
 ]
 
+[project.urls]
+Changelog = "https://github.com/ag-ui-protocol/ag-ui/releases"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
