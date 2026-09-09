@@ -41,6 +41,9 @@ dependencies = [
 [tool.uv.sources]
 ag-ui-protocol = { path = "../../../sdks/python" }
 
+[project.urls]
+Changelog = "https://github.com/ag-ui-protocol/ag-ui/releases"
+
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115.12"]
 
