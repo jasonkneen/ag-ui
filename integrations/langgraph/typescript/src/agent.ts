@@ -900,6 +900,7 @@ export class LangGraphAgent extends AbstractAgent {
     let latestRootStateValues = state.values;
     let hasOrderedRootStateValues = true;
     let rootValuesCanAdvanceBoundary = false;
+    let hasReturnedFromSubgraph = false;
     let updatedState = state;
 
     try {
@@ -1071,6 +1072,7 @@ export class LangGraphAgent extends AbstractAgent {
             // between.
             latestRootStateValues = latestStateValues;
             hasOrderedRootStateValues = true;
+            hasReturnedFromSubgraph = true;
           } else {
             // Do not reuse a root boundary after entering a subgraph. The next
             // root boundary or root on_chain_end output will advance it.
@@ -1116,11 +1118,10 @@ export class LangGraphAgent extends AbstractAgent {
         // LangGraph JS doesn't emit `values` chunks with the latest state between
         // tool execution and run end, so without this update, intermediate
         // STATE_SNAPSHOTs go stale after a tool Command updates state.
-        // Before events mode becomes active, a root on_chain_end also advances
-        // the ordered root cache: without events or values mode, this callback
-        // output is the only boundary signal available. During events mode,
-        // callback outputs are provisional updates that have not passed through
-        // reducers, so they must stay separate from the ordered root boundary.
+        // Preserve legacy first-entry seeding before model streaming begins.
+        // After a subgraph returns, only reduced values or a checkpoint may
+        // advance its root boundary; callback outputs remain provisional even
+        // when the graph never emits a model-stream callback.
         if (
           eventType === LangGraphEventTypes.OnChainEnd &&
           chunkData.data?.output != null
@@ -1146,7 +1147,8 @@ export class LangGraphAgent extends AbstractAgent {
             latestStateValues = { ...latestStateValues, ...outputUpdate };
             if (
               currentSubgraph === ROOT_SUBGRAPH_NAME &&
-              !this.eventsStreamActive
+              !this.eventsStreamActive &&
+              !hasReturnedFromSubgraph
             ) {
               latestRootStateValues = {
                 ...latestRootStateValues,
@@ -1159,12 +1161,12 @@ export class LangGraphAgent extends AbstractAgent {
         if (eventType === LangGraphEventTypes.OnChainEnd) {
           if (
             currentSubgraph === ROOT_SUBGRAPH_NAME &&
-            this.eventsStreamActive
+            (this.eventsStreamActive || hasReturnedFromSubgraph)
           ) {
-            // The root step has advanced, but its callback output is only an
-            // update. Until reduced values arrive, force the next subgraph
-            // boundary to read committed state instead of treating that update
-            // as a complete snapshot.
+            // The root step has advanced, but after model streaming or a prior
+            // subgraph return its callback output is only an update. Until
+            // reduced values arrive, force the next subgraph boundary to read
+            // committed state instead of treating that update as a snapshot.
             hasOrderedRootStateValues = false;
           }
           // `values` carries the fully reduced root state for a completed graph
