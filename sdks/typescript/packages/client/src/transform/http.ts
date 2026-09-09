@@ -36,7 +36,7 @@ export const transformHttpEventStream = (
   // The parser can fail synchronously from inside subscribe(), before the
   // handle below exists, so the intent is recorded and acted on as soon as it
   // does.
-  let sourceSubscription: Subscription | undefined;
+  let sourceSubscription: Subscription | undefined = undefined;
   let teardownRequested = false;
 
   const stopReading = () => {
