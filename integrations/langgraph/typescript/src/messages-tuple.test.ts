@@ -11,12 +11,14 @@ import { AIMessageChunk, HumanMessage } from "@langchain/core/messages";
 import { LangGraphAgent } from "./agent";
 import { EventType } from "@ag-ui/client";
 
-// The wire vocabulary, read off real LangChain messages instead of written out
-// as literals, so these fixtures cannot quietly drift from what the platform
-// sends. A streamed chunk carries `type: "ai"`; the class name exists only as
-// `AIMessageChunk.lc_name()` and never reaches this handler.
+// The wire vocabulary. The two runtimes spell an assistant chunk differently
+// and a graph served by either one reaches this handler, so both spellings are
+// exercised below. JavaScript is read off a real message; Python is the
+// `Literal` declared by `langchain_core.messages.ai.AIMessageChunk`, written
+// out because Python does not run in this suite.
 const AI_CHUNK_TYPE = new AIMessageChunk({ content: "" }).type;
 const HUMAN_MESSAGE_TYPE = new HumanMessage({ content: "" }).type;
+const PY_CHUNK_TYPE = "AIMessageChunk";
 
 // What the LangGraph API puts on the wire for a streamed chunk: a plain object
 // carrying the message type and the streamed fields, not a serialized class.
@@ -845,140 +847,130 @@ describe("messages-tuple stream mode", () => {
       );
     });
   });
+  it("streams text from a chunk LangChain built", () => {
+    const { agent, events } = createAgent();
+    const chunk = new AIMessageChunk({ id: "msg-1", content: "Hello" });
 
-  describe("chunks as LangChain and the providers actually shape them", () => {
-    it("streams text from a chunk LangChain built", () => {
-      const { agent, events } = createAgent();
-      const chunk = new AIMessageChunk({ id: "msg-1", content: "Hello" });
+    // The JavaScript half of the premise, pinned to the library rather than
+    // asserted from memory: over there the chunk class keeps the parent's type.
+    expect(chunk.type).toBe("ai");
 
-      // The premise of the fix, pinned to the library rather than asserted from
-      // memory: a real chunk reports the wire type, never the class name.
-      expect(chunk.type).toBe("ai");
-      expect(AIMessageChunk.lc_name()).toBe("AIMessageChunk");
+    agent.handleSingleEvent([toWireChunk(chunk), {}]);
 
-      agent.handleSingleEvent([toWireChunk(chunk), {}]);
+    const start = events.find((e) => e.type === EventType.TEXT_MESSAGE_START);
+    const content = events.find(
+      (e) => e.type === EventType.TEXT_MESSAGE_CONTENT,
+    );
+    expect(start).toBeDefined();
+    expect(content?.delta).toBe("Hello");
+  });
 
-      const start = events.find((e) => e.type === EventType.TEXT_MESSAGE_START);
-      const content = events.find(
-        (e) => e.type === EventType.TEXT_MESSAGE_CONTENT,
-      );
-      expect(start).toBeDefined();
-      expect(content?.delta).toBe("Hello");
-    });
-
-    it("ends a tool call turn that finishes with tool_calls", () => {
+  describe.each([
+    ["JavaScript", AI_CHUNK_TYPE],
+    ["Python", PY_CHUNK_TYPE],
+  ])("an assistant chunk serialized by %s", (_runtime, chunkType) => {
+    it("streams start, content and end", () => {
       const { agent, events } = createAgent();
 
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            tool_call_chunks: [
-              {
-                id: "tc-1",
-                name: "search",
-                args: "",
-                index: 0,
-                type: "tool_call_chunk",
-              },
-            ],
-          }),
-        ),
+        {
+          id: "msg-1",
+          type: chunkType,
+          content: "Hello",
+          response_metadata: {},
+        },
         {},
       ]);
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            response_metadata: { finish_reason: "tool_calls" },
-          }),
-        ),
+        {
+          id: "msg-1",
+          type: chunkType,
+          content: "",
+          response_metadata: { finish_reason: "stop" },
+        },
         {},
       ]);
 
       const types = events.map((e) => e.type);
-      expect(types).toContain(EventType.TOOL_CALL_START);
-      expect(types).toContain(EventType.TOOL_CALL_END);
+      expect(types).toContain(EventType.TEXT_MESSAGE_START);
+      expect(types).toContain(EventType.TEXT_MESSAGE_END);
+      expect(
+        events.find((e) => e.type === EventType.TEXT_MESSAGE_CONTENT)?.delta,
+      ).toBe("Hello");
     });
 
-    it("ends a tool call turn that finishes with tool_use", () => {
+    it("is still told apart from a chunk that is not an assistant message", () => {
       const { agent, events } = createAgent();
 
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            tool_call_chunks: [
-              {
-                id: "tc-1",
-                name: "search",
-                args: "",
-                index: 0,
-                type: "tool_call_chunk",
-              },
-            ],
-          }),
-        ),
+        { id: "msg-1", type: HUMAN_MESSAGE_TYPE, content: "Hello" },
         {},
       ]);
+      expect(events).toHaveLength(0);
+
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            response_metadata: { finish_reason: "tool_use" },
-          }),
-        ),
+        {
+          id: "msg-2",
+          type: chunkType,
+          content: "Hello",
+          response_metadata: {},
+        },
         {},
       ]);
-
-      expect(events.map((e) => e.type)).toContain(EventType.TOOL_CALL_END);
+      expect(events.map((e) => e.type)).toContain(EventType.TEXT_MESSAGE_START);
     });
+  });
 
-    it("starts the text of the turn that follows a tool call", () => {
+  describe.each([
+    ["OpenAI", { response_metadata: { finish_reason: "tool_calls" } }],
+    [
+      "Anthropic through Python",
+      { response_metadata: { stop_reason: "tool_use" } },
+    ],
+    [
+      "Anthropic through JavaScript",
+      { additional_kwargs: { stop_reason: "tool_use" } },
+    ],
+  ])("a tool call turn ended by %s", (_provider, terminal) => {
+    it("ends the call and starts the text of the turn that follows", () => {
       const { agent, events } = createAgent();
 
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({ id: "msg-1", content: "Let me search" }),
-        ),
+        {
+          id: "msg-1",
+          type: AI_CHUNK_TYPE,
+          content: "",
+          tool_call_chunks: [
+            {
+              id: "tc-1",
+              name: "search",
+              args: "",
+              index: 0,
+              type: "tool_call_chunk",
+            },
+          ],
+          response_metadata: {},
+        },
+        {},
+      ]);
+      // The terminal chunk in the shape that provider actually produces.
+      agent.handleSingleEvent([
+        {
+          id: "msg-1",
+          type: AI_CHUNK_TYPE,
+          content: "",
+          response_metadata: {},
+          ...terminal,
+        },
         {},
       ]);
       agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            tool_call_chunks: [
-              {
-                id: "tc-1",
-                name: "search",
-                args: "",
-                index: 0,
-                type: "tool_call_chunk",
-              },
-            ],
-          }),
-        ),
-        {},
-      ]);
-      agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({
-            id: "msg-1",
-            content: "",
-            response_metadata: { finish_reason: "tool_calls" },
-          }),
-        ),
-        {},
-      ]);
-      agent.handleSingleEvent([
-        toWireChunk(
-          new AIMessageChunk({ id: "msg-2", content: "The result is 42" }),
-        ),
+        {
+          id: "msg-2",
+          type: AI_CHUNK_TYPE,
+          content: "The result is 42",
+          response_metadata: {},
+        },
         {},
       ]);
 
@@ -987,8 +979,7 @@ describe("messages-tuple stream mode", () => {
       expect(toolEnd).toBeGreaterThan(-1);
 
       // The reported failure was TEXT_MESSAGE_CONTENT for a message that was
-      // never started, so the order of the two after the tool call is the
-      // assertion, not their presence alone.
+      // never started, so the order of the two after the call is the assertion.
       const textStart = types.indexOf(EventType.TEXT_MESSAGE_START, toolEnd);
       const textContent = types.indexOf(
         EventType.TEXT_MESSAGE_CONTENT,
@@ -997,12 +988,13 @@ describe("messages-tuple stream mode", () => {
       expect(textStart).toBeGreaterThan(-1);
       expect(textContent).toBeGreaterThan(textStart);
 
-      const resumed = events.find(
-        (e) =>
-          e.type === EventType.TEXT_MESSAGE_CONTENT &&
-          e.delta === "The result is 42",
-      );
-      expect(resumed).toBeDefined();
+      expect(
+        events.find(
+          (e) =>
+            e.type === EventType.TEXT_MESSAGE_CONTENT &&
+            e.delta === "The result is 42",
+        ),
+      ).toBeDefined();
     });
   });
 });

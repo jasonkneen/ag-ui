@@ -1749,14 +1749,23 @@ export class LangGraphAgent extends AbstractAgent {
 
     // Skip non-AI chunks (e.g., tool result messages, human messages).
     //
-    // The value carried here is LangChain's MessageType — "ai", "human",
-    // "tool", "system" — and not a class name. A real AIMessageChunk reports
-    // "ai" on the wire and in process alike, so comparing against the class
-    // name matched nothing and discarded every tuple this handler was given.
-    // "generic" is accepted next to "ai" for the same reason
-    // langchainMessagesToAgui folds it into the assistant branch: LangGraph
-    // emits it for non-chat models that set no more specific type.
-    if (chunk.type && chunk.type !== "ai" && chunk.type !== "generic") return;
+    // The two runtimes spell an assistant chunk differently and a graph served
+    // by either one reaches this handler, so both spellings have to pass.
+    // Python declares `type: Literal["AIMessageChunk"]` on AIMessageChunk while
+    // its parent AIMessage declares "ai"; JavaScript keeps "ai" on the chunk
+    // class too and exposes "AIMessageChunk" only through lc_name(). Matching
+    // one spelling alone drops every tuple produced by the other runtime.
+    // "generic" passes for the same reason langchainMessagesToAgui folds it
+    // into the assistant branch: LangGraph emits it for non-chat models that
+    // set no more specific type.
+    if (
+      chunk.type &&
+      chunk.type !== "ai" &&
+      chunk.type !== "AIMessageChunk" &&
+      chunk.type !== "generic"
+    ) {
+      return;
+    }
 
     const content =
       typeof chunk.content === "string"
@@ -1765,13 +1774,25 @@ export class LangGraphAgent extends AbstractAgent {
           ? chunk.content.find((c: any) => c.type === "text")?.text
           : null;
     const toolCallChunks = chunk.tool_call_chunks;
-    // Any finish reason ends the turn, not "stop" alone: a turn that ends in a
-    // tool call reports "tool_calls" or "tool_use" depending on the provider.
-    // Matching only "stop" left that turn's entry in messagesInProcess, so its
-    // TOOL_CALL_END was never emitted and the text of the following turn was
-    // streamed against a message that had never been started. The events-mode
-    // path reads the same field the same way, returning on any finish reason.
-    const isFinished = Boolean(chunk.response_metadata?.finish_reason);
+    // A turn is over when the provider says so, and the providers disagree on
+    // both the name and the place. OpenAI reports finish_reason in
+    // response_metadata. Anthropic reports stop_reason instead, and puts it in
+    // response_metadata through the Python integration but in
+    // additional_kwargs through the JavaScript one, whose message_delta branch
+    // spreads the whole delta there and builds response_metadata by hand
+    // without it.
+    //
+    // The value is not examined: "stop", "tool_calls" and "tool_use" all end
+    // the turn. Reading one field alone left a tool-call turn sitting in
+    // messagesInProcess, so its TOOL_CALL_END was never emitted and the text
+    // of the following turn streamed against a message that had never been
+    // started. The events-mode path reads its own field the same way, on
+    // presence rather than value.
+    const isFinished = Boolean(
+      chunk.response_metadata?.finish_reason ??
+        chunk.response_metadata?.stop_reason ??
+        chunk.additional_kwargs?.stop_reason,
+    );
     const currentStream = this.getMessageInProgress(this.activeRun!.id);
 
     // Handle tool call chunks
