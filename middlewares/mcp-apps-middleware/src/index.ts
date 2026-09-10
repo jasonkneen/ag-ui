@@ -170,6 +170,8 @@ export interface MCPAppsMiddlewareConfig {
    * List of MCP server configurations
    */
   mcpServers?: MCPClientConfig[];
+  /** Continue without unavailable servers by default, or stop before invoking the agent. */
+  discoveryFailureMode?: "continue" | "throw";
 }
 
 /**
@@ -414,6 +416,9 @@ export class MCPAppsMiddleware extends Middleware {
         default:
           throw new Error(`MCP method not allowed for UI proxy: ${method}`);
       }
+    } catch {
+      // Transport errors can contain server response bodies and credentials.
+      throw new Error("MCP request failed");
     } finally {
       await closeMCPConnection(client, transport);
     }
@@ -634,11 +639,11 @@ export class MCPAppsMiddleware extends Middleware {
       try {
         const tools = await this.fetchToolsFromServer(serverConfig);
         allUITools.push(...tools);
-      } catch (error) {
-        console.error(
-          `Failed to fetch tools from MCP server ${serverConfig.url}:`,
-          error,
-        );
+      } catch {
+        if (this.config.discoveryFailureMode === "throw") {
+          throw new Error("MCP tool discovery failed");
+        }
+        console.error("MCP tool discovery failed");
       }
     }
 

@@ -126,3 +126,7 @@ Hash-only requests for that endpoint are rejected because they cannot identify t
 
 MCP connections do not follow redirects, and transport requests must stay on the configured origin.
 URLs must use HTTP(S) and must not contain embedded user credentials.
+
+Discovery continues past unavailable servers by default. Set `discoveryFailureMode: "throw"`
+to stop before invoking the agent if any configured server cannot provide its tools.
+Proxy errors and discovery diagnostics omit raw upstream response bodies.

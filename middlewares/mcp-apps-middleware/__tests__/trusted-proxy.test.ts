@@ -1,6 +1,8 @@
 import { createServer } from "node:http";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { once } from "node:events";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { firstValueFrom, toArray } from "rxjs";
 import { MCPAppsMiddleware, getServerHash } from "../src/index";
 import { MockAgent, createRunAgentInput } from "./test-utils";
@@ -10,6 +12,7 @@ async function setup(
   sharedEndpoint = false,
   stallDelete = false,
   redirect = false,
+  rejectAuth = false,
 ) {
   const requests: Array<{
     method: string;
@@ -23,6 +26,10 @@ async function setup(
       rpc: undefined as string | undefined,
     };
     requests.push(entry);
+    if (rejectAuth) {
+      response.writeHead(401).end("private-auth-diagnostic");
+      return;
+    }
     if (redirect && request.url !== "/capture") {
       response.writeHead(307, { location: "/capture" }).end();
       return;
@@ -68,10 +75,11 @@ async function setup(
   if (!address || typeof address === "string")
     throw new Error("Fixture did not listen");
   const url = `http://127.0.0.1:${address.port}`;
-  const middleware = new MCPAppsMiddleware({
+  const config = {
+    discoveryFailureMode: "throw" as const,
     mcpServers: [
       {
-        type: "http",
+        type: "http" as const,
         url,
         serverId: "cards",
         headers: { Authorization: "Bearer fixture-token" },
@@ -87,11 +95,16 @@ async function setup(
           ]
         : []),
     ],
-  });
+  };
+  const middleware = new MCPAppsMiddleware(config);
   const agent = new MockAgent();
   return {
     requests,
     agent,
+    discover: () =>
+      firstValueFrom(
+        middleware.run(createRunAgentInput(), agent).pipe(toArray()),
+      ),
     run: (
       method: string,
       serverId: string | undefined = "cards",
@@ -263,5 +276,103 @@ test("MCP redirects cannot forward configured credentials", async () => {
     expect(requests).toHaveLength(1);
   } finally {
     await teardown();
+  }
+});
+
+test("strict discovery failures stop the agent without exposing upstream diagnostics", async () => {
+  const { discover, agent, teardown } = await setup(false, false, false, true);
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(discover()).rejects.toThrow("MCP tool discovery failed");
+    expect(agent.runCalls).toEqual([]);
+    expect(JSON.stringify(log.mock.calls)).not.toContain(
+      "private-auth-diagnostic",
+    );
+  } finally {
+    log.mockRestore();
+    await teardown();
+  }
+});
+
+test("proxy errors do not expose upstream diagnostics", async () => {
+  const { run, teardown } = await setup(false, false, false, true);
+  try {
+    const events = await run("resources/read");
+    expect(events.at(-1)).toMatchObject({
+      result: { error: "Error: MCP request failed" },
+    });
+    expect(JSON.stringify(events)).not.toContain("private-auth-diagnostic");
+  } finally {
+    await teardown();
+  }
+});
+
+test("legacy SSE reentry keeps trusted authentication on GET and POST", async () => {
+  const requests: Array<{ method?: string; authorization?: string }> = [];
+  const sdkServer = new Server(
+    { name: "legacy-fixture", version: "1" },
+    { capabilities: {} },
+  );
+  let transport: SSEServerTransport | undefined;
+  const server = createServer(async (request, response) => {
+    requests.push({
+      method: request.method,
+      authorization: request.headers.authorization,
+    });
+    if (request.headers.authorization !== "Bearer legacy-secret") {
+      response.writeHead(401).end();
+      return;
+    }
+    if (request.method === "GET") {
+      transport = new SSEServerTransport("/messages", response);
+      await sdkServer.connect(transport);
+    } else if (transport) {
+      await transport.handlePostMessage(request, response);
+    } else {
+      response.writeHead(404).end();
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("No fixture address");
+    const middleware = new MCPAppsMiddleware({
+      mcpServers: [
+        {
+          type: "sse",
+          url: `http://127.0.0.1:${address.port}/sse`,
+          serverId: "legacy",
+          headers: { Authorization: "Bearer legacy-secret" },
+        },
+      ],
+    });
+    const agent = new MockAgent();
+    const events = await firstValueFrom(
+      middleware
+        .run(
+          createRunAgentInput({
+            forwardedProps: {
+              __proxiedMCPRequest: { serverId: "legacy", method: "ping" },
+            },
+          }),
+          agent,
+        )
+        .pipe(toArray()),
+    );
+    expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED", result: {} });
+    expect(agent.runCalls).toEqual([]);
+    expect(requests.some((request) => request.method === "GET")).toBe(true);
+    expect(requests.some((request) => request.method === "POST")).toBe(true);
+    expect(
+      requests.every(
+        (request) => request.authorization === "Bearer legacy-secret",
+      ),
+    ).toBe(true);
+  } finally {
+    await sdkServer.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

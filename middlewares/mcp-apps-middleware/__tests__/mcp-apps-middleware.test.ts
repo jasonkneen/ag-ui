@@ -485,8 +485,7 @@ describe("MCPAppsMiddleware", () => {
 
       expect(events.length).toBeGreaterThanOrEqual(2);
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to fetch tools from MCP server"),
-        expect.any(Error),
+        "MCP tool discovery failed",
       );
 
       consoleErrorSpy.mockRestore();
@@ -1554,9 +1553,7 @@ describe("MCPAppsMiddleware", () => {
       const finishedEvent = events.find(
         (e) => e.type === EventType.RUN_FINISHED,
       );
-      expect((finishedEvent as any).result.error).toContain(
-        "Connection refused",
-      );
+      expect((finishedEvent as any).result.error).toBe("Error: MCP request failed");
     });
 
     it("emits error for unknown serverHash", async () => {
