@@ -22,17 +22,24 @@ async function setup(
   redirect = false,
   rejectAuth = false,
   metadata: "legacy" | "nested" | "both" = "legacy",
-  visibility?: string[],
+  options: {
+    visibility?: string[];
+    initializationFailure?: "initialized-error" | "unsupported-version";
+    rejectDelete?: boolean;
+  } = {},
 ) {
   const requests: Array<{
     method: string;
     authorization?: string;
     rpc?: string;
+    sessionId?: string;
   }> = [];
+  let stalledDeleteClosed = false;
   const server = createServer(async (request, response) => {
     const entry = {
       method: request.method!,
       authorization: request.headers.authorization,
+      sessionId: request.headers["mcp-session-id"]?.toString(),
       rpc: undefined as string | undefined,
     };
     requests.push(entry);
@@ -45,7 +52,16 @@ async function setup(
       return;
     }
     if (request.method === "DELETE") {
-      if (stallDelete) return;
+      if (stallDelete) {
+        response.on("close", () => {
+          stalledDeleteClosed = true;
+        });
+        return;
+      }
+      if (options.rejectDelete) {
+        response.writeHead(500).end("private-cleanup-diagnostic");
+        return;
+      }
       response.writeHead(204).end();
       return;
     }
@@ -57,6 +73,13 @@ async function setup(
     for await (const chunk of request) raw += chunk;
     const message = JSON.parse(raw);
     entry.rpc = message.method;
+    if (
+      message.method === "notifications/initialized" &&
+      options.initializationFailure === "initialized-error"
+    ) {
+      response.writeHead(500).end("private-initialization-diagnostic");
+      return;
+    }
     if (message.id === undefined) {
       response.writeHead(202).end();
       return;
@@ -64,7 +87,10 @@ async function setup(
     const result =
       message.method === "initialize"
         ? {
-            protocolVersion: message.params.protocolVersion,
+            protocolVersion:
+              options.initializationFailure === "unsupported-version"
+                ? "2099-01-01"
+                : message.params.protocolVersion,
             capabilities: { resources: {}, tools: {} },
             serverInfo: { name: "fixture", version: "1" },
           }
@@ -81,7 +107,9 @@ async function setup(
                       : {
                           ui: {
                             resourceUri: "ui://card",
-                            ...(visibility ? { visibility } : {}),
+                            ...(options.visibility
+                              ? { visibility: options.visibility }
+                              : {}),
                           },
                           ...(metadata === "both"
                             ? { "ui/resourceUri": "ui://legacy" }
@@ -134,6 +162,7 @@ async function setup(
   const agent = new MockAgent();
   return {
     requests,
+    isStalledDeleteClosed: () => stalledDeleteClosed,
     agent,
     config,
     discover: () =>
@@ -492,7 +521,7 @@ test.each(["nested", "both"] as const)(
   },
 );
 
-test.each([undefined, ["model"], ["app"], ["app", "model"]])(
+test.each([undefined, [], ["model"], ["app"], ["app", "model"]])(
   "discovery respects tool visibility %j",
   async (visibility) => {
     const { discover, agent, run, requests, teardown } = await setup(
@@ -501,7 +530,7 @@ test.each([undefined, ["model"], ["app"], ["app", "model"]])(
       false,
       false,
       "nested",
-      visibility,
+      { visibility },
     );
     try {
       await discover();
@@ -548,5 +577,99 @@ test("continue discovery names the failing server and retains the error", async 
   } finally {
     log.mockRestore();
     await teardown();
+  }
+});
+
+test.each(["nested", "both"] as const)(
+  "app-only %s metadata stays hidden from the model",
+  async (metadata) => {
+    const fixture = await setup(false, false, false, false, metadata, {
+      visibility: ["app"],
+    });
+    try {
+      await fixture.discover();
+      expect(fixture.agent.runCalls[0].tools).toEqual([]);
+    } finally {
+      await fixture.teardown();
+    }
+  },
+);
+
+test.each([
+  ["proxy", "initialized-error"],
+  ["proxy", "unsupported-version"],
+  ["discovery", "initialized-error"],
+  ["discovery", "unsupported-version"],
+] as const)(
+  "%s deletes authenticated session after %s",
+  async (operation, initializationFailure) => {
+    const fixture = await setup(false, false, false, false, "legacy", {
+      initializationFailure,
+    });
+    try {
+      if (operation === "proxy") {
+        expect((await fixture.run("resources/read")).at(-1)).toMatchObject({
+          result: { error: "Error: MCP request failed" },
+        });
+      } else {
+        await expect(fixture.discover()).rejects.toThrow(
+          "MCP tool discovery failed",
+        );
+      }
+      expect(fixture.agent.runCalls).toEqual([]);
+      expect(
+        fixture.requests.filter((request) => request.method === "DELETE"),
+      ).toEqual([
+        expect.objectContaining({
+          authorization: "Bearer fixture-token",
+          sessionId: "fixture-session",
+        }),
+      ]);
+    } finally {
+      await fixture.teardown();
+    }
+  },
+);
+
+test("failed handshake bounds and aborts stalled session cleanup", async () => {
+  const fixture = await setup(false, true, false, false, "legacy", {
+    initializationFailure: "initialized-error",
+  });
+  try {
+    const started = Date.now();
+    expect((await fixture.run("resources/read")).at(-1)).toMatchObject({
+      result: { error: "Error: MCP request failed" },
+    });
+    expect(Date.now() - started).toBeLessThan(4500);
+    expect(
+      fixture.requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(1);
+    await vi.waitFor(() => expect(fixture.isStalledDeleteClosed()).toBe(true));
+    expect(fixture.agent.runCalls).toEqual([]);
+  } finally {
+    await fixture.teardown();
+  }
+}, 6000);
+
+test("rejected session cleanup preserves the private handshake failure", async () => {
+  const fixture = await setup(false, false, false, false, "legacy", {
+    initializationFailure: "initialized-error",
+    rejectDelete: true,
+  });
+  try {
+    const events = await fixture.run("resources/read");
+    expect(events.at(-1)).toMatchObject({
+      result: { error: "Error: MCP request failed" },
+    });
+    expect(
+      fixture.requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain("private-cleanup-diagnostic");
+    expect(JSON.stringify(events)).not.toContain(
+      "private-initialization-diagnostic",
+    );
+    expect(fixture.agent.runCalls).toEqual([]);
+  } finally {
+    await fixture.teardown();
   }
 });

@@ -150,7 +150,7 @@ async function closeMCPConnection(
     // Session cleanup must not replace a successful operation or its error.
   } finally {
     clearTimeout(deadline);
-    // Closing aborts the SDK transport, including an outstanding DELETE.
+    // Close the SDK transport; DELETE has its own bounded signal.
     await client.close();
   }
 }
@@ -170,7 +170,9 @@ export interface MCPAppsMiddlewareConfig {
 /**
  * Check for a UI resource that the server allows the model to discover
  */
-function isModelVisibleUITool(tool: { _meta?: Record<string, unknown> }): boolean {
+function isModelVisibleUITool(tool: {
+  _meta?: Record<string, unknown>;
+}): boolean {
   const ui = tool._meta?.ui;
   const visibility =
     ui && typeof ui === "object" && "visibility" in ui
@@ -713,11 +715,13 @@ export class MCPAppsMiddleware extends Middleware {
       const response = await client.listTools();
 
       // Filter for tools with UI resources and convert to AG-UI format with server config
-      const uiTools = response.tools.filter(isModelVisibleUITool).map((mcpTool) => ({
-        tool: convertMCPToolToAGUITool(mcpTool),
-        serverConfig,
-        resourceUri: getUIResourceUri(mcpTool)!,
-      }));
+      const uiTools = response.tools
+        .filter(isModelVisibleUITool)
+        .map((mcpTool) => ({
+          tool: convertMCPToolToAGUITool(mcpTool),
+          serverConfig,
+          resourceUri: getUIResourceUri(mcpTool)!,
+        }));
 
       return uiTools;
     } finally {

@@ -123,6 +123,7 @@ The lockfile pins this package's SDK to 1.15.0 so CI tests the minimum supported
 The middleware accepts only `tools/call`, `resources/read`, `notifications/message`, and `ping` from an iframe proxy request.
 It rejects other methods before it connects to the MCP server.
 HTTP discovery, tool calls, and proxy requests delete their MCP sessions before closing the client.
+Session deletion uses its own three-second abort signal so cleanup can run after a failed handshake aborts the SDK signal.
 If a server rejects session deletion or does not respond within three seconds, the client still closes and preserves the original operation result.
 
 Server hashes exclude headers so browser-visible references do not contain a checksum of credentials.
