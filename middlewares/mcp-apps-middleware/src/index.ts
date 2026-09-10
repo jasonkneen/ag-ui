@@ -124,14 +124,22 @@ async function closeMCPConnection(
   client: Client,
   transport: Awaited<ReturnType<typeof buildMCPTransport>>,
 ): Promise<void> {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
     if (transport instanceof StreamableHTTPClientTransport) {
-      // Older servers can reject DELETE. Still close the local connection.
-      await transport.terminateSession();
+      // Do not hold a completed operation behind an unresponsive DELETE.
+      await Promise.race([
+        transport.terminateSession(),
+        new Promise<void>((resolve) => {
+          deadline = setTimeout(resolve, 3_000);
+        }),
+      ]);
     }
   } catch {
     // Session cleanup must not replace a successful operation or its error.
   } finally {
+    clearTimeout(deadline);
+    // Closing aborts the SDK transport, including an outstanding DELETE.
     await client.close();
   }
 }

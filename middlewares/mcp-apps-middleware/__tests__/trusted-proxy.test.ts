@@ -6,7 +6,7 @@ import { MCPAppsMiddleware, getServerHash } from "../src/index";
 import { MockAgent, createRunAgentInput } from "./test-utils";
 
 /** Serve the MCP HTTP protocol and record transport effects on real sockets. */
-async function setup(sharedEndpoint = false) {
+async function setup(sharedEndpoint = false, stallDelete = false) {
   const requests: Array<{
     method: string;
     authorization?: string;
@@ -20,6 +20,7 @@ async function setup(sharedEndpoint = false) {
     };
     requests.push(entry);
     if (request.method === "DELETE") {
+      if (stallDelete) return;
       response.writeHead(204).end();
       return;
     }
@@ -221,3 +222,28 @@ test("duplicate explicit server IDs are rejected", () => {
       }),
   ).toThrow("distinct serverId");
 });
+
+test("an unresponsive DELETE cannot hold a completed proxy result", async () => {
+  const { run, requests, teardown } = await setup(false, true);
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const events = await Promise.race([
+      run("resources/read"),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(
+          () => reject(new Error("session cleanup did not finish")),
+          4500,
+        );
+      }),
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      result: { contents: [{ text: "Card" }] },
+    });
+    expect(
+      requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(1);
+  } finally {
+    clearTimeout(deadline);
+    await teardown();
+  }
+}, 6000);

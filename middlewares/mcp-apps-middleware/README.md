@@ -116,7 +116,7 @@ MIT
 The middleware accepts only `tools/call`, `resources/read`, `notifications/message`, and `ping` from an iframe proxy request.
 It rejects other methods before it connects to the MCP server.
 HTTP discovery, tool calls, and proxy requests delete their MCP sessions before closing the client.
-If a server rejects session deletion, the client still closes and preserves the original operation result.
+If a server rejects session deletion or does not respond within three seconds, the client still closes and preserves the original operation result.
 
 Server hashes exclude headers so browser-visible references do not contain a checksum of credentials.
 This changes hashes for servers configured with headers. Recreate activity messages after upgrading;
