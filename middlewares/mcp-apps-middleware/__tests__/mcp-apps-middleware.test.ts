@@ -486,6 +486,8 @@ describe("MCPAppsMiddleware", () => {
       expect(events.length).toBeGreaterThanOrEqual(2);
       expect(consoleErrorSpy).toHaveBeenCalledWith(
         "MCP tool discovery failed",
+        expect.objectContaining({ serverHash: expect.any(String) }),
+        expect.any(Error),
       );
 
       consoleErrorSpy.mockRestore();
@@ -560,7 +562,10 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockHTTPTransportCalls).toHaveLength(1);
-      expect(mockHTTPTransportOpts[0]).toEqual({ requestInit: { headers, redirect: "error" }, fetch: expect.any(Function) });
+      expect(mockHTTPTransportOpts[0]).toEqual({
+        requestInit: { headers, redirect: "error" },
+        fetch: expect.any(Function),
+      });
     });
 
     it("forwards configured headers to the SSE transport (#1862)", async () => {
@@ -580,7 +585,10 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockSSETransportCalls).toHaveLength(1);
-      expect(mockSSETransportOpts[0]).toEqual({ requestInit: { headers, redirect: "error" }, fetch: expect.any(Function) });
+      expect(mockSSETransportOpts[0]).toEqual({
+        requestInit: { headers, redirect: "error" },
+        fetch: expect.any(Function),
+      });
     });
 
     it("retains redirect protection when no headers are configured", async () => {
@@ -597,7 +605,10 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockHTTPTransportCalls).toHaveLength(1);
-      expect(mockHTTPTransportOpts[0]).toEqual({ requestInit: { headers: undefined, redirect: "error" }, fetch: expect.any(Function) });
+      expect(mockHTTPTransportOpts[0]).toEqual({
+        requestInit: { headers: undefined, redirect: "error" },
+        fetch: expect.any(Function),
+      });
     });
 
     it("getServerHash excludes HTTP credentials from the browser-visible reference", () => {
@@ -1553,7 +1564,9 @@ describe("MCPAppsMiddleware", () => {
       const finishedEvent = events.find(
         (e) => e.type === EventType.RUN_FINISHED,
       );
-      expect((finishedEvent as any).result.error).toBe("Error: MCP request failed");
+      expect((finishedEvent as any).result.error).toBe(
+        "Error: MCP request failed",
+      );
     });
 
     it("emits error for unknown serverHash", async () => {

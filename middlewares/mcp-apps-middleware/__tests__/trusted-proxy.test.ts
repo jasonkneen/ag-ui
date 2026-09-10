@@ -22,6 +22,7 @@ async function setup(
   redirect = false,
   rejectAuth = false,
   metadata: "legacy" | "nested" | "both" = "legacy",
+  visibility?: string[],
 ) {
   const requests: Array<{
     method: string;
@@ -78,7 +79,10 @@ async function setup(
                     metadata === "legacy"
                       ? { "ui/resourceUri": "ui://card" }
                       : {
-                          ui: { resourceUri: "ui://card" },
+                          ui: {
+                            resourceUri: "ui://card",
+                            ...(visibility ? { visibility } : {}),
+                          },
                           ...(metadata === "both"
                             ? { "ui/resourceUri": "ui://legacy" }
                             : {}),
@@ -106,7 +110,7 @@ async function setup(
     throw new Error("Fixture did not listen");
   const url = `http://127.0.0.1:${address.port}`;
   const config = {
-    discoveryFailureMode: "throw" as const,
+    discoveryFailureMode: "throw" as "throw" | "continue",
     mcpServers: [
       {
         type: "http" as const,
@@ -131,6 +135,7 @@ async function setup(
   return {
     requests,
     agent,
+    config,
     discover: () =>
       firstValueFrom(
         middleware.run(createRunAgentInput(), agent).pipe(toArray()),
@@ -149,7 +154,10 @@ async function setup(
                   serverId: hashOnly ? undefined : serverId,
                   serverHash: getServerHash({ type: "http", url }),
                   method,
-                  params: { uri: "ui://card" },
+                  params:
+                    method === "tools/call"
+                      ? { name: "card", arguments: {} }
+                      : { uri: "ui://card" },
                 },
               },
             }),
@@ -315,9 +323,15 @@ test("strict discovery failures stop the agent without exposing upstream diagnos
   try {
     await expect(discover()).rejects.toThrow("MCP tool discovery failed");
     expect(agent.runCalls).toEqual([]);
-    expect(JSON.stringify(log.mock.calls)).not.toContain(
-      "private-auth-diagnostic",
+    expect(log).toHaveBeenCalledWith(
+      "MCP tool discovery failed",
+      expect.objectContaining({
+        serverId: "cards",
+        serverHash: expect.any(String),
+      }),
+      expect.any(Error),
     );
+    expect(String(log.mock.calls[0][2])).toContain("private-auth-diagnostic");
   } finally {
     log.mockRestore();
     await teardown();
@@ -326,13 +340,24 @@ test("strict discovery failures stop the agent without exposing upstream diagnos
 
 test("proxy errors do not expose upstream diagnostics", async () => {
   const { run, teardown } = await setup(false, false, false, true);
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
     const events = await run("resources/read");
     expect(events.at(-1)).toMatchObject({
       result: { error: "Error: MCP request failed" },
     });
     expect(JSON.stringify(events)).not.toContain("private-auth-diagnostic");
+    expect(log).toHaveBeenCalledWith(
+      "MCP proxy request failed",
+      expect.objectContaining({
+        serverId: "cards",
+        serverHash: expect.any(String),
+      }),
+      expect.any(Error),
+    );
+    expect(String(log.mock.calls[0][2])).toContain("private-auth-diagnostic");
   } finally {
+    log.mockRestore();
     await teardown();
   }
 });
@@ -466,3 +491,62 @@ test.each(["nested", "both"] as const)(
     }
   },
 );
+
+test.each([undefined, ["model"], ["app"], ["app", "model"]])(
+  "discovery respects tool visibility %j",
+  async (visibility) => {
+    const { discover, agent, run, requests, teardown } = await setup(
+      false,
+      false,
+      false,
+      false,
+      "nested",
+      visibility,
+    );
+    try {
+      await discover();
+      expect(agent.runCalls[0].tools.some((tool) => tool.name === "card")).toBe(
+        visibility === undefined || visibility.includes("model"),
+      );
+      if (visibility?.length === 1 && visibility[0] === "app") {
+        const events = await run("tools/call");
+        expect(events.at(-1)).toMatchObject({
+          result: { content: [{ text: "Card result" }] },
+        });
+        expect(requests.some((request) => request.rpc === "tools/call")).toBe(
+          true,
+        );
+        expect(agent.runCalls).toHaveLength(1);
+      }
+    } finally {
+      await teardown();
+    }
+  },
+);
+
+test("continue discovery names the failing server and retains the error", async () => {
+  const { discover, agent, config, teardown } = await setup(
+    false,
+    false,
+    false,
+    true,
+  );
+  config.discoveryFailureMode = "continue";
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await discover();
+    expect(agent.runCalls).toHaveLength(1);
+    expect(log).toHaveBeenCalledWith(
+      "MCP tool discovery failed",
+      expect.objectContaining({
+        serverId: "cards",
+        serverHash: expect.any(String),
+      }),
+      expect.any(Error),
+    );
+    expect(String(log.mock.calls[0][2])).toContain("private-auth-diagnostic");
+  } finally {
+    log.mockRestore();
+    await teardown();
+  }
+});

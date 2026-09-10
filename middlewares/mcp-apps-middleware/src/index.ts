@@ -16,6 +16,7 @@ import { Observable, from, switchMap } from "rxjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { randomUUID, createHash } from "crypto";
+import { createTrustedFetch } from "./trusted-fetch";
 
 /**
  * Activity type for MCP Apps events
@@ -115,15 +116,7 @@ async function buildMCPTransport(config: MCPClientConfig) {
   ) {
     throw new Error("MCP URL must use HTTP(S) without embedded credentials");
   }
-  const trustedFetch: typeof fetch = (target, init) => {
-    const url = new URL(
-      target instanceof Request ? target.url : String(target),
-    );
-    if (url.origin !== endpoint.origin) {
-      return Promise.reject(new Error("MCP transport changed origin"));
-    }
-    return fetch(target, { ...init, redirect: "error" });
-  };
+  const trustedFetch = createTrustedFetch(endpoint.origin);
   const options = {
     requestInit: { headers: config.headers, redirect: "error" as const },
     fetch: trustedFetch,
@@ -175,10 +168,19 @@ export interface MCPAppsMiddlewareConfig {
 }
 
 /**
- * Check if a tool has a UI resource attached (per SEP-1865)
+ * Check for a UI resource that the server allows the model to discover
  */
-function hasUIResource(tool: { _meta?: Record<string, unknown> }): boolean {
-  return getUIResourceUri(tool) !== undefined;
+function isModelVisibleUITool(tool: { _meta?: Record<string, unknown> }): boolean {
+  const ui = tool._meta?.ui;
+  const visibility =
+    ui && typeof ui === "object" && "visibility" in ui
+      ? ui.visibility
+      : undefined;
+  return (
+    getUIResourceUri(tool) !== undefined &&
+    (visibility === undefined ||
+      (Array.isArray(visibility) && visibility.includes("model")))
+  );
 }
 
 /** Read current MCP Apps metadata first, with the legacy flat key as fallback. */
@@ -412,8 +414,7 @@ export class MCPAppsMiddleware extends Middleware {
     try {
       await client.connect(transport);
 
-      // Per SEP-1865: Forward any method that doesn't start with "ui/"
-      // Methods starting with "ui/" are handled by the host, not the MCP server
+      // Dispatch only methods admitted by the UI proxy allowlist.
       switch (method) {
         case "tools/call":
           return await client.callTool(
@@ -431,10 +432,19 @@ export class MCPAppsMiddleware extends Middleware {
         case "ping":
           return await client.ping();
         default:
+          // Defensive assertion: the pre-connection allowlist covers every case above.
           throw new Error(`MCP method not allowed for UI proxy: ${method}`);
       }
-    } catch {
-      // Transport errors can contain server response bodies and credentials.
+    } catch (error) {
+      console.error(
+        "MCP proxy request failed",
+        {
+          serverId: serverConfig.serverId,
+          serverHash: getServerHash(serverConfig),
+        },
+        error,
+      );
+      // Keep operator diagnostics on the server, never in the iframe response.
       throw new Error("MCP request failed");
     } finally {
       await closeMCPConnection(client, transport);
@@ -656,11 +666,18 @@ export class MCPAppsMiddleware extends Middleware {
       try {
         const tools = await this.fetchToolsFromServer(serverConfig);
         allUITools.push(...tools);
-      } catch {
+      } catch (error) {
+        console.error(
+          "MCP tool discovery failed",
+          {
+            serverId: serverConfig.serverId,
+            serverHash: getServerHash(serverConfig),
+          },
+          error,
+        );
         if (this.config.discoveryFailureMode === "throw") {
           throw new Error("MCP tool discovery failed");
         }
-        console.error("MCP tool discovery failed");
       }
     }
 
@@ -696,7 +713,7 @@ export class MCPAppsMiddleware extends Middleware {
       const response = await client.listTools();
 
       // Filter for tools with UI resources and convert to AG-UI format with server config
-      const uiTools = response.tools.filter(hasUIResource).map((mcpTool) => ({
+      const uiTools = response.tools.filter(isModelVisibleUITool).map((mcpTool) => ({
         tool: convertMCPToolToAGUITool(mcpTool),
         serverConfig,
         resourceUri: getUIResourceUri(mcpTool)!,
