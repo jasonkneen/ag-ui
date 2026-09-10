@@ -899,6 +899,9 @@ export class LangGraphAgent extends AbstractAgent {
     // chunk, including a first subgraph event that arrives before values mode.
     let latestRootStateValues = state.values;
     let hasOrderedRootStateValues = true;
+    let rootValuesCanAdvanceBoundary = false;
+    let hasReturnedFromSubgraph = false;
+    const pendingSubgraphBoundarySteps = new Map<string, number>();
     let updatedState = state;
 
     try {
@@ -990,8 +993,26 @@ export class LangGraphAgent extends AbstractAgent {
             ...latestStateValues,
             ...chunk.data,
           };
-          latestRootStateValues = chunk.data;
-          hasOrderedRootStateValues = true;
+          const preservesRootBoundaryShape = Object.keys(
+            latestRootStateValues ?? {},
+          ).every((key) =>
+            Object.prototype.hasOwnProperty.call(chunk.data, key),
+          );
+          // Before events-mode model streaming begins, `values` is the only
+          // ordered root boundary available. Once events-mode is active,
+          // multiplexed `values` can race ahead of the event currently being
+          // processed. A chain completion makes the next root `values` pulse a
+          // candidate, but subgraph multiplexing can still surface an empty or
+          // partial pulse. Only let a candidate replace the ordered boundary
+          // when it preserves every state channel already present there.
+          if (
+            !this.eventsStreamActive ||
+            (rootValuesCanAdvanceBoundary && preservesRootBoundaryShape)
+          ) {
+            latestRootStateValues = chunk.data;
+            hasOrderedRootStateValues = true;
+          }
+          rootValuesCanAdvanceBoundary = false;
           continue;
         } else if (
           subgraphsStreamEnabled &&
@@ -1028,28 +1049,58 @@ export class LangGraphAgent extends AbstractAgent {
         // ns format: "" | "node:uuid" | "node:uuid|inner:uuid"
         const ns: string = metadata.langgraph_checkpoint_ns ?? "";
         const nsRoot = ns.split("|")[0].split(":")[0];
+        if (
+          nsRoot &&
+          !ns.includes("|") &&
+          typeof metadata.langgraph_step === "number"
+        ) {
+          pendingSubgraphBoundarySteps.set(nsRoot, metadata.langgraph_step - 1);
+        }
         if (ns.includes("|") && nsRoot) this.subgraphs.add(nsRoot);
         const currentSubgraph =
           nsRoot && this.subgraphs.has(nsRoot) ? nsRoot : ROOT_SUBGRAPH_NAME;
 
         if (currentSubgraph !== this.currentSubgraph) {
           this.currentSubgraph = currentSubgraph;
-          const boundaryCheckpointStep =
-            currentSubgraph === ROOT_SUBGRAPH_NAME &&
-            typeof metadata.langgraph_step === "number"
+          const enteringSubgraph = currentSubgraph !== ROOT_SUBGRAPH_NAME;
+          const boundaryCheckpointStep = enteringSubgraph
+            ? pendingSubgraphBoundarySteps.get(currentSubgraph)
+            : typeof metadata.langgraph_step === "number"
               ? metadata.langgraph_step - 1
               : undefined;
+          const durability = input.forwardedProps?.durability ?? "async";
+          // Root values and event callbacks are multiplexed independently. A
+          // future values pulse can therefore arrive before the first nested
+          // callback reveals that an outer node is a subgraph. When the outer
+          // root step is known, its checkpoint is the causal pre-entry state;
+          // prefer it over an arrival-ordered values cache. Exit durability has
+          // no mid-run checkpoint, so it keeps using the ordered cache.
+          const shouldReadEntryCheckpoint =
+            enteringSubgraph &&
+            boundaryCheckpointStep !== undefined &&
+            durability !== "exit";
           latestStateValues = await this.getStateAndMessagesSnapshots(
             threadId,
             latestRootStateValues,
-            hasOrderedRootStateValues,
+            shouldReadEntryCheckpoint ? false : hasOrderedRootStateValues,
             boundaryCheckpointStep,
-            input.forwardedProps?.durability ?? "async",
+            durability,
           );
-          // A root values snapshot describes the boundary that follows it. Do
-          // not reuse it after crossing that boundary: a subgraph may commit
-          // newer state before the next root values event arrives.
-          hasOrderedRootStateValues = false;
+          if (enteringSubgraph) {
+            pendingSubgraphBoundarySteps.delete(currentSubgraph);
+          }
+          if (currentSubgraph === ROOT_SUBGRAPH_NAME) {
+            // A checkpoint-selected root boundary is ordered by construction
+            // and can seed the next subgraph even when no root node runs in
+            // between.
+            latestRootStateValues = latestStateValues;
+            hasOrderedRootStateValues = true;
+            hasReturnedFromSubgraph = true;
+          } else {
+            // Do not reuse a root boundary after entering a subgraph. The next
+            // root boundary or root on_chain_end output will advance it.
+            hasOrderedRootStateValues = false;
+          }
         }
 
         // Set server-assigned run id as soon as available
@@ -1090,9 +1141,10 @@ export class LangGraphAgent extends AbstractAgent {
         // LangGraph JS doesn't emit `values` chunks with the latest state between
         // tool execution and run end, so without this update, intermediate
         // STATE_SNAPSHOTs go stale after a tool Command updates state.
-        // A root on_chain_end also advances the ordered root cache: when values
-        // mode is omitted, the next subgraph boundary snapshots straight from
-        // that cache, so it must carry the same merged output.
+        // Preserve legacy first-entry seeding before model streaming begins.
+        // After a subgraph returns, only reduced values or a checkpoint may
+        // advance its root boundary; callback outputs remain provisional even
+        // when the graph never emits a model-stream callback.
         if (
           eventType === LangGraphEventTypes.OnChainEnd &&
           chunkData.data?.output != null
@@ -1116,13 +1168,35 @@ export class LangGraphAgent extends AbstractAgent {
           }
           if (outputUpdate) {
             latestStateValues = { ...latestStateValues, ...outputUpdate };
-            if (currentSubgraph === ROOT_SUBGRAPH_NAME) {
+            if (
+              currentSubgraph === ROOT_SUBGRAPH_NAME &&
+              !this.eventsStreamActive &&
+              !hasReturnedFromSubgraph
+            ) {
               latestRootStateValues = {
                 ...latestRootStateValues,
                 ...outputUpdate,
               };
+              hasOrderedRootStateValues = true;
             }
           }
+        }
+        if (eventType === LangGraphEventTypes.OnChainEnd) {
+          if (
+            currentSubgraph === ROOT_SUBGRAPH_NAME &&
+            (this.eventsStreamActive || hasReturnedFromSubgraph)
+          ) {
+            // The root step has advanced, but after model streaming or a prior
+            // subgraph return its callback output is only an update. Until
+            // reduced values arrive, force the next subgraph boundary to read
+            // committed state instead of treating that update as a snapshot.
+            hasOrderedRootStateValues = false;
+          }
+          // `values` carries the fully reduced root state for a completed graph
+          // step. Before a chain completes it may race ahead of events-mode,
+          // but after completion it is the authoritative boundary and must
+          // replace provisional node-output updates.
+          rootValuesCanAdvanceBoundary = true;
         }
 
         if (
