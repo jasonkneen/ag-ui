@@ -2,11 +2,11 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { expect, test } from "vitest";
 import { firstValueFrom, toArray } from "rxjs";
-import { MCPAppsMiddleware } from "../src/index";
+import { MCPAppsMiddleware, getServerHash } from "../src/index";
 import { MockAgent, createRunAgentInput } from "./test-utils";
 
 /** Serve the MCP HTTP protocol and record transport effects on real sockets. */
-async function setup() {
+async function setup(sharedEndpoint = false) {
   const requests: Array<{
     method: string;
     authorization?: string;
@@ -58,28 +58,44 @@ async function setup() {
   const address = server.address();
   if (!address || typeof address === "string")
     throw new Error("Fixture did not listen");
+  const url = `http://127.0.0.1:${address.port}`;
   const middleware = new MCPAppsMiddleware({
     mcpServers: [
       {
         type: "http",
-        url: `http://127.0.0.1:${address.port}`,
+        url,
         serverId: "cards",
         headers: { Authorization: "Bearer fixture-token" },
       },
+      ...(sharedEndpoint
+        ? [
+            {
+              type: "http" as const,
+              url,
+              serverId: "other",
+              headers: { Authorization: "Bearer other-token" },
+            },
+          ]
+        : []),
     ],
   });
   const agent = new MockAgent();
   return {
     requests,
     agent,
-    run: (method: string) =>
+    run: (
+      method: string,
+      serverId: string | undefined = "cards",
+      hashOnly = false,
+    ) =>
       firstValueFrom(
         middleware
           .run(
             createRunAgentInput({
               forwardedProps: {
                 __proxiedMCPRequest: {
-                  serverId: "cards",
+                  serverId: hashOnly ? undefined : serverId,
+                  serverHash: getServerHash({ type: "http", url }),
                   method,
                   params: { uri: "ui://card" },
                 },
@@ -128,4 +144,80 @@ test("successful HTTP proxy requests delete their authenticated MCP session", as
   } finally {
     await teardown();
   }
+});
+
+test.each(["http", "sse"] as const)(
+  "%s server hashes do not expose a credential checksum",
+  (type) => {
+    const publicServer = { type, url: "https://mcp.example.test" };
+    expect(
+      getServerHash({
+        ...publicServer,
+        headers: { Authorization: "guessable-token" },
+      }),
+    ).toBe(getServerHash(publicServer));
+  },
+);
+
+test("servers sharing a public endpoint require distinct server IDs", () => {
+  expect(
+    () =>
+      new MCPAppsMiddleware({
+        mcpServers: [
+          {
+            type: "http",
+            url: "https://mcp.example.test",
+            headers: { Authorization: "first" },
+          },
+          {
+            type: "http",
+            url: "https://mcp.example.test",
+            headers: { Authorization: "second" },
+          },
+        ],
+      }),
+  ).toThrow("distinct serverId");
+});
+
+test("explicit IDs select the right credentials on a shared endpoint", async () => {
+  const { run, requests, teardown } = await setup(true);
+  try {
+    const events = await run("resources/read", "other");
+    expect(events.at(-1)).toMatchObject({
+      result: { contents: [{ text: "Card" }] },
+    });
+    expect(requests.length).toBeGreaterThan(0);
+    expect(
+      requests.every(
+        (request) => request.authorization === "Bearer other-token",
+      ),
+    ).toBe(true);
+  } finally {
+    await teardown();
+  }
+});
+
+test("hash-only requests cannot select an ambiguous credential scope", async () => {
+  const { run, requests, teardown } = await setup(true);
+  try {
+    const events = await run("resources/read", undefined, true);
+    expect(events.at(-1)).toMatchObject({
+      result: { error: expect.stringContaining("Unknown server") },
+    });
+    expect(requests).toEqual([]);
+  } finally {
+    await teardown();
+  }
+});
+
+test("duplicate explicit server IDs are rejected", () => {
+  expect(
+    () =>
+      new MCPAppsMiddleware({
+        mcpServers: [
+          { type: "http", url: "https://one.example.test", serverId: "cards" },
+          { type: "http", url: "https://two.example.test", serverId: "cards" },
+        ],
+      }),
+  ).toThrow("distinct serverId");
 });

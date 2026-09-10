@@ -117,3 +117,9 @@ The middleware accepts only `tools/call`, `resources/read`, `notifications/messa
 It rejects other methods before it connects to the MCP server.
 HTTP discovery, tool calls, and proxy requests delete their MCP sessions before closing the client.
 If a server rejects session deletion, the client still closes and preserves the original operation result.
+
+Server hashes exclude headers so browser-visible references do not contain a checksum of credentials.
+This changes hashes for servers configured with headers. Recreate activity messages after upgrading;
+use stable `serverId` values for references that must survive configuration changes.
+If multiple configurations share a transport type and URL, each must have a distinct `serverId`.
+Hash-only requests for that endpoint are rejected because they cannot identify the intended credential scope.

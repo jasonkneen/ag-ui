@@ -82,14 +82,13 @@ export interface MCPClientConfigSSE {
 export type MCPClientConfig = MCPClientConfigHTTP | MCPClientConfigSSE;
 
 /**
- * Generate a stable server hash from config using MD5 hash.
+ * Generate a stable reference from the public endpoint, excluding credentials.
  * This allows the frontend to reference servers without knowing their URLs.
  */
 export function getServerHash(config: MCPClientConfig): string {
   const serialized = JSON.stringify({
     type: config.type,
     url: config.url,
-    headers: config.headers,
   });
   return createHash("md5").update(serialized).digest("hex");
 }
@@ -196,6 +195,7 @@ export class MCPAppsMiddleware extends Middleware {
   private serverConfigMapByHash: Map<string, MCPClientConfig> = new Map();
   /** Map of serverId -> server config for proxied requests */
   private serverConfigMapById: Map<string, MCPClientConfig> = new Map();
+  private ambiguousServerHashes = new Set<string>();
 
   constructor(config: MCPAppsMiddlewareConfig = {}) {
     super();
@@ -203,8 +203,22 @@ export class MCPAppsMiddleware extends Middleware {
     // Build server config maps for proxied requests
     for (const serverConfig of config.mcpServers || []) {
       const serverHash = getServerHash(serverConfig);
-      this.serverConfigMapByHash.set(serverHash, serverConfig);
+      const previous = this.serverConfigMapByHash.get(serverHash);
+      if (previous || this.ambiguousServerHashes.has(serverHash)) {
+        if (!serverConfig.serverId || (previous && !previous.serverId)) {
+          throw new Error(
+            "MCP servers sharing an endpoint require distinct serverId values",
+          );
+        }
+        this.serverConfigMapByHash.delete(serverHash);
+        this.ambiguousServerHashes.add(serverHash);
+      } else {
+        this.serverConfigMapByHash.set(serverHash, serverConfig);
+      }
       if (serverConfig.serverId) {
+        if (this.serverConfigMapById.has(serverConfig.serverId)) {
+          throw new Error("MCP servers require distinct serverId values");
+        }
         this.serverConfigMapById.set(serverConfig.serverId, serverConfig);
       }
     }

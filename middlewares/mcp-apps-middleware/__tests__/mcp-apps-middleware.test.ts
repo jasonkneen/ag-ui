@@ -601,13 +601,13 @@ describe("MCPAppsMiddleware", () => {
       expect(mockHTTPTransportOpts[0]).toBeUndefined();
     });
 
-    it("getServerHash distinguishes HTTP servers that differ only by headers (#1862)", () => {
+    it("getServerHash excludes HTTP credentials from the browser-visible reference", () => {
       const base = { type: "http" as const, url: "http://localhost:3000" };
       const withAuth = { ...base, headers: { Authorization: "Bearer a" } };
       const withOtherAuth = { ...base, headers: { Authorization: "Bearer b" } };
 
-      expect(getServerHash(base)).not.toBe(getServerHash(withAuth));
-      expect(getServerHash(withAuth)).not.toBe(getServerHash(withOtherAuth));
+      expect(getServerHash(base)).toBe(getServerHash(withAuth));
+      expect(getServerHash(withAuth)).toBe(getServerHash(withOtherAuth));
     });
 
     it("aggregates tools from multiple servers", async () => {
@@ -1650,7 +1650,7 @@ describe("MCPAppsMiddleware", () => {
       expect(getServerHash(config1)).not.toBe(getServerHash(config2));
     });
 
-    it("generates different serverHashes for SSE configs with different headers", () => {
+    it("excludes SSE headers from public serverHashes", () => {
       const config1: MCPClientConfig = {
         type: "sse",
         url: "http://localhost:3000",
@@ -1661,7 +1661,7 @@ describe("MCPAppsMiddleware", () => {
         url: "http://localhost:3000",
         headers: { Authorization: "token2" },
       };
-      expect(getServerHash(config1)).not.toBe(getServerHash(config2));
+      expect(getServerHash(config1)).toBe(getServerHash(config2));
     });
 
     it("includes serverHash in ACTIVITY_SNAPSHOT content", async () => {
