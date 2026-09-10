@@ -304,9 +304,12 @@ def _resolve_template_param(agent: Any, name: str, annotation: Any = None) -> An
         if value is _MISSING:
             continue
 
+        # Managers may live directly under a parameter's name (for example,
+        # Strands background_tasks), not only under a registry alias.
+        if _references_agent(value, agent):
+            return _AGENT_BOUND
+
         if attr.endswith("_registry") and not name.endswith("_registry"):
-            if _references_agent(value, agent):
-                return _AGENT_BOUND
             contents = _registry_contents(value)
             if contents is _MISSING:
                 continue

@@ -750,26 +750,19 @@ def test_reads_a_dict_backed_registry_from_its_backing_field():
     assert recovered[0] is plugin
 
 
-def test_registry_holding_the_agent_is_not_forwarded():
-    """A registry that keeps a reference to its own agent must not be shared.
-
-    Registration hands the owning agent to whatever the registry holds, so its
-    contents are wired to that agent and cannot serve a second one.
-    """
-    import weakref
-
-    param = _first_forwardable_param()
-    singular = param[:-1] if param.endswith("s") else param
-
-    class OwnedRegistry:
-        def __init__(self, owner, contents):
-            self._agent_ref = weakref.ref(owner)
-            self._contents = contents
-
+@pytest.mark.parametrize(
+    "attribute", ["setting", "_setting", "_default_setting", "_setting_registry"]
+)
+@pytest.mark.parametrize("weak", [False, True])
+def test_value_holding_the_agent_is_not_forwarded(attribute, weak):
+    """Agent-owned managers are unsafe to forward regardless of storage name."""
     fake = type("FakeAgent", (), {})()
-    setattr(fake, f"_{singular}_registry", OwnedRegistry(fake, [object()]))
-
-    assert _resolve_template_param(fake, param) is _AGENT_BOUND
+    holder = types.SimpleNamespace(
+        _agent=weakref.ref(fake) if weak else fake,
+        _contents=[object()],
+    )
+    setattr(fake, attribute, holder)
+    assert _resolve_template_param(fake, "setting") is _AGENT_BOUND
 
 
 def test_registry_holding_an_unrelated_agent_is_still_forwarded():
