@@ -561,7 +561,7 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockHTTPTransportCalls).toHaveLength(1);
-      expect(mockHTTPTransportOpts[0]).toEqual({ requestInit: { headers } });
+      expect(mockHTTPTransportOpts[0]).toEqual({ requestInit: { headers, redirect: "error" }, fetch: expect.any(Function) });
     });
 
     it("forwards configured headers to the SSE transport (#1862)", async () => {
@@ -581,10 +581,10 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockSSETransportCalls).toHaveLength(1);
-      expect(mockSSETransportOpts[0]).toEqual({ requestInit: { headers } });
+      expect(mockSSETransportOpts[0]).toEqual({ requestInit: { headers, redirect: "error" }, fetch: expect.any(Function) });
     });
 
-    it("passes no transport options when no headers are configured", async () => {
+    it("retains redirect protection when no headers are configured", async () => {
       mockListTools.mockResolvedValue({ tools: [] });
 
       const middleware = new MCPAppsMiddleware({
@@ -598,7 +598,7 @@ describe("MCPAppsMiddleware", () => {
       await collectEvents(middleware.run(createRunAgentInput(), agent));
 
       expect(mockHTTPTransportCalls).toHaveLength(1);
-      expect(mockHTTPTransportOpts[0]).toBeUndefined();
+      expect(mockHTTPTransportOpts[0]).toEqual({ requestInit: { headers: undefined, redirect: "error" }, fetch: expect.any(Function) });
     });
 
     it("getServerHash excludes HTTP credentials from the browser-visible reference", () => {

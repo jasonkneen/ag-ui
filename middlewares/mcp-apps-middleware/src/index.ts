@@ -107,9 +107,27 @@ export function getServerHash(config: MCPClientConfig): string {
  * back and throws.
  */
 async function buildMCPTransport(config: MCPClientConfig) {
-  const options = config.headers
-    ? { requestInit: { headers: config.headers } }
-    : undefined;
+  const endpoint = new URL(config.url);
+  if (
+    !["http:", "https:"].includes(endpoint.protocol) ||
+    endpoint.username ||
+    endpoint.password
+  ) {
+    throw new Error("MCP URL must use HTTP(S) without embedded credentials");
+  }
+  const trustedFetch: typeof fetch = (target, init) => {
+    const url = new URL(
+      target instanceof Request ? target.url : String(target),
+    );
+    if (url.origin !== endpoint.origin) {
+      return Promise.reject(new Error("MCP transport changed origin"));
+    }
+    return fetch(target, { ...init, redirect: "error" });
+  };
+  const options = {
+    requestInit: { headers: config.headers, redirect: "error" as const },
+    fetch: trustedFetch,
+  };
   if (config.type === "sse") {
     const { SSEClientTransport } = await import(
       "@modelcontextprotocol/sdk/client/sse.js"

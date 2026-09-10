@@ -6,7 +6,11 @@ import { MCPAppsMiddleware, getServerHash } from "../src/index";
 import { MockAgent, createRunAgentInput } from "./test-utils";
 
 /** Serve the MCP HTTP protocol and record transport effects on real sockets. */
-async function setup(sharedEndpoint = false, stallDelete = false) {
+async function setup(
+  sharedEndpoint = false,
+  stallDelete = false,
+  redirect = false,
+) {
   const requests: Array<{
     method: string;
     authorization?: string;
@@ -19,6 +23,10 @@ async function setup(sharedEndpoint = false, stallDelete = false) {
       rpc: undefined as string | undefined,
     };
     requests.push(entry);
+    if (redirect && request.url !== "/capture") {
+      response.writeHead(307, { location: "/capture" }).end();
+      return;
+    }
     if (request.method === "DELETE") {
       if (stallDelete) return;
       response.writeHead(204).end();
@@ -247,3 +255,13 @@ test("an unresponsive DELETE cannot hold a completed proxy result", async () => 
     await teardown();
   }
 }, 6000);
+
+test("MCP redirects cannot forward configured credentials", async () => {
+  const { run, requests, teardown } = await setup(false, false, true);
+  try {
+    await run("resources/read");
+    expect(requests).toHaveLength(1);
+  } finally {
+    await teardown();
+  }
+});

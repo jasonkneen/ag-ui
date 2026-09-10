@@ -123,3 +123,6 @@ This changes hashes for servers configured with headers. Recreate activity messa
 use stable `serverId` values for references that must survive configuration changes.
 If multiple configurations share a transport type and URL, each must have a distinct `serverId`.
 Hash-only requests for that endpoint are rejected because they cannot identify the intended credential scope.
+
+MCP connections do not follow redirects, and transport requests must stay on the configured origin.
+URLs must use HTTP(S) and must not contain embedded user credentials.
