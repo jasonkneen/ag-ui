@@ -120,6 +120,23 @@ async function buildMCPTransport(config: MCPClientConfig) {
   return new StreamableHTTPClientTransport(new URL(config.url), options);
 }
 
+/** Release a short-lived HTTP session before closing its transport. */
+async function closeMCPConnection(
+  client: Client,
+  transport: Awaited<ReturnType<typeof buildMCPTransport>>,
+): Promise<void> {
+  try {
+    if (transport instanceof StreamableHTTPClientTransport) {
+      // Older servers can reject DELETE. Still close the local connection.
+      await transport.terminateSession();
+    }
+  } catch {
+    // Session cleanup must not replace a successful operation or its error.
+  } finally {
+    await client.close();
+  }
+}
+
 /**
  * Configuration for MCPAppsMiddleware
  */
@@ -307,6 +324,17 @@ export class MCPAppsMiddleware extends Middleware {
     method: string,
     params?: Record<string, unknown>,
   ): Promise<unknown> {
+    // Reject iframe methods before creating a credentialed MCP connection.
+    if (
+      ![
+        "tools/call",
+        "resources/read",
+        "notifications/message",
+        "ping",
+      ].includes(method)
+    ) {
+      throw new Error(`MCP method not allowed for UI proxy: ${method}`);
+    }
     const transport = await buildMCPTransport(serverConfig);
 
     const client = new Client(
@@ -347,7 +375,7 @@ export class MCPAppsMiddleware extends Middleware {
           throw new Error(`MCP method not allowed for UI proxy: ${method}`);
       }
     } finally {
-      await client.close();
+      await closeMCPConnection(client, transport);
     }
   }
 
@@ -503,7 +531,7 @@ export class MCPAppsMiddleware extends Middleware {
 
       return result;
     } finally {
-      await client.close();
+      await closeMCPConnection(client, transport);
     }
   }
 
@@ -615,7 +643,7 @@ export class MCPAppsMiddleware extends Middleware {
       return uiTools;
     } finally {
       // Always close the connection
-      await client.close();
+      await closeMCPConnection(client, transport);
     }
   }
 }

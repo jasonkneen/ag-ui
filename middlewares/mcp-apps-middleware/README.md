@@ -18,9 +18,13 @@ import { MCPAppsMiddleware } from "@ag-ui/mcp-apps-middleware";
 const agent = new YourAgent().use(
   new MCPAppsMiddleware({
     mcpServers: [
-      { type: "http", url: "http://localhost:3001/mcp", serverId: "weather-server" }
+      {
+        type: "http",
+        url: "http://localhost:3001/mcp",
+        serverId: "weather-server",
+      },
     ],
-  })
+  }),
 );
 ```
 
@@ -40,12 +44,18 @@ interface MCPAppsMiddlewareConfig {
 
 type MCPClientConfig =
   | { type: "http"; url: string; serverId?: string }
-  | { type: "sse"; url: string; headers?: Record<string, string>; serverId?: string };
+  | {
+      type: "sse";
+      url: string;
+      headers?: Record<string, string>;
+      serverId?: string;
+    };
 ```
 
 ### Server ID
 
 The optional `serverId` field provides a stable identifier for the server. This is useful when:
+
 - Server URLs may change (e.g., different environments)
 - You want human-readable server identification
 - Frontend code needs to reference servers by name
@@ -79,9 +89,9 @@ The middleware supports proxied MCP requests from the frontend. Pass a `ProxiedM
 
 ```typescript
 interface ProxiedMCPRequest {
-  serverHash: string;      // MD5 hash of server config
-  serverId?: string;     // Optional server ID for lookup
-  method: string;          // MCP method (e.g., "resources/read", "tools/call")
+  serverHash: string; // MD5 hash of server config
+  serverId?: string; // Optional server ID for lookup
+  method: string; // MCP method (e.g., "resources/read", "tools/call")
   params?: Record<string, unknown>;
 }
 ```
@@ -92,11 +102,18 @@ Server lookup prefers `serverId` if provided, falling back to `serverHash`.
 
 ```typescript
 import {
-  MCPAppsActivityType,  // "mcp-apps" constant
-  getServerHash         // Generate server hash from config
+  MCPAppsActivityType, // "mcp-apps" constant
+  getServerHash, // Generate server hash from config
 } from "@ag-ui/mcp-apps-middleware";
 ```
 
 ## License
 
 MIT
+
+## Proxy connections
+
+The middleware accepts only `tools/call`, `resources/read`, `notifications/message`, and `ping` from an iframe proxy request.
+It rejects other methods before it connects to the MCP server.
+HTTP discovery, tool calls, and proxy requests delete their MCP sessions before closing the client.
+If a server rejects session deletion, the client still closes and preserves the original operation result.
