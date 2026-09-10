@@ -178,7 +178,24 @@ export interface MCPAppsMiddlewareConfig {
  * Check if a tool has a UI resource attached (per SEP-1865)
  */
 function hasUIResource(tool: { _meta?: Record<string, unknown> }): boolean {
-  return typeof tool._meta?.["ui/resourceUri"] === "string";
+  return getUIResourceUri(tool) !== undefined;
+}
+
+/** Read current MCP Apps metadata first, with the legacy flat key as fallback. */
+function getUIResourceUri(tool: {
+  _meta?: Record<string, unknown>;
+}): string | undefined {
+  const ui = tool._meta?.ui;
+  if (
+    ui &&
+    typeof ui === "object" &&
+    "resourceUri" in ui &&
+    typeof ui.resourceUri === "string"
+  ) {
+    return ui.resourceUri;
+  }
+  const legacy = tool._meta?.["ui/resourceUri"];
+  return typeof legacy === "string" ? legacy : undefined;
 }
 
 /**
@@ -206,7 +223,7 @@ function convertMCPToolToAGUITool(mcpTool: {
 
   // Store UI resource URI in the description for now
   // TODO: Once AG-UI Tool type supports _meta, use that instead
-  const uiResourceUri = mcpTool._meta?.["ui/resourceUri"];
+  const uiResourceUri = getUIResourceUri(mcpTool);
   if (typeof uiResourceUri === "string") {
     tool.description = `${tool.description}\n[UI Resource: ${uiResourceUri}]`;
   }
@@ -682,7 +699,7 @@ export class MCPAppsMiddleware extends Middleware {
       const uiTools = response.tools.filter(hasUIResource).map((mcpTool) => ({
         tool: convertMCPToolToAGUITool(mcpTool),
         serverConfig,
-        resourceUri: mcpTool._meta!["ui/resourceUri"] as string,
+        resourceUri: getUIResourceUri(mcpTool)!,
       }));
 
       return uiTools;

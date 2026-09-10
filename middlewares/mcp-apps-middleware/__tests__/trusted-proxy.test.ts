@@ -21,6 +21,7 @@ async function setup(
   stallDelete = false,
   redirect = false,
   rejectAuth = false,
+  metadata: "legacy" | "nested" | "both" = "legacy",
 ) {
   const requests: Array<{
     method: string;
@@ -73,7 +74,15 @@ async function setup(
                   name: "card",
                   description: "Card",
                   inputSchema: { type: "object", properties: {} },
-                  _meta: { "ui/resourceUri": "ui://card" },
+                  _meta:
+                    metadata === "legacy"
+                      ? { "ui/resourceUri": "ui://card" }
+                      : {
+                          ui: { resourceUri: "ui://card" },
+                          ...(metadata === "both"
+                            ? { "ui/resourceUri": "ui://legacy" }
+                            : {}),
+                        },
                 },
               ],
             }
@@ -426,3 +435,34 @@ test("authenticated discovery and tool execution delete both sessions", async ()
     await teardown();
   }
 });
+
+test.each(["nested", "both"] as const)(
+  "discovery uses current MCP metadata (%s)",
+  async (metadata) => {
+    const { discover, agent, teardown } = await setup(
+      false,
+      false,
+      false,
+      false,
+      metadata,
+    );
+    agent.setEvents([
+      createRunStartedEvent(),
+      createToolCallStartEvent("call", "card"),
+      createToolCallArgsEvent("call", "{}"),
+      createToolCallEndEvent("call"),
+      createRunFinishedEvent(),
+    ]);
+    try {
+      const events = await discover();
+      expect(agent.runCalls[0].tools.map((tool) => tool.name)).toContain(
+        "card",
+      );
+      expect(
+        events.find((event) => event.type === "ACTIVITY_SNAPSHOT"),
+      ).toMatchObject({ content: { resourceUri: "ui://card" } });
+    } finally {
+      await teardown();
+    }
+  },
+);
