@@ -449,7 +449,18 @@ export class MCPAppsMiddleware extends Middleware {
       // Keep operator diagnostics on the server, never in the iframe response.
       throw new Error("MCP request failed");
     } finally {
-      await closeMCPConnection(client, transport);
+      try {
+        await closeMCPConnection(client, transport);
+      } catch (error) {
+        console.error(
+          "MCP session cleanup failed",
+          {
+            serverId: serverConfig.serverId,
+            serverHash: getServerHash(serverConfig),
+          },
+          error,
+        );
+      }
     }
   }
 

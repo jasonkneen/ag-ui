@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { once } from "node:events";
@@ -673,3 +674,44 @@ test("rejected session cleanup preserves the private handshake failure", async (
     await fixture.teardown();
   }
 });
+
+test.each([false, true])(
+  "proxy preserves its result when client close rejects (handshake failure: %s)",
+  async (failHandshake) => {
+    const fixture = await setup(false, false, false, false, "legacy", {
+      initializationFailure: failHandshake ? "unsupported-version" : undefined,
+    });
+    const closeError = new Error(
+      "private-close-diagnostic: Bearer fixture-token",
+    );
+    const originalClose = Client.prototype.close;
+    const close = vi
+      .spyOn(Client.prototype, "close")
+      .mockImplementation(async function (this: Client) {
+        await originalClose.call(this);
+        throw closeError;
+      });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const events = await fixture.run("resources/read");
+      expect(events.at(-1)).toMatchObject({
+        result: failHandshake
+          ? { error: "Error: MCP request failed" }
+          : { contents: [{ text: "Card" }] },
+      });
+      expect(JSON.stringify(events)).not.toContain("private-close-diagnostic");
+      expect(log).toHaveBeenCalledWith(
+        "MCP session cleanup failed",
+        {
+          serverId: "cards",
+          serverHash: getServerHash(fixture.config.mcpServers[0]),
+        },
+        closeError,
+      );
+    } finally {
+      close.mockRestore();
+      log.mockRestore();
+      await fixture.teardown();
+    }
+  },
+);
