@@ -1076,6 +1076,50 @@ describe("interrupt bridge: resume path", () => {
     expect(events[events.length - 1].type).toBe(EventType.RUN_FINISHED);
   });
 
+  it("emits TOOL_CALL_START/ARGS/END before RESULT on resume of a suspended tool", async () => {
+    // First run discarded the triple on tool-call-suspended. Resume streams
+    // only tool-result, so the adapter must introduce the id before RESULT
+    // or CopilotKit drops the orphan tool message (#2668).
+    const { agent } = makeFakeLocalAgentWithResumeStream([
+      {
+        type: "tool-result",
+        payload: { toolCallId: "tc-1", result: { approved: true } },
+      },
+    ]);
+
+    const events = await collectEvents(
+      agent,
+      makeResumeInput({
+        type: "mastra_suspend",
+        toolCallId: "tc-1",
+        toolName: "process-expense",
+        args: { amount: 250, description: "team dinner" },
+        runId: "original-run-id",
+      }),
+    );
+
+    const types = events.map((e) => e.type);
+    const startAt = types.indexOf(EventType.TOOL_CALL_START);
+    const argsAt = types.indexOf(EventType.TOOL_CALL_ARGS);
+    const endAt = types.indexOf(EventType.TOOL_CALL_END);
+    const resultAt = types.indexOf(EventType.TOOL_CALL_RESULT);
+    expect(startAt).toBeGreaterThan(-1);
+    expect(argsAt).toBeGreaterThan(startAt);
+    expect(endAt).toBeGreaterThan(argsAt);
+    expect(resultAt).toBeGreaterThan(endAt);
+
+    const start = events[startAt] as { toolCallId: string; toolCallName: string };
+    expect(start.toolCallId).toBe("tc-1");
+    expect(start.toolCallName).toBe("process-expense");
+    const args = events[argsAt] as { toolCallId: string; delta: string };
+    expect(args.toolCallId).toBe("tc-1");
+    expect(JSON.parse(args.delta)).toEqual({
+      amount: 250,
+      description: "team dinner",
+    });
+    expect((events[resultAt] as { toolCallId: string }).toolCallId).toBe("tc-1");
+  });
+
   it("handles interruptEvent passed as an object (not just JSON string)", async () => {
     const { agent, calls } = makeFakeLocalAgentWithResumeStream([]);
 
