@@ -5,7 +5,15 @@ import { once } from "node:events";
 import { expect, test, vi } from "vitest";
 import { firstValueFrom, toArray } from "rxjs";
 import { MCPAppsMiddleware, getServerHash } from "../src/index";
-import { MockAgent, createRunAgentInput } from "./test-utils";
+import {
+  MockAgent,
+  createRunAgentInput,
+  createRunStartedEvent,
+  createRunFinishedEvent,
+  createToolCallStartEvent,
+  createToolCallArgsEvent,
+  createToolCallEndEvent,
+} from "./test-utils";
 
 /** Serve the MCP HTTP protocol and record transport effects on real sockets. */
 async function setup(
@@ -55,14 +63,27 @@ async function setup(
       message.method === "initialize"
         ? {
             protocolVersion: message.params.protocolVersion,
-            capabilities: { resources: {} },
+            capabilities: { resources: {}, tools: {} },
             serverInfo: { name: "fixture", version: "1" },
           }
-        : {
-            contents: [
-              { uri: "ui://card", text: "Card", mimeType: "text/html+mcp" },
-            ],
-          };
+        : message.method === "tools/list"
+          ? {
+              tools: [
+                {
+                  name: "card",
+                  description: "Card",
+                  inputSchema: { type: "object", properties: {} },
+                  _meta: { "ui/resourceUri": "ui://card" },
+                },
+              ],
+            }
+          : message.method === "tools/call"
+            ? { content: [{ type: "text", text: "Card result" }] }
+            : {
+                contents: [
+                  { uri: "ui://card", text: "Card", mimeType: "text/html+mcp" },
+                ],
+              };
     response.writeHead(200, {
       "content-type": "application/json",
       "mcp-session-id": "fixture-session",
@@ -374,5 +395,34 @@ test("legacy SSE reentry keeps trusted authentication on GET and POST", async ()
     await sdkServer.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("authenticated discovery and tool execution delete both sessions", async () => {
+  const { discover, agent, requests, teardown } = await setup();
+  agent.setEvents([
+    createRunStartedEvent(),
+    createToolCallStartEvent("call", "card"),
+    createToolCallArgsEvent("call", "{}"),
+    createToolCallEndEvent("call"),
+    createRunFinishedEvent(),
+  ]);
+  try {
+    const events = await discover();
+    expect(agent.runCalls[0].tools.map((tool) => tool.name)).toContain("card");
+    expect(events.some((event) => event.type === "ACTIVITY_SNAPSHOT")).toBe(
+      true,
+    );
+    expect(events.at(-1)).toMatchObject({ type: "RUN_FINISHED" });
+    expect(
+      requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(2);
+    expect(
+      requests.every(
+        (request) => request.authorization === "Bearer fixture-token",
+      ),
+    ).toBe(true);
+  } finally {
+    await teardown();
   }
 });
