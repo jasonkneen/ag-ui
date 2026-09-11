@@ -1791,6 +1791,8 @@ export class MastraAgent extends AbstractAgent {
           argsTextDelta: JSON.stringify(args ?? {}),
         });
         callbacks.onToolCallEnd?.({ toolCallId });
+        streamedStarted.add(toolCallId);
+        streamedEnded.add(toolCallId);
       }
     };
 
@@ -2331,19 +2333,18 @@ export class MastraAgent extends AbstractAgent {
             backgroundToolCalls.delete(chunk.payload.toolCallId);
             break;
           }
-          const flushedId = pendingToolCall?.toolCallId;
           flush();
           // Resume of a tool that suspended on the previous run: that run
           // discarded TOOL_CALL_START/ARGS/END (by design), so CopilotKit
           // never registered the id. Emit the triple now from the interrupt
           // snapshot before TOOL_CALL_RESULT, otherwise the result is
-          // orphaned (#2668). Skip when this resumed stream already flushed
-          // a matching buffered tool-call, or when START was streamed live.
-          // Do not emit on the first-run suspend path (replay is unset).
+          // orphaned (#2668). Skip when START was already emitted (buffered
+          // flush or live deltas). Do not emit on the first-run suspend path
+          // (replay is unset). Standard input.resume does not round-trip
+          // args; Mastra puts them on tool-result instead.
           if (
             replaySuspendedToolCall &&
             replaySuspendedToolCall.toolCallId === chunk.payload.toolCallId &&
-            flushedId !== chunk.payload.toolCallId &&
             !streamedStarted.has(chunk.payload.toolCallId)
           ) {
             const toolCallId = replaySuspendedToolCall.toolCallId;
@@ -2355,7 +2356,7 @@ export class MastraAgent extends AbstractAgent {
             callbacks.onToolCallArgs?.({
               toolCallId,
               argsTextDelta: JSON.stringify(
-                replaySuspendedToolCall.args ?? {},
+                replaySuspendedToolCall.args ?? chunk.payload.args ?? {},
               ),
             });
             callbacks.onToolCallEnd?.({ toolCallId });
