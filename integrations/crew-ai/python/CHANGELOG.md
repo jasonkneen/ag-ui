@@ -12,9 +12,6 @@
 - Dojo app is now built once per boot in the serving process.
 - Removed the dead, fully commented-out `enterprise.py` module from published artifacts.
 - Published distributions now include a Changelog URL in metadata.
-
-### Breaking changes
-
 - The `dev` console script is no longer published; run the dojo via the relocated examples project instead.
 - The dojo server and demo flows moved into a separate examples project and are no longer shipped in the published package.
 - `enterprise.py` removed from the package.
