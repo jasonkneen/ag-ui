@@ -14,6 +14,7 @@ import {
   CREWAI_A2UI_INJECT_AGENTS,
 } from "@/agents";
 import { IntegrationId } from "@/menu";
+import { withUtf8SseResponse } from "@/lib/utf8-sse-response";
 import { getPostHogClient } from "@/lib/posthog-server";
 
 type RouteParams = {
@@ -121,5 +122,9 @@ export async function POST(request: NextRequest, context: RouteParams) {
       integration_id: integrationId,
     },
   });
-  return handler(request);
+  const response = await handler(request);
+  return integrationId === "aws-strands" ||
+    integrationId === "aws-strands-typescript"
+    ? withUtf8SseResponse(response)
+    : response;
 }
