@@ -430,8 +430,9 @@ export interface MastraAgentConfig extends AgentConfig {
    * already emitted TOOL_CALL_START can only be CLOSED (TOOL_CALL_END), not
    * un-emitted. Under this option those two paths therefore close the streamed
    * call instead of suppressing it, and the consumer sees a tool call with no
-   * TOOL_CALL_RESULT (the interrupt / activity carries the outcome). If your
-   * server tools suspend or run as background tasks, leave this off.
+   * TOOL_CALL_RESULT (the interrupt / activity carries the outcome, and the
+   * activity retains the assembled tool arguments). If your server tools
+   * suspend or run as background tasks, leave this off.
    */
   streamServerToolCalls?: boolean;
   /**
@@ -1514,6 +1515,9 @@ export class MastraAgent extends AbstractAgent {
     // (delta) path, and (separately) for which we have emitted TOOL_CALL_END.
     const streamedStarted = new Set<string>();
     const streamedEnded = new Set<string>();
+    // Keep final arguments independently of the render buffer: a streamed
+    // call may still become a background activity after its args have ended.
+    const streamedToolCallArgs = new Map<string, unknown>();
 
     // Skipped / unrecognized chunk types warn at most once each. Mastra 1.31+
     // custom-data streams (e.g. `data-*` via context.writer.custom) can emit
@@ -2058,9 +2062,10 @@ export class MastraAgent extends AbstractAgent {
             break;
           }
           if (toolCallId && streamedStarted.has(toolCallId)) {
-            // Client tool: args were already streamed live via deltas — close
+            // Args were already streamed live via deltas — close
             // the call (the streaming-end chunk may have been absent) and don't
-            // re-emit.
+            // re-emit. Retain the assembled args for a background handoff.
+            streamedToolCallArgs.set(toolCallId, args);
             endStreamedToolCall(toolCallId);
             break;
           }
@@ -2072,6 +2077,7 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "tool-result": {
+          streamedToolCallArgs.delete(chunk.payload.toolCallId);
           // Swallow the `{ success: true }` result of a working-memory update —
           // its tool-call was mapped to STATE_DELTA and never rendered, so a
           // TOOL_CALL_RESULT here would have no matching call (and is internal
@@ -2166,6 +2172,7 @@ export class MastraAgent extends AbstractAgent {
           break;
         }
         case "tool-call-suspended": {
+          streamedToolCallArgs.delete(chunk.payload.toolCallId);
           // Always discard the pending tool-call: if it matches, the tool
           // was suspended before execution; if it doesn't match, the pending
           // call is orphaned (never executed) so emitting TOOL_CALL_START/
@@ -2251,14 +2258,15 @@ export class MastraAgent extends AbstractAgent {
         // first-write and updates.
         case "background-task-started": {
           const { taskId, toolName, toolCallId } = chunk.payload;
-          // The agent loop emits `tool-call` immediately before this; the
-          // bridge has it buffered in pendingToolCall. Suppress that normal
-          // tool render (the work is now an activity) but reuse its args for
-          // the snapshot. Mirrors the tool-call-suspended suppression.
+          // The final `tool-call` supplies the authoritative args. Buffered
+          // calls are still suppressible, while streamed calls keep
+          // their final args separately. Reuse either source for the activity
+          // without emitting another tool-call family.
           const args =
             pendingToolCall && pendingToolCall.toolCallId === toolCallId
               ? pendingToolCall.args
-              : undefined;
+              : streamedToolCallArgs.get(toolCallId);
+          streamedToolCallArgs.delete(toolCallId);
           pendingToolCall = null;
           // Under streamServerToolCalls the call may already be OPEN rather
           // than buffered (same reasoning as tool-call-suspended above): close
