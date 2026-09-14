@@ -1446,7 +1446,12 @@ export class LangGraphAgent extends AbstractAgent {
             predictStateTool.tool === toolCallData?.name,
         );
 
-        let isToolCallStartEvent = !hasCurrentStream && toolCallData?.name;
+        let isToolCallStartEvent =
+          toolCallData?.name &&
+          (!hasCurrentStream ||
+            (currentStream?.toolCallId &&
+              toolCallData.id &&
+              toolCallData.id !== currentStream.toolCallId));
         const isToolCallArgsEvent =
           hasCurrentStream && currentStream?.toolCallId && toolCallData?.args;
         const isToolCallEndEvent =
@@ -1546,6 +1551,16 @@ export class LangGraphAgent extends AbstractAgent {
         }
 
         if (isToolCallStartEvent && shouldEmitToolCalls) {
+          if (currentStream?.toolCallId) {
+            const resolved = this.dispatchEvent({
+              type: EventType.TOOL_CALL_END,
+              toolCallId: currentStream.toolCallId,
+              rawEvent: event,
+            });
+            if (resolved) {
+              this.messagesInProcess[this.activeRun!.id] = null;
+            }
+          }
           const resolved = this.dispatchEvent({
             type: EventType.TOOL_CALL_START,
             toolCallId: toolCallData.id,
@@ -1560,6 +1575,14 @@ export class LangGraphAgent extends AbstractAgent {
               toolCallId: toolCallData.id,
               toolCallName: toolCallData.name,
             });
+            if (toolCallData.args) {
+              this.dispatchEvent({
+                type: EventType.TOOL_CALL_ARGS,
+                toolCallId: toolCallData.id,
+                delta: toolCallData.args,
+                rawEvent: event,
+              });
+            }
           }
           break;
         }
