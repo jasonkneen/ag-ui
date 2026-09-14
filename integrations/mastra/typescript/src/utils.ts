@@ -188,15 +188,13 @@ export function convertAGUIMessagesToMastra(
         content: userContent,
       } as CoreMessage);
     } else if (message.role === "developer") {
-      // AG-UI's `developer` role carries app-injected context (CopilotKit uses
-      // it for instructions the user never typed). Mastra has no such role, so
-      // forward it as a user message rather than dropping it — a run whose
-      // only new message is a developer message must still reach the model.
+      // Mastra has no developer role. Preserve app-injected instructions as
+      // system messages, separate from user input and persisted chat history.
       result.push({
         ...(message.id !== undefined
           ? { id: toModelSafeMessageId(message.id) }
           : {}),
-        role: "user",
+        role: "system",
         content: message.content,
       } as CoreMessage);
     } else if (message.role === "tool") {

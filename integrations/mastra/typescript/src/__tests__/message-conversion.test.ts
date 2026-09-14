@@ -575,7 +575,7 @@ describe("convertAGUIMessagesToMastra", () => {
   });
 
   describe("developer messages", () => {
-    it("forwards a developer message as a user message", () => {
+    it("forwards a developer message as a system message", () => {
       const messages: Message[] = [
         { id: "d1", role: "developer", content: "Answer in German." },
       ];
@@ -583,7 +583,7 @@ describe("convertAGUIMessagesToMastra", () => {
       const result = convertAGUIMessagesToMastra(messages);
 
       expect(result).toEqual([
-        { id: "d1", role: "user", content: "Answer in German." },
+        { id: "d1", role: "system", content: "Answer in German." },
       ]);
     });
 
@@ -597,7 +597,7 @@ describe("convertAGUIMessagesToMastra", () => {
       const result = convertAGUIMessagesToMastra(messages);
 
       expect(result.map((m) => (m as any).id)).toEqual(["u1", "d1", "a1"]);
-      expect(result[1]).toEqual({ id: "d1", role: "user", content: "Be brief." });
+      expect(result[1]).toEqual({ id: "d1", role: "system", content: "Be brief." });
     });
   });
 
