@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import re
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from ag_ui.core import (
+    EventType,
     AudioInputContent,
+    BinaryInputContent,
     DocumentInputContent,
     ImageInputContent,
     InputContentDataSource,
@@ -24,6 +27,30 @@ from ag_ui_strands.utils import (
     flatten_content_to_text,
     _mime_to_format,
 )
+from ag_ui_strands.agent import StrandsAgent, _build_strands_history, _build_snapshot_messages
+
+
+@pytest.mark.parametrize("media_class,mime", [
+    (ImageInputContent, "image/png"),
+    (DocumentInputContent, "application/pdf"),
+    (VideoInputContent, "video/mp4"),
+])
+@pytest.mark.parametrize("source_type", ["data", "url"])
+@pytest.mark.parametrize("failure", ["malformed", "empty"])
+def test_invalid_media_is_never_delivered(media_class, mime, source_type, failure):
+    source_class = InputContentDataSource if source_type == "data" else InputContentUrlSource
+    value = "" if failure == "empty" else base64.b64encode(b"file").decode()
+    source = source_class(
+        value=value if source_type == "data" else "https://example.com/file",
+        mime_type="invalid/" + mime if failure == "malformed" else mime,
+    )
+    with patch("ag_ui_strands.utils._fetch_url_bytes", return_value=b"" if failure == "empty" else b"file"):
+        assert convert_agui_content_to_strands([media_class(source=source)]) == []
+
+
+@pytest.mark.parametrize("mime", ["png", "/png", "image/extra/png", "image/", " /png"])
+def test_malformed_mime_is_rejected(mime):
+    assert _mime_to_format(mime, {"png"}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +295,7 @@ class TestConvertAguiContentToStrands:
 
     def test_binary_input_content_with_data(self):
         """Test deprecated BinaryInputContent with base64 data."""
-        from ag_ui.core import BinaryInputContent
-        from ag_ui_strands.utils import convert_agui_content_to_strands
 
-        import base64
         b64_data = base64.b64encode(b"binary-img").decode()
         content = [
             BinaryInputContent(type="binary", mime_type="image/png", data=b64_data)
@@ -285,8 +309,6 @@ class TestConvertAguiContentToStrands:
 
     def test_binary_input_content_with_url(self):
         """Test deprecated BinaryInputContent with URL."""
-        from ag_ui.core import BinaryInputContent
-        from ag_ui_strands.utils import convert_agui_content_to_strands
 
         content = [
             BinaryInputContent(type="binary", mime_type="image/jpeg", url="https://example.com/img.jpg")
@@ -300,7 +322,6 @@ class TestConvertAguiContentToStrands:
 
     def test_malformed_base64_skipped(self):
         """Test that malformed base64 in data source is skipped gracefully."""
-        from ag_ui_strands.utils import convert_agui_content_to_strands
 
         content = [
             ImageInputContent(
@@ -416,10 +437,17 @@ class TestMimeToFormat:
 
 
 class MockStrandsAgentForMultimodal:
-    """Mock Strands agent that records the prompt passed to stream_async."""
+    """Mock Strands agent that records how, and whether, it was invoked.
+
+    ``last_prompt`` alone cannot answer whether the agent ran: the adapter
+    passes ``None`` as the prompt whenever it has already reconciled the turn
+    into ``messages``, which is the usual case. ``stream_calls`` is what a test
+    about a run that must not reach the agent asserts on.
+    """
 
     def __init__(self):
         self.last_prompt = None
+        self.stream_calls = 0
         self.model = MagicMock()
         self.system_prompt = "test"
         self.tool_registry = MagicMock()
@@ -433,27 +461,87 @@ class MockStrandsAgentForMultimodal:
         self.session_manager = None
 
     async def stream_async(self, prompt):
+        self.stream_calls += 1
         self.last_prompt = prompt
         yield {"data": "response"}
         yield {"complete": True}
 
 
 def _make_input(messages):
-    """Create a minimal mock RunAgentInput."""
-    input_data = MagicMock()
-    input_data.thread_id = "test-thread"
-    input_data.run_id = "test-run"
-    input_data.state = {}
-    input_data.tools = []
-    input_data.messages = messages
-    return input_data
+    """Stand-in for ``RunAgentInput`` stating every field it carries.
+
+    A ``MagicMock`` answers ``resume``, ``context`` and ``forwarded_props``
+    with truthy mocks nobody stated, which leaves a plain first turn one
+    defensive check away from being read as a resume. ``SimpleNamespace``
+    states the empty first-turn values, and makes a field the adapter starts
+    reading fail out loud rather than be answered with a mock.
+    """
+    return SimpleNamespace(
+        thread_id="test-thread",
+        run_id="test-run",
+        state={},
+        tools=[],
+        messages=messages,
+        context=[],
+        forwarded_props={},
+        resume=None,
+    )
 
 
 class TestAgentMultimodalIntegration:
     """Integration tests verifying multimodal content flows through agent.run()."""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_text", [True, False])
+    @pytest.mark.parametrize("mime,payload,reason", [
+        ("invalid/image/png", "ZmlsZQ==", "unsupported media type"),
+        ("image/bmp", "ZmlsZQ==", "unsupported media type"),
+        ("image/png", "", "content was empty"),
+        ("image/png", "a", "content could not be resolved"),
+    ])
+    async def test_media_drop_is_visible_before_terminal_event(self, with_text, mime, payload, reason):
+        core = MockStrandsAgentForMultimodal()
+        agent = StrandsAgent(MockStrandsAgentForMultimodal(), name="test", description="test")
+        agent._agents_by_thread["test-thread"] = core
+        content = [TextInputContent(text="hello")] if with_text else []
+        content.append(ImageInputContent(source=InputContentDataSource(value=payload, mime_type=mime)))
+        message = UserMessage(id="upload", content=content)
+
+        events = [event async for event in agent.run(_make_input([message]))]
+
+        drops = [event for event in events if event.type == EventType.CUSTOM and event.name == "MediaDropped"]
+        assert len(drops) == 1
+        assert drops[0].value == {"dropped": [{"type": "image", "reason": reason}], "delivered": 0}
+        assert events.index(drops[0]) < len(events) - 1
+        assert core.stream_calls == int(with_text)
+        assert events[-1].type == (EventType.RUN_FINISHED if with_text else EventType.RUN_ERROR)
+        if not with_text:
+            assert events[-1].code == "MEDIA_RESOLUTION_FAILED"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload,reason", [
+        (None, "content could not be resolved"),
+        (b"", "content was empty"),
+    ])
+    async def test_url_drop_reports_reason_and_delivered_attachment_count(self, payload, reason):
+        core = MockStrandsAgentForMultimodal()
+        agent = StrandsAgent(MockStrandsAgentForMultimodal(), name="test", description="test")
+        agent._agents_by_thread["test-thread"] = core
+        message = UserMessage(id="upload", content=[
+            TextInputContent(text="Describe my files"),
+            ImageInputContent(source=InputContentDataSource(value="ZmlsZQ==", mime_type="image/png")),
+            DocumentInputContent(source=InputContentUrlSource(value="https://example.com/private.pdf?token=secret", mime_type="application/pdf")),
+        ])
+        with patch("ag_ui_strands.utils._fetch_url_bytes", return_value=payload):
+            events = [event async for event in agent.run(_make_input([message]))]
+        drops = [event for event in events if event.type == EventType.CUSTOM and event.name == "MediaDropped"]
+        assert len(drops) == 1
+        assert drops[0].value == {"dropped": [{"type": "document", "reason": reason}], "delivered": 1}
+        assert events[-1].type == EventType.RUN_FINISHED
+        assert core.stream_calls == 1
+        assert all("document" not in block for block in core.messages[-1]["content"])
+
     def test_replayed_history_keeps_document_names_stable_across_turns(self):
-        from ag_ui_strands.agent import _build_strands_history
 
         raw_bytes = b"identical-document-bytes"
         b64_value = base64.b64encode(raw_bytes).decode()
@@ -495,7 +583,6 @@ class TestAgentMultimodalIntegration:
 
     @pytest.mark.asyncio
     async def test_session_manager_prompt_uses_message_scoped_document_name(self):
-        from ag_ui_strands.agent import StrandsAgent
 
         mock_base = MockStrandsAgentForMultimodal()
         agent = StrandsAgent(mock_base, name="test", description="test")
@@ -531,7 +618,6 @@ class TestAgentMultimodalIntegration:
     @pytest.mark.asyncio
     async def test_multimodal_user_message_converted(self):
         """When user message has image content, stream_async receives a list."""
-        from ag_ui_strands.agent import StrandsAgent
 
         # Build a mock base agent to satisfy the StrandsAgent constructor
         mock_base = MockStrandsAgentForMultimodal()
@@ -571,9 +657,80 @@ class TestAgentMultimodalIntegration:
         assert any("image" in block for block in last_user["content"])
 
     @pytest.mark.asyncio
+    async def test_unconvertible_media_with_no_text_fails_the_run(self):
+        """A prompt stripped of everything the user sent is not worth sending."""
+
+        agent = StrandsAgent(
+            MockStrandsAgentForMultimodal(), name="test", description="test"
+        )
+        mock_strands = MockStrandsAgentForMultimodal()
+        mock_strands.session_manager = object()
+        agent._agents_by_thread["test-thread"] = mock_strands
+
+        message = UserMessage(
+            id="unconvertible-1",
+            content=[
+                ImageInputContent(
+                    source=InputContentDataSource(
+                        value=base64.b64encode(b"fake-tiff").decode(),
+                        mime_type="image/tiff",
+                    )
+                )
+            ],
+        )
+
+        events = [event async for event in agent.run(_make_input([message]))]
+
+        assert mock_strands.stream_calls == 0, "the agent was invoked anyway"
+        assert events[-1].type == EventType.RUN_ERROR
+        assert events[-1].code == "MEDIA_RESOLUTION_FAILED"
+
+    @pytest.mark.asyncio
+    async def test_unconvertible_media_falls_back_to_the_text_the_user_sent(self):
+        """Every block is dropped by the converter, but the typed text survives.
+
+        The text arrives as a raw ``{"type": "text", ...}`` mapping rather than
+        a validated ``TextInputContent``, which is the shape that reaches this
+        path when history is replayed without model validation. The converter
+        yields nothing for a mapping, so the whole prompt is empty and the
+        fallback has to recover the text instead of failing the run.
+        """
+
+        agent = StrandsAgent(
+            MockStrandsAgentForMultimodal(), name="test", description="test"
+        )
+        mock_strands = MockStrandsAgentForMultimodal()
+        mock_strands.session_manager = object()
+        agent._agents_by_thread["test-thread"] = mock_strands
+
+        message = UserMessage.model_construct(
+            id="unconvertible-2",
+            role="user",
+            content=[
+                {"type": "text", "text": "what is in this picture?"},
+                ImageInputContent(
+                    source=InputContentDataSource(
+                        value=base64.b64encode(b"fake-tiff").decode(),
+                        mime_type="image/tiff",
+                    )
+                ),
+            ],
+        )
+
+        # Without this the run never enters the fallback at all: a converter
+        # that returns the text itself leaves nothing for the fallback to do.
+        assert convert_agui_content_to_strands(message.content) == []
+        assert flatten_content_to_text(message.content) == "what is in this picture?"
+
+        events = [event async for event in agent.run(_make_input([message]))]
+
+        assert all(event.type != EventType.RUN_ERROR for event in events)
+        assert mock_strands.stream_calls == 1, "the surviving text never reached the agent"
+        assert mock_strands.last_prompt == "what is in this picture?"
+
+    @pytest.mark.asyncio
     async def test_text_only_list_flattened_to_string(self):
         """When user message content is a list of text-only items, it's flattened to a string."""
-        from ag_ui_strands.agent import StrandsAgent
 
         mock_base = MockStrandsAgentForMultimodal()
         agent = StrandsAgent(mock_base, name="test", description="test")
@@ -601,7 +758,6 @@ class TestAgentMultimodalIntegration:
     @pytest.mark.asyncio
     async def test_plain_string_message_unchanged(self):
         """When content is a plain string, it passes through unchanged."""
-        from ag_ui_strands.agent import StrandsAgent
 
         mock_base = MockStrandsAgentForMultimodal()
         agent = StrandsAgent(mock_base, name="test", description="test")
@@ -647,7 +803,6 @@ class TestBuildSnapshotMessages:
         return msg
 
     def test_string_content_preserved(self):
-        from ag_ui_strands.agent import _build_snapshot_messages
 
         msg = self._make_msg("user", "hello")
         result = _build_snapshot_messages([msg])
@@ -658,7 +813,6 @@ class TestBuildSnapshotMessages:
     def test_list_content_preserved_as_list(self):
         """List content (multimodal) must not be stringified — it should reach
         the MessagesSnapshotEvent intact so the frontend can render images."""
-        from ag_ui_strands.agent import _build_snapshot_messages
 
         list_content = [
             TextInputContent(type="text", text="look at this"),
@@ -682,7 +836,6 @@ class TestBuildSnapshotMessages:
 
     def test_unexpected_type_coerced_to_string(self):
         """Non-str/non-list content (e.g. an int) falls back to _coerce_text."""
-        from ag_ui_strands.agent import _build_snapshot_messages
 
         msg = self._make_msg("user", 42)
         result = _build_snapshot_messages([msg])
