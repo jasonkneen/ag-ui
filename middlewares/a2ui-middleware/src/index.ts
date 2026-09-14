@@ -261,7 +261,7 @@ export class A2UIMiddleware extends Middleware {
     // A new click starts a new run, even when its payload is unchanged.
     const actionId = createHash("sha256").update(input.runId).digest("hex");
     const assistantMessageId = `a2ui-action-assistant-${actionId}`;
-    const toolCallId = `a2ui-action-call-${actionId}`;
+    const toolCallId = actionId;
     const toolMessageId = `a2ui-action-result-${actionId}`;
 
     // Create synthetic assistant message with tool call
