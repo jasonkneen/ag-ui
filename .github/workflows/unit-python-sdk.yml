@@ -440,6 +440,8 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
+          # The unittest suite uses only the standard library, so there is no uv cache.
+          enable-cache: false
 
       - name: Run tests
         working-directory: sdks/python/a2ui_toolkit
