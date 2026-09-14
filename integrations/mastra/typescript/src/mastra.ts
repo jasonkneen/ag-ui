@@ -2824,7 +2824,11 @@ export class MastraAgent extends AbstractAgent {
         const base = MastraAgent.continuationBaseId(id);
         return base !== null && storedIds.has(base);
       };
-      const fresh = messages.filter((m) => !(m.id && isStored(m.id)));
+      // Developer messages become system instructions and must be supplied on
+      // every run, even if their id appears in recalled conversation history.
+      const fresh = messages.filter(
+        (m) => m.role === "developer" || !(m.id && isStored(m.id)),
+      );
       // Never send an empty turn (a no-op run). If everything was already
       // stored, fall back to forwarding the full list.
       if (fresh.length === 0) return messages;
