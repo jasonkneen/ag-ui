@@ -426,6 +426,7 @@ jobs:
   # No uv.lock: the package is the lockfiles job's known_missing exception
   # (empty dependencies). unittest is what [tool.ag-ui.scripts] declares.
   a2ui-toolkit-python:
+    name: a2ui-toolkit-python
     runs-on: ubuntu-latest
 
     steps:
