@@ -237,6 +237,9 @@ export function convertAGUIMessagesToMastra(
   // API when it is replayed as `input[].id` on later turns (deterministic, so
   // dedup is unaffected).
   const result: CoreMessageWithId[] = [];
+  // Track only calls skipped from this conversion. Calls in lookupMessages
+  // alone may already be stored in Mastra and still need their new results.
+  const skippedToolCallIds = new Set<string>();
 
   for (const message of messages) {
     if (message.role === "assistant") {
@@ -246,8 +249,11 @@ export function convertAGUIMessagesToMastra(
         parts.push({ type: "text", text: assistantContent });
       }
       for (const toolCall of message.toolCalls ?? []) {
-        const parsed = parseReplayToolCallArguments(toolCall.function.arguments);
+        const parsed = parseReplayToolCallArguments(
+          toolCall.function.arguments,
+        );
         if (parsed === undefined) {
+          skippedToolCallIds.add(toolCall.id);
           console.warn(
             `[convertAGUIMessagesToMastra] Skipping tool-call ${toolCall.function.name} (${toolCall.id}): arguments are not valid JSON`,
           );
@@ -264,6 +270,9 @@ export function convertAGUIMessagesToMastra(
           toolName: toolCall.function.name,
           args: parsed.args,
         });
+      }
+      if (parts.length === 0 && message.toolCalls?.length) {
+        continue;
       }
       result.push({
         ...(message.id !== undefined
@@ -313,7 +322,18 @@ export function convertAGUIMessagesToMastra(
     }
   }
 
-  return result;
+  // Mastra reconstructs a call with {} arguments for an orphaned result.
+  // Remove results of skipped calls too, including results encountered before
+  // their calls, so malformed history cannot invent a successful invocation.
+  return result.filter(
+    (message) =>
+      message.role !== "tool" ||
+      message.content.every(
+        (part) =>
+          part.type !== "tool-result" ||
+          !skippedToolCallIds.has(part.toolCallId),
+      ),
+  );
 }
 
 export interface GetRemoteAgentsOptions {
