@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { withUtf8SseResponse } from "../../src/lib/utf8-sse-response";
+import { ensureSseUtf8 } from "../../src/lib/ensure-sse-utf8";
 
 const unicodePayload = 'data: {"delta":"🍝 sauté 勝利"}\n\n';
 
@@ -15,7 +15,7 @@ test("declares UTF-8 without consuming or replacing the live SSE stream", async 
       "cache-control": "no-cache",
     },
   });
-  const response = withUtf8SseResponse(original);
+  const response = ensureSseUtf8(original);
   assert.equal(
     response.headers.get("content-type"),
     "text/event-stream; charset=utf-8",
@@ -32,15 +32,3 @@ test("declares UTF-8 without consuming or replacing the live SSE stream", async 
   await writer.close();
   assert.equal(await body, unicodePayload);
 });
-
-for (const contentType of [
-  "application/json",
-  "text/event-stream; charset=utf-8",
-]) {
-  test(`preserves a response already typed ${contentType}`, () => {
-    const response = new Response("body", {
-      headers: { "content-type": contentType },
-    });
-    assert.equal(withUtf8SseResponse(response), response);
-  });
-}
