@@ -431,8 +431,7 @@ describe("MESSAGES_SNAPSHOT preserves client-only messages", () => {
   it("preserves activity position when a message ID changes in snapshot", async () => {
     // Simulates the real-world scenario: streaming creates a tool message with ID "tool-stream",
     // but MESSAGES_SNAPSHOT has the same tool message with a different canonical ID "tool-canon".
-    // The canonical tool result stays before the final answer; the activity
-    // remains anchored before that same final answer.
+    // The activity stays in its original position; the renamed message is appended as new.
     const msgs = await applySnapshot(
       [
         { id: "m1", role: "user", content: "create a dashboard" },
@@ -454,7 +453,7 @@ describe("MESSAGES_SNAPSHOT preserves client-only messages", () => {
       ],
     );
 
-    expect(msgs.map((m) => m.id)).toEqual(["m1", "asst-1", "tool-canon", "act-1", "asst-2"]);
+    expect(msgs.map((m) => m.id)).toEqual(["m1", "asst-1", "act-1", "asst-2", "tool-canon"]);
   });
 });
 
@@ -803,7 +802,7 @@ describe("REASONING_MESSAGE_* against an activity message's id", () => {
   });
 });
 
-it("anchors foreign activities when an owner replaces its authoritative activity set", async () => {
+it("preserves existing order and appends new activities when replacing an owned set", async () => {
   const user: Message = { id: "u", role: "user", content: "prompt" };
   const answer: Message = { id: "a", role: "assistant", content: "answer" };
   const foreign: Message = { id: "foreign", role: "activity", activityType: "other", content: {} };
@@ -822,75 +821,97 @@ it("anchors foreign activities when an owner replaces its authoritative activity
   });
   expect(updates.at(-1)?.messages?.map((message) => message.id)).toEqual([
     "u",
-    "owned",
     "foreign",
     "a",
+    "owned",
   ]);
 });
 
-it("takes canonical tool-result order from an unmarked snapshot", async () => {
-  const user: Message = { id: "u", role: "user", content: "apply" };
-  const toolCall: Message = {
-    id: "call",
+it("keeps prior subagent positions when Python LangGraph appends them to a later snapshot", async () => {
+  const user: Message = { id: "u1", role: "user", content: "first" };
+  const subagent: Message = {
+    id: "sub-a",
     role: "assistant",
-    toolCalls: [
-      {
-        id: "tool-call",
-        type: "function",
-        function: { name: "apply", arguments: "{}" },
-      },
-    ],
+    content: "subagent answer",
+    subagentRunId: "sub-run",
   };
-  const result: Message = {
-    id: "result-canonical",
-    role: "tool",
-    toolCallId: "tool-call",
-    content: "done",
-  };
-  const answer: Message = { id: "answer", role: "assistant", content: "Applied." };
-  const snapshot: Message[] = [user, toolCall, result, answer];
-
-  const messages = await applySnapshot(
-    [user, toolCall, { ...result, id: "result-browser" }, answer],
-    snapshot,
-  );
-
-  expect(messages).toEqual(snapshot);
-  expect(await applySnapshot(messages, snapshot)).toEqual(snapshot);
+  const answer: Message = { id: "a1", role: "assistant", content: "first answer" };
+  const nextUser: Message = { id: "u2", role: "user", content: "second" };
+  const nextAnswer: Message = { id: "a2", role: "assistant", content: "second answer" };
+  // _merge_subagent_messages appends inbound subagent messages after the new turn.
+  const snapshot = [user, answer, nextUser, nextAnswer, subagent];
+  const expected = [user, subagent, answer, nextUser, nextAnswer];
+  const messages = await applySnapshot([user, subagent, answer], snapshot);
+  expect(messages).toEqual(expected);
+  expect(await applySnapshot(messages, snapshot)).toEqual(expected);
 });
+
+it.each([
+  { name: "empty scope", declaration: { authoritativeActivityTypes: [] } },
+  { name: "foreign scope", declaration: { authoritativeActivityTypes: ["owned"] } },
+  { name: "mixed array", declaration: { authoritativeActivityTypes: ["owned", 5] } },
+  { name: "non-array field", declaration: { authoritativeActivityTypes: "owned" } },
+  { name: "null namespace", declaration: null },
+  { name: "array namespace", declaration: [] },
+  { name: "primitive namespace", declaration: true },
+])(
+  "updates matching IDs but preserves omitted foreign activities with $name",
+  async ({ declaration }) => {
+    const omitted: Message = {
+      id: "omitted",
+      role: "activity",
+      activityType: "foreign",
+      content: {},
+    };
+    const previous: Message = {
+      id: "same",
+      role: "activity",
+      activityType: "foreign",
+      content: { version: 1 },
+    };
+    const updated: Message = { ...previous, content: { version: 2 } };
+    const incoming: Message = { id: "new", role: "activity", activityType: "owned", content: {} };
+    const snapshot = {
+      type: EventType.MESSAGES_SNAPSHOT,
+      messages: [incoming, updated],
+      metadata: { "@ag-ui/client": declaration },
+    };
+    const updates = await emitAndCollect([omitted, previous], (events) => {
+      events.next(snapshot);
+      events.next(snapshot);
+    });
+    expect(updates[0]?.messages).toEqual([omitted, updated, incoming]);
+    expect(updates.at(-1)?.messages).toEqual([omitted, updated, incoming]);
+  },
+);
 
 it.each([
   { scope: null, expected: [] },
   { scope: [], expected: ["file", "surface"] },
   { scope: ["a2ui-surface"], expected: ["file"] },
-])(
-  "reconciles empty snapshots with explicit authority $scope",
-  async ({ scope, expected }) => {
-    const previous: Message[] = [
-      {
-        id: "file",
-        role: "activity",
-        activityType: "dsh-deliverables",
-        content: {},
+])("reconciles empty snapshots with explicit authority $scope", async ({ scope, expected }) => {
+  const previous: Message[] = [
+    {
+      id: "file",
+      role: "activity",
+      activityType: "dsh-deliverables",
+      content: {},
+    },
+    {
+      id: "surface",
+      role: "activity",
+      activityType: "a2ui-surface",
+      content: {},
+    },
+  ];
+  const updates = await emitAndCollect(previous, (events) => {
+    events.next({
+      type: EventType.MESSAGES_SNAPSHOT,
+      messages: [],
+      metadata: {
+        "@ag-ui/client": { authoritativeActivityTypes: scope },
       },
-      {
-        id: "surface",
-        role: "activity",
-        activityType: "a2ui-surface",
-        content: {},
-      },
-    ];
-    const updates = await emitAndCollect(previous, (events) => {
-      events.next({
-        type: EventType.MESSAGES_SNAPSHOT,
-        messages: [],
-        metadata: {
-          "@ag-ui/client": { authoritativeActivityTypes: scope },
-        },
-      });
     });
-    expect(updates.at(-1)?.messages?.map((message) => message.id)).toEqual(
-      expected,
-    );
-  },
-);
+  });
+  expect(updates.at(-1)?.messages?.map((message) => message.id)).toEqual(expected);
+});

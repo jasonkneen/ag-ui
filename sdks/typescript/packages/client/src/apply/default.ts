@@ -758,7 +758,7 @@ export const defaultApplyEvents = (
               return copy as typeof m;
             });
 
-            // Replace transcript messages with the canonical snapshot while
+            // Update existing messages in place and append new snapshot messages,
             // preserving client-only messages the backend leaves out.
             const snapshotMap = new Map(newMessages.map((m) => [m.id, m]));
 
@@ -786,46 +786,30 @@ export const defaultApplyEvents = (
             // itself carries reasoning, treat it as the source of truth for
             // reasoning messages too and apply the normal replace semantics.
             // Explicit null replaces all types, including an empty activity set.
-            // Arrays replace only their types; absent metadata uses the rule above.
+            // Arrays replace only their types; absent declarations use the rule above.
+            // Invalid declarations own no types. Matching IDs always update.
             const ownedActivityTypes = authoritativeActivityTypes(event as MessagesSnapshotEvent);
             const snapshotHasActivity = newMessages.some((m) => m.role === "activity");
             const snapshotHasReasoning = newMessages.some((m) => m.role === "reasoning");
             const isPreservedClientOnly = (m: Message) =>
               (m.role === "activity" &&
                 (ownedActivityTypes
-                  ? !ownedActivityTypes.includes(m.activityType) && !snapshotMap.has(m.id)
+                  ? !ownedActivityTypes.includes(m.activityType)
                   : ownedActivityTypes !== null && !snapshotHasActivity)) ||
               (m.role === "reasoning" && !snapshotHasReasoning);
 
-            // Every snapshot owns transcript order. Preserve client-only messages
-            // before their next surviving message; if none survives after them,
-            // keep them after the preceding survivor, before newly added messages.
-            const before = new Map<string, Message[]>();
-            const trailing: Message[] = [];
-            let anchor: string | undefined;
-            let lastSurvivor: string | undefined;
-            for (let index = messages.length - 1; index >= 0; index--) {
-              const previous = messages[index]!;
-              if (snapshotMap.has(previous.id)) {
-                anchor = previous.id;
-                lastSurvivor ??= previous.id;
-              } else if (isPreservedClientOnly(previous)) {
-                if (anchor === undefined) {
-                  trailing.push(previous);
-                } else {
-                  const group = before.get(anchor) ?? [];
-                  group.push(previous);
-                  before.set(anchor, group);
-                }
+            // A matching ID updates even when this snapshot cannot delete that
+            // activity type. Authority applies only to messages omitted from it.
+            messages = messages
+              .filter((m) => snapshotMap.has(m.id) || isPreservedClientOnly(m))
+              .map((m) => snapshotMap.get(m.id) ?? m);
+
+            const existingIds = new Set(messages.map((m) => m.id));
+            for (const snapshotMsg of newMessages) {
+              if (!existingIds.has(snapshotMsg.id)) {
+                messages.push(snapshotMsg);
               }
             }
-            trailing.reverse();
-            messages = [...snapshotMap.values()].flatMap((message) => [
-              ...(before.get(message.id)?.reverse() ?? []),
-              message,
-              ...(message.id === lastSurvivor ? trailing : []),
-            ]);
-            if (lastSurvivor === undefined) messages.unshift(...trailing);
 
             applyMutation({ messages });
           }
