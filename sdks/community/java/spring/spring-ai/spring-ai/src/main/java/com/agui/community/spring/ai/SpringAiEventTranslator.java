@@ -63,6 +63,12 @@ final class SpringAiEventTranslator {
     }
 
     private final String messageId;
+    // Reasoning is a separate AG-UI message from the assistant text, so it needs its
+    // own message id. A client reconstructs conversation history by keying events on
+    // their messageId; reusing the assistant id for reasoning would fold the reasoning
+    // and the answer into a single message (for <think>planning</think>answer the client
+    // ends up with one message "planninganswer" and the assistant answer is lost).
+    private final String reasoningMessageId;
     private final String stateToolName;
     private final ReasoningSegmenter segmenter = new ReasoningSegmenter();
 
@@ -102,6 +108,7 @@ final class SpringAiEventTranslator {
 
     SpringAiEventTranslator(String messageId, String stateToolName) {
         this.messageId = messageId;
+        this.reasoningMessageId = messageId + "-reasoning";
         this.stateToolName = stateToolName;
     }
 
@@ -168,7 +175,7 @@ final class SpringAiEventTranslator {
         }
         if (segment.kind() == ReasoningSegmenter.Kind.REASONING) {
             enterReasoning(events);
-            events.add(new ReasoningMessageContentEvent(messageId, segment.text()));
+            events.add(new ReasoningMessageContentEvent(reasoningMessageId, segment.text()));
         } else {
             enterText(events);
             textContent.append(segment.text());
@@ -192,11 +199,11 @@ final class SpringAiEventTranslator {
             closeText(events);
         }
         if (!reasoningPhaseOpen) {
-            events.add(new ReasoningStartEvent(messageId));
+            events.add(new ReasoningStartEvent(reasoningMessageId));
             reasoningPhaseOpen = true;
         }
         if (!reasoningMessageOpen) {
-            events.add(new ReasoningMessageStartEvent(messageId));
+            events.add(new ReasoningMessageStartEvent(reasoningMessageId));
             reasoningMessageOpen = true;
         }
         mode = Mode.REASONING;
@@ -214,11 +221,11 @@ final class SpringAiEventTranslator {
 
     private void closeReasoning(List<Event> events) {
         if (reasoningMessageOpen) {
-            events.add(new ReasoningMessageEndEvent(messageId));
+            events.add(new ReasoningMessageEndEvent(reasoningMessageId));
             reasoningMessageOpen = false;
         }
         if (reasoningPhaseOpen) {
-            events.add(new ReasoningEndEvent(messageId));
+            events.add(new ReasoningEndEvent(reasoningMessageId));
             reasoningPhaseOpen = false;
         }
         if (mode == Mode.REASONING) {

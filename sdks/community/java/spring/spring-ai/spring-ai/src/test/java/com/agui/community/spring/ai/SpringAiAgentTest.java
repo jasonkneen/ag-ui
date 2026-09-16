@@ -20,6 +20,7 @@ import com.agui.community.core.event.RunFinishedEvent;
 import com.agui.community.core.event.StateDeltaEvent;
 import com.agui.community.core.event.StateSnapshotEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
+import com.agui.community.core.event.TextMessageStartEvent;
 import com.agui.community.core.event.ToolCallResultEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
 import com.agui.community.core.interrupt.Interrupt;
@@ -31,6 +32,7 @@ import com.agui.community.core.message.Role;
 import com.agui.community.core.message.UserMessage;
 import com.agui.community.core.tool.Tool;
 import com.agui.community.core.tool.ToolParameters;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -544,36 +546,89 @@ class SpringAiAgentTest {
                 .orElseThrow();
         assertEquals(Role.REASONING, reasoningStart.role());
 
-        String reasoning = events.stream()
-                .filter(e -> e instanceof ReasoningMessageContentEvent)
-                .map(e -> ((ReasoningMessageContentEvent) e).delta())
-                .collect(Collectors.joining());
-        String answer = events.stream()
-                .filter(e -> e instanceof TextMessageContentEvent)
-                .map(e -> ((TextMessageContentEvent) e).delta())
-                .collect(Collectors.joining());
-        assertEquals("planning", reasoning);
-        assertEquals("answer", answer);
+        // Reconstruct the conversation history the way a compliant client does: fold the
+        // streamed events into messages keyed by their messageId (the Java client is a
+        // thin SSE decoder and does not rebuild messages, so this mirrors that step). This
+        // is what exposes the id-collision bug: if reasoning and text shared a messageId
+        // they would collapse into one "planninganswer" message, losing the answer.
+        List<Message> history = reconstructHistory(events);
 
-        // Second turn: the reasoning + answer come back as conversation history. It must
-        // round-trip (reasoning replayed as <think>...</think>) without aborting the run.
+        var reasoningMsg = history.stream()
+                .filter(m -> m instanceof com.agui.community.core.message.ReasoningMessage)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no reasoning message reconstructed: " + history));
+        assertEquals("planning", reasoningMsg.content());
+        var assistantMsg = history.stream()
+                .filter(m -> m instanceof com.agui.community.core.message.AssistantMessage)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no assistant message reconstructed: " + history));
+        assertEquals("answer", assistantMsg.content(), "the assistant answer must survive as its own message");
+        assertNotEquals(reasoningMsg.id(), assistantMsg.id(), "reasoning and answer must be distinct messages");
+
+        // Second turn: feed the reconstructed history back. It must round-trip (reasoning
+        // replayed as <think>...</think>, answer preserved as an assistant message) without
+        // aborting the run.
         AtomicReference<Prompt> captured = new AtomicReference<>();
-        RunAgentInput second = new RunAgentInput("t1", "r2",
-                List.of(new UserMessage("u1", "hi"),
-                        new com.agui.community.core.message.ReasoningMessage("msg-1", "planning"),
-                        new com.agui.community.core.message.AssistantMessage("msg-1", "answer")),
-                List.of());
+        List<Message> secondMessages = new java.util.ArrayList<>();
+        secondMessages.add(new UserMessage("u1", "hi"));
+        secondMessages.addAll(history);
+        RunAgentInput second = new RunAgentInput("t1", "r2", secondMessages, List.of());
         SpringAiAgent agent2 = new SpringAiAgent(ChatClient.create(capturingModel(captured)), () -> "msg-2");
 
         List<Event> secondEvents = collect(agent2.run(second));
 
         assertEquals(EventType.RUN_FINISHED, secondEvents.get(secondEvents.size() - 1).type());
         assertTrue(secondEvents.stream().noneMatch(e -> e.type() == EventType.RUN_ERROR));
-        boolean replayed = captured.get().getInstructions().stream()
+        List<String> assistantTexts = captured.get().getInstructions().stream()
                 .filter(m -> m instanceof AssistantMessage)
                 .map(org.springframework.ai.chat.messages.Message::getText)
-                .anyMatch(t -> "<think>planning</think>".equals(t));
-        assertTrue(replayed, "reasoning must be replayed into the second-turn prompt");
+                .toList();
+        assertTrue(assistantTexts.contains("<think>planning</think>"),
+                "reasoning must be replayed into the second-turn prompt: " + assistantTexts);
+        assertTrue(assistantTexts.contains("answer"),
+                "the assistant answer must be carried into the second-turn prompt: " + assistantTexts);
+    }
+
+    /**
+     * Minimal, protocol-faithful reconstruction of conversation history from an AG-UI event
+     * stream — the step a compliant client (e.g. the TypeScript HttpAgent) performs before
+     * sending history back for the next turn. Messages are keyed by {@code messageId}:
+     * {@code REASONING_MESSAGE_*} builds a {@link com.agui.community.core.message.ReasoningMessage}
+     * and {@code TEXT_MESSAGE_*} an {@link com.agui.community.core.message.AssistantMessage},
+     * appended in first-seen order. Deliberately generic (keyed only by id), so a shared id
+     * between reasoning and text collapses them into one message.
+     */
+    private static List<Message> reconstructHistory(List<Event> events) {
+        Map<String, StringBuilder> reasoning = new LinkedHashMap<>();
+        Map<String, StringBuilder> text = new LinkedHashMap<>();
+        Map<String, Boolean> isReasoning = new LinkedHashMap<>();
+        for (Event event : events) {
+            if (event instanceof ReasoningMessageStartEvent e) {
+                reasoning.computeIfAbsent(e.messageId(), id -> new StringBuilder());
+                isReasoning.putIfAbsent(e.messageId(), true);
+            } else if (event instanceof ReasoningMessageContentEvent e) {
+                reasoning.computeIfAbsent(e.messageId(), id -> new StringBuilder()).append(e.delta());
+                isReasoning.putIfAbsent(e.messageId(), true);
+            } else if (event instanceof TextMessageStartEvent e) {
+                text.computeIfAbsent(e.messageId(), id -> new StringBuilder());
+                isReasoning.putIfAbsent(e.messageId(), false);
+            } else if (event instanceof TextMessageContentEvent e) {
+                text.computeIfAbsent(e.messageId(), id -> new StringBuilder()).append(e.delta());
+                isReasoning.putIfAbsent(e.messageId(), false);
+            }
+        }
+        List<Message> messages = new java.util.ArrayList<>();
+        for (Map.Entry<String, Boolean> entry : isReasoning.entrySet()) {
+            String id = entry.getKey();
+            if (entry.getValue()) {
+                messages.add(new com.agui.community.core.message.ReasoningMessage(
+                        id, reasoning.getOrDefault(id, new StringBuilder()).toString()));
+            } else {
+                messages.add(new com.agui.community.core.message.AssistantMessage(
+                        id, text.getOrDefault(id, new StringBuilder()).toString()));
+            }
+        }
+        return messages;
     }
 
     @Test
