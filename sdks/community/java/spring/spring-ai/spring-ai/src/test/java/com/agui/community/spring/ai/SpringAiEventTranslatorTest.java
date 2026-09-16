@@ -2,13 +2,16 @@ package com.agui.community.spring.ai;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
 import com.agui.community.core.event.ReasoningMessageContentEvent;
+import com.agui.community.core.event.ReasoningMessageStartEvent;
 import com.agui.community.core.event.StateSnapshotEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
+import com.agui.community.core.event.TextMessageStartEvent;
 import com.agui.community.core.event.ToolCallArgsEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
 import java.util.ArrayList;
@@ -154,6 +157,16 @@ class SpringAiEventTranslatorTest {
         assertEquals("planning", reasoning.delta());
         TextMessageContentEvent text = assertInstanceOf(TextMessageContentEvent.class, events.get(6));
         assertEquals("answer", text.delta());
+
+        // Reasoning and the assistant answer are distinct messages, so they must carry
+        // distinct ids: a client keys messages by id, and a shared id would merge
+        // "planning" and "answer" into one message (losing the answer).
+        ReasoningMessageStartEvent reasoningStart =
+                assertInstanceOf(ReasoningMessageStartEvent.class, events.get(1));
+        TextMessageStartEvent textStart = assertInstanceOf(TextMessageStartEvent.class, events.get(5));
+        assertNotEquals(reasoningStart.messageId(), textStart.messageId());
+        assertEquals(reasoning.messageId(), reasoningStart.messageId());
+        assertEquals(text.messageId(), textStart.messageId());
     }
 
     @Test
