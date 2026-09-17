@@ -6,6 +6,9 @@ import {
   BaseEvent,
   AgentCapabilities,
   Interrupt,
+  // The version this client declares and judges a producer's declaration
+  // against, generated from the schema's $id rather than written beside it.
+  PROTOCOL_VERSION,
 } from "@ag-ui/core";
 
 import {
@@ -46,17 +49,6 @@ import {
 } from "@/middleware";
 import packageJson from "../../package.json";
 
-/**
- * The protocol version this client declares on every RunAgentInput it builds.
- *
- * Deliberately the protocol LINE, "1.0", not the generated PROTOCOL_VERSION
- * constant (currently "draft"): the wire names what the client speaks, the
- * constant names which spec revision the models were generated from, and at
- * the 1.0 freeze the two collapse into the same string. Also deliberately
- * comparable: "1.0" works with the compareVersions machinery below, where
- * "draft" never could.
- */
-export const WIRE_PROTOCOL_VERSION = "1.0";
 
 /** The maxVersion deprecation warns once per process, not once per call. */
 let warnedDeprecatedMaxVersion = false;
@@ -82,8 +74,8 @@ export const compareDeclaredProtocol = (
 
 const warnOnProducerDeclaration = (event: unknown): void => {
   const declared = (event as { protocolVersion?: string }).protocolVersion;
-  if (declared === undefined || declared === WIRE_PROTOCOL_VERSION) return;
-  switch (compareDeclaredProtocol(declared, WIRE_PROTOCOL_VERSION)) {
+  if (declared === undefined || declared === PROTOCOL_VERSION) return;
+  switch (compareDeclaredProtocol(declared, PROTOCOL_VERSION)) {
     case "uninterpretable":
       console.warn(
         `[ag-ui] The producer declared protocol version '${declared}', which this client cannot interpret.`,
@@ -91,7 +83,7 @@ const warnOnProducerDeclaration = (event: unknown): void => {
       return;
     case "newer":
       console.warn(
-        `[ag-ui] The producer speaks protocol ${declared}; this client speaks ${WIRE_PROTOCOL_VERSION}. Unrecognised material will be stripped with warnings.`,
+        `[ag-ui] The producer speaks protocol ${declared}; this client speaks ${PROTOCOL_VERSION}. Unrecognised material will be stripped with warnings.`,
       );
       return;
     case "not-newer":
@@ -562,7 +554,7 @@ export abstract class AbstractAgent {
       // client: a downgraded peer predates the field, and an unknown input
       // member is exactly what a strict old parser could reject.
       ...(compareVersions(this.maxProtocolVersion, packageJson.version) >= 0 && {
-        protocolVersion: WIRE_PROTOCOL_VERSION,
+        protocolVersion: PROTOCOL_VERSION,
       }),
       tools: structuredClone_(parameters?.tools ?? []),
       context: structuredClone_(parameters?.context ?? []),

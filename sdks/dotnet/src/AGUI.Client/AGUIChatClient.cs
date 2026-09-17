@@ -21,24 +21,10 @@ public sealed class AGUIChatClient : DelegatingChatClient
     /// </summary>
     /// <param name="options">The options that configure the transport and serialization.</param>
     public AGUIChatClient(AGUIChatClientOptions options)
-        : base(CreateInnerClient(
-            GetTransport(options),
-            CombineJsonSerializerOptions(options?.JsonSerializerOptions),
-            options?.MaxProtocolVersion))
+        : base(CreateInnerClient(GetTransport(options), CombineJsonSerializerOptions(options?.JsonSerializerOptions)))
     {
     }
 
-    /// <summary>
-    /// The protocol version this client declares on every <see cref="RunAgentInput"/> it
-    /// builds, and judges a producer's own declaration against.
-    /// </summary>
-    /// <remarks>
-    /// The protocol LINE, not the generated <c>PROTOCOL_VERSION</c> constant, which names
-    /// the spec revision the models were generated from and currently reads "draft": the
-    /// wire value names what the client speaks, and it has to be comparable. Mirrors the
-    /// TypeScript client's <c>WIRE_PROTOCOL_VERSION</c>.
-    /// </remarks>
-    public const string WireProtocolVersion = AGUIProtocolVersion.Wire;
 
     /// <inheritdoc />
     public override Task<ChatResponse> GetResponseAsync(
@@ -181,12 +167,11 @@ public sealed class AGUIChatClient : DelegatingChatClient
 
     private static FunctionInvokingChatClient CreateInnerClient(
         IAGUITransport transport,
-        JsonSerializerOptions jsonSerializerOptions,
-        string? maxProtocolVersion)
+        JsonSerializerOptions jsonSerializerOptions)
     {
         ArgumentNullThrowHelper.ThrowIfNull(transport);
 
-        var handler = new AGUIChatClientHandler(transport, jsonSerializerOptions, maxProtocolVersion);
+        var handler = new AGUIChatClientHandler(transport, jsonSerializerOptions);
         return new FunctionInvokingChatClient(handler);
     }
 
@@ -222,16 +207,13 @@ public sealed class AGUIChatClient : DelegatingChatClient
     {
         private readonly IAGUITransport _transport;
         private readonly JsonSerializerOptions _jsonSerializerOptions;
-        private readonly string? _maxProtocolVersion;
 
         public AGUIChatClientHandler(
             IAGUITransport transport,
-            JsonSerializerOptions jsonSerializerOptions,
-            string? maxProtocolVersion)
+            JsonSerializerOptions jsonSerializerOptions)
         {
             _transport = transport;
             _jsonSerializerOptions = jsonSerializerOptions;
-            _maxProtocolVersion = maxProtocolVersion;
 
             Metadata = new ChatClientMetadata("ag-ui");
         }
@@ -261,8 +243,7 @@ public sealed class AGUIChatClient : DelegatingChatClient
                 ?? ExtractThreadIdFromOptions(options)
                 ?? AGUIIdGenerator.NewThreadId();
 
-            var input = BuildRunAgentInput(
-                messagesList, options, providedInput, threadId, _jsonSerializerOptions, _maxProtocolVersion);
+            var input = BuildRunAgentInput(messagesList, options, providedInput, threadId, _jsonSerializerOptions);
 
             // Build set of client tool names for distinguishing client vs server tool calls
             var clientToolSet = new HashSet<string>();
@@ -341,8 +322,7 @@ public sealed class AGUIChatClient : DelegatingChatClient
             ChatOptions? options,
             RunAgentInput? providedInput,
             string threadId,
-            JsonSerializerOptions jsonSerializerOptions,
-            string? maxProtocolVersion)
+            JsonSerializerOptions jsonSerializerOptions)
         {
             var input = new RunAgentInput
             {
@@ -350,12 +330,8 @@ public sealed class AGUIChatClient : DelegatingChatClient
                 RunId = string.IsNullOrEmpty(providedInput?.RunId) ? AGUIIdGenerator.NewRunId() : providedInput!.RunId,
                 Messages = messagesList.AsAGUIMessages(jsonSerializerOptions).ToList(),
                 // "A consumer implementing this version MUST declare the version it speaks
-                // here, unless it knows its peer predates the field" (run-input.mdx,
-                // protocolVersion). The gate is MaxProtocolVersion; absent means a current
-                // peer and the declaration goes out.
-                ProtocolVersion = AGUIProtocolVersion.ShouldDeclare(maxProtocolVersion)
-                    ? AGUIProtocolVersion.Wire
-                    : null,
+                // here" (run-input.mdx, protocolVersion).
+                ProtocolVersion = AGUIProtocolVersion.Wire,
             };
 
             // Tracks whether the caller hand-supplied Resume via RawRepresentationFactory.

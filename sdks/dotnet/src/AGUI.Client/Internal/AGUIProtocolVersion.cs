@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Globalization;
+using AGUI.Abstractions;
 
 namespace AGUI.Client;
 
@@ -26,44 +27,18 @@ internal enum ProtocolDeclarationVerdict
 /// <summary>
 /// The in-band protocol version this client declares and the judgment it passes on the
 /// one a producer declares back. Mirrors the TypeScript client's
-/// <c>WIRE_PROTOCOL_VERSION</c> / <c>compareDeclaredProtocol</c> pair
+/// <c>PROTOCOL_VERSION</c> / <c>compareDeclaredProtocol</c> pair
 /// (<c>sdks/typescript/packages/client/src/agent/agent.ts</c>), so the same exchange is
 /// read the same way by both SDKs.
 /// </summary>
 internal static class AGUIProtocolVersion
 {
     /// <summary>
-    /// The protocol LINE this client speaks, which is what goes on the wire.
+    /// The protocol version this client speaks and declares, read from the generated
+    /// <see cref="AGUIProtocol.Version"/> so the version on the wire is the version the
+    /// models were generated from rather than a hand-written string beside them.
     /// </summary>
-    /// <remarks>
-    /// Deliberately not the generated <c>PROTOCOL_VERSION</c> constant, which names the
-    /// spec revision the models were generated from and currently reads "draft": the wire
-    /// value names what the client speaks, and it has to be comparable — "draft" never
-    /// could be. At the 1.0 freeze the two collapse into the same string.
-    /// </remarks>
-    internal const string Wire = "1.0";
-
-    /// <summary>
-    /// Whether this client declares its version to a peer whose ceiling is
-    /// <paramref name="peerCeiling"/>. A peer pinned below this line predates the field,
-    /// and an unrecognised input member is exactly what a strict old parser could reject —
-    /// the same gate the TypeScript client applies in <c>prepareRunAgentInput</c>.
-    /// </summary>
-    /// <remarks>
-    /// An absent or unreadable ceiling means "a current peer": silence about the peer is
-    /// not evidence that it is old, and refusing to declare on a value this client cannot
-    /// read would make the common case — no ceiling configured at all — the downgraded one.
-    /// </remarks>
-    internal static bool ShouldDeclare(string? peerCeiling)
-    {
-        if (string.IsNullOrEmpty(peerCeiling) || !TryReadComponents(peerCeiling!, out var ceiling))
-        {
-            return true;
-        }
-
-        TryReadComponents(Wire, out var wire);
-        return CompareComponents(ceiling, wire) >= 0;
-    }
+    internal const string Wire = AGUIProtocol.Version;
 
     /// <summary>
     /// Judges a producer's declaration against <see cref="Wire"/>.

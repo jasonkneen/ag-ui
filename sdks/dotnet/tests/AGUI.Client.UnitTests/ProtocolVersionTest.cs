@@ -44,57 +44,10 @@ public sealed class ProtocolVersionTest
         await DrainAsync(client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]));
 
         Assert.Equal("1.0", transport.LastInput!.ProtocolVersion);
-        Assert.Equal(AGUIChatClient.WireProtocolVersion, transport.LastInput!.ProtocolVersion);
+        Assert.Equal(AGUIProtocol.Version, transport.LastInput!.ProtocolVersion);
     }
 
-    // A peer pinned below the line this client speaks predates the field entirely, and an
-    // unrecognised input member is exactly what a strict old parser could reject.
-    [Fact]
-    public async Task Request_PeerPinnedBelowTheLine_OmitsTheDeclaration()
-    {
-        var transport = new CapturingTransport();
-        using var client = new AGUIChatClient(new()
-        {
-            Transport = transport,
-            MaxProtocolVersion = "0.0.57",
-        });
 
-        await DrainAsync(client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]));
-
-        Assert.Null(transport.LastInput!.ProtocolVersion);
-    }
-
-    [Fact]
-    public async Task Request_PeerAtTheLine_DeclaresIt()
-    {
-        var transport = new CapturingTransport();
-        using var client = new AGUIChatClient(new()
-        {
-            Transport = transport,
-            MaxProtocolVersion = "1.0",
-        });
-
-        await DrainAsync(client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]));
-
-        Assert.Equal("1.0", transport.LastInput!.ProtocolVersion);
-    }
-
-    // Silence about a peer is not evidence that it is old: a ceiling this client cannot
-    // read must not silently downgrade the declaration.
-    [Fact]
-    public async Task Request_UnreadablePeerCeiling_DeclaresIt()
-    {
-        var transport = new CapturingTransport();
-        using var client = new AGUIChatClient(new()
-        {
-            Transport = transport,
-            MaxProtocolVersion = "whenever",
-        });
-
-        await DrainAsync(client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]));
-
-        Assert.Equal("1.0", transport.LastInput!.ProtocolVersion);
-    }
 
     // ────────────────────────────────────────────────
     // The version the producer declares on RUN_STARTED
@@ -125,7 +78,7 @@ public sealed class ProtocolVersionTest
     public async Task ProducerDeclaresTheSameVersion_IsQuiet()
     {
         var warnings = await ReplayAsync(
-            new RunStartedEvent { ThreadId = "t1", RunId = "r1", ProtocolVersion = AGUIChatClient.WireProtocolVersion },
+            new RunStartedEvent { ThreadId = "t1", RunId = "r1", ProtocolVersion = AGUIProtocol.Version },
             new RunFinishedEvent { ThreadId = "t1", RunId = "r1" });
 
         Assert.Empty(warnings);

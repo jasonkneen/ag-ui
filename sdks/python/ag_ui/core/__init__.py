@@ -104,7 +104,6 @@ from ag_ui.core.token_usage import (
 )
 
 from ag_ui.core.version import (
-    WIRE_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 )
 
@@ -130,7 +129,6 @@ __all__ = [
     "AGUI_METADATA_KEY",
     "Metadata",
     # Protocol version
-    "WIRE_PROTOCOL_VERSION",
     "PROTOCOL_VERSION",
     # Events
     "EventType",

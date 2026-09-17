@@ -18,6 +18,3 @@ AGUI.Client.AGUIEventStreamHandler
 AGUI.Client.AGUIEventStreamHandler.AGUIEventStreamHandler(System.Collections.Generic.IEnumerable<AGUI.Formatting.IAGUIEventStreamFormatter!>! formatters) -> void
 AGUI.Client.AGUIResponseExtensions
 static AGUI.Client.AGUIResponseExtensions.ReadAGUIEventStreamAsync(this System.Net.Http.HttpResponseMessage! response, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Collections.Generic.IAsyncEnumerable<AGUI.Abstractions.BaseEvent!>!
-const AGUI.Client.AGUIChatClient.WireProtocolVersion = "1.0" -> string!
-AGUI.Client.AGUIChatClientOptions.MaxProtocolVersion.get -> string?
-AGUI.Client.AGUIChatClientOptions.MaxProtocolVersion.init -> void

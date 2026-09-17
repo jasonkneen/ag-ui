@@ -944,6 +944,15 @@ export function emitDotnetModels(
     unionDef("ContentPart").description,
     unionConstMembers("ContentPart"),
   );
+  // The version segment of the schema's $id, as a constant the SDK can name.
+  // The peer-facing declaration is read from here rather than hand-written, so
+  // the version on the wire is the version the models were generated from.
+  const protocolVersion = emitConstClass(
+    "AGUIProtocol",
+    `The protocol version this code was generated from: the version segment of the schema's $id (${model.schemaId}). Never typed by a human.`,
+    [["Version", model.version]],
+  );
+
   const sourceTypes = emitConstClass(
     "AGUIInputContentSourceTypes",
     unionDef("PartSource").description,
@@ -1180,6 +1189,7 @@ export function emitDotnetModels(
     file("AGUIRoles.g.cs", roles),
     file(
       "AGUIConstants.g.cs",
+      protocolVersion,
       resumeStatus,
       outcomeTypes,
       subagentOutcomeTypes,

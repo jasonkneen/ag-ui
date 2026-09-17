@@ -1,7 +1,6 @@
 import { of, Observable } from "rxjs";
-import { BaseEvent, EventType, RunAgentInput } from "@ag-ui/core";
-import { PROTOCOL_VERSION } from "@ag-ui/core";
-import { AbstractAgent, WIRE_PROTOCOL_VERSION, compareDeclaredProtocol } from "../agent";
+import { BaseEvent, EventType, PROTOCOL_VERSION, RunAgentInput } from "@ag-ui/core";
+import { AbstractAgent, compareDeclaredProtocol } from "../agent";
 import packageJson from "../../../package.json";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +26,7 @@ describe("the in-band protocol version", () => {
   it("declares the wire protocol version on the input it builds", async () => {
     const agent = new StubAgent();
     await agent.runAgent();
-    expect(agent.lastInput?.protocolVersion).toBe(WIRE_PROTOCOL_VERSION);
+    expect(agent.lastInput?.protocolVersion).toBe(PROTOCOL_VERSION);
   });
 
   it("omits the declaration when the peer's ceiling is pinned below this client", async () => {
@@ -71,7 +70,7 @@ describe("the in-band protocol version", () => {
     });
 
     it("stays quiet on the same version, an older one, or none", async () => {
-      await runWithEcho(WIRE_PROTOCOL_VERSION);
+      await runWithEcho(PROTOCOL_VERSION);
       await runWithEcho("0.9");
       await runWithEcho(undefined);
       const protocolWarnings = warn.mock.calls.filter((c: unknown[]) =>

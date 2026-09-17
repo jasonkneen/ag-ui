@@ -351,15 +351,9 @@ public sealed class ConformanceStreamTest
         {
             ThreadId = (string?)opener?["threadId"] ?? "conformance-thread",
             RunId = (string?)opener?["runId"] ?? "conformance-run",
-            // The in-band declaration, gated exactly as AGUIChatClient gates it — through
-            // the client's own rule, given the peer ceiling the fixture pins in its
-            // `client` block. A fixture that pins a peer below this line is stating that
-            // the member must not be sent at all, which is a property of the client's gate
-            // rather than of this file.
-            ProtocolVersion = AGUIProtocolVersion.ShouldDeclare(
-                (string?)fixture["client"]?["maxProtocolVersion"])
-                ? AGUIProtocolVersion.Wire
-                : null,
+            // The in-band declaration, sent exactly as AGUIChatClient sends it: on every
+            // request, with no peer ceiling to gate it.
+            ProtocolVersion = AGUIProtocolVersion.Wire,
         };
 
         if (fixture["input"] is not JsonObject fixtureInput)
