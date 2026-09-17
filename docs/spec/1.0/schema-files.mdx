@@ -3,12 +3,6 @@ title: "Schema files"
 description: "The machine-readable schema, its address, and how to use it — 1.0"
 ---
 
-<Warning>
-  **Draft — not yet ratified.** Published for review. The address below is
-  stable for the draft, but the draft's *contents* change without notice. Pin a
-  frozen version once one exists.
-</Warning>
-
 The schema is authoritative for structure: which fields exist, which are
 required, what type each carries, and which values a discriminator may take.
 This page is where to fetch it.
@@ -16,7 +10,7 @@ This page is where to fetch it.
 ## The file
 
 <Card title="schema.json" href="/spec/1.0/schema.json" icon="brackets-curly">
-  The complete draft schema — every event, message, and the run input.
+  The complete 1.0 schema — every event, message, and the run input.
 </Card>
 
 ```
@@ -35,7 +29,7 @@ Every definition is reachable by anchor — `#TextMessageStartEvent`,
 ## Using it
 
 ```bash
-curl -sS https://ag-ui.com/spec/1.0/schema.json -o ag-ui-draft.json
+curl -sS https://ag-ui.com/spec/1.0/schema.json -o ag-ui-1.0.json
 ```
 
 Validate an event against the whole schema and let the discriminator select the
