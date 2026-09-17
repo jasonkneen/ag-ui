@@ -18,7 +18,6 @@ from ag_ui.core import (
     ToolMessage,
     ToolCall,
     AssistantMessage,
-    WIRE_PROTOCOL_VERSION,
 )
 from ag_ui.encoder import EventEncoder
 
@@ -44,8 +43,6 @@ async def backend_tool_rendering_endpoint(input_data: RunAgentInput, request: Re
                 type=EventType.RUN_STARTED,
                 thread_id=input_data.thread_id,
                 run_id=input_data.run_id,
-                # Every producer declares the protocol line it speaks.
-                protocol_version=WIRE_PROTOCOL_VERSION,
             ),
         )
 
