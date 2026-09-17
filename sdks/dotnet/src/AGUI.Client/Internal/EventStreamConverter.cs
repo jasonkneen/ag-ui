@@ -878,6 +878,10 @@ internal static class EventStreamConverter
             switch (evt)
             {
                 case RunStartedEvent runStartedEvt:
+                    // The producer's own declaration, judged against the version this
+                    // client speaks. Absent is a peer from before the field and is silent;
+                    // newer or uninterpretable means material this client may be dropping.
+                    AGUIProtocolVersion.WarnOnProducerDeclaration(runStartedEvt.ProtocolVersion);
                     runStarted = true;
                     conversationId = runStartedEvt.ThreadId;
                     responseId = runStartedEvt.RunId;
