@@ -251,7 +251,7 @@ export abstract class AbstractAgent {
     // Auto-insert BackwardCompatibility_0_0_45 for backward compatibility with
     // the retired THINKING_* events. Registered in the repo-root
     // DEPRECATIONS.md (not this package's own, which tracks a different set
-    // under a different schema) with an expiry of 2027-08-24, not removed in
+    // under a different schema) with an expiry of 2027-09-17, not removed in
     // 1.0 — see also the note on
     // CompatibilityBoundary, which translates the same shapes innermost and so
     // usually gets to them first.
