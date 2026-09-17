@@ -351,6 +351,9 @@ public sealed class ConformanceStreamTest
         {
             ThreadId = (string?)opener?["threadId"] ?? "conformance-thread",
             RunId = (string?)opener?["runId"] ?? "conformance-run",
+            // The in-band declaration, sent exactly as AGUIChatClient sends it: on every
+            // request, with no peer ceiling to gate it.
+            ProtocolVersion = AGUIProtocolVersion.Wire,
         };
 
         if (fixture["input"] is not JsonObject fixtureInput)

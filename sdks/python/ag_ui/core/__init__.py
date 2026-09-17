@@ -103,6 +103,10 @@ from ag_ui.core.token_usage import (
     aggregate_token_usage,
 )
 
+from ag_ui.core.version import (
+    PROTOCOL_VERSION,
+)
+
 from ag_ui.core.capabilities import (
     SubagentInfo,
     SubAgentInfo,
@@ -124,6 +128,8 @@ from ag_ui.core.capabilities import (
 __all__ = [
     "AGUI_METADATA_KEY",
     "Metadata",
+    # Protocol version
+    "PROTOCOL_VERSION",
     # Events
     "EventType",
     "BaseEvent",

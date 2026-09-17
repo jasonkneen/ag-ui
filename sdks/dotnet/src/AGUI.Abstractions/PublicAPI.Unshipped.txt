@@ -995,3 +995,5 @@ static AGUI.Abstractions.AGUIToolExtensions.AsAITools(this System.Collections.Ge
 ~AGUI.Abstractions.AGUIJsonSerializerContext.ToolCallStartEvent.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.ToolCallStartEvent>
 ~AGUI.Abstractions.AGUIJsonSerializerContext.ToolsCapabilities.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.ToolsCapabilities>
 ~AGUI.Abstractions.AGUIJsonSerializerContext.TransportCapabilities.get -> System.Text.Json.Serialization.Metadata.JsonTypeInfo<AGUI.Abstractions.TransportCapabilities>
+AGUI.Abstractions.AGUIProtocol
+const AGUI.Abstractions.AGUIProtocol.Version = "1.0" -> string!

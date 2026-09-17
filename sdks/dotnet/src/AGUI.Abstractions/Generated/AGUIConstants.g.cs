@@ -11,6 +11,16 @@ using System.Text.Json.Serialization;
 namespace AGUI.Abstractions;
 
 /// <summary>
+/// The protocol version this code was generated from: the version segment of
+/// the schema's $id (https://ag-ui.com/spec/1.0/schema.json). Never typed by a
+/// human.
+/// </summary>
+public static class AGUIProtocol
+{
+    public const string Version = "1.0";
+}
+
+/// <summary>
 /// Constants for the resume entry status discriminator.
 /// </summary>
 public static class ResumeStatus
