@@ -24,7 +24,7 @@ const STREAMS_DIR = join(
   "..",
   "..",
   "spec",
-  "draft",
+  "1.0",
   "conformance",
   "streams",
 );
@@ -576,7 +576,7 @@ describe("the conformance fixture corpus", () => {
       .filter((line) => line.length > 0 && !line.startsWith("#"));
     expect(
       manifest,
-      "spec/draft/conformance/streams/MANIFEST.txt is out of date. If you added or removed a " +
+      "spec/1.0/conformance/streams/MANIFEST.txt is out of date. If you added or removed a " +
         "fixture, regenerate it in the same commit (the command is in the file's header) and " +
         "say so in the message; if you did not, a fixture has gone missing.",
     ).toEqual(files);

@@ -1,4 +1,4 @@
-// @generated from https://ag-ui.com/spec/draft/schema.json. DO NOT EDIT.
+// @generated from https://ag-ui.com/spec/1.0/schema.json. DO NOT EDIT.
 // Regenerate with pnpm --filter @ag-ui/spec generate.
 
 type Shape =

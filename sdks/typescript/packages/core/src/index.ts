@@ -1,5 +1,5 @@
 // The generated protocol source: types and constants, regenerated from
-// spec/draft/schema.json (`pnpm --filter @ag-ui/spec generate`).
+// spec/1.0/schema.json (`pnpm --filter @ag-ui/spec generate`).
 //
 // The zod validators are deliberately NOT here. They live behind the
 // `@ag-ui/core/schemas` subpath so that importing this entry pulls no zod at

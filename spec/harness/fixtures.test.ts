@@ -2,7 +2,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  DRAFT_DIR,
+  SPEC_DIR,
   eventDefinitions,
   eventValidator,
   normaliseErrors,
@@ -10,7 +10,7 @@ import {
   validatorFor,
 } from "./validator";
 
-const FIXTURES_DIR = join(DRAFT_DIR, "fixtures");
+const FIXTURES_DIR = join(SPEC_DIR, "fixtures");
 
 interface Fixture {
   /** The anchored definition the document is validated against. */
@@ -80,7 +80,7 @@ describe("the fixture corpus", () => {
       .sort();
     expect(
       manifest,
-      "spec/draft/fixtures/MANIFEST.txt is out of date. If you added or removed a fixture, " +
+      "spec/1.0/fixtures/MANIFEST.txt is out of date. If you added or removed a fixture, " +
         "regenerate it in the same commit (the command is in the file's header) and say so in " +
         "the message; if you did not, a fixture has gone missing.",
     ).toEqual(found);
@@ -235,7 +235,7 @@ describe("the shared capabilities fixture", () => {
   // checks that, so both copies could drift while every suite stayed green.
   const shared = readJson<{
     cases: Array<{ name: string; input: unknown; expected: unknown }>;
-  }>(join(DRAFT_DIR, "..", "..", "sdks", "fixtures", "agent-capabilities.json"));
+  }>(join(SPEC_DIR, "..", "..", "sdks", "fixtures", "agent-capabilities.json"));
   const SPEC_FIXTURE_FOR: Record<string, string> = {
     full_every_group_populated: "full.json",
     minimal_nothing_declared: "minimal.json",
