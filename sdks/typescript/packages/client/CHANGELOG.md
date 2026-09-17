@@ -16,7 +16,7 @@
 
 ### Breaking changes
 
-- The wire protocol version is now the generated PROTOCOL_VERSION ("1.0"); the hand-written WIRE_PROTOCOL_VERSION is removed.
+- The wire protocol version is now the generated PROTOCOL_VERSION ("1.0").
 - Enforcement pipeline now runs after middleware and strips/validates against the schema, changing which events pass through.
 - MESSAGES_SNAPSHOT ordering and activity-ownership semantics changed; re-verify snapshot handling.
 - Framing buffers are now capped; oversized unbounded streams will error instead of growing.
