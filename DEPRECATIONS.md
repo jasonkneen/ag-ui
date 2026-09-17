@@ -8,7 +8,7 @@ rather than twelve months from when they shipped, and they will be re-dated
 from the 1.0 release if it slips. After the expiry date the shim may be
 removed in the next release, and the deprecated shape stops working entirely.
 
-The canonical 1.0 contract (spec/draft/schema.json) excludes these shapes.
+The canonical 1.0 contract (spec/1.0/schema.json) excludes these shapes.
 Compatibility conversions live in the TypeScript client boundary and
 middleware layer: the
 always-on boundary (`CompatibilityBoundary`) upgrades what arrives and converts

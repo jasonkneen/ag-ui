@@ -1,5 +1,5 @@
 /**
- * Emits the human-readable schema reference page, docs/spec/draft/schema.mdx,
+ * Emits the human-readable schema reference page, docs/spec/1.0/schema.mdx,
  * from the same model every SDK is generated from.
  *
  * The page exists so the prose specification can link a field's shape instead
@@ -249,13 +249,13 @@ const sectionize = (model: ProtocolModel): Section[] => {
     {
       title: "Run Input",
       intro:
-        "The request that starts a run, and the types only it carries. Behaviour: [Run Input](/spec/draft/basic/run-input).",
+        "The request that starts a run, and the types only it carries. Behaviour: [Run Input](/spec/1.0/basic/run-input).",
       definitions: pick(input),
     },
     {
       title: "Outcomes and Interrupts",
       intro:
-        "How runs and subagents report ending, and what an interrupted run is waiting for. Behaviour: [Interrupts and Resume](/spec/draft/basic/patterns/interrupt-resume).",
+        "How runs and subagents report ending, and what an interrupted run is waiting for. Behaviour: [Interrupts and Resume](/spec/1.0/basic/patterns/interrupt-resume).",
       definitions: pick(outcomes),
     },
     {
@@ -298,10 +298,6 @@ export function emitSchemaReference(model: ProtocolModel): string {
     // @generated banner every other output leads with sits directly after it,
     // as an MDX comment. The harness knows this exception.
     `{/* @generated from ${model.schemaId} — DO NOT EDIT. Change the schema and regenerate. */}`,
-    "",
-    'import DraftBanner from "/snippets/spec-draft-banner.mdx";',
-    "",
-    "<DraftBanner />",
     "",
     "This page is generated from the machine-readable schema at",
     `[\`/spec/${model.version}/schema.json\`](/spec/${model.version}/schema.json) — the source of truth for`,

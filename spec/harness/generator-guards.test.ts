@@ -37,7 +37,7 @@ const realSchema = (): Json => JSON.parse(RAW_SCHEMA) as Json;
 /** A minimal document with the same shape the reader expects of the real one. */
 const doc = (defs: Json): Json => ({
   $schema: "https://json-schema.org/draft/2020-12/schema",
-  $id: "https://ag-ui.example/spec/draft/schema.json",
+  $id: "https://ag-ui.example/spec/1.0/schema.json",
   description: "A synthetic document, built to exercise one guard.",
   $defs: defs,
 });

@@ -10,12 +10,12 @@ import Ajv2020, {
 // when this file is loaded through a CommonJS transpile such as tsx's.
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 
-export const DRAFT_DIR = join(HERE, "..", "draft");
+export const SPEC_DIR = join(HERE, "..", "1.0");
 
-export const SCHEMA_ID = "https://ag-ui.com/spec/draft/schema.json";
+export const SCHEMA_ID = "https://ag-ui.com/spec/1.0/schema.json";
 
 export const schema = JSON.parse(
-  readFileSync(join(DRAFT_DIR, "schema.json"), "utf8"),
+  readFileSync(join(SPEC_DIR, "schema.json"), "utf8"),
 ) as Record<string, unknown>;
 
 /**

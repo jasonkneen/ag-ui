@@ -19,7 +19,7 @@ import { DOCS_SPEC_OUTPUT_DIR, SCHEMA_PATH } from "../generator/generate";
  * that configuration, who owns it, and how to verify it by hand.
  */
 const PUBLISHED_ORIGIN = "https://ag-ui.com";
-const PUBLISHED_PREFIX = "/spec/draft";
+const PUBLISHED_PREFIX = "/spec/1.0";
 
 describe("the published draft schema", () => {
   const publishedPath = join(DOCS_SPEC_OUTPUT_DIR, "schema.json");
@@ -49,14 +49,14 @@ describe("the published draft schema", () => {
 
   it("keeps every published file's address free for the docs pages beside it", () => {
     // One folder holds both the readable pages and the machine-readable files,
-    // so /spec/draft/schema.json is a file while /spec/draft/lifecycle is a
+    // so /spec/1.0/schema.json is a file while /spec/1.0/lifecycle is a
     // page. Two things must not claim one address: which of them the renderer
     // would serve is its business rather than something the protocol should
     // depend on.
     //
     // Compare ADDRESSES, not file names. A page's address is its name without
-    // the .mdx suffix, so `schema.json.mdx` claims /spec/draft/schema.json and
-    // collides, while `schema.mdx` claims /spec/draft/schema and does not.
+    // the .mdx suffix, so `schema.json.mdx` claims /spec/1.0/schema.json and
+    // collides, while `schema.mdx` claims /spec/1.0/schema and does not.
     // Comparing stems would get both of those backwards.
     const entries = readdirSync(DOCS_SPEC_OUTPUT_DIR);
     const pageAddresses = new Set(

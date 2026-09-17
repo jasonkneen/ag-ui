@@ -4,14 +4,14 @@ description: "What changes for an application or integration moving to AG-UI 1.0
 ---
 
 AG-UI 1.0 is the first release with a specification behind it: the
-[schema](/spec/draft/schema) is the single source of truth, every SDK's
+[schema](/spec/1.0/schema) is the single source of truth, every SDK's
 protocol types are generated from it, and the behavioural rules that used to
-live only in the TypeScript client are [written down](/spec/draft). Most of
+live only in the TypeScript client are [written down](/spec/1.0). Most of
 what changed is additive. This page is the part that is not — what you have to
 touch, per SDK, and what keeps working on its own.
 
 The protocol-level changes are listed in the specification's
-[Key Changes](/spec/draft/changelog); this page does not repeat them, it says
+[Key Changes](/spec/1.0/changelog); this page does not repeat them, it says
 what each one means for code you already have.
 
 ## What keeps working
@@ -246,7 +246,7 @@ differ:
 
 Validation stays as tolerant as it was: unknown keys are kept, pydantic's
 default coercion applies. The strict contract is the specification's
-[fixture corpus](/spec/draft/schema-files), not the SDK models.
+[fixture corpus](/spec/1.0/schema-files), not the SDK models.
 
 ### Read JSON Patch entries as objects
 
@@ -342,7 +342,7 @@ throws `AGUIUnknownEventTypeException`.
 JSON handling and protobuf mappers. `SubagentRunId` is a property on the
 events that can carry attribution — not on the base event — so a consumer
 that switches on event type reads it from the concrete type. The
-[subagent rules](/spec/draft/events/subagents) say what a consumer must do
+[subagent rules](/spec/1.0/events/subagents) say what a consumer must do
 with it.
 
 ### Retired
@@ -397,9 +397,9 @@ previously been present only by accident.
 
 ## Where to look next
 
-- The [Key Changes](/spec/draft/changelog) page for the protocol-level
+- The [Key Changes](/spec/1.0/changelog) page for the protocol-level
   differences, with links into the specification.
-- [Capabilities](/spec/draft/basic/capabilities) for what a declaration
+- [Capabilities](/spec/1.0/basic/capabilities) for what a declaration
   obliges now that it is specified.
-- [Versioning and compatibility](/spec/draft/basic/versioning) for how a
+- [Versioning and compatibility](/spec/1.0/basic/versioning) for how a
   1.0 peer talks to an older one.
