@@ -13,6 +13,7 @@ and the real snapshot manager over local storage. Only the model is scripted.
 from __future__ import annotations
 
 import copy
+import importlib.metadata
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -46,6 +47,29 @@ snapshot_module = pytest.importorskip(
 storage_module = pytest.importorskip("strands.storage")
 
 SnapshotSessionManager = snapshot_module.SnapshotSessionManager
+
+
+def _sdk_saves_a_halted_turn_before_the_run_ends() -> bool:
+    """Whether the installed Strands closes its run loop when a stream closes.
+
+    A frontend-tool halt closes ``stream_async`` early. Only from 1.55.0 does
+    that close the SDK's inner run loop too; before it, the loop's
+    ``AfterInvocationEvent`` (a snapshot session's only save) runs whenever the
+    event loop finalizes the orphan, after RUN_FINISHED. No public symbol marks
+    the change, so the release number is the probe.
+    """
+    parts = importlib.metadata.version("strands-agents").split(".")[:2]
+    return tuple(int(part) for part in parts) >= (1, 55)
+
+
+_needs_halted_turn_saved = pytest.mark.skipif(
+    not _sdk_saves_a_halted_turn_before_the_run_ends(),
+    reason=(
+        "strands-agents < 1.55 writes a halted turn's snapshot only when the "
+        "abandoned run loop is finalized, after RUN_FINISHED, so an immediate "
+        "restore finds nothing of that turn to reconcile"
+    ),
+)
 
 THREAD = "snapshot-thread"
 AGENT_ID = "snapshot-agent"
@@ -132,6 +156,26 @@ class _FailingSnapshotManager(SnapshotSessionManager):
         ):
             self.failures += 1
             raise RuntimeError("snapshot storage unavailable")
+        return await super().save_snapshot(agent, is_latest=is_latest)
+
+
+class _RecordingSnapshotManager(SnapshotSessionManager):
+    """Records what each ``snapshot_latest`` write carried."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.saves: list[dict[str, Any]] = []
+
+    async def save_snapshot(self, agent, *, is_latest):
+        self.saves.append(
+            {
+                "results": {
+                    result["toolUseId"]: _result_text(result)
+                    for result in _all_results(agent)
+                },
+                "call_ids": agent.state.get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY),
+            }
+        )
         return await super().save_snapshot(agent, is_latest=is_latest)
 
 
@@ -287,7 +331,13 @@ async def _history_then_frontend_call(adapter: StrandsAgent) -> list[Any]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restart", [False, True], ids=["same-process", "restarted"])
+@pytest.mark.parametrize(
+    "restart",
+    [
+        pytest.param(False, id="same-process"),
+        pytest.param(True, id="restarted", marks=_needs_halted_turn_saved),
+    ],
+)
 @pytest.mark.parametrize(
     ("answer", "error"),
     [("sunny, 22C", None), ("weather service down", "lookup failed")],
@@ -407,6 +457,7 @@ async def test_each_answer_lands_on_its_own_call_when_one_tool_is_called_twice(
     assert _results_by_id(restored.messages) == expected
 
 
+@_needs_halted_turn_saved
 @pytest.mark.asyncio
 async def test_several_answers_in_one_continuation_are_all_persisted(tmp_path):
     adapter, _ = _adapter(lambda: _snapshot_manager(tmp_path))
@@ -589,7 +640,7 @@ async def test_a_failed_save_rolls_back_and_degrades_like_the_repository_path(
     assert _results_by_id(live.messages)["native-w"]["content"] == [
         {"text": PROXY_RESULT_PLACEHOLDER}
     ]
-    assert "native-w" in live.state.get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY)
+    assert live.state.get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY) == ["native-w"]
     assert _results_by_id(model.seen[-1])["native-w"]["content"] == [
         {"text": PROXY_RESULT_PLACEHOLDER}
     ]
@@ -636,3 +687,67 @@ async def test_a_failed_save_refuses_the_resume_and_leaves_it_retryable(tmp_path
     )
     restored, _ = _restore(tmp_path)
     assert restored.messages == core.messages
+
+
+async def _answer_weather(adapter: StrandsAgent, ask) -> None:
+    await _run(
+        adapter,
+        _input(
+            "run-2",
+            [
+                *ask,
+                _calls(("native-w", "get_weather")),
+                ToolMessage(id="t-w", tool_call_id="native-w", content="sunny"),
+            ],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_save_carries_the_call_ids_already_pruned(tmp_path):
+    manager = _RecordingSnapshotManager(
+        session_id=THREAD, storage=storage_module.LocalFileStorage(str(tmp_path))
+    )
+    adapter, _ = _adapter(lambda: manager)
+    ask = [UserMessage(id="u1", content="weather?")]
+    await _run(adapter, _input("run-1", ask))
+    live = adapter._agents_by_thread[THREAD]
+    assert "native-w" in live.state.get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY)
+    manager.saves.clear()
+
+    await _answer_weather(adapter, ask)
+
+    # The first write that carries the answer is the reconciliation's own.
+    answered = [s for s in manager.saves if s["results"].get("native-w") == "sunny"]
+    assert answered and manager.saves[0] is answered[0]
+    assert "native-w" not in (answered[0]["call_ids"] or [])
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_only_session_is_not_written_mid_turn(tmp_path):
+    fire = {"now": False}
+    manager = _RecordingSnapshotManager(
+        session_id=THREAD,
+        storage=storage_module.LocalFileStorage(str(tmp_path)),
+        save_latest_on="trigger",
+        snapshot_trigger=lambda **_kwargs: fire["now"],
+    )
+    adapter, model = _adapter(lambda: manager)
+    ask = [UserMessage(id="u1", content="weather?")]
+    await _run(adapter, _input("run-1", ask))
+
+    await _answer_weather(adapter, ask)
+
+    # Corrected where the run reads it, and written nowhere.
+    live = adapter._agents_by_thread[THREAD]
+    assert _results_by_id(live.messages)["native-w"] == _expected("native-w", "sunny")
+    assert _results_by_id(model.seen[-1])["native-w"] == _expected("native-w", "sunny")
+    assert manager.saves == []
+    assert list(tmp_path.rglob("snapshot_latest.json")) == []
+
+    # The user's own trigger then persists it with everything else.
+    fire["now"] = True
+    await _run(adapter, _input("run-3", [UserMessage(id="u3", content="thanks")]))
+    disk = _disk_snapshot(tmp_path)
+    assert _results_by_id(disk["messages"])["native-w"] == _expected("native-w", "sunny")
+    assert "native-w" not in disk["state"].get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY, [])

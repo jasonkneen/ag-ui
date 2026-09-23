@@ -9,7 +9,10 @@ This package exposes a lightweight wrapper that lets any `strands.Agent` speak t
 - `strands-agents>=1.15.0`, which is the declared floor. Some behaviour described
   below is release-dependent: the SDK's own concurrency lock arrives in 1.22.0,
   the citations demo needs 1.35.0, and `SnapshotSessionManager` sessions need
-  1.51.0, the release that added it, while the Gemini guardrail hint and the release
+  1.51.0, the release that added it. Below 1.55.0 the SDK writes a halted
+  frontend-tool turn's snapshot only when the abandoned run loop is finalized,
+  after `RUN_FINISHED`, so a restore in that window loses the turn; 1.55.0+ is
+  recommended for snapshot sessions. The Gemini guardrail hint and the release
   that turned a provider failure from `STRANDS_ERROR` into `STRANDS_FORCE_STOP`
   were never bisected. [ARCHITECTURE.md](../ARCHITECTURE.md) records which
   releases each observation was made against.

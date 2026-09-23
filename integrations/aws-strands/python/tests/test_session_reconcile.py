@@ -117,17 +117,93 @@ def test_snapshot_capability_requires_a_real_snapshot_manager_and_stable_ids(
     )
     stable = SimpleNamespace(agent_id="stable-agent")
 
-    assert session_reconcile._supports_session_reconciliation(manager, stable)
-    assert not session_reconcile._supports_repository_reconciliation(manager, stable)
-    assert not session_reconcile._supports_session_reconciliation(
-        manager, SimpleNamespace(agent_id="")
+    assert session_reconcile.session_reconciliation_kind(manager, stable) == "snapshot"
+    assert (
+        session_reconcile.session_reconciliation_kind(
+            manager, SimpleNamespace(agent_id="")
+        )
+        is None
     )
     # Only the SDK's own snapshot manager: a look-alike's save may not persist
     # the agent the way restore reads it back.
-    assert not session_reconcile._supports_session_reconciliation(
-        SimpleNamespace(session_id="session-1", save_snapshot=lambda *a, **k: None),
-        stable,
+    assert (
+        session_reconcile.session_reconciliation_kind(
+            SimpleNamespace(session_id="session-1", save_snapshot=lambda *a, **k: None),
+            stable,
+        )
+        is None
     )
+    assert (
+        session_reconcile.session_reconciliation_kind(
+            _make_session(tmp_path / "file"), stable
+        )
+        == "repository"
+    )
+
+
+class _FailingSnapshotSave:
+    """The two things the snapshot reconcile reads off its manager."""
+
+    _save_latest_on = "invocation"
+
+    async def save_snapshot(self, agent, *, is_latest):
+        raise RuntimeError("storage down")
+
+
+def _snapshot_agent(tool_result, call_ids=None):
+    from strands.agent.state import AgentState
+
+    state = AgentState()
+    if call_ids is not None:
+        state.set(AG_UI_FRONTEND_CALL_IDS_STATE_KEY, call_ids)
+    return SimpleNamespace(
+        messages=[{"role": "user", "content": [{"toolResult": tool_result}]}],
+        state=state,
+        _interrupt_state=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_snapshot_save_restores_the_exact_shape_it_found():
+    # No ``status`` key: the rollback must not leave ``status: None`` behind.
+    placeholder = {"toolUseId": "native-1", "content": [{"text": PLACEHOLDER}]}
+    agent = _snapshot_agent(dict(placeholder))
+
+    with pytest.raises(RuntimeError, match="storage down"):
+        await session_reconcile.reconcile_snapshot_tool_results(
+            _FailingSnapshotSave(), agent, {"native-1": ("real", True)}, []
+        )
+
+    assert agent.messages[0]["content"][0]["toolResult"] == placeholder
+    assert AG_UI_FRONTEND_CALL_IDS_STATE_KEY not in agent.state.get()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_snapshot_save_undoes_the_call_id_prune():
+    agent = _snapshot_agent(
+        {
+            "toolUseId": "native-1",
+            "status": "success",
+            "content": [{"text": PLACEHOLDER}],
+        },
+        call_ids=["native-0", "native-1"],
+    )
+
+    with pytest.raises(RuntimeError, match="storage down"):
+        await session_reconcile.reconcile_snapshot_tool_results(
+            _FailingSnapshotSave(),
+            agent,
+            {"native-1": ("real", False)},
+            ["native-0", "native-1"],
+        )
+
+    assert agent.state.get(AG_UI_FRONTEND_CALL_IDS_STATE_KEY) == [
+        "native-0",
+        "native-1",
+    ]
+    assert agent.messages[0]["content"][0]["toolResult"]["content"] == [
+        {"text": PLACEHOLDER}
+    ]
 
 
 @pytest.mark.parametrize(
