@@ -25,6 +25,7 @@ from ag_ui.core import Context, EventType, RunAgentInput, Tool, ToolMessage, Use
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from strands import Agent
+from strands.hooks import AfterInvocationEvent, HookProvider, HookRegistry
 from strands.models.model import Model
 from strands.session.file_session_manager import FileSessionManager
 from strands.tools.tools import PythonAgentTool
@@ -615,3 +616,41 @@ async def test_halted_turn_persists_no_assistant_turn_the_client_never_saw(tmp_p
 
     assert emitted_text == []
     assert persisted_text == [], f"assistant text persisted but never emitted: {persisted_text}"
+
+
+class _InvocationEndRecorder(HookProvider):
+    """Marks the timeline when Strands finishes the invocation it was running."""
+
+    def __init__(self, timeline: list[str]) -> None:
+        self.timeline = timeline
+
+    def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
+        registry.add_callback(
+            AfterInvocationEvent,
+            lambda _event: self.timeline.append("after_invocation"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_halted_invocation_finishes_before_the_run_reports_finished():
+    """The halt closes Strands' own loop, not only the stream wrapping it.
+
+    ``AfterInvocationEvent`` is where Strands does its end-of-invocation work,
+    including a snapshot session's only save. Left to garbage collection it
+    runs at some later loop iteration, after RUN_FINISHED, so a restore in that
+    window finds no trace of the halted turn.
+    """
+    timeline: list[str] = []
+    model = _ScriptedModel(follow_ups=2, first_turn_tools=("get_cell",))
+    adapter = StrandsAgent(
+        Agent(model=model, tools=[]),
+        name="halt-test-agent",
+        hooks=[_InvocationEndRecorder(timeline)],
+    )
+
+    async for event in adapter.run(_run_input("t-settled")):
+        timeline.append(event.type)
+
+    assert model.calls == 1
+    assert timeline.count("after_invocation") == 1
+    assert timeline.index("after_invocation") < timeline.index(EventType.RUN_FINISHED)

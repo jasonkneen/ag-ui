@@ -94,6 +94,74 @@ def _supports_repository_reconciliation(session_manager: Any, agent: Any) -> boo
     )
 
 
+def _supports_snapshot_reconciliation(session_manager: Any, agent: Any) -> bool:
+    """Return whether *session_manager* persists the whole agent as a snapshot."""
+    try:
+        from strands.session.snapshot_session_manager import SnapshotSessionManager
+    except ImportError:  # SDK releases before snapshot sessions
+        return False
+    if not isinstance(session_manager, SnapshotSessionManager):
+        return False
+    try:
+        session_id = session_manager.session_id
+        agent_id = agent.agent_id
+    except Exception:  # noqa: BLE001 - unsafe/missing capability fails closed
+        return False
+    return (
+        isinstance(session_id, str)
+        and bool(session_id)
+        and isinstance(agent_id, str)
+        and bool(agent_id)
+    )
+
+
+def _supports_session_reconciliation(session_manager: Any, agent: Any) -> bool:
+    """Return whether either persistence format can take a corrected result."""
+    return _supports_repository_reconciliation(
+        session_manager, agent
+    ) or _supports_snapshot_reconciliation(session_manager, agent)
+
+
+async def reconcile_snapshot_tool_results(
+    session_manager: Any,
+    agent: Any,
+    pending_results: Mapping[str, Tuple[str, bool]],
+) -> set[str]:
+    """Correct placeholder results in the agent, then persist ``snapshot_latest``.
+
+    A snapshot holds the whole agent, so the live history and any parked
+    interrupt batch are corrected in place and written in one save. If the save
+    fails the edits are undone before re-raising, so an unsaved correction is
+    never mistaken for an answered call by the caller's fallback or a retry.
+
+    Returns the same set as :func:`reconcile_frontend_tool_results`.
+    """
+    undo: list[tuple[dict, Any, Any]] = []
+    corrected: set[str] = set()
+    try:
+        for message in getattr(agent, "messages", None) or []:
+            corrected |= _correct_message(message, pending_results, undo=undo)
+
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if interrupt_state is not None and getattr(
+            interrupt_state, "activated", False
+        ):
+            tool_results = parked_tool_results(interrupt_state)
+            if tool_results:
+                corrected |= _correct_all_tools(
+                    tool_results, pending_results, undo=undo
+                )
+
+        if undo:
+            await session_manager.save_snapshot(agent, is_latest=True)
+    except BaseException:
+        for tool_result, content, status in reversed(undo):
+            tool_result["content"] = content
+            tool_result["status"] = status
+        raise
+    return corrected
+
+
 def reconcile_frontend_tool_results(
     session_manager: Any,
     agent: Any,
@@ -209,8 +277,13 @@ def _correct_single_tool(
     pending_results: Mapping[str, Tuple[str, bool]],
     *,
     mutated_ids: set[str] | None = None,
+    undo: list | None = None,
 ) -> str | None:
-    """Reconcile a matching ToolResult dict and return its tool_use_id."""
+    """Reconcile a matching ToolResult dict and return its tool_use_id.
+
+    ``undo``, when given, collects ``(tool_result, content, status)`` as they
+    were before each rewrite, so a caller can put them back.
+    """
     if not isinstance(tool_result, dict):
         return None
 
@@ -227,6 +300,10 @@ def _correct_single_tool(
     ):
         return tool_use_id
     if _is_placeholder(tool_result.get("content")):
+        if undo is not None:
+            undo.append(
+                (tool_result, tool_result.get("content"), tool_result.get("status"))
+            )
         tool_result["content"] = expected_content
         tool_result["status"] = expected_status
         if mutated_ids is not None:
@@ -239,6 +316,7 @@ def _correct_all_tools(
     pending_results: Mapping[str, Tuple[str, bool]],
     *,
     mutated_ids: set[str] | None = None,
+    undo: list | None = None,
 ) -> set[str]:
     """Reconcile matching ToolResult dicts in *tool_results* in place.
 
@@ -250,7 +328,7 @@ def _correct_all_tools(
     changed: set[str] = set()
     for tool_result in tool_results:
         tool_use_id = _correct_single_tool(
-            tool_result, pending_results, mutated_ids=mutated_ids
+            tool_result, pending_results, mutated_ids=mutated_ids, undo=undo
         )
         if tool_use_id:
             changed.add(tool_use_id)
@@ -262,6 +340,7 @@ def _correct_message(
     pending_results: Mapping[str, Tuple[str, bool]],
     *,
     mutated_ids: set[str] | None = None,
+    undo: list | None = None,
 ) -> set[str]:
     """Reconcile matching ``toolResult`` blocks in *message* in place.
 
@@ -280,7 +359,7 @@ def _correct_message(
             continue
         tool_result = block.get("toolResult")
         tool_use_id = _correct_single_tool(
-            tool_result, pending_results, mutated_ids=mutated_ids
+            tool_result, pending_results, mutated_ids=mutated_ids, undo=undo
         )
         if tool_use_id:
             changed.add(tool_use_id)

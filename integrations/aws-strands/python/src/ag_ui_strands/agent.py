@@ -741,6 +741,29 @@ def _get_strands_session_manager(agent: Any) -> Any:
     )
 
 
+def _abandoned_sdk_run_loop(agent_stream: Any) -> Any:
+    """Return the run loop a pre-1.55 ``stream_async`` leaves open on close.
+
+    Before strands-agents 1.55, closing ``stream_async`` early does not close
+    the ``_run_loop`` generator it iterates, so that loop's ``finally`` (which
+    fires ``AfterInvocationEvent`` and with it a ``SnapshotSessionManager``'s
+    save) only runs whenever the event loop finalizes the orphan, after the
+    adapter has already reported the run finished. 1.55 closes it itself.
+    Closing it here is the same ``aclose()`` the finalizer would run, done now.
+
+    Must be read before ``agent_stream`` is closed, while its frame is live.
+    Returns ``None`` when the stream finished, or the layout is not recognized.
+    """
+    frame = getattr(agent_stream, "ag_frame", None)
+    if frame is None:
+        return None
+    try:
+        inner = frame.f_locals.get("events")
+    except Exception:  # noqa: BLE001 - unknown layout means nothing to close
+        return None
+    return inner if inspect.isasyncgen(inner) else None
+
+
 def _plain_mapping(value: Any) -> Mapping:
     """Return ``value`` if it is a mapping, else an empty one."""
     return value if isinstance(value, Mapping) else {}
@@ -987,8 +1010,8 @@ def _interrupt_session_capability_error(
         type=EventType.RUN_ERROR,
         message=(
             "Mixed frontend-proxy/native interrupt state requires session_id, "
-            "a stable agent_id, and a session_repository exposing "
-            "list_messages() and update_message()"
+            "a stable agent_id, and either a session_repository exposing "
+            "list_messages() and update_message() or a SnapshotSessionManager"
         ),
         code="INTERRUPT_SESSION_CAPABILITY_ERROR",
         usage=usage,
@@ -1486,9 +1509,11 @@ from .session_reconcile import (
     AG_UI_TOOL_CALL_MAP_STATE_KEY,
     recorded_frontend_call_ids,
     _supports_repository_reconciliation,
+    _supports_session_reconciliation,
     active_proxy_placeholder_ids,
     has_placeholder_results,
     reconcile_frontend_tool_results,
+    reconcile_snapshot_tool_results,
 )
 from .config import (
     StrandsAgentConfig,
@@ -4711,7 +4736,7 @@ class StrandsAgent:
         if active_proxy_native_ids:
             if session_manager is None:
                 session_error = _interrupt_session_required_error()
-            elif not _supports_repository_reconciliation(
+            elif not _supports_session_reconciliation(
                 session_manager, strands_agent
             ):
                 session_error = _interrupt_session_capability_error()
@@ -5656,7 +5681,8 @@ class StrandsAgent:
             # No session manager: rebuild history in-memory and stream it.
             # With a session manager (which owns persistence): overwrite the
             # persisted placeholder toolResult(s) with the real client result
-            # via the session repository, then continue from the corrected
+            # (per message in a repository, or in one save of a snapshot
+            # session), then continue from the corrected
             # native history — keeping a single source of truth rather than a
             # placeholder plus a synthetic "tool returned: X" message.
             replay_history = (
@@ -5667,7 +5693,7 @@ class StrandsAgent:
             # proxy placeholders do, including when the client result is void.
             reconcile_session_results = (
                 reconciliation_setup_error is None
-                and _supports_repository_reconciliation(session_manager, strands_agent)
+                and _supports_session_reconciliation(session_manager, strands_agent)
                 and (
                     (
                         self.config.replay_history_into_strands
@@ -5763,9 +5789,16 @@ class StrandsAgent:
                 resume_prompt = None
             elif reconcile_session_results:
                 try:
-                    corrected_native_ids = reconcile_frontend_tool_results(
-                        session_manager, strands_agent, resolved_native_results
-                    )
+                    if _supports_repository_reconciliation(
+                        session_manager, strands_agent
+                    ):
+                        corrected_native_ids = reconcile_frontend_tool_results(
+                            session_manager, strands_agent, resolved_native_results
+                        )
+                    else:
+                        corrected_native_ids = await reconcile_snapshot_tool_results(
+                            session_manager, strands_agent, resolved_native_results
+                        )
                 except Exception as e:  # noqa: BLE001 — degrade, don't crash the turn
                     if has_active_interrupt:
                         logger.error(
@@ -7326,21 +7359,26 @@ class StrandsAgent:
                 # strands-agents 1.22.0 it also left that invocation holding the
                 # SDK's concurrency lock, so the thread's next run could not
                 # start at all.
+                inner_run_loop = _abandoned_sdk_run_loop(agent_stream)
                 try:
-                    await agent_stream.aclose()
-                except (
-                    GeneratorExit,
-                    ValueError,
-                    RuntimeError,
-                    StopAsyncIteration,
-                ) as e:
-                    # Suppress context detachment errors - they occur when the generator
-                    # is closed in a different context, but don't affect functionality
-                    # These errors are logged by Strands internally, we just prevent them from propagating
-                    pass
-                except Exception as e:
-                    # Log other errors but don't fail
-                    logger.warning(f"Error closing agent stream: {e}")
+                    for generator in (agent_stream, inner_run_loop):
+                        if generator is None:
+                            continue
+                        try:
+                            await generator.aclose()
+                        except (
+                            GeneratorExit,
+                            ValueError,
+                            RuntimeError,
+                            StopAsyncIteration,
+                        ) as e:
+                            # Suppress context detachment errors - they occur when the generator
+                            # is closed in a different context, but don't affect functionality
+                            # These errors are logged by Strands internally, we just prevent them from propagating
+                            pass
+                        except Exception as e:
+                            # Log other errors but don't fail
+                            logger.warning(f"Error closing agent stream: {e}")
                 finally:
                     _restore_transient_model_context(strands_agent)
 
@@ -7405,7 +7443,7 @@ class StrandsAgent:
                         _collect_run_usage(run_usage)
                     )
                     return
-                if not _supports_repository_reconciliation(
+                if not _supports_session_reconciliation(
                     session_manager, strands_agent
                 ):
                     yield _interrupt_session_capability_error(

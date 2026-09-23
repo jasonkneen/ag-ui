@@ -107,6 +107,29 @@ def test_repository_capability_requires_public_repository_api_and_stable_agent_i
     )
 
 
+def test_snapshot_capability_requires_a_real_snapshot_manager_and_stable_ids(
+    tmp_path,
+):
+    snapshot = pytest.importorskip("strands.session.snapshot_session_manager")
+    storage = pytest.importorskip("strands.storage")
+    manager = snapshot.SnapshotSessionManager(
+        session_id="session-1", storage=storage.LocalFileStorage(str(tmp_path))
+    )
+    stable = SimpleNamespace(agent_id="stable-agent")
+
+    assert session_reconcile._supports_session_reconciliation(manager, stable)
+    assert not session_reconcile._supports_repository_reconciliation(manager, stable)
+    assert not session_reconcile._supports_session_reconciliation(
+        manager, SimpleNamespace(agent_id="")
+    )
+    # Only the SDK's own snapshot manager: a look-alike's save may not persist
+    # the agent the way restore reads it back.
+    assert not session_reconcile._supports_session_reconciliation(
+        SimpleNamespace(session_id="session-1", save_snapshot=lambda *a, **k: None),
+        stable,
+    )
+
+
 @pytest.mark.parametrize(
     ("throwing_owner", "throwing_attribute"),
     [
