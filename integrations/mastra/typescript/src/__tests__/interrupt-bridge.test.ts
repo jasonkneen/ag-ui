@@ -825,16 +825,19 @@ describe("interrupt bridge: standard RUN_FINISHED.outcome (opt-in)", () => {
       );
       const streamSpy = vi.spyOn(fakeAgent, "stream");
 
-      const { error, events } = await collectError(
+      const { error, events } = await collectRunError(
         agent,
         makeInput({
           resume: [{ interruptId: "", status: "resolved" }],
         } as any),
       );
 
-      expect(error.name).toBe("ResumeRequestError");
       expect(error.message).toContain("Invalid resume entry");
-      expect(events.map((e) => e.type)).toEqual([EventType.RUN_STARTED]);
+      expect(error.code).toBeUndefined();
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.RUN_ERROR,
+      ]);
       expect(calls).toHaveLength(0);
       expect(streamSpy).not.toHaveBeenCalled();
     });
@@ -871,7 +874,7 @@ describe("interrupt bridge: standard RUN_FINISHED.outcome (opt-in)", () => {
       expect(ids).toHaveLength(2);
 
       const streamSpy = vi.spyOn(fakeAgent, "stream");
-      const { error, events } = await collectError(
+      const { error, events } = await collectRunError(
         agent,
         makeInput({
           runId: "run-2",
@@ -885,9 +888,11 @@ describe("interrupt bridge: standard RUN_FINISHED.outcome (opt-in)", () => {
 
       expect(calls).toHaveLength(0);
       expect(streamSpy).not.toHaveBeenCalled();
-      expect(events.map((e) => e.type)).toEqual([EventType.RUN_STARTED]);
-      expect(error.name).toBe("ResumeRequestError");
-      expect((error as any).code).toBe("MASTRA_MULTIPLE_RESUME_ENTRIES");
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.RUN_ERROR,
+      ]);
+      expect(error.code).toBe("MASTRA_MULTIPLE_RESUME_ENTRIES");
       for (const id of ids) expect(error.message).toContain(id);
     });
   });

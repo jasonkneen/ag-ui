@@ -833,7 +833,7 @@ export class MastraAgent extends AbstractAgent {
       // the RUN_ERROR reaches onRunErrorEvent. A cancelled run is settled by the
       // abort listener above instead and reports nothing.
       let runErrored = false;
-      const failRun = (error: unknown) => {
+      const failRun = (error: unknown, code?: string) => {
         if (runErrored || subscriber.closed || abortController.signal.aborted) {
           return;
         }
@@ -841,6 +841,7 @@ export class MastraAgent extends AbstractAgent {
         subscriber.next({
           type: EventType.RUN_ERROR,
           message: error instanceof Error ? error.message : String(error),
+          ...(code ? { code } : {}),
         } as RunErrorEvent);
         subscriber.complete();
       };
@@ -858,7 +859,10 @@ export class MastraAgent extends AbstractAgent {
         try {
           directive = this.resolveResumeDirective(input);
         } catch (error) {
-          subscriber.error(error);
+          failRun(
+            error,
+            error instanceof ResumeRequestError ? error.code : undefined,
+          );
           return;
         }
 
