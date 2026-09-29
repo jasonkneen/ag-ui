@@ -385,12 +385,18 @@ class TestMultimodalE2E:
     # ---- Attachment filenames ---------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_named_attachments_reach_gemini_without_display_name(self, monkeypatch):
+    async def test_named_attachments_reach_gemini_without_display_name(
+        self, forced_llmock, monkeypatch
+    ):
         """Filenames ride as display_name in the session but never reach the Gemini API.
 
         The Gemini API backend rejects display_name, and ADK strips it from a
         copy of each part before building the request. Captures the request
         bodies google-genai serializes and sends to check exactly that.
+
+        Always runs on LLMock, even when a real GOOGLE_API_KEY is set: it checks
+        the request the adapter builds, not a model's answer, and its audio,
+        video and PDF samples are not valid files a live model would accept.
         """
         sent_bodies = []
         original_build_request = _api_client.BaseApiClient._build_request
