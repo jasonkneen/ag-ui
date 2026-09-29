@@ -26,7 +26,6 @@ describe("non-image media preservation", () => {
 
   it.each([
     ["audio", "audio/ogg", "audio"],
-    ["video", "video/mp4", "video"],
     ["document", "text/plain", "file"],
   ] as const)(
     "preserves %s for inline bytes, data URLs and remote URLs",
@@ -67,4 +66,88 @@ describe("non-image media preservation", () => {
       }
     },
   );
+});
+
+describe("TypeScript video compatibility", () => {
+  it.each([
+    [
+      "typed inline",
+      {
+        type: "video",
+        source: { type: "data", value: "AAA=", mimeType: "video/mp4" },
+        metadata: { filename: "clip.mp4" },
+      },
+      "data:video/mp4;base64,AAA=",
+    ],
+    [
+      "typed data URL",
+      {
+        type: "video",
+        source: { type: "url", value: "data:video/mp4;base64,AAA=" },
+        metadata: { filename: "clip.mp4" },
+      },
+      "data:video/mp4;base64,AAA=",
+    ],
+    [
+      "typed remote",
+      {
+        type: "video",
+        source: {
+          type: "url",
+          value: "https://example.com/clip.mp4",
+          mimeType: "video/mp4",
+        },
+        metadata: { filename: "clip.mp4" },
+      },
+      "https://example.com/clip.mp4",
+    ],
+    [
+      "legacy inline",
+      {
+        type: "binary",
+        data: "AAA=",
+        mimeType: "video/mp4",
+        filename: "clip.mp4",
+      },
+      "data:video/mp4;base64,AAA=",
+    ],
+    [
+      "legacy data URL",
+      {
+        type: "binary",
+        url: "data:video/mp4;base64,AAA=",
+        mimeType: "video/mp4",
+        filename: "clip.mp4",
+      },
+      "data:video/mp4;base64,AAA=",
+    ],
+    [
+      "legacy remote",
+      {
+        type: "binary",
+        url: "https://example.com/clip.mp4",
+        mimeType: "video/mp4",
+        filename: "clip.mp4",
+      },
+      "https://example.com/clip.mp4",
+    ],
+    [
+      "legacy id",
+      {
+        type: "binary",
+        id: "provider-video",
+        mimeType: "video/mp4",
+        filename: "clip.mp4",
+      },
+      "provider-video",
+    ],
+  ])("retains the base image_url shape for %s video", (_label, item, url) => {
+    // Legacy binary is an older wire shape outside the current content union.
+    const message: UserMessage = JSON.parse(
+      JSON.stringify({ id: "video", role: "user", content: [item] }),
+    );
+    expect(aguiMessagesToLangChain([message])[0].content).toEqual([
+      { type: "image_url", image_url: { url } },
+    ]);
+  });
 });

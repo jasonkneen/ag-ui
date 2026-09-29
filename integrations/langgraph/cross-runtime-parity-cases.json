@@ -1,5 +1,8 @@
 {
   "readme": [
+    "EXCEPTION: outbound video retains TypeScript's existing image_url path for Gemini compatibility.",
+    "Only these cases have typescriptVideoExpect; Python asserts expect unchanged.",
+    "The exception preserves no video filename or remote MIME/modality guarantee.",
     "ONE TABLE, TWO RUNTIMES. Every case below is fed to BOTH langgraph adapters —",
     "`integrations/langgraph/typescript/src/utils.ts` and",
     "`integrations/langgraph/python/ag_ui_langgraph/utils.py` — and both must produce",
@@ -5252,6 +5255,16 @@
       "pythonBuilds": [
         "VideoPart"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:video/mp4;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -5285,6 +5298,16 @@
       "pythonBuilds": [
         "VideoPart"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -5317,6 +5340,16 @@
       "pythonBuilds": [
         "VideoPart"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/a.bin"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -5646,6 +5679,16 @@
       "pythonBuilds": [
         "BinaryInputContent"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:video/mp4;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -6716,6 +6759,16 @@
       "pythonBuilds": [
         "VideoPart"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "data:video/mp4;base64,QUJD"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -6996,6 +7049,16 @@
       "pythonBuilds": [
         "VideoPart"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/content?id=synthetic-481"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {
@@ -7028,6 +7091,16 @@
       "pythonBuilds": [
         "BinaryInputContent"
       ],
+      "typescriptVideoExpect": {
+        "kept": [
+          {
+            "kind": "image_url",
+            "url": "https://example.com/content?id=synthetic-481"
+          }
+        ],
+        "dropped": 0,
+        "loggedDrops": 0
+      },
       "expect": {
         "kept": [
           {

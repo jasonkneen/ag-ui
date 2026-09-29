@@ -130,12 +130,12 @@ function inlineMediaData(
   return null;
 }
 
-/** Preserve modality independently of downstream provider capabilities. */
+/** Preserve audio/document modality; video keeps the existing provider-compatible URL path. */
 function standardBlockTypeFor(
   mediaType: string,
   mimeType: unknown,
   inline = true,
-): { type: "audio" | "video" | "file"; mimeType?: string } | null {
+): { type: "audio" | "file"; mimeType?: string } | null {
   const mime = firstNonEmptyString(mimeType);
   const resolvedMime = inline ? (mime ?? "application/octet-stream") : mime;
   if (mediaType === "audio") {
@@ -144,7 +144,8 @@ function standardBlockTypeFor(
       mimeType: inline ? (normalizedAudioMimeType(mime) ?? resolvedMime) : mime,
     };
   }
-  if (mediaType === "video") return { type: "video", mimeType: resolvedMime };
+  // Gemini's legacy standard-block converter rejects video blocks. Keep video
+  // on the existing image_url path for every source, including legacy binary.
   if (mediaType === "document") return { type: "file", mimeType: resolvedMime };
   return null;
 }

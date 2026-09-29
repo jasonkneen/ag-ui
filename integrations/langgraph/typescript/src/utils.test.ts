@@ -267,7 +267,7 @@ describe("Multimodal Message Conversion", () => {
       });
     });
 
-    it("keeps video as standard media, whatever the source", () => {
+    it("keeps video on the existing image_url path, whatever the source", () => {
       const aguiMessage: UserMessage = {
         id: "test-video",
         role: "user",
@@ -297,15 +297,12 @@ describe("Multimodal Message Conversion", () => {
         throw new Error("Expected content blocks");
       expect(content).toEqual([
         {
-          type: "video",
-          source_type: "base64",
-          data: "dmlkZW9kYXRh",
-          mime_type: "video/mp4",
+          type: "image_url",
+          image_url: { url: "data:video/mp4;base64,dmlkZW9kYXRh" },
         },
         {
-          type: "video",
-          source_type: "url",
-          url: "https://example.com/clip.mp4",
+          type: "image_url",
+          image_url: { url: "https://example.com/clip.mp4" },
         },
       ]);
     });
@@ -690,7 +687,7 @@ describe("Multimodal Message Conversion", () => {
       return { wire: wire[0], content: content[0] };
     };
 
-    it("keeps a video a video across the round trip", () => {
+    it("recovers inline video MIME without adding filename transport", () => {
       const { wire, content } = roundTrip({
         type: "video",
         source: { type: "data", value: "SGVsbG8=", mimeType: "video/mp4" },
@@ -698,14 +695,10 @@ describe("Multimodal Message Conversion", () => {
       } as VideoPart);
 
       expect(wire).toEqual({
-        type: "video",
-        source_type: "base64",
-        data: "SGVsbG8=",
-        mime_type: "video/mp4",
-        metadata: { filename: "clip.mp4" },
+        type: "image_url",
+        image_url: { url: "data:video/mp4;base64,SGVsbG8=" },
       });
       expect(content).toEqual({
-        metadata: { filename: "clip.mp4" },
         type: "video",
         source: { type: "data", value: "SGVsbG8=", mimeType: "video/mp4" },
       });
@@ -737,10 +730,8 @@ describe("Multimodal Message Conversion", () => {
       } as LegacyBinaryInputContent);
 
       expect(wire).toEqual({
-        type: "video",
-        source_type: "base64",
-        data: "SGVsbG8=",
-        mime_type: "video/mp4",
+        type: "image_url",
+        image_url: { url: "data:video/mp4;base64,SGVsbG8=" },
       });
       expect(content).toEqual({
         type: "video",
@@ -800,7 +791,7 @@ describe("Multimodal Message Conversion", () => {
       );
     });
 
-    it("preserves URL-sourced video modality", () => {
+    it("keeps the existing image interpretation for remote video URLs", () => {
       const { content } = roundTrip({
         type: "video",
         source: {
@@ -811,11 +802,10 @@ describe("Multimodal Message Conversion", () => {
       } as VideoPart);
 
       expect(content).toEqual({
-        type: "video",
+        type: "image",
         source: {
           type: "url",
           value: "https://example.com/clip.mp4",
-          mimeType: "video/mp4",
         },
       });
     });
@@ -2603,38 +2593,6 @@ describe("Multimodal Message Conversion", () => {
         /must be formatted as a data URL/,
       ],
       [
-        "video by base64",
-        {
-          type: "video",
-          source: { type: "data", value: "AAA=", mimeType: "video/mp4" },
-        },
-        {
-          type: "video",
-          source_type: "base64",
-          data: "AAA=",
-          mime_type: "video/mp4",
-        },
-        /'video'.*not recognized/,
-      ],
-      [
-        "video by url",
-        {
-          type: "video",
-          source: {
-            type: "url",
-            value: "https://example.com/v.mp4",
-            mimeType: "video/mp4",
-          },
-        },
-        {
-          type: "video",
-          source_type: "url",
-          url: "https://example.com/v.mp4",
-          mime_type: "video/mp4",
-        },
-        /'video'.*not recognized/,
-      ],
-      [
         "file by url",
         {
           type: "document",
@@ -3571,6 +3529,12 @@ describe("cross-runtime parity table", () => {
      */
     pythonBuild?: "unvalidated";
     expect: { kept: unknown[]; dropped: number; loggedDrops: number };
+    /** Only outbound video keeps TypeScript's existing image_url compatibility path. */
+    typescriptVideoExpect?: {
+      kept: unknown[];
+      dropped: number;
+      loggedDrops: number;
+    };
   }
 
   const table: { readme: string[]; cases: ParityCase[] } = JSON.parse(
@@ -3747,9 +3711,7 @@ describe("cross-runtime parity table", () => {
       `  why: ${testCase.why}`,
       `  input: ${JSON.stringify(testCase.content)}`,
       "  This runtime (TypeScript) disagrees with cross-runtime-parity-cases.json,",
-      "  which records the outcome BOTH adapters must produce and which the Python",
-      "  adapter produces today. Fix the runtime that is wrong — do not split the",
-      "  expectation.",
+      "  using the explicit TypeScript video expectation where present.",
     ].join("\n");
   }
 
@@ -3773,7 +3735,9 @@ describe("cross-runtime parity table", () => {
   it.each(outboundCases.map((c) => [c.id, c] as const))(
     "outbound %s",
     (_id, testCase) => {
-      expect(outcomeOf(testCase), report(testCase)).toEqual(testCase.expect);
+      expect(outcomeOf(testCase), report(testCase)).toEqual(
+        testCase.typescriptVideoExpect ?? testCase.expect,
+      );
     },
   );
 });

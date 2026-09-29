@@ -9,18 +9,7 @@ const input: RunAgentInput = {
   tools: [],
   context: [],
   forwardedProps: {},
-  messages: [
-    {
-      id: "video",
-      role: "user",
-      content: [
-        {
-          type: "video",
-          source: { type: "data", value: "AAAA", mimeType: "video/mp4" },
-        },
-      ],
-    },
-  ],
+  messages: [{ id: "text", role: "user", content: "Hello" }],
 };
 
 function makeAgent(mode: "in-band" | "throw" | "prepare") {
@@ -28,9 +17,7 @@ function makeAgent(mode: "in-band" | "throw" | "prepare") {
     graphId: "test",
     deploymentUrl: "http://localhost:8000",
   });
-  const failure = new Error(
-    "Unsupported video format from provider translator",
-  );
+  const failure = new Error("Producer failed while processing text");
   const client = {
     assistants: {
       search: vi
@@ -81,6 +68,22 @@ async function collect(agent: LangGraphAgent) {
 }
 
 describe("public run error lifecycle", () => {
+  it("resolves runAgent and notifies onRunErrorEvent for a text-only producer failure", async () => {
+    const { agent } = makeAgent("throw");
+    agent.messages = input.messages;
+    const errors: string[] = [];
+    const result = await agent.runAgent(
+      { runId: input.runId },
+      {
+        onRunErrorEvent: ({ event }) => {
+          errors.push(event.message);
+        },
+      },
+    );
+    expect(result).toBeDefined();
+    expect(errors).toEqual(["Producer failed while processing text"]);
+    expect(agent.isRunning).toBe(false);
+  });
   it("does not emit errors after the caller unsubscribes", async () => {
     const { agent } = makeAgent("throw");
     let rejectPreparation!: (error: Error) => void;
@@ -111,14 +114,7 @@ describe("public run error lifecycle", () => {
             input: expect.objectContaining({
               messages: [
                 expect.objectContaining({
-                  content: [
-                    {
-                      type: "video",
-                      source_type: "base64",
-                      data: "AAAA",
-                      mime_type: "video/mp4",
-                    },
-                  ],
+                  content: "Hello",
                 }),
               ],
             }),
@@ -137,7 +133,7 @@ describe("public run error lifecycle", () => {
       ).toEqual([EventType.RUN_ERROR]);
       expect(events.at(-1)?.type).toBe(EventType.RUN_ERROR);
       expect(events.at(-1)?.message).toContain(
-        "Unsupported video format from provider translator",
+        "Producer failed while processing text",
       );
     },
   );

@@ -17,6 +17,21 @@ as a `RUN_ERROR`; it is not relabeled as an image. Existing inline WAV/MP3 MIME 
 are normalized for compatibility, while other audio MIME types remain unchanged.
 Provider file handles remain unsupported and are skipped with a warning.
 
+## Run errors
+
+Graph/provider and stream failures are delivered by the public `run()` async
+iterator as a terminal `RUN_ERROR` event, followed by stream completion without
+`RUN_FINISHED`. This also applies to text-only runs. Inspect the yielded error
+event instead of relying on these producer exceptions escaping the iterator.
+Cancellation still propagates, and private stream helpers retain their exception
+behavior.
+
+For TypeScript AG-UI clients consuming this stream, handle producer failures in
+`onRunErrorEvent` when using `runAgent()`, or inspect the emitted `RUN_ERROR` when
+subscribing to `run()`. These producer failures no longer reject the `runAgent()`
+promise or invoke the Observable's `error` callback. Consumer and client-side
+validation failures retain their existing error behavior.
+
 ## Installation
 
 ```bash
