@@ -10,7 +10,7 @@ import {
   makeRemoteMastraAgent,
   makeInput,
   collectEvents,
-  collectError,
+  collectRunError,
 } from "./helpers";
 
 describe("working memory edge cases", () => {
@@ -290,7 +290,7 @@ describe("error handling", () => {
       ],
     });
 
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
     expect(error.message).toBe("Something went wrong");
 
     expect(events[0].type).toBe(EventType.RUN_STARTED);
@@ -309,7 +309,7 @@ describe("error handling", () => {
       resourceId: "resource-1",
     });
 
-    const { error } = await collectError(agent, makeInput());
+    const { error } = await collectRunError(agent, makeInput());
     expect(error.message).toBe("Agent connection failed");
   });
 
@@ -325,8 +325,126 @@ describe("error handling", () => {
       resourceId: "resource-1",
     });
 
-    const { error } = await collectError(agent, makeInput());
+    const { error } = await collectRunError(agent, makeInput());
     expect(error.message).toBe("Remote agent unavailable");
+  });
+
+  describe("RUN_ERROR", () => {
+    const failingChunks = [
+      { type: "text-delta", payload: { text: "Hello" } },
+      { type: "error", payload: { error: "Model overloaded" } },
+      { type: "text-delta", payload: { text: "never sent" } },
+    ];
+
+    it.each([
+      ["local", () => makeLocalMastraAgent({ streamChunks: failingChunks })],
+      ["remote", () => makeRemoteMastraAgent({ streamChunks: failingChunks })],
+    ])(
+      "ends a %s run that hits an error chunk with exactly one RUN_ERROR",
+      async (_kind, makeAgent) => {
+        const { events } = await collectRunError(makeAgent(), makeInput());
+
+        expect(events.map((e) => e.type)).toEqual([
+          EventType.RUN_STARTED,
+          EventType.TEXT_MESSAGE_CHUNK,
+          EventType.RUN_ERROR,
+        ]);
+        expect(events[2]).toEqual({
+          type: EventType.RUN_ERROR,
+          message: "Model overloaded",
+        });
+      },
+    );
+
+    it("emits RUN_ERROR when the local agent's stream() throws", async () => {
+      const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
+      fakeAgent.stream = async () => {
+        throw new Error("Agent connection failed");
+      };
+      const agent = new MastraAgent({
+        agentId: "test-agent",
+        agent: fakeAgent as any,
+        resourceId: "resource-1",
+      });
+
+      const { events } = await collectRunError(agent, makeInput());
+
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.RUN_ERROR,
+      ]);
+      expect((events[1] as any).message).toBe("Agent connection failed");
+    });
+
+    // runAgent() applies events asynchronously. Erroring the Observable right
+    // after RUN_ERROR tears that pipeline down before the event is applied, so
+    // these drive runAgent() rather than the raw Observable.
+    it.each([
+      [
+        "fresh run",
+        () => makeLocalMastraAgent({ streamChunks: failingChunks }),
+        {},
+      ],
+      [
+        "local resume",
+        () => makeLocalMastraAgent({ resumeChunks: failingChunks }),
+        {
+          resume: [
+            {
+              interruptId: "r::tc-1",
+              status: "resolved" as const,
+              payload: { approved: true },
+            },
+          ],
+        },
+      ],
+      [
+        "remote resume",
+        () => makeRemoteMastraAgent({ resumeChunks: failingChunks }),
+        {
+          resume: [
+            {
+              interruptId: "r::tc-1",
+              status: "resolved" as const,
+              payload: { approved: true },
+            },
+          ],
+        },
+      ],
+    ])(
+      "delivers the RUN_ERROR to runAgent() subscribers on a %s",
+      async (_kind, makeAgent, params) => {
+        const agent = makeAgent();
+        const runErrors: string[] = [];
+        const failures: unknown[] = [];
+        const seen: string[] = [];
+
+        const settled = await agent
+          .runAgent(params, {
+            onEvent: ({ event }) => {
+              seen.push(event.type);
+            },
+            onRunErrorEvent: ({ event }) => {
+              runErrors.push(event.message);
+            },
+            onRunFailed: ({ error }) => {
+              failures.push(error);
+            },
+          })
+          .then(
+            () => "resolved",
+            () => "rejected",
+          );
+
+        expect(runErrors).toEqual(["Model overloaded"]);
+        expect(seen[seen.length - 1]).toBe(EventType.RUN_ERROR);
+        expect(seen).not.toContain(EventType.RUN_FINISHED);
+        // The failure is reported as an event, like an HttpAgent whose server
+        // sent RUN_ERROR and closed the stream, not as a rejected run.
+        expect(settled).toBe("resolved");
+        expect(failures).toEqual([]);
+      },
+    );
   });
 
   it("still emits RUN_FINISHED when getWorkingMemory throws on run finish", async () => {
