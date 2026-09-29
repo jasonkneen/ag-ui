@@ -322,6 +322,58 @@ The middleware emits the following AG-UI events for tools:
 | `TOOL_CALL_ARGS` | Tool arguments provided |
 | `TOOL_CALL_END` | Tool execution completes |
 
+## Interrupts and Resume
+
+With `emit_interrupt_outcome=True`, a run that pauses for a human decision
+ends with a `RUN_FINISHED` event carrying an
+[interrupt outcome](https://docs.ag-ui.com/concepts/interrupts)
+(`outcome.type == "interrupt"`). The tool call events are still emitted, so
+existing frontends that render them keep working.
+
+The flag defaults to `False`. Once a `RUN_FINISHED` carries interrupts,
+`@ag-ui/client` rejects the next run unless it answers them through
+`RunAgentInput.resume`, so frontends that answer with a plain tool message
+(CopilotKit `useHumanInTheLoop`, the predictive-state `confirm_changes` dialog)
+would fail. Turn it on only with a frontend that resumes via
+`RunAgentInput.resume` (for example CopilotKit `useInterrupt`):
+
+```python
+agent = ADKAgent.from_app(adk_app, user_id="user123", emit_interrupt_outcome=True)
+```
+
+Two pauses are reported:
+
+| Pause | `reason` | `id` / `toolCallId` | `metadata` |
+|-------|----------|---------------------|------------|
+| ADK tool confirmation (`tool_context.request_confirmation()`) | `confirmation` | the `adk_request_confirmation` tool call id | `{"adk": {"originalFunctionCall", "toolConfirmation"}}` |
+| Predictive-state review (`confirm_changes`) | `confirm_changes` | the `confirm_changes` tool call id | `{"predict_state": [...]}` |
+
+The confirmation interrupt's `message` is the hint passed to
+`request_confirmation()`. Ordinary frontend tool calls (`AGUIToolset`) are not
+reported as interrupts.
+
+Whatever the flag, a client can answer either with a `role: "tool"` message, as
+before, or with `RunAgentInput.resume`, where `interruptId` is the tool call id:
+
+| Target | `resolved` | `cancelled` |
+|--------|------------|-------------|
+| `adk_request_confirmation` | a payload with `confirmed` is used as the confirmation; `false` or `{"approved": false}` denies; any other payload becomes `{"confirmed": true, "payload": <payload>}` | `{"confirmed": false}` |
+| `confirm_changes` | the decision, e.g. `{"accepted": true}` | rejected |
+| any other pending tool call | the payload is the tool result | `{"status": "cancelled", "cancelled": true}` |
+
+A resume entry that names no pending call or open interrupt ends the run with
+`RUN_ERROR` (code `UNKNOWN_INTERRUPT`). If a tool message and a resume entry
+answer the same call, the resume entry wins.
+
+The `confirm_changes` decision is not an ADK tool result (ADK never called that
+tool), so the middleware hands it to the model as user text on the next run,
+for example "The user rejected the proposed changes, so they were not applied."
+This also happens whatever the flag. The open `confirm_changes` ids are kept in
+ADK session state (`_ag_ui_pending_confirm_changes`, backend-managed and never
+sent in `STATE_SNAPSHOT`), so the decision is delivered exactly once, including
+when it arrives at another instance that shares the session store. An answer
+already delivered is ignored when the history is replayed.
+
 ## Best Practices
 
 1. **Tool Design**: Create tools with clear, single responsibilities
