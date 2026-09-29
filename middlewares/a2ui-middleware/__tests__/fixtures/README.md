@@ -35,3 +35,11 @@ must instead produce the dashboard on its render call and flight cards on their
 own flight call. Existing recovery tests cover the legacy nested-render path
 where adapters omit parent message IDs. Separate synthetic unit events exercise
 out-of-order ordinary results and failure envelopes.
+
+## Parallel-call limitation
+
+Sibling detection requires matching, nonempty `parentMessageId` values on both
+`TOOL_CALL_START` events. If an adapter omits either parent ID, the middleware
+retains the legacy nesting fallback, so independent parallel calls may still
+share an activity or have their output suppressed. Adapters should preserve the
+originating assistant message ID on each sibling call.
