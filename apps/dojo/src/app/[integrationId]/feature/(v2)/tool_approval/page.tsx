@@ -21,6 +21,11 @@ interface ApprovalRequest {
   args?: { amount?: number; description?: string };
 }
 
+// Approval details as the bridge sends them, before the type check.
+interface ApprovalPayload extends ApprovalRequest {
+  type?: unknown;
+}
+
 // The @ag-ui/mastra bridge publishes a pending approval on both channels: the
 // standard interrupt (`event.value` is the Interrupt, details under
 // `metadata.mastra`) and the legacy on_interrupt event (`event.value` is a JSON
@@ -35,9 +40,9 @@ function readApprovalRequest(value: unknown): ApprovalRequest | null {
     }
   }
   if (!parsed || typeof parsed !== "object") return null;
-  const standard = (parsed as { metadata?: { mastra?: Record<string, any> } })
+  const standard = (parsed as { metadata?: { mastra?: ApprovalPayload } })
     .metadata?.mastra;
-  const request = standard ?? (parsed as Record<string, any>);
+  const request = standard ?? (parsed as ApprovalPayload);
   if (request.type !== "mastra_tool_approval") return null;
   return { toolName: request.toolName, args: request.args };
 }
