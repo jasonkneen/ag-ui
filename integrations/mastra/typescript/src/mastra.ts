@@ -827,11 +827,11 @@ export class MastraAgent extends AbstractAgent {
       }
 
       // The single failure exit for this run: exactly one RUN_ERROR, then the
-      // Observable completes, the same shape a remote agent has over HttpAgent.
-      // Completing rather than erroring is deliberate: runAgent() applies events
-      // asynchronously, and an Observable error tears that pipeline down before
-      // the RUN_ERROR reaches onRunErrorEvent. A cancelled run is settled by the
-      // abort listener above instead and reports nothing.
+      // Observable errors with the original error, so the existing failure
+      // contract (rejections, onRunFailed, the Error itself) is unchanged.
+      // runAgent() subscribers may not see the RUN_ERROR until the client
+      // applies queued events before propagating a source error. A cancelled
+      // run is settled by the abort listener above instead and reports nothing.
       let runErrored = false;
       const failRun = (error: unknown, code?: string) => {
         if (runErrored || subscriber.closed || abortController.signal.aborted) {
@@ -843,7 +843,7 @@ export class MastraAgent extends AbstractAgent {
           message: error instanceof Error ? error.message : String(error),
           ...(code ? { code } : {}),
         } as RunErrorEvent);
-        subscriber.complete();
+        subscriber.error(error);
       };
 
       const run = async () => {

@@ -1,4 +1,4 @@
-import type { BaseEvent, RunAgentInput, RunErrorEvent } from "@ag-ui/client";
+import type { BaseEvent, RunAgentInput } from "@ag-ui/client";
 import { EventType } from "@ag-ui/client";
 import { firstValueFrom, toArray } from "rxjs";
 import { MastraAgent } from "../mastra";
@@ -223,35 +223,31 @@ export function collectEvents(
 }
 
 /**
- * Runs `input` to a failure. A failed run ends with exactly one RUN_ERROR and
- * then completes, the same shape a remote agent has over HttpAgent. Rejects if
- * the run finishes cleanly, errors the Observable, or reports more than once.
+ * Runs `input` to a failure: exactly one RUN_ERROR as the last event, then an
+ * Observable error. Rejects if the run completes or errors without that event.
  */
 export function collectRunError(
   agent: MastraAgent,
   input: RunAgentInput,
-): Promise<{ error: RunErrorEvent; events: BaseEvent[] }> {
+): Promise<{ error: Error; events: BaseEvent[] }> {
   const events: BaseEvent[] = [];
   return new Promise((resolve, reject) => {
     agent.run(input).subscribe({
       next: (event) => events.push(event),
-      error: (err) =>
-        reject(
-          new Error(`Expected RUN_ERROR then completion, got an error: ${err}`),
-        ),
-      complete: () => {
+      error: (err) => {
         const last = events[events.length - 1];
         const runErrors = events.filter((e) => e.type === EventType.RUN_ERROR);
         if (runErrors.length === 1 && last?.type === EventType.RUN_ERROR) {
-          resolve({ error: last as RunErrorEvent, events });
+          resolve({ error: err, events });
         } else {
           reject(
             new Error(
-              `Expected one terminal RUN_ERROR, got: ${events.map((e) => e.type).join(", ")}`,
+              `Expected one RUN_ERROR before the error, got: ${events.map((e) => e.type).join(", ")}`,
             ),
           );
         }
       },
+      complete: () => reject(new Error("Expected error but completed")),
     });
   });
 }

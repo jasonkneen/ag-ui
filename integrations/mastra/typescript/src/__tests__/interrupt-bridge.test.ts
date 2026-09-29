@@ -832,12 +832,16 @@ describe("interrupt bridge: standard RUN_FINISHED.outcome (opt-in)", () => {
         } as any),
       );
 
+      expect(error.name).toBe("ResumeRequestError");
       expect(error.message).toContain("Invalid resume entry");
-      expect(error.code).toBeUndefined();
       expect(events.map((e) => e.type)).toEqual([
         EventType.RUN_STARTED,
         EventType.RUN_ERROR,
       ]);
+      expect(events[1]).toEqual({
+        type: EventType.RUN_ERROR,
+        message: error.message,
+      });
       expect(calls).toHaveLength(0);
       expect(streamSpy).not.toHaveBeenCalled();
     });
@@ -892,8 +896,14 @@ describe("interrupt bridge: standard RUN_FINISHED.outcome (opt-in)", () => {
         EventType.RUN_STARTED,
         EventType.RUN_ERROR,
       ]);
-      expect(error.code).toBe("MASTRA_MULTIPLE_RESUME_ENTRIES");
+      expect(error.name).toBe("ResumeRequestError");
+      expect((error as any).code).toBe("MASTRA_MULTIPLE_RESUME_ENTRIES");
       for (const id of ids) expect(error.message).toContain(id);
+      expect(events[1]).toEqual({
+        type: EventType.RUN_ERROR,
+        message: error.message,
+        code: "MASTRA_MULTIPLE_RESUME_ENTRIES",
+      });
     });
   });
 });

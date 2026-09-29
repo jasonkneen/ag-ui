@@ -545,7 +545,7 @@ describe("run() cancellation propagation (#2288)", () => {
       ).resolves.toBeDefined();
     });
 
-    it("does not report a stream that rejects after abortRun() as a RUN_ERROR", async () => {
+    it("does not report a stream that rejects after abortRun() as a failure", async () => {
       const gate = deferred();
       const stream = (async function* () {
         yield { type: "text-delta", payload: { text: "first" } };
@@ -563,13 +563,20 @@ describe("run() cancellation propagation (#2288)", () => {
       const events: BaseEvent[] = [];
       const firstChunk = deferred();
       const settled = deferred();
+      let outcome: "complete" | "error" | null = null;
       agent.run(STREAM_INPUT).subscribe({
         next: (event) => {
           events.push(event);
           if (event.type === EventType.TEXT_MESSAGE_CHUNK) firstChunk.release();
         },
-        error: () => settled.release(),
-        complete: () => settled.release(),
+        error: () => {
+          outcome = "error";
+          settled.release();
+        },
+        complete: () => {
+          outcome = "complete";
+          settled.release();
+        },
       });
 
       await firstChunk.promise;

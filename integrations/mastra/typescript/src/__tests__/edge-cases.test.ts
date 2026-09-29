@@ -342,8 +342,12 @@ describe("error handling", () => {
     ])(
       "ends a %s run that hits an error chunk with exactly one RUN_ERROR",
       async (_kind, makeAgent) => {
-        const { events } = await collectRunError(makeAgent(), makeInput());
+        const { error, events } = await collectRunError(
+          makeAgent(),
+          makeInput(),
+        );
 
+        expect(error.message).toBe("Model overloaded");
         expect(events.map((e) => e.type)).toEqual([
           EventType.RUN_STARTED,
           EventType.TEXT_MESSAGE_CHUNK,
@@ -356,10 +360,11 @@ describe("error handling", () => {
       },
     );
 
-    it("emits RUN_ERROR when the local agent's stream() throws", async () => {
+    it("emits RUN_ERROR, then the original error, when the local agent's stream() throws", async () => {
+      const thrown = new Error("Agent connection failed");
       const fakeAgent = new FakeLocalAgent({ streamChunks: [] });
       fakeAgent.stream = async () => {
-        throw new Error("Agent connection failed");
+        throw thrown;
       };
       const agent = new MastraAgent({
         agentId: "test-agent",
@@ -367,7 +372,10 @@ describe("error handling", () => {
         resourceId: "resource-1",
       });
 
-      const { events } = await collectRunError(agent, makeInput());
+      const { error, events } = await collectRunError(agent, makeInput());
+
+      // The Observable still errors with the very error that was thrown.
+      expect(error).toBe(thrown);
 
       expect(events.map((e) => e.type)).toEqual([
         EventType.RUN_STARTED,
@@ -376,9 +384,8 @@ describe("error handling", () => {
       expect((events[1] as any).message).toBe("Agent connection failed");
     });
 
-    // runAgent() applies events asynchronously. Erroring the Observable right
-    // after RUN_ERROR tears that pipeline down before the event is applied, so
-    // these drive runAgent() rather than the raw Observable.
+    // Emitting RUN_ERROR must not change what runAgent() callers already rely
+    // on: the run still rejects with the original error and onRunFailed fires.
     it.each([
       [
         "fresh run",
@@ -412,37 +419,30 @@ describe("error handling", () => {
         },
       ],
     ])(
-      "delivers the RUN_ERROR to runAgent() subscribers on a %s",
+      "keeps runAgent() rejecting with the original error on a %s",
       async (_kind, makeAgent, params) => {
+        const errorSpy = vi
+          .spyOn(console, "error")
+          .mockImplementation(() => {});
         const agent = makeAgent();
-        const runErrors: string[] = [];
         const failures: unknown[] = [];
-        const seen: string[] = [];
 
-        const settled = await agent
+        const rejection = await agent
           .runAgent(params, {
-            onEvent: ({ event }) => {
-              seen.push(event.type);
-            },
-            onRunErrorEvent: ({ event }) => {
-              runErrors.push(event.message);
-            },
             onRunFailed: ({ error }) => {
               failures.push(error);
             },
           })
           .then(
-            () => "resolved",
-            () => "rejected",
+            () => undefined,
+            (error: unknown) => error,
           );
+        errorSpy.mockRestore();
 
-        expect(runErrors).toEqual(["Model overloaded"]);
-        expect(seen[seen.length - 1]).toBe(EventType.RUN_ERROR);
-        expect(seen).not.toContain(EventType.RUN_FINISHED);
-        // The failure is reported as an event, like an HttpAgent whose server
-        // sent RUN_ERROR and closed the stream, not as a rejected run.
-        expect(settled).toBe("resolved");
-        expect(failures).toEqual([]);
+        expect(rejection).toBeInstanceOf(Error);
+        expect((rejection as Error).message).toBe("Model overloaded");
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toBe(rejection);
       },
     );
   });
