@@ -14,7 +14,7 @@ import {
   FakeRemoteAgent,
   makeInput,
   collectEvents,
-  collectError,
+  collectRunError,
 } from "./helpers";
 import { MastraAgent } from "../mastra";
 
@@ -225,7 +225,7 @@ describe("tool approval: pause surfaces an interrupt", () => {
         },
       ],
     });
-    const { error } = await collectError(agent, makeInput());
+    const { error } = await collectRunError(agent, makeInput());
     expect(error.message).toMatch(/tool-call-approval/);
   });
 });
