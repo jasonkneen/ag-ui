@@ -580,20 +580,23 @@ function realApprovalAgent(level: "tool" | "agent") {
     ...(level === "tool" ? { requireApproval: true } : {}),
     execute,
   });
+  // One store for both the thread messages and the workflow snapshots, so a
+  // test can read everything Mastra persisted from a single place.
+  const storage = new InMemoryStore();
   const mastraAgent = new Agent({
     id: "approval-agent",
     name: "approval-agent",
     instructions: "Record expenses when asked.",
     model: approvalModel() as any,
     tools: { record_expense: tool },
-    memory: new MockMemory() as any,
+    memory: new MockMemory({ storage }) as any,
     ...(level === "agent"
       ? { defaultOptions: { requireToolApproval: true } }
       : {}),
   });
   const mastra = new Mastra({
     agents: { approval: mastraAgent },
-    storage: new InMemoryStore(),
+    storage,
     logger: false,
   });
   const agent = new MastraAgent({
@@ -601,13 +604,90 @@ function realApprovalAgent(level: "tool" | "agent") {
     agent: mastra.getAgent("approval") as any,
     resourceId: "resource-1",
   });
-  return { agent, execute };
+  return { agent, execute, storage };
 }
 
 const userTurn = makeInput({
   runId: "run-1",
   messages: [{ id: "u1", role: "user", content: "Record a $250 expense" }],
 });
+
+function snapshotStatus(snapshot: unknown): unknown {
+  const value =
+    typeof snapshot === "string" ? JSON.parse(snapshot) : (snapshot as any);
+  return value?.status;
+}
+
+// What Mastra has persisted for a paused approval: the workflow runs still
+// suspended under the snapshot runId, and the stored tool invocation.
+async function storedApproval(
+  storage: InMemoryStore,
+  runId: string,
+  toolCallId: string,
+) {
+  const workflows = await storage.getStore("workflows");
+  const { runs } = await workflows!.listWorkflowRuns();
+  const suspendedRuns = runs
+    .filter(
+      (run) =>
+        run.runId === runId && snapshotStatus(run.snapshot) === "suspended",
+    )
+    .map((run) => run.workflowName);
+
+  const memory = await storage.getStore("memory");
+  const { messages } = await memory!.listMessages({ threadId: "thread-1" });
+  const invocation = messages
+    .flatMap((message) => message.content.parts ?? [])
+    .flatMap((part) => (part.type === "tool-invocation" ? [part] : []))
+    .map((part) => part.toolInvocation)
+    .find((inv) => inv.toolCallId === toolCallId);
+
+  return { suspendedRuns, invocation };
+}
+
+// A decline must leave no pending approval behind: the tool never ran, the
+// original call got Mastra's decline result, the snapshot is no longer
+// suspended, and the stored invocation is settled rather than still a `call`.
+async function expectDeclinedAndCleared(
+  resumed: BaseEvent[],
+  storage: InMemoryStore,
+  execute: ReturnType<typeof vi.fn>,
+) {
+  expect(execute).not.toHaveBeenCalled();
+
+  const results = resumed.filter(
+    (e) => e.type === EventType.TOOL_CALL_RESULT,
+  ) as any[];
+  expect(results).toHaveLength(1);
+  expect(results[0].toolCallId).toBe("tc-real");
+  const declineResult = JSON.parse(results[0].content);
+  expect(declineResult).toMatch(/not approved/);
+  expect(outcomeInterrupts(resumed)).toEqual([]);
+
+  const stored = await storedApproval(storage, "run-1", "tc-real");
+  expect(stored.suspendedRuns).toEqual([]);
+  expect(stored.invocation).toMatchObject({
+    state: "result",
+    result: declineResult,
+  });
+}
+
+async function pauseForApproval(level: "tool" | "agent") {
+  const setup = realApprovalAgent(level);
+  const first = await collectEvents(setup.agent, userTurn);
+  expect(setup.execute).not.toHaveBeenCalled();
+
+  // Guard against a vacuous "cleared" check: the pause is really persisted.
+  const stored = await storedApproval(setup.storage, "run-1", "tc-real");
+  expect(stored.suspendedRuns).not.toEqual([]);
+  expect(stored.invocation).toMatchObject({ state: "call" });
+
+  return { ...setup, first };
+}
+
+function canonicalResume(entry: Record<string, unknown>) {
+  return makeInput({ runId: "run-2", resume: [entry] } as any);
+}
 
 describe.each(["tool", "agent"] as const)(
   "tool approval: real @mastra/core round trip (%s-level approval)",
@@ -662,22 +742,43 @@ describe.each(["tool", "agent"] as const)(
     });
 
     it("decline resolves the pending approval in Mastra without executing", async () => {
-      const { agent, execute } = realApprovalAgent(level);
-      const value = legacyValue(await collectEvents(agent, userTurn));
+      const { agent, execute, storage, first } = await pauseForApproval(level);
+      const value = legacyValue(first);
 
       const resumed = await collectEvents(agent, legacyResume(value, false));
 
-      expect(execute).not.toHaveBeenCalled();
-      const result = resumed.find(
-        (e) => e.type === EventType.TOOL_CALL_RESULT,
-      ) as any;
-      expect(result.toolCallId).toBe("tc-real");
-      expect(JSON.parse(result.content)).toMatch(/not approved/);
+      await expectDeclinedAndCleared(resumed, storage, execute);
       const text = resumed
         .filter((e) => e.type === EventType.TEXT_MESSAGE_CHUNK)
         .map((e: any) => e.delta)
         .join("");
       expect(text).toBe("All done.");
     });
+
+    it.each([
+      ["resolved with { approved: false }", "resolved", { approved: false }],
+      ["cancelled without a payload", "cancelled", undefined],
+      // The status decides: a cancelled entry declines whatever it carries.
+      ["cancelled with an approving payload", "cancelled", { approved: true }],
+    ] as const)(
+      "a canonical entry %s declines and clears the pending approval",
+      async (_label, status, payload) => {
+        const { agent, execute, storage, first } =
+          await pauseForApproval(level);
+        const [interrupt] = outcomeInterrupts(first);
+
+        const resumed = await collectEvents(
+          agent,
+          canonicalResume({
+            interruptId: interrupt.id,
+            status,
+            ...(payload === undefined ? {} : { payload }),
+          }),
+        );
+
+        await expectDeclinedAndCleared(resumed, storage, execute);
+        expect(resumed[resumed.length - 1].type).toBe(EventType.RUN_FINISHED);
+      },
+    );
   },
 );
