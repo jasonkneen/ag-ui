@@ -245,24 +245,41 @@ function isToolApprovalEvent(interruptEvent: unknown): boolean {
   return (value as { type?: unknown } | null)?.type === TOOL_APPROVAL_TYPE;
 }
 
-// Only an explicit approval runs the tool; anything else declines.
-function isApprovedResume(resume: unknown): boolean {
-  return (
-    resume === true ||
-    (!!resume &&
-      typeof resume === "object" &&
-      (resume as { approved?: unknown }).approved === true)
-  );
+/**
+ * Reads a tool approval answer: `true` or `{ approved: true }` approves,
+ * `{ approved: false }` declines. Anything else returns `undefined`, which is
+ * not an answer, so the run fails and the approval stays pending.
+ */
+function parseApprovalAnswer(resume: unknown): boolean | undefined {
+  if (resume === true) return true;
+  if (resume && typeof resume === "object") {
+    const approved = (resume as { approved?: unknown }).approved;
+    if (typeof approved === "boolean") return approved;
+  }
+  return undefined;
+}
+
+function describeResumeValue(value: unknown): string {
+  if (value === undefined) return "no payload";
+  try {
+    const json = JSON.stringify(value);
+    return json.length > 80 ? `${json.slice(0, 80)}...` : json;
+  } catch {
+    return typeof value;
+  }
 }
 
 /**
  * What a run was asked to do about a suspended tool call, resolved from either
  * resume channel. `declined` comes from the entry's status (or, legacy,
  * `resume === false`), never from the payload value, so a resolved entry with
- * no payload still resumes.
+ * no payload still resumes an ordinary suspend. An approval also accepts
+ * `{ approved: false }` as a decline and rejects any other payload.
  */
 interface ResumeDirective {
   interruptEvent: unknown;
+  /** The canonical entry's interruptId; absent on the legacy channel. */
+  interruptId?: string;
   declined: boolean;
   resumeData: unknown;
 }
@@ -942,6 +959,27 @@ export class MastraAgent extends AbstractAgent {
             return;
           }
 
+          // Checked before any Mastra call so a malformed answer leaves the
+          // approval pending in Mastra, still answerable.
+          const approved = toolApproval
+            ? directive.declined
+              ? false
+              : parseApprovalAnswer(directive.resumeData)
+            : undefined;
+          if (toolApproval && approved === undefined) {
+            const target = directive.interruptId
+              ? `interrupt ${directive.interruptId} (toolCallId ${interruptEvent.toolCallId})`
+              : `toolCallId ${interruptEvent.toolCallId}`;
+            const error = new ResumeRequestError(
+              `Invalid tool approval answer for ${target}: received ${describeResumeValue(directive.resumeData)}. ` +
+                "Approve with true or { approved: true }; decline with { approved: false }, a cancelled entry, or a legacy resume of false. " +
+                "The approval is still pending.",
+              "MASTRA_INVALID_TOOL_APPROVAL",
+            );
+            failRun(error, error.code);
+            return;
+          }
+
           // Re-set this run's context so resume forwards it, not the prior turn's.
           const resumeRequestContext = this.applyInputContext(input.context);
 
@@ -1052,10 +1090,6 @@ export class MastraAgent extends AbstractAgent {
             );
             subscriber.complete();
           };
-
-          const approved = toolApproval
-            ? !directive.declined && isApprovedResume(directive.resumeData)
-            : undefined;
 
           try {
             if (this.isLocalMastraAgent(this.agent)) {
@@ -1376,6 +1410,7 @@ export class MastraAgent extends AbstractAgent {
           runId: sep >= 0 ? encodedId.slice(0, sep) : input.runId,
           ...(approval ? { type: TOOL_APPROVAL_TYPE } : {}),
         },
+        interruptId: entry.interruptId,
         declined: entry.status === "cancelled",
         resumeData: entry.payload,
       };

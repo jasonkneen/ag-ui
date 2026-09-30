@@ -155,12 +155,16 @@ dismisses the card and sends no resume, so the call stays pending in Mastra.
 
 - `{ status: "resolved", payload: { approved: true } }` approves (so does
   `payload: true`).
-- `{ status: "resolved", payload: { approved: false } }` declines, as does any
-  other payload.
+- `{ status: "resolved", payload: { approved: false } }` declines.
 - `{ status: "cancelled" }` declines, whatever payload it carries.
+- Any other resolved payload (none, `null`, `{}`, `{ approve: true }`,
+  `{ approved: "yes" }`, a string) fails the run with a `RUN_ERROR` coded
+  `MASTRA_INVALID_TOOL_APPROVAL`. Mastra is not called, so the approval stays
+  pending and can still be answered.
 
-The legacy `forwardedProps.command.resume` approves on `true` or
-`{ approved: true }` and declines otherwise. The bridge then completes the
+The legacy `forwardedProps.command.resume` follows the same rules: `true` or
+`{ approved: true }` approves, `false` or `{ approved: false }` declines, and
+anything else fails the run. The bridge then completes the
 original call, keyed by the snapshot `runId` and `toolCallId`: local agents
 call Mastra's `approveToolCall` or `declineToolCall`, and remote agents call
 `resumeStream({ approved })`, which is what those calls do on the server. The

@@ -432,6 +432,121 @@ describe("tool approval: resume completes the original call natively", () => {
   });
 });
 
+// Only `true`, `{ approved: boolean }` or a cancelled entry answers an
+// approval. Anything else fails the run before any Mastra call, so a client bug
+// cannot silently decline a call nobody declined.
+function spyOnMastraCalls(fake: FakeLocalAgent) {
+  return [
+    vi.spyOn(fake, "approveToolCall"),
+    vi.spyOn(fake, "declineToolCall"),
+    vi.spyOn(fake, "resumeStream"),
+    vi.spyOn(fake, "stream"),
+  ];
+}
+
+function expectInvalidApproval(error: Error, events: BaseEvent[]) {
+  expect(events.map((e) => e.type)).toEqual([
+    EventType.RUN_STARTED,
+    EventType.RUN_ERROR,
+  ]);
+  expect(error.name).toBe("ResumeRequestError");
+  expect((error as any).code).toBe("MASTRA_INVALID_TOOL_APPROVAL");
+  expect(error.message).toContain("tc-1");
+  expect(events[1]).toEqual({
+    type: EventType.RUN_ERROR,
+    message: error.message,
+    code: "MASTRA_INVALID_TOOL_APPROVAL",
+  });
+}
+
+const MALFORMED_ANSWERS = [
+  ["null", null],
+  ["{}", {}],
+  ["{ approve: true }", { approve: true }],
+  ['{ approved: "yes" }', { approved: "yes" }],
+  ["a string", "ok"],
+] as const;
+
+describe("tool approval: a malformed answer fails the run without calling Mastra", () => {
+  it.each([["no payload", undefined], ...MALFORMED_ANSWERS] as const)(
+    "a canonical resolved entry with %s",
+    async (_label, payload) => {
+      const { agent, fake } = makeLocal({ streamChunks: approvalChunks() });
+      const [interrupt] = outcomeInterrupts(
+        await collectEvents(agent, makeInput()),
+      );
+      const spies = spyOnMastraCalls(fake);
+
+      const { error, events } = await collectRunError(
+        agent,
+        makeInput({
+          runId: "run-2",
+          resume: [
+            {
+              interruptId: interrupt.id,
+              status: "resolved",
+              ...(payload === undefined ? {} : { payload }),
+            },
+          ],
+        } as any),
+      );
+
+      expectInvalidApproval(error, events);
+      expect(error.message).toContain(interrupt.id);
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      expect(fake.toolApprovalCalls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["{}", {}],
+    ["a string", "ok"],
+    ["null", null],
+  ] as const)("a legacy command.resume of %s", async (_label, resume) => {
+    const { agent, fake } = makeLocal({ streamChunks: approvalChunks() });
+    const value = legacyValue(await collectEvents(agent, makeInput()));
+    const spies = spyOnMastraCalls(fake);
+
+    const { error, events } = await collectRunError(
+      agent,
+      legacyResume(value, resume),
+    );
+
+    expectInvalidApproval(error, events);
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    expect(fake.toolApprovalCalls).toHaveLength(0);
+  });
+
+  it("a remote agent is not resumed either", async () => {
+    const { agent, fake } = makeRemote({
+      streamChunks: approvalChunks(),
+      resumeChunks: approvedResumeChunks(),
+    });
+    const [interrupt] = outcomeInterrupts(
+      await collectEvents(agent, makeInput()),
+    );
+    const streamSpy = vi.spyOn(fake, "stream");
+
+    const { error, events } = await collectRunError(
+      agent,
+      makeInput({
+        runId: "run-2",
+        resume: [
+          {
+            interruptId: interrupt.id,
+            status: "resolved",
+            payload: { approve: true },
+          },
+        ],
+      } as any),
+    );
+
+    expectInvalidApproval(error, events);
+    expect(fake.resumeCalls).toHaveLength(0);
+    expect(streamSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("tool approval: ordinary suspend is unchanged", () => {
   it("resume: false on a suspend still closes the run without calling Mastra", async () => {
     const { agent, fake } = makeLocal({ streamChunks: [] });
@@ -512,6 +627,24 @@ describe("tool approval: ordinary suspend is unchanged", () => {
     expect(fake.toolApprovalCalls).toHaveLength(0);
     expect(resumeSpy).toHaveBeenCalledWith(
       { chosen_time: "2pm" },
+      expect.objectContaining({ runId: "r", toolCallId: "tc-1" }),
+    );
+  });
+  it("a canonical suspend resume passes any payload to resumeStream unchanged", async () => {
+    const { agent, fake } = makeLocal({ streamChunks: [] });
+    const resumeSpy = vi.spyOn(fake, "resumeStream");
+
+    await collectEvents(
+      agent,
+      makeInput({
+        runId: "run-2",
+        resume: [{ interruptId: "r::tc-1", status: "resolved", payload: "ok" }],
+      } as any),
+    );
+
+    expect(fake.toolApprovalCalls).toHaveLength(0);
+    expect(resumeSpy).toHaveBeenCalledWith(
+      "ok",
       expect.objectContaining({ runId: "r", toolCallId: "tc-1" }),
     );
   });
@@ -780,5 +913,45 @@ describe.each(["tool", "agent"] as const)(
         expect(resumed[resumed.length - 1].type).toBe(EventType.RUN_FINISHED);
       },
     );
+    it("a malformed answer fails the run and leaves the approval answerable", async () => {
+      const { agent, execute, storage, first } = await pauseForApproval(level);
+      const [interrupt] = outcomeInterrupts(first);
+
+      const { error } = await collectRunError(
+        agent,
+        canonicalResume({
+          interruptId: interrupt.id,
+          status: "resolved",
+          payload: { approve: true },
+        }),
+      );
+
+      expect((error as any).code).toBe("MASTRA_INVALID_TOOL_APPROVAL");
+      expect(execute).not.toHaveBeenCalled();
+      const stored = await storedApproval(storage, "run-1", "tc-real");
+      expect(stored.suspendedRuns).not.toEqual([]);
+      expect(stored.invocation).toMatchObject({ state: "call" });
+
+      const resumed = await collectEvents(
+        agent,
+        canonicalResume({
+          interruptId: interrupt.id,
+          status: "resolved",
+          payload: { approved: true },
+        }),
+      );
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      const results = resumed.filter(
+        (e) => e.type === EventType.TOOL_CALL_RESULT,
+      ) as any[];
+      expect(results).toHaveLength(1);
+      expect(results[0].toolCallId).toBe("tc-real");
+      expect(JSON.parse(results[0].content)).toEqual({
+        recordId: "expense-250",
+        amount: 250,
+      });
+      expect(resumed[resumed.length - 1].type).toBe(EventType.RUN_FINISHED);
+    });
   },
 );
