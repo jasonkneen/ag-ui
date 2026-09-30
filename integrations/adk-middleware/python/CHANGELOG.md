@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a plain tool message (CopilotKit `useHumanInTheLoop`, the predictive-state
   `confirm_changes` dialog). Enable it with a frontend that resumes via
   `RunAgentInput.resume` (for example CopilotKit `useInterrupt`).
+- With `emit_interrupt_outcome=True`, the interrupt contract's rules 3 and 4
+  are enforced server side. While a thread has open interrupts (pending tool
+  confirmations and `confirm_changes` reviews, read from session state so
+  every instance enforces them), a run without a `resume` is rejected with
+  `RUN_ERROR` code `INTERRUPT_RESUME_REQUIRED` (this includes an answer sent as
+  a `role: "tool"` message), and a `resume` that leaves an open interrupt
+  unanswered is rejected with `INTERRUPT_RESUME_INCOMPLETE`. A rejection changes
+  nothing. Ordinary frontend tool calls never block. With the flag off nothing
+  is enforced.
 - `RunAgentInput.resume` is accepted, whatever `emit_interrupt_outcome` is set
   to, as an alternative to `role: "tool"` messages for answering a pending tool
   call or interrupt. Entries reuse the

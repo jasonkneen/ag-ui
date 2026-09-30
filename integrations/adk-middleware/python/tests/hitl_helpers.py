@@ -24,13 +24,15 @@ RC_TOOL_NAME = "adk_request_confirmation"
 
 
 class ScriptedLlm(BaseLlm):
-    """Turn 1 calls ``first_call`` (name, args); every later turn replies with text.
+    """Turn 1 calls ``first_call`` (name, args), or every call in ``first_calls``;
+    every later turn replies with text.
 
     Every request's final content is recorded in ``last_contents`` so a test can
     inspect exactly what reached the model on each turn.
     """
 
     first_call: Optional[Dict[str, Any]] = None
+    first_calls: Optional[List[Dict[str, Any]]] = None
     turn_count: int = 0
     last_contents: List[Any] = Field(default_factory=list)
 
@@ -40,17 +42,18 @@ class ScriptedLlm(BaseLlm):
         self.turn_count += 1
         contents = getattr(llm_request, "contents", None) or []
         self.last_contents.append(contents[-1] if contents else None)
-        if self.turn_count == 1 and self.first_call is not None:
+        calls = self.first_calls or ([self.first_call] if self.first_call else [])
+        if self.turn_count == 1 and calls:
             yield LlmResponse(
                 content=types.Content(
                     role="model",
                     parts=[
                         types.Part(
                             function_call=types.FunctionCall(
-                                name=self.first_call["name"],
-                                args=self.first_call.get("args", {}),
+                                name=call["name"], args=call.get("args", {})
                             )
                         )
+                        for call in calls
                     ],
                 ),
                 partial=False,
@@ -95,11 +98,13 @@ class ConfirmationTool:
 
 
 def build_confirmation_agent(
-    tool: ConfirmationTool, **agent_kwargs: Any
+    tool: ConfirmationTool, *, targets: tuple = ("foo",), **agent_kwargs: Any
 ) -> tuple[ADKAgent, ScriptedLlm]:
     llm = ScriptedLlm(
         model="scripted",
-        first_call={"name": "dangerous_action", "args": {"target": "foo"}},
+        first_calls=[
+            {"name": "dangerous_action", "args": {"target": target}} for target in targets
+        ],
     )
     agent = ADKAgent.from_app(
         App(
@@ -110,7 +115,7 @@ def build_confirmation_agent(
             resumability_config=ResumabilityConfig(is_resumable=True),
         ),
         user_id="test_user",
-        session_service=InMemorySessionService(),
+        session_service=agent_kwargs.pop("session_service", None) or InMemorySessionService(),
         **agent_kwargs,
     )
     return agent, llm

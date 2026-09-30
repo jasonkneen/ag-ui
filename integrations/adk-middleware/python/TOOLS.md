@@ -352,8 +352,11 @@ The confirmation interrupt's `message` is the hint passed to
 `request_confirmation()`. Ordinary frontend tool calls (`AGUIToolset`) are not
 reported as interrupts.
 
-Whatever the flag, a client can answer either with a `role: "tool"` message, as
-before, or with `RunAgentInput.resume`, where `interruptId` is the tool call id:
+With the flag off, a client can answer either with a `role: "tool"` message, as
+before, or with `RunAgentInput.resume`, where `interruptId` is the tool call id.
+With the flag on, open interrupts must be answered through `resume` (see
+[Enforcement](#enforcement-with-emit_interrupt_outcometrue) below); ordinary
+pending tool calls can still take either form.
 
 | Target | `resolved` | `cancelled` |
 |--------|------------|-------------|
@@ -373,6 +376,30 @@ ADK session state (`_ag_ui_pending_confirm_changes`, backend-managed and never
 sent in `STATE_SNAPSHOT`), so the decision is delivered exactly once, including
 when it arrives at another instance that shares the session store. An answer
 already delivered is ignored when the history is replayed.
+
+An answer is consumed only once its continuation is accepted. If the backend
+refuses to start the continuation (for example "Maximum concurrent executions
+reached"), the pending call or `confirm_changes` id and the answering message
+stay as they were, so the client can retry the same answer.
+
+### Enforcement with `emit_interrupt_outcome=True`
+
+With the flag on, the middleware enforces the interrupt contract's rules 3 and
+4. While a thread has open interrupts (pending tool confirmations and
+`confirm_changes` reviews, read from session state, so every instance sharing
+the store enforces them), a run is rejected with `RUN_ERROR` and nothing is
+changed:
+
+| Code | When |
+|------|------|
+| `INTERRUPT_RESUME_REQUIRED` | the run has no `resume`, for example a new user message, or an answer sent as a `role: "tool"` message |
+| `INTERRUPT_RESUME_INCOMPLETE` | the `resume` leaves at least one open interrupt unanswered |
+| `UNKNOWN_INTERRUPT` | a `resume` entry names no pending call or open interrupt (checked first, with or without the flag) |
+
+A tool message answering an open interrupt is therefore rejected with the flag
+on: the frontend must send `resume` instead. Ordinary frontend tool calls
+(`AGUIToolset`) are not interrupts and never block a run. With the flag off
+nothing is enforced.
 
 ## Best Practices
 

@@ -839,13 +839,12 @@ class TestConfirmChangesDecisionReachesModel:
     """The user's approve/reject decision on confirm_changes is handed to the
     model as user text on the next run, whether it arrives as the dojo's
     ToolMessage (``respond({accepted})`` -> ``'{"accepted":true}'``) or as a
-    ``resume`` entry. This holds whether or not RUN_FINISHED reports the
-    confirm_changes interrupt (``emit_interrupt_outcome``)."""
+    ``resume`` entry. A resume works whether or not RUN_FINISHED reports the
+    confirm_changes interrupt (``emit_interrupt_outcome``); a ToolMessage answer
+    is the flag-off path, since with the flag on an open interrupt must be
+    answered through ``resume`` (see test_interrupt_enforcement.py)."""
 
-    @pytest.fixture(autouse=True, params=[False, True], ids=["outcome_off", "outcome_on"])
-    def emit_outcome(self, request):
-        self.emit_outcome = request.param
-        return request.param
+    emit_outcome = False
 
     @pytest.fixture(autouse=True)
     def reset_session_manager(self):
@@ -985,9 +984,12 @@ class TestConfirmChangesDecisionReachesModel:
         assert "Now add a title" in text
 
     @pytest.mark.asyncio
-    async def test_resume_decision_reaches_model(self):
+    @pytest.mark.parametrize("emit_outcome", [False, True], ids=["outcome_off", "outcome_on"])
+    async def test_resume_decision_reaches_model(self, emit_outcome):
         from ag_ui.core import ResumeEntry
         from tests.hitl_helpers import collect, content_text, run_input
+
+        self.emit_outcome = emit_outcome
 
         agent, llm, confirm_id, history = await self._propose("t-decide-resume")
         turn2 = await collect(
@@ -1005,11 +1007,14 @@ class TestConfirmChangesDecisionReachesModel:
         assert "user rejected the proposed changes" in content_text(llm.last_contents[-1]).lower()
 
     @pytest.mark.asyncio
-    async def test_resume_decision_without_history_reaches_model(self):
+    @pytest.mark.parametrize("emit_outcome", [False, True], ids=["outcome_off", "outcome_on"])
+    async def test_resume_decision_without_history_reaches_model(self, emit_outcome):
         """Only the recorded open interrupt correlates this resume: the replayed
         history does not contain the confirm_changes call."""
         from ag_ui.core import ResumeEntry
         from tests.hitl_helpers import collect, content_text, run_input
+
+        self.emit_outcome = emit_outcome
 
         agent, llm, confirm_id, history = await self._propose("t-decide-bare")
         turn2 = await collect(

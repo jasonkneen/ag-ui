@@ -413,7 +413,11 @@ class ADKAgent:
                 ``confirm_changes`` dialog). Turn it on with a frontend that
                 resumes via ``RunAgentInput.resume`` (for example CopilotKit
                 ``useInterrupt``). ``resume`` input and the ``confirm_changes``
-                decision are handled either way.
+                decision are handled either way. When on, the interrupt
+                contract is also enforced: while a thread has open interrupts,
+                a run without a ``resume`` covering all of them is rejected
+                (``INTERRUPT_RESUME_REQUIRED`` / ``INTERRUPT_RESUME_INCOMPLETE``),
+                including an answer sent as a plain tool message.
 
             Note:
             If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
@@ -1401,6 +1405,13 @@ class ADKAgent:
                 )
                 return
 
+        # Nothing has been mutated yet (applying resume only rewrites the input).
+        if self._emit_interrupt_outcome:
+            rejection = await self._check_interrupt_resume(input, user_id)
+            if rejection is not None:
+                yield rejection
+                return
+
         unseen_messages = await self._get_unseen_messages(input)
 
         if not unseen_messages:
@@ -1702,6 +1713,47 @@ class ADKAgent:
         except Exception as e:
             logger.error(f"Failed to ensure session for thread {thread_id}: {e}")
             raise
+
+    async def _open_interrupt_ids(self, input: RunAgentInput, user_id: str) -> List[str]:
+        """Interrupts still awaiting an answer on this thread, from session state.
+
+        Pending ``adk_request_confirmation`` calls and open ``confirm_changes``
+        reviews. Other pending long-running calls (frontend tools) are not
+        interrupts.
+        """
+        open_ids: List[str] = []
+        for call_id in await self._get_pending_tool_call_ids(input.thread_id, user_id) or []:
+            if await self._find_pending_call_name(input, user_id, call_id) == REQUEST_CONFIRMATION_TOOL_NAME:
+                open_ids.append(call_id)
+        for confirm_id in await self._get_pending_confirm_changes(input.thread_id, user_id):
+            if confirm_id not in open_ids:
+                open_ids.append(confirm_id)
+        return open_ids
+
+    async def _check_interrupt_resume(
+        self, input: RunAgentInput, user_id: str
+    ) -> Optional[RunErrorEvent]:
+        """Enforce interrupt contract rules 3 and 4; returns the rejection, if any."""
+        open_ids = await self._open_interrupt_ids(input, user_id)
+        if not open_ids:
+            return None
+        resumed = {entry.interrupt_id for entry in getattr(input, "resume", None) or []}
+        missing = [interrupt_id for interrupt_id in open_ids if interrupt_id not in resumed]
+        if not missing:
+            return None
+        if not resumed:
+            code = "INTERRUPT_RESUME_REQUIRED"
+            message = (
+                f"Thread has open interrupt(s) {missing}; the run must answer them "
+                "through RunAgentInput.resume."
+            )
+        else:
+            code = "INTERRUPT_RESUME_INCOMPLETE"
+            message = (
+                f"resume must address every open interrupt; missing {missing}."
+            )
+        logger.warning("Rejecting run for thread %s: %s", input.thread_id, message)
+        return RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
 
     async def _apply_resume_entries(
         self, input: RunAgentInput, user_id: str
