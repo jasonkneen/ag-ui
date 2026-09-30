@@ -100,6 +100,24 @@ const WORKING_MEMORY_TOOL_NAMES = new Set([
   "update-working-memory",
 ]);
 
+// Chunk types the chunk processor handles without emitting anything.
+const SILENT_CHUNK_TYPES = new Set([
+  "text-start",
+  "text-end",
+  "reasoning-signature",
+  "redacted-reasoning",
+  "tool-output",
+  "abort",
+]);
+
+// Chunk types that can carry the turn's native message id.
+const MESSAGE_ID_CHUNK_TYPES = new Set([
+  "start",
+  "step-start",
+  "step-finish",
+  "finish",
+]);
+
 /**
  * Deep-merges a working-memory update onto the existing state, mirroring
  * @mastra/core's `deepMergeWorkingMemory` (the semantics schema/json working
@@ -558,6 +576,15 @@ interface MastraAgentStreamOptions {
   }) => void;
   /** Emit TOOL_CALL_END. Fired once per tool call, after all args. */
   onToolCallEnd?: (streamPart: { toolCallId: string }) => void;
+  /**
+   * A resumed tool call the client already holds under `parentMessageId`.
+   * Nothing is emitted for the call itself; later text on that id is placed
+   * after its result, as it is after a streamed call.
+   */
+  onToolCallInHistory?: (streamPart: {
+    toolCallId: string;
+    parentMessageId: string;
+  }) => void;
   onToolResultPart?: (streamPart: { toolCallId: string; result: any }) => void;
   onError: (error: Error) => void;
   /**
@@ -970,15 +997,24 @@ export class MastraAgent extends AbstractAgent {
             };
           }
 
-          const resumeReplay =
+          const resumedToolCallId =
             interruptEvent.toolCallId != null
+              ? String(interruptEvent.toolCallId)
+              : undefined;
+          const resumeReplay =
+            resumedToolCallId !== undefined
               ? {
-                  toolCallId: String(interruptEvent.toolCallId),
+                  toolCallId: resumedToolCallId,
                   toolName:
                     typeof interruptEvent.toolName === "string"
                       ? interruptEvent.toolName
                       : undefined,
                   args: interruptEvent.args,
+                  historyMessageId: (input.messages ?? []).find(
+                    (m) =>
+                      m.role === "assistant" &&
+                      m.toolCalls?.some((tc) => tc.id === resumedToolCallId),
+                  )?.id,
                 }
               : null;
 
@@ -1581,6 +1617,20 @@ export class MastraAgent extends AbstractAgent {
         : MastraAgent.continuationMessageId(currentId, segmentIndex);
     };
 
+    // Open a text-continuation boundary on the id a tool call renders under;
+    // trailing text on the same id is then split to a continuation message
+    // (see onTextPart). Only advance past the first boundary once text has
+    // actually streamed into the current segment, so consecutive tool calls
+    // share one boundary instead of skipping segment ids.
+    const openToolCallBoundary = (parentMessageId: string) => {
+      const openBoundaries =
+        continuationIndexByParentId.get(parentMessageId) ?? 0;
+      if (openBoundaries === 0 || textSinceLastToolCall) {
+        continuationIndexByParentId.set(parentMessageId, openBoundaries + 1);
+      }
+      textSinceLastToolCall = false;
+    };
+
     const closeReasoning = () => {
       if (isReasoning && reasoningMessageId) {
         subscriber.next({
@@ -1665,17 +1715,7 @@ export class MastraAgent extends AbstractAgent {
       onToolCallStart: (streamPart) => {
         closeReasoning();
         const parentMessageId = getMessageId();
-        // Open a text-continuation boundary on the id this tool call renders
-        // under; trailing text on the same id is then split to a continuation
-        // message (see onTextPart). Only advance past the first boundary once
-        // text has actually streamed into the current segment, so consecutive
-        // tool calls share one boundary instead of skipping segment ids.
-        const openBoundaries =
-          continuationIndexByParentId.get(parentMessageId) ?? 0;
-        if (openBoundaries === 0 || textSinceLastToolCall) {
-          continuationIndexByParentId.set(parentMessageId, openBoundaries + 1);
-        }
-        textSinceLastToolCall = false;
+        openToolCallBoundary(parentMessageId);
         subscriber.next({
           type: EventType.TOOL_CALL_START,
           parentMessageId,
@@ -1695,6 +1735,10 @@ export class MastraAgent extends AbstractAgent {
           type: EventType.TOOL_CALL_END,
           toolCallId: streamPart.toolCallId,
         } as ToolCallEndEvent);
+      },
+      onToolCallInHistory: ({ parentMessageId }) => {
+        closeReasoning();
+        openToolCallBoundary(parentMessageId);
       },
       onToolResultPart: (streamPart) => {
         subscriber.next({
@@ -1808,6 +1852,8 @@ export class MastraAgent extends AbstractAgent {
       toolCallId: string;
       toolName?: string;
       args?: any;
+      // The assistant message in `input.messages` that already holds the call.
+      historyMessageId?: string;
     } | null,
   ) {
     // Remote processDataStream responses report token usage on the terminal
@@ -1935,6 +1981,70 @@ export class MastraAgent extends AbstractAgent {
         streamedEnded.add(toolCallId);
         callbacks.onToolCallEnd?.({ toolCallId });
       }
+    };
+
+    // Whether this stream has announced the native message id yet. Until it
+    // has, the current id is the run's own fallback.
+    let messageIdAnnounced = false;
+    const adoptMessageId = (messageId: string) => {
+      messageIdAnnounced = true;
+      callbacks.onMessageId?.(messageId);
+    };
+
+    const isWorkingMemoryResult = (payload: any) =>
+      workingMemoryToolCalls.has(payload?.toolCallId) ||
+      WORKING_MEMORY_TOOL_NAMES.has(payload?.toolName);
+
+    const emitReplayedToolCall = (
+      toolCallId: string,
+      toolName: string,
+      args: unknown,
+    ) => {
+      callbacks.onToolCallStart?.({ toolCallId, toolName });
+      callbacks.onToolCallArgs?.({
+        toolCallId,
+        argsTextDelta: JSON.stringify(args ?? {}),
+      });
+      callbacks.onToolCallEnd?.({ toolCallId });
+      streamedStarted.add(toolCallId);
+      streamedEnded.add(toolCallId);
+    };
+
+    // A resumed call and its result, held until the stream announces the id
+    // Mastra stores the call under (see the `tool-result` arm).
+    let deferredReplay: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      result: unknown;
+    } | null = null;
+
+    const releaseDeferredReplay = () => {
+      if (!deferredReplay) return;
+      const { toolCallId, toolName, args, result } = deferredReplay;
+      deferredReplay = null;
+      emitReplayedToolCall(toolCallId, toolName, args);
+      callbacks.onToolResultPart?.({ toolCallId, result });
+    };
+
+    // Release the held replay ahead of any chunk that produces output, under
+    // the id that chunk announces if it carries one. Chunks that emit nothing
+    // keep holding it.
+    const settleDeferredReplay = (chunk: any) => {
+      const type = chunk?.type;
+      if (typeof type === "string" && type.startsWith("data-om-")) {
+        if (!surfaceOM) return;
+      } else if (
+        !chunk?.payload ||
+        SILENT_CHUNK_TYPES.has(type) ||
+        (type === "tool-result" && isWorkingMemoryResult(chunk.payload))
+      ) {
+        return;
+      }
+      if (MESSAGE_ID_CHUNK_TYPES.has(type) && chunk.payload?.messageId) {
+        adoptMessageId(chunk.payload.messageId);
+      }
+      releaseDeferredReplay();
     };
 
     const flush = () => {
@@ -2298,6 +2408,8 @@ export class MastraAgent extends AbstractAgent {
     };
 
     const handleChunk = (chunk: any): boolean => {
+      if (deferredReplay) settleDeferredReplay(chunk);
+
       // Observational Memory data parts arrive on fullStream as
       // `{ type: "data-om-*", data: {...} }` (no `payload`). Handle them before
       // the payload guard below so they map to activity when surfacing is on,
@@ -2482,7 +2594,9 @@ export class MastraAgent extends AbstractAgent {
           // its tool-call was mapped to STATE_DELTA and never rendered, so a
           // TOOL_CALL_RESULT here would have no matching call (and is internal
           // plumbing regardless).
-          if (workingMemoryToolCalls.has(chunk.payload.toolCallId)) {
+          // Matched by name too: a resumed stream carries the result of a
+          // call made in the previous run.
+          if (isWorkingMemoryResult(chunk.payload)) {
             workingMemoryToolCalls.delete(chunk.payload.toolCallId);
             break;
           }
@@ -2507,26 +2621,43 @@ export class MastraAgent extends AbstractAgent {
           // flush or live deltas). Do not emit on the first-run suspend path
           // (replay is unset). Standard input.resume does not round-trip
           // args; Mastra puts them on tool-result instead.
+          //
+          // The call belongs to the message Mastra stores it under. When the
+          // client already holds it there, re-emitting would add a second
+          // copy (and ARGS would append to its arguments), so only the result
+          // goes out. Otherwise the result arrives before the stream announces
+          // that id, so the triple and result wait for it.
           if (
             replaySuspendedToolCall &&
             replaySuspendedToolCall.toolCallId === chunk.payload.toolCallId &&
             !streamedStarted.has(chunk.payload.toolCallId)
           ) {
-            const toolCallId = replaySuspendedToolCall.toolCallId;
+            const { toolCallId, historyMessageId } = replaySuspendedToolCall;
             const toolName =
               replaySuspendedToolCall.toolName ||
               chunk.payload.toolName ||
               "tool";
-            callbacks.onToolCallStart?.({ toolCallId, toolName });
-            callbacks.onToolCallArgs?.({
-              toolCallId,
-              argsTextDelta: JSON.stringify(
-                replaySuspendedToolCall.args ?? chunk.payload.args ?? {},
-              ),
-            });
-            callbacks.onToolCallEnd?.({ toolCallId });
-            streamedStarted.add(toolCallId);
-            streamedEnded.add(toolCallId);
+            const args =
+              replaySuspendedToolCall.args ?? chunk.payload.args ?? {};
+            if (historyMessageId) {
+              if (!messageIdAnnounced) adoptMessageId(historyMessageId);
+              callbacks.onToolCallInHistory?.({
+                toolCallId,
+                parentMessageId: historyMessageId,
+              });
+              streamedStarted.add(toolCallId);
+              streamedEnded.add(toolCallId);
+            } else if (!messageIdAnnounced) {
+              deferredReplay = {
+                toolCallId,
+                toolName,
+                args,
+                result: chunk.payload.result,
+              };
+              break;
+            } else {
+              emitReplayedToolCall(toolCallId, toolName, args);
+            }
           }
           callbacks.onToolResultPart?.({
             toolCallId: chunk.payload.toolCallId,
@@ -2673,7 +2804,7 @@ export class MastraAgent extends AbstractAgent {
           // per-step text is never suppressed (see lastEmittedText).
           lastEmittedText = undefined;
           if (chunk.payload?.messageId) {
-            callbacks.onMessageId?.(chunk.payload.messageId);
+            adoptMessageId(chunk.payload.messageId);
           }
           break;
         }
@@ -2856,6 +2987,7 @@ export class MastraAgent extends AbstractAgent {
     return {
       handleChunk,
       flush: () => {
+        releaseDeferredReplay();
         flush();
         if (pendingRetryReason !== undefined) {
           const reason = pendingRetryReason;
@@ -2885,6 +3017,8 @@ export class MastraAgent extends AbstractAgent {
       toolCallId: string;
       toolName?: string;
       args?: any;
+      // The assistant message in `input.messages` that already holds the call.
+      historyMessageId?: string;
     } | null,
   ): Promise<"completed" | "cancelled" | "error"> {
     const { handleChunk, flush } = this.createChunkProcessor(
