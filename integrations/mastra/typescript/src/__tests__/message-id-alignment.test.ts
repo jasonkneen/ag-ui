@@ -6,9 +6,11 @@ import {
   makeRemoteMastraAgent,
   makeInput,
   collectEvents,
+  collectRunError,
   runThroughClient,
   FakeMemory,
   FakeLocalAgent,
+  FakeRemoteAgent,
 } from "./helpers";
 
 /**
@@ -827,5 +829,183 @@ describe("resumed suspended tool call identity", () => {
         events.indexOf(firstText),
       );
     });
+
+    it("keeps holding the call across observational-memory chunks that emit nothing", async () => {
+      const agent = makeRemoteMastraAgent({
+        observationalMemory: true,
+        resumeChunks: resumeChunks({
+          beforeFirstId: [
+            { type: "data-om-status", data: { tokens: 120 } },
+            { type: "data-om-thread-update", data: { title: "Sync" } },
+          ],
+        }),
+      });
+
+      const events = await collectEvents(
+        agent,
+        makeInput({ messages: [userTurn], forwardedProps: resumeProps }),
+      );
+
+      const [start] = ofType(events, EventType.TOOL_CALL_START);
+      expect(start.parentMessageId).toBe(TURN_ID);
+    });
+
+    it("emits the call and its result when the stream ends right after the result", async () => {
+      const [result] = resumeChunks();
+      const agent = makeRemoteMastraAgent({ resumeChunks: [result] });
+
+      const events = await collectEvents(
+        agent,
+        makeInput({ messages: [userTurn], forwardedProps: resumeProps }),
+      );
+
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.TOOL_CALL_START,
+        EventType.TOOL_CALL_ARGS,
+        EventType.TOOL_CALL_END,
+        EventType.TOOL_CALL_RESULT,
+        EventType.RUN_FINISHED,
+      ]);
+    });
+
+    const expectCallAndResultBeforeError = (events: BaseEvent[]) => {
+      expect(events.map((e) => e.type)).toEqual([
+        EventType.RUN_STARTED,
+        EventType.TOOL_CALL_START,
+        EventType.TOOL_CALL_ARGS,
+        EventType.TOOL_CALL_END,
+        EventType.TOOL_CALL_RESULT,
+        EventType.RUN_ERROR,
+      ]);
+      expect(ofType(events, EventType.TOOL_CALL_RESULT)[0].toolCallId).toBe(
+        CALL_ID,
+      );
+    };
+
+    it("emits the call and its result before an error chunk", async () => {
+      const [result] = resumeChunks();
+      const agent = makeRemoteMastraAgent({
+        resumeChunks: [
+          result,
+          { type: "error", runId: MASTRA_RUN_ID, payload: { error: "boom" } },
+        ],
+      });
+
+      const { events } = await collectRunError(
+        agent,
+        makeInput({ messages: [userTurn], forwardedProps: resumeProps }),
+      );
+
+      expectCallAndResultBeforeError(events);
+    });
+
+    it("emits the call and its result before a remote stream failure", async () => {
+      const [result] = resumeChunks();
+      const remote = new FakeRemoteAgent();
+      remote.resumeStream = async () => ({
+        processDataStream: async ({ onChunk }) => {
+          await onChunk(result);
+          throw new Error("connection reset");
+        },
+      });
+      const agent = new MastraAgent({
+        agentId: "test-agent",
+        agent: remote as any,
+        resourceId: "resource-1",
+      });
+
+      const { error, events } = await collectRunError(
+        agent,
+        makeInput({ messages: [userTurn], forwardedProps: resumeProps }),
+      );
+
+      expect(error.message).toBe("connection reset");
+      expectCallAndResultBeforeError(events);
+    });
+
+    it("emits the call and its result before a local stream failure", async () => {
+      const [result] = resumeChunks();
+      const local = new FakeLocalAgent();
+      local.resumeStream = async () => ({
+        fullStream: (async function* () {
+          yield result;
+          throw new Error("model crashed");
+        })(),
+      });
+      const agent = new MastraAgent({
+        agentId: "test-agent",
+        agent: local as any,
+        resourceId: "resource-1",
+      });
+
+      const { error, events } = await collectRunError(
+        agent,
+        makeInput({ messages: [userTurn], forwardedProps: resumeProps }),
+      );
+
+      expect(error.message).toBe("model crashed");
+      expectCallAndResultBeforeError(events);
+    });
+  });
+
+  // An earlier step of the suspended turn already split text off the turn id,
+  // so the resumed text needs the next continuation id, not that one.
+  describe("when the turn already has continuation text", () => {
+    const EARLIER_CALL_ID = "call-lookup";
+    const earlierCall = {
+      id: EARLIER_CALL_ID,
+      type: "function" as const,
+      function: { name: "lookup", arguments: "{}" },
+    };
+    const pendingCall = {
+      id: CALL_ID,
+      type: "function" as const,
+      function: { name: "schedule_meeting", arguments: JSON.stringify(ARGS) },
+    };
+    const historyFor = (toolCalls: (typeof earlierCall)[]): Message[] => [
+      userTurn,
+      { id: TURN_ID, role: "assistant", content: "Checking.", toolCalls },
+      {
+        id: "result-lookup",
+        role: "tool",
+        toolCallId: EARLIER_CALL_ID,
+        content: '"free at 3pm"',
+      },
+      {
+        id: CONTINUATION_ID,
+        role: "assistant",
+        content: "Booking it, need approval.",
+      },
+    ];
+
+    it.each([
+      ["already holds the pending call", [earlierCall, pendingCall]],
+      ["does not hold the pending call", [earlierCall]],
+    ])(
+      "streams the resumed text as a new message when the client %s",
+      async (_case, toolCalls) => {
+        const agent = makeRemoteMastraAgent({ resumeChunks: resumeChunks() });
+
+        const messages = await runThroughClient(agent, historyFor(toolCalls), {
+          runId: "run-2",
+          forwardedProps: resumeProps,
+        });
+
+        expect(messages.map((m) => [m.id, m.role, m.content ?? ""])).toEqual([
+          ["user-1", "user", "Book a sync at 3pm"],
+          [TURN_ID, "assistant", "Checking."],
+          ["result-lookup", "tool", '"free at 3pm"'],
+          // The client files a result right after its call's tool results.
+          [expect.any(String), "tool", expect.any(String)],
+          [CONTINUATION_ID, "assistant", "Booking it, need approval."],
+          [`${CONTINUATION_ID}-2`, "assistant", "Booked for 3pm."],
+        ]);
+        expect(messages[3]).toMatchObject({ toolCallId: CALL_ID });
+        expect(
+          (messages[1] as AssistantMessage).toolCalls?.map((tc) => tc.id),
+        ).toEqual([EARLIER_CALL_ID, CALL_ID]);
+      },
+    );
   });
 });

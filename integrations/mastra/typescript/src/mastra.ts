@@ -110,6 +110,18 @@ const SILENT_CHUNK_TYPES = new Set([
   "abort",
 ]);
 
+// Observational Memory chunk types surfaced as activity (see handleOmChunk);
+// every other data-om-* chunk is swallowed.
+const SURFACED_OM_CHUNK_TYPES = new Set([
+  "data-om-observation-start",
+  "data-om-buffering-start",
+  "data-om-observation-end",
+  "data-om-buffering-end",
+  "data-om-observation-failed",
+  "data-om-buffering-failed",
+  "data-om-activation",
+]);
+
 // Chunk types that can carry the turn's native message id.
 const MESSAGE_ID_CHUNK_TYPES = new Set([
   "start",
@@ -1026,6 +1038,7 @@ export class MastraAgent extends AbstractAgent {
             },
             input.runId,
             pendingInterrupts,
+            input.messages,
           );
 
           // Shared completion: emit a best-effort working-memory snapshot
@@ -1131,7 +1144,7 @@ export class MastraAgent extends AbstractAgent {
               }
 
               let stopped = false;
-              const { handleChunk, flush, getUsage } =
+              const { handleChunk, flush, getUsage, releaseDeferredReplay } =
                 this.createChunkProcessor(
                   {
                     ...callbacks,
@@ -1144,17 +1157,24 @@ export class MastraAgent extends AbstractAgent {
                   resumeReplay,
                 );
 
-              await response.processDataStream({
-                onChunk: async (chunk: any) => {
-                  if (stopped) return;
-                  // Cancelled mid-resume: stop consuming (#2288).
-                  if (abortController.signal.aborted) {
-                    stopped = true;
-                    return;
-                  }
-                  if (handleChunk(chunk)) stopped = true;
-                },
-              });
+              try {
+                await response.processDataStream({
+                  onChunk: async (chunk: any) => {
+                    if (stopped) return;
+                    // Cancelled mid-resume: stop consuming (#2288).
+                    if (abortController.signal.aborted) {
+                      stopped = true;
+                      return;
+                    }
+                    if (handleChunk(chunk)) stopped = true;
+                  },
+                });
+              } catch (error) {
+                // A resumed call already streamed must reach the client
+                // before the failure.
+                if (!abortController.signal.aborted) releaseDeferredReplay();
+                throw error;
+              }
 
               if (!stopped) {
                 flush();
@@ -1575,6 +1595,7 @@ export class MastraAgent extends AbstractAgent {
     setMessageId: (id: string) => void,
     runId: string,
     pendingInterrupts: Interrupt[],
+    historyMessages: Message[] = [],
   ): Omit<MastraAgentStreamOptions, "onError" | "onRunFinished"> {
     let reasoningMessageId: string | null = null;
     let isReasoning = false;
@@ -1601,6 +1622,22 @@ export class MastraAgent extends AbstractAgent {
     // id. Each further boundary bumps the index, giving that run of text its own
     // continuation message (#2380) — a turn can alternate more than once.
     const continuationIndexByParentId = new Map<string, number>();
+    // Per base id: the highest continuation index already in history. A resumed
+    // turn's first boundary starts past it so its text never appends onto a
+    // continuation message an earlier run emitted.
+    const historyContinuationIndex = new Map<string, number>();
+    for (const { id } of historyMessages) {
+      const base = MastraAgent.continuationBaseId(id);
+      if (!base) continue;
+      const suffix = id.slice(
+        base.length + MastraAgent.ASSISTANT_TEXT_CONTINUATION_SUFFIX.length,
+      );
+      const index = suffix ? Number(suffix.slice(1)) : 1;
+      historyContinuationIndex.set(
+        base,
+        Math.max(historyContinuationIndex.get(base) ?? 0, index),
+      );
+    }
     // Whether text has streamed since the last tool call on the current base id.
     // Back-to-back tool calls (parallel calls) must not burn a segment index.
     let textSinceLastToolCall = false;
@@ -1623,9 +1660,13 @@ export class MastraAgent extends AbstractAgent {
     // actually streamed into the current segment, so consecutive tool calls
     // share one boundary instead of skipping segment ids.
     const openToolCallBoundary = (parentMessageId: string) => {
-      const openBoundaries =
-        continuationIndexByParentId.get(parentMessageId) ?? 0;
-      if (openBoundaries === 0 || textSinceLastToolCall) {
+      const openBoundaries = continuationIndexByParentId.get(parentMessageId);
+      if (openBoundaries === undefined) {
+        continuationIndexByParentId.set(
+          parentMessageId,
+          (historyContinuationIndex.get(parentMessageId) ?? 0) + 1,
+        );
+      } else if (textSinceLastToolCall) {
         continuationIndexByParentId.set(parentMessageId, openBoundaries + 1);
       }
       textSinceLastToolCall = false;
@@ -2033,7 +2074,7 @@ export class MastraAgent extends AbstractAgent {
     const settleDeferredReplay = (chunk: any) => {
       const type = chunk?.type;
       if (typeof type === "string" && type.startsWith("data-om-")) {
-        if (!surfaceOM) return;
+        if (!surfaceOM || !SURFACED_OM_CHUNK_TYPES.has(type)) return;
       } else if (
         !chunk?.payload ||
         SILENT_CHUNK_TYPES.has(type) ||
@@ -2986,6 +3027,7 @@ export class MastraAgent extends AbstractAgent {
 
     return {
       handleChunk,
+      releaseDeferredReplay,
       flush: () => {
         releaseDeferredReplay();
         flush();
@@ -3021,20 +3063,27 @@ export class MastraAgent extends AbstractAgent {
       historyMessageId?: string;
     } | null,
   ): Promise<"completed" | "cancelled" | "error"> {
-    const { handleChunk, flush } = this.createChunkProcessor(
-      callbacks,
-      clientToolNames,
-      initialState,
-      replaySuspendedToolCall,
-    );
-    for await (const chunk of stream) {
-      // Cancelled (unsubscribe or abortRun): stop pulling from the source
-      // instead of draining it to completion (#2288). Reported distinctly from
-      // an error so the caller can tell "stopped on purpose" from "failed" —
-      // neither emits RUN_FINISHED, but only the error path has already
-      // reported itself through onError.
-      if (abortSignal.aborted) return "cancelled";
-      if (handleChunk(chunk)) return "error";
+    const { handleChunk, flush, releaseDeferredReplay } =
+      this.createChunkProcessor(
+        callbacks,
+        clientToolNames,
+        initialState,
+        replaySuspendedToolCall,
+      );
+    try {
+      for await (const chunk of stream) {
+        // Cancelled (unsubscribe or abortRun): stop pulling from the source
+        // instead of draining it to completion (#2288). Reported distinctly
+        // from an error so the caller can tell "stopped on purpose" from
+        // "failed". Neither emits RUN_FINISHED, but only the error path has
+        // already reported itself through onError.
+        if (abortSignal.aborted) return "cancelled";
+        if (handleChunk(chunk)) return "error";
+      }
+    } catch (error) {
+      // A resumed call already streamed must reach the client before the failure.
+      if (!abortSignal.aborted) releaseDeferredReplay();
+      throw error;
     }
     flush();
     return "completed";
