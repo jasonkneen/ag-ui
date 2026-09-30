@@ -4,7 +4,7 @@
 from ag_ui_adk.agui_toolset import AGUIToolset
 
 import copy
-from typing import Optional, Dict, Callable, Any, AsyncGenerator, List, Iterable, Set, TYPE_CHECKING, Tuple, Union
+from typing import Optional, Dict, Callable, Any, AsyncGenerator, Awaitable, List, Iterable, Set, TYPE_CHECKING, Tuple, Union
 
 if TYPE_CHECKING:
     from google.adk.apps import App
@@ -2018,36 +2018,48 @@ class ADKAgent:
         # confirm_changes results are not ADK tool results, but the user's
         # decision is handed to the model as user text so it can react.
         confirm_decisions = self._extract_confirm_changes_decisions(input, candidate_messages)
-        if confirm_decisions:
-            await self._consume_pending_confirm_changes(
-                thread_id,
-                self._get_user_id(input),
-                [message.tool_call_id for message, _ in confirm_decisions],
-            )
+
+        async def consume_confirm_decisions() -> None:
+            if confirm_decisions:
+                await self._consume_pending_confirm_changes(
+                    thread_id,
+                    self._get_user_id(input),
+                    [message.tool_call_id for message, _ in confirm_decisions],
+                )
 
         # If all tool results were filtered out (e.g., only confirm_changes messages),
         # we still need to mark those messages as processed and continue with trailing messages
         if not tool_results and actual_tool_messages:
-            # Mark the tool messages as processed (they were confirm_changes results)
             tool_message_ids = self._collect_message_ids(actual_tool_messages)
-            if tool_message_ids:
-                self._session_manager.mark_messages_processed(app_name, thread_id, tool_message_ids)
-                logger.debug(
-                    "Marked %d synthetic tool result messages as processed for thread %s",
-                    len(tool_message_ids),
-                    thread_id,
-                )
+
+            def mark_synthetic_processed() -> None:
+                if tool_message_ids:
+                    self._session_manager.mark_messages_processed(app_name, thread_id, tool_message_ids)
+                    logger.debug(
+                        "Marked %d synthetic tool result messages as processed for thread %s",
+                        len(tool_message_ids),
+                        thread_id,
+                    )
 
             if confirm_decisions:
+                # Consume the decision only once the continuation is accepted, so
+                # a refused start (e.g. the concurrency limit) stays retryable.
+                async def accept_decisions() -> None:
+                    await consume_confirm_decisions()
+                    mark_synthetic_processed()
+
                 async for event in self._start_new_execution(
                     input,
                     tool_results=None,
                     message_batch=self._with_confirm_changes_decisions(
                         confirm_decisions, trailing_messages
                     ),
+                    on_accepted=accept_decisions,
                 ):
                     yield event
                 return
+
+            mark_synthetic_processed()
 
             # If we have trailing messages (e.g., a follow-up user request after confirming changes),
             # process them as a new execution
@@ -2291,14 +2303,17 @@ class ADKAgent:
                 )
                 return
 
-            # All of this turn's long-running calls are answered: remove them
-            # from the pending set, then resume the model with the results. Use
-            # trailing_messages if provided, otherwise fall back to
-            # candidate_messages.
-            for tool_result in tool_results:
-                tool_call_id = tool_result["message"].tool_call_id
-                if await self._has_pending_tool_calls(thread_id, user_id):
-                    await self._remove_pending_tool_call(thread_id, tool_call_id, user_id)
+            # All of this turn's long-running calls are answered: resume the
+            # model with the results, removing them from the pending set only
+            # once the continuation is accepted (a refused start stays
+            # retryable). Use trailing_messages if provided, otherwise fall back
+            # to candidate_messages.
+            async def accept_results() -> None:
+                for tool_result in tool_results:
+                    tool_call_id = tool_result["message"].tool_call_id
+                    if await self._has_pending_tool_calls(thread_id, user_id):
+                        await self._remove_pending_tool_call(thread_id, tool_call_id, user_id)
+                await consume_confirm_decisions()
 
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
             if confirm_decisions:
@@ -2310,6 +2325,7 @@ class ADKAgent:
                 input,
                 tool_results=tool_results,
                 message_batch=message_batch,
+                on_accepted=accept_results,
             ):
                 yield event
 
@@ -2662,11 +2678,16 @@ class ADKAgent:
         *,
         tool_results: Optional[List[Dict]] = None,
         message_batch: Optional[List[Any]] = None,
+        on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Start a new ADK execution with tool support.
 
         Args:
             input: The run input
+            on_accepted: Awaited once the execution is about to start, after
+                the concurrency check; bookkeeping that consumes the input
+                (pending calls, processed markers) belongs here so a refused
+                start leaves it retryable.
 
         Yields:
             AG-UI events from the execution
@@ -2717,6 +2738,7 @@ class ADKAgent:
                 input,
                 tool_results=tool_results,
                 message_batch=message_batch,
+                **({"on_accepted": on_accepted} if on_accepted is not None else {}),
             )
             
             # Store execution (replacing any previous one)
@@ -2905,6 +2927,7 @@ class ADKAgent:
         *,
         tool_results: Optional[List[Dict]] = None,
         message_batch: Optional[List[Any]] = None,
+        on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> ExecutionState:
         """Start ADK execution in background with tool support.
 
@@ -3167,6 +3190,8 @@ class ADKAgent:
         if message_batch is not None:
             run_kwargs["message_batch"] = message_batch
 
+        if on_accepted is not None:
+            await on_accepted()
         task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
 

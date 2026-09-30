@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An answer to a paused run is no longer lost when its continuation is refused
+  before it starts (for example "Maximum concurrent executions reached"). The
+  pending tool call or `confirm_changes` id and the answering message are now
+  consumed only once the continuation is accepted, so retrying the same answer
+  delivers it exactly once. This covers tool results, tool confirmations and
+  `confirm_changes` decisions, sent as tool messages or as `resume` entries.
+  Before, the tool call was already removed from the pending set, so the retry
+  was skipped as a stale result.
 - Attachment filenames now survive the ADK session. An image, audio, video or
   document part that carries `metadata.filename` is stored with that name as
   the native `display_name` on its `Blob` (inline data) or `FileData` (URL).

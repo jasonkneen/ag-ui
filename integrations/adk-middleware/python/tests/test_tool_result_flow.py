@@ -441,7 +441,9 @@ class TestToolResultFlow:
 
         # In the all-long-running architecture, tool result inputs are processed as new executions
         # Mock the background execution to avoid ADK library errors
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+            if on_accepted is not None:
+                await on_accepted()
             yield RunStartedEvent(
                 type=EventType.RUN_STARTED,
                 thread_id=input_data.thread_id,
@@ -482,7 +484,11 @@ class TestToolResultFlow:
 
         start_calls = []
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             start_calls.append((tool_results, message_batch))
             yield RunStartedEvent(
                 type=EventType.RUN_STARTED,
@@ -584,7 +590,11 @@ class TestToolResultFlow:
 
         start_calls = []
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             start_calls.append((tool_results, message_batch))
 
             call_id = None
@@ -670,7 +680,11 @@ class TestToolResultFlow:
 
         call_sequence = []
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             call_sequence.append(("start", tool_results, message_batch))
             yield RunStartedEvent(
                 type=EventType.RUN_STARTED,
@@ -745,7 +759,11 @@ class TestToolResultFlow:
             RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id="thread_1", run_id="run_1")
         ]
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             for event in mock_events:
                 yield event
 
@@ -937,7 +955,11 @@ class TestConfirmChangesFiltering:
 
         start_calls = []
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             start_calls.append({"tool_results": tool_results, "message_batch": message_batch})
             yield RunStartedEvent(
                 type=EventType.RUN_STARTED,
@@ -1012,7 +1034,11 @@ class TestConfirmChangesFiltering:
         # Mock _start_new_execution to track calls
         start_calls = []
 
-        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None):
+        async def mock_start_new_execution(input_data, *, tool_results=None, message_batch=None, on_accepted=None):
+
+            if on_accepted is not None:
+
+                await on_accepted()
             start_calls.append({"tool_results": tool_results, "message_batch": message_batch})
             yield RunStartedEvent(
                 type=EventType.RUN_STARTED,
